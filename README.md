@@ -8,7 +8,7 @@
 
 [![Chrome](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)](https://github.com/AlexBelguim/TabPaladin)
 [![Firefox](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox&logoColor=white)](https://github.com/AlexBelguim/TabPaladin)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 
 </div>
 
@@ -94,7 +94,7 @@ Contributions are welcome! Feel free to:
 
 ## 📜 License
 
-MIT License — do whatever you want, just don't blame us if you accidentally close your 200 tabs.
+**Proprietary** — All rights reserved. Contact for licensing inquiries.
 
 ---
 
