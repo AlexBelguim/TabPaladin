@@ -1,0 +1,428 @@
+/* Modern Clean Theme - TabPaladin */
+:root {
+  --bg-color: #0f172a;
+  /* Deep Slate/Navy */
+  --surface-color: #1e293b;
+  /* Lighter Slate */
+  --surface-hover: #334155;
+  --text-color: #f1f5f9;
+  --text-muted: #94a3b8;
+  --border-color: #334155;
+
+  --primary-color: #3b82f6;
+  /* Blue */
+  --primary-hover: #2563eb;
+  --success-color: #10b981;
+  /* Emerald */
+  --warning-color: #f59e0b;
+  /* Amber */
+  --danger-color: #ef4444;
+  /* Red */
+  --accent-color: #8b5cf6;
+  /* Violet */
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-glow: 0 0 15px rgba(59, 130, 246, 0.3);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* --- Layout Components --- */
+header {
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+  background: linear-gradient(to right, #60a5fa, #a78bfa);
+  -webkit-background-clip: text;
+  background-clip: text;
+  /* Standard property */
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  margin: 0 0 16px 0;
+  color: var(--text-muted);
+}
+
+section {
+  margin-bottom: 24px;
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* --- Buttons (Premium Style) --- */
+button {
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.primary-btn {
+  width: 100%;
+  padding: 10px 16px;
+  background-color: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 0.95rem;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+  display: inline-flex;
+  /* Use inline-flex for better flow if needed */
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  /* Prevent button text wrapping */
+}
+
+.primary-btn:hover:not(:disabled) {
+  background-color: var(--primary-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 8px -1px rgba(0, 0, 0, 0.3);
+}
+
+.primary-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.primary-btn:disabled {
+  background-color: var(--surface-color);
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none;
+  box-shadow: none;
+}
+
+.sm-btn {
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+}
+
+.sm-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-color);
+}
+
+/* --- Inputs --- */
+input[type="text"],
+input[type="search"] {
+  width: 100%;
+  padding: 10px 12px;
+  background-color: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: white;
+  font-size: 0.9rem;
+  transition: all 0.2s ease;
+}
+
+input[type="text"]:focus,
+input[type="search"]:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  background-color: rgba(0, 0, 0, 0.3);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+label {
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+/* --- Grid Layout --- */
+.action-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.action-grid .primary-btn {
+  width: 100%;
+  height: 100%;
+  /* Fill cell */
+  min-height: 50px;
+  /* Touch target */
+  margin: 0 !important;
+  /* Override inline styles if any */
+  padding: 8px;
+  /* Compact padding */
+  font-size: 0.85rem;
+  /* Slightly smaller text for grid */
+  line-height: 1.2;
+}
+
+/* --- List Resets --- */
+ul,
+ol {
+  list-style: none;
+  /* No dots */
+  padding: 0;
+  margin: 0;
+}
+
+/* --- Input Fixes --- */
+#ai-regroup-controls input {
+  min-width: 0;
+  /*  Prevent flex item from overflowing */
+}
+
+
+/* --- Source Grid (Cards) --- */
+.source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  /* WIDER Cards */
+  gap: 12px;
+}
+
+/* Unified Card Style */
+.source-btn,
+.source-split-card {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-color);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  overflow: hidden;
+  position: relative;
+  height: 60px;
+  /* Fixed robust height */
+  display: flex;
+  /* Flex is crucial */
+  align-items: center;
+  text-align: left;
+}
+
+/* Simple Button Card (e.g. Loose Files) */
+.source-btn {
+  padding: 0 12px;
+  justify-content: center;
+  /* Center content if simple button */
+  flex-direction: column;
+  align-items: flex-start;
+  /* Align text left */
+}
+
+/* Allow inner divs to stack properly in source-btn */
+.source-btn div {
+  width: 100%;
+}
+
+
+.source-btn:hover,
+.source-split-card:hover {
+  border-color: var(--primary-color);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+/* Selection State */
+.source-btn.selected,
+.source-split-card.selected {
+  background-color: rgba(59, 130, 246, 0.15);
+  /* Subtle blue tint */
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 1px var(--primary-color);
+}
+
+/* Specifics for Split Card */
+.source-split-card {
+  display: flex;
+  height: 80px;
+  /* Fixed height for consistency */
+}
+
+/* Split Card Internals */
+.source-select-area {
+  flex: 1;
+  /* Take remaining space */
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 100%;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.source-drill-btn {
+  width: 32px;
+  /* Fixed width trigger */
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.1);
+  /* Slightly darker trigger area */
+  transition: background 0.2s;
+}
+
+.source-drill-btn:hover {
+  background: var(--primary-color);
+  color: white;
+}
+
+/* --- AI Controls --- */
+#ai-regroup-controls {
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  padding: 12px;
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+}
+
+#ai-regroup-controls .input-group {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  align-items: center;
+  /* Vertical center */
+}
+
+#ai-regroup-controls input {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  /* Reset margins */
+}
+
+/* FIX: Override the 100% width from primary-btn */
+#ai-regroup-controls .primary-btn {
+  width: auto !important;
+  flex-shrink: 0;
+  margin: 0 !important;
+  height: 100%;
+  /* Match input height if possible */
+  padding: 10px 16px;
+  /* Ensure consistency */
+}
+
+/* --- Card Tweaks --- */
+/* --- Card Tweaks --- */
+.source-btn {
+  /* Match split-card exact padding structure */
+  padding: 8px 12px;
+  /* "Loose Files" often has 2 lines (Title + Count).
+     Align exactly like the LEFT side of a split card. */
+  display: flex;
+  flex-direction: column;
+  /* Vertical Stacking */
+  justify-content: center;
+  align-items: flex-start;
+  /* Align text left */
+}
+
+
+
+/* --- Proposal & Workflow Items --- */
+.group-card,
+.workflow-item {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  /* Reduced vertical padding */
+  margin-bottom: 12px;
+  transition: transform 0.2s ease;
+}
+
+.workflow-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px;
+}
+
+.workflow-item:hover {
+  background-color: var(--surface-hover);
+}
+
+/* Draggable Items within Groups */
+.draggable-item {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
+
+.draggable-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* --- Scrollbar --- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* --- Animations --- */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 20px;
+  border: 2px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  margin-top: 10px;
+}

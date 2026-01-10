@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "TabPaladin",
+  "version": "1.0.0",
+  "minimum_chrome_version": "116",
+  "description": "Group tabs, save workflows, and manage your browsing sessions efficiently.",
+  "permissions": [
+    "tabs",
+    "bookmarks",
+    "storage",
+    "sidePanel",
+    "downloads"
+  ],
+  "background": {
+    "service_worker": "src/background/background.js"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/sidepanel.html"
+  },
+  "icons": {
+    "16": "assets/icon16.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  },
+  "action": {
+    "default_title": "Open TabPaladin",
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "48": "assets/icon48.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content/videoSeek.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

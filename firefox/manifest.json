@@ -1,0 +1,57 @@
+{
+    "manifest_version": 2,
+    "name": "TabPaladin",
+    "version": "1.0.0",
+    "description": "Group tabs, save workflows, and manage your browsing sessions efficiently.",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "tabpaladin@extension",
+            "strict_min_version": "109.0"
+        }
+    },
+    "permissions": [
+        "tabs",
+        "bookmarks",
+        "storage",
+        "downloads",
+        "<all_urls>"
+    ],
+    "background": {
+        "scripts": [
+            "src/background/background.js"
+        ],
+        "persistent": false
+    },
+    "sidebar_action": {
+        "default_title": "TabPaladin",
+        "default_panel": "src/sidepanel/sidepanel.html",
+        "default_icon": {
+            "16": "assets/icon16.png",
+            "48": "assets/icon48.png"
+        }
+    },
+    "icons": {
+        "16": "assets/icon16.png",
+        "48": "assets/icon48.png",
+        "128": "assets/icon128.png"
+    },
+    "browser_action": {
+        "default_title": "Open TabPaladin Sidebar",
+        "default_icon": {
+            "16": "assets/icon16.png",
+            "48": "assets/icon48.png",
+            "128": "assets/icon128.png"
+        }
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "src/content/videoSeek.js"
+            ],
+            "run_at": "document_idle"
+        }
+    ]
+}

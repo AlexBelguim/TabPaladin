@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TabPaladin</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+
+<body>
+  <div class="container">
+    <header style="display:flex; justify-content:space-between; align-items:center;">
+      <h1><img src="../../assets/icon48.png" alt="TabPaladin Logo"
+          style="height:24px; vertical-align:middle; margin-right:8px;">TabPaladin</h1>
+      <button id="settingsToggleBtn" class="sm-btn"
+        style="font-size:1.2rem; background:none; border:none; cursor:pointer;" title="Settings">⚙️</button>
+    </header>
+
+    <main>
+      <section id="actions" class="action-grid">
+        <button id="groupTabsBtn" class="primary-btn">Group Open Tabs</button>
+        <button id="organizeBookmarksBtn" class="primary-btn" style="background-color: #10b981;">Organize
+          Bookmarks</button>
+        <button id="viewWorkflowsBtn" class="primary-btn" style="background-color: #6366f1;">View Workflows</button>
+        <button id="saveWorkflowBtn" class="primary-btn" style="background-color: #f59e0b;">Create Workflow 💾</button>
+      </section>
+
+      <section id="groups-container">
+        <!-- Groups will be inserted here -->
+        <p class="empty-state">No tabs grouped yet.</p>
+      </section>
+
+      <section id="organizer-source-container"
+        style="display:none; border-top:1px solid #ddd; margin-top:16px; padding-top:16px;">
+        <h2>Select Folders to Clean</h2>
+        <div id="source-list" class="source-grid" style="margin-bottom:12px;">
+        </div>
+
+        <!-- AI Hints Input -->
+        <div style="margin-bottom:10px;">
+          <label style="display:block; font-size:0.75rem; color:#aaa; margin-bottom:4px;">AI Hints (Optional)</label>
+          <input type="text" id="aiHintsInput" placeholder="e.g. pop, kpop, fitness, react..."
+            style="width:100%; padding:8px; background:rgba(0,0,0,0.2); border:1px solid #374151; color:white; border-radius:6px; font-size:0.9rem;">
+        </div>
+
+        <div style="display:flex; gap:8px; margin-bottom:8px;">
+          <button id="analyzeBtn" class="primary-btn" style="flex:1;">✨ Analyze & Sort</button>
+          <button id="restructureBtn" class="primary-btn" style="flex:1; background-color: #8b5cf6;"
+            title="Revamp the entire folder structure">🏗️ Restructure</button>
+        </div>
+        <button id="cancelSourceBtn" class="sm-btn"
+          style="width:100%; margin-top:5px; border:none; color:#666;">Cancel</button>
+      </section>
+
+      <section id="organizer-container"
+        style="display:none; border-top:1px solid #ddd; margin-top:16px; padding-top:16px;">
+        <h2>Bookmark Proposals</h2>
+
+        <!-- AI Controls for Re-Grouping -->
+        <div id="ai-regroup-controls">
+          <label style="display:block; font-size:0.75rem; color:#aaa; margin-bottom:4px;">✨ Refine with AI
+            (Optional)</label>
+          <div class="input-group">
+            <input type="text" id="aiTabsHintsInput" placeholder="Hints e.g. Work, News..."
+              style="/* Style handled in CSS */">
+            <button id="aiGroupTabsBtn" class="primary-btn" style="/* Style handled in CSS */">Re-Group</button>
+          </div>
+        </div>
+
+        <div id="proposals-list"></div>
+        <button id="applyOrganizerBtn" class="primary-btn" style="margin-top:10px;">Apply Changes</button>
+        <button id="cancelOrganizerBtn" class="sm-btn"
+          style="width:100%; margin-top:5px; border:none; color:#666;">Back</button>
+      </section>
+
+      <hr>
+
+      <section id="workflows-container"
+        style="display:none; border-top:1px solid #ddd; margin-top:16px; padding-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <h2 style="margin:0;">Saved Workflows</h2>
+          <div style="display:flex; gap:6px;">
+            <button id="importWorkflowsBtn" class="sm-btn" title="Import workflows from JSON"
+              style="padding:4px 8px; font-size:0.85rem;">📥 Import</button>
+            <button id="exportAllWorkflowsBtn" class="sm-btn" title="Export all workflows to JSON"
+              style="padding:4px 8px; font-size:0.85rem;">📤 Export All</button>
+          </div>
+        </div>
+        <input type="file" id="importFileInput" accept=".json" style="display:none;">
+        <ul id="workflows-list">
+          <!-- Workflows will be listed here -->
+        </ul>
+      </section>
+
+      <section id="settings-container"
+        style="display:none; border-top:1px solid #ddd; margin-top:16px; padding-top:16px;">
+        <h2>Extension Settings</h2>
+        <p style="font-size:0.8rem; color:#666; margin-bottom:12px;">Select folders to analyze for Smart Grouping and
+          Organization.</p>
+        <div id="settings-folder-list"
+          style="margin-bottom:12px; max-height: 200px; overflow-y:auto; border:1px solid #eee; padding:5px;"></div>
+        <button id="saveSettingsBtn" class="primary-btn">Save Settings</button>
+        <button id="closeSettingsBtn" class="sm-btn"
+          style="width:100%; margin-top:5px; border:none; color:#666;">Close</button>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="sidepanel.js"></script>
+</body>
+
+</html>
