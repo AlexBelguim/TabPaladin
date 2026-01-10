@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![TabPaladin Logo](logo.png)
+<img src="logo.png" alt="TabPaladin Logo" width="150">
 
 **Your tabs deserve a guardian.**
 
