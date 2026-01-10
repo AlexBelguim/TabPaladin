@@ -1,5 +1,8 @@
+// Firefox/Chrome compatibility - use browser API directly
+const api = typeof browser !== 'undefined' ? browser : chrome;
+
 /**
- * StorageManager - Handles Chrome Storage for Workflows and Settings.
+ * StorageManager - Handles Storage for Workflows and Settings.
  */
 
 export const StorageManager = {
@@ -16,11 +19,11 @@ export const StorageManager = {
             tabs: tabs.map(t => ({ url: t.url, title: t.title, favIconUrl: t.favIconUrl }))
         };
 
-        const data = await chrome.storage.local.get("workflows");
-        const workflows = data.workflows || [];
+        const data = await api.storage.local.get("workflows") || {};
+        const workflows = (data && data.workflows) || [];
         workflows.push(workflow);
 
-        await chrome.storage.local.set({ workflows });
+        await api.storage.local.set({ workflows });
         return workflow;
     },
 
@@ -28,18 +31,18 @@ export const StorageManager = {
      * Get all saved workflows.
      */
     getWorkflows: async () => {
-        const data = await chrome.storage.local.get("workflows");
-        return data.workflows || [];
+        const data = await api.storage.local.get("workflows") || {};
+        return (data && data.workflows) || [];
     },
 
     /**
      * Delete a workflow by ID.
      */
     deleteWorkflow: async (id) => {
-        const data = await chrome.storage.local.get("workflows");
-        let workflows = data.workflows || [];
+        const data = await api.storage.local.get("workflows") || {};
+        let workflows = (data && data.workflows) || [];
         workflows = workflows.filter(w => w.id !== id);
-        await chrome.storage.local.set({ workflows });
+        await api.storage.local.set({ workflows });
     },
 
     /**
@@ -50,11 +53,11 @@ export const StorageManager = {
 
         // Create new window with the first tab
         const firstUrl = workflow.tabs[0].url;
-        const window = await chrome.windows.create({ url: firstUrl, focused: true });
+        const window = await api.windows.create({ url: firstUrl, focused: true });
 
         // Open remaining tabs
         for (let i = 1; i < workflow.tabs.length; i++) {
-            await chrome.tabs.create({ windowId: window.id, url: workflow.tabs[i].url });
+            await api.tabs.create({ windowId: window.id, url: workflow.tabs[i].url });
         }
     },
 
@@ -67,7 +70,7 @@ export const StorageManager = {
         const url = URL.createObjectURL(blob);
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-        await chrome.downloads.download({
+        await api.downloads.download({
             url: url,
             filename: `tabworkflow_backup_${timestamp}.json`
         });
@@ -81,13 +84,13 @@ export const StorageManager = {
             const newWorkflows = JSON.parse(jsonString);
             if (!Array.isArray(newWorkflows)) throw new Error("Invalid format");
 
-            const data = await chrome.storage.local.get("workflows");
-            const currentWorkflows = data.workflows || [];
+            const data = await api.storage.local.get("workflows") || {};
+            const currentWorkflows = (data && data.workflows) || [];
 
             // Merge unique flows (simple check by name+length for now, or just append)
             const merged = [...currentWorkflows, ...newWorkflows];
 
-            await chrome.storage.local.set({ workflows: merged });
+            await api.storage.local.set({ workflows: merged });
             return { success: true, count: newWorkflows.length };
         } catch (e) {
             console.error("Import failed", e);
@@ -98,15 +101,13 @@ export const StorageManager = {
      * Settings Management
      */
     saveSettings: async (settings) => {
-        await chrome.storage.local.set({ settings });
+        await api.storage.local.set({ settings });
     },
 
     getSettings: async () => {
-        const data = await chrome.storage.local.get("settings");
-        return data.settings || {
-            focusedFolderIds: [] // Default: check all if empty? Or check '2' (Other)? 
-            // Let's default to [] which implies "Scan All" or "Ask User". 
-            // Actually, if we want "Scope", we probably want explicit. 
+        const data = await api.storage.local.get("settings") || {};
+        return (data && data.settings) || {
+            focusedFolderIds: []
         };
     }
 };

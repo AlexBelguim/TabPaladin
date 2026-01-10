@@ -72,13 +72,13 @@ TabPaladin is a powerful browser extension that helps you **tame tab chaos** and
 TabPaladin/
 ├── manifest.json           # Chrome extension manifest (v3)
 ├── firefox/
-│   └── manifest.json       # Firefox add-on manifest (v2)
-├── src/
-│   ├── background/         # Service worker / background scripts
+│   └── manifest.json       # Firefox add-on manifest (v2, points to ../src/)
+├── src/                    # Shared source code (Chrome + Firefox)
+│   ├── background/         # Background script (polyfilled)
 │   ├── sidepanel/          # Main UI (HTML, CSS, JS)
 │   ├── content/            # Content scripts (video scroll)
 │   └── utils/              # Shared utilities
-└── assets/                 # Icons and images
+└── assets/                 # Shared icons and images
 ```
 
 ---

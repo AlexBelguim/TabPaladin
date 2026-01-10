@@ -1,3 +1,11 @@
+// Firefox/Chrome compatibility - Firefox uses 'browser', Chrome uses 'chrome'
+// We need to make 'chrome' available globally for all the code that uses it
+if (typeof globalThis.chrome === 'undefined' && typeof globalThis.browser !== 'undefined') {
+    globalThis.chrome = globalThis.browser;
+}
+// Ensure chrome is available as a local reference too
+const chrome = globalThis.chrome || globalThis.browser;
+
 import { TabGrouper } from '../utils/tabGrouper.js';
 import { StorageManager } from '../utils/storageManager.js';
 import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
@@ -22,29 +30,37 @@ function setupEventListeners() {
     document.getElementById('saveWorkflowBtn').addEventListener('click', saveSessionAndClose);
 
     async function saveSessionAndClose() {
-        // 1. Get all tabs
-        const tabs = await chrome.tabs.query({ currentWindow: true });
-        if (tabs.length === 0) return;
+        try {
+            // 1. Get all tabs - try browser API directly for Firefox
+            const api = typeof browser !== 'undefined' ? browser : chrome;
+            const tabs = await api.tabs.query({});
 
-        // 2. Prompt for name
-        const name = prompt("Name this session (e.g. 'Research', 'Private'):");
-        if (!name) return;
+            if (!tabs || tabs.length === 0) {
+                alert("No tabs found to save.");
+                return;
+            }
 
-        // 3. Save Workflow
-        await StorageManager.saveWorkflow(name, tabs);
+            // 2. Prompt for name
+            const name = prompt("Name this session (e.g. 'Research', 'Private'):");
+            if (!name) return;
 
-        // 4. Create a clean new tab so window doesn't close
-        await chrome.tabs.create({});
+            // 3. Save Workflow
+            await StorageManager.saveWorkflow(name, tabs);
 
-        // 5. Close old tabs
-        const tabIds = tabs.map(t => t.id);
-        await chrome.tabs.remove(tabIds);
+            // 4. Create a clean new tab so window doesn't close
+            await chrome.tabs.create({});
 
-        // 6. Refresh UI
-        loadWorkflows();
+            // 5. Close old tabs
+            const tabIds = tabs.map(t => t.id);
+            await chrome.tabs.remove(tabIds);
 
-        // Optional: Notify
-        // alert("Session saved and closed!");
+            // 6. Refresh UI
+            loadWorkflows();
+            alert("Workflow saved!");
+        } catch (err) {
+            console.error("Save workflow error:", err);
+            alert("Error saving workflow: " + err.message);
+        }
     }
 
     // Dynamic listeners for workflow items
@@ -53,10 +69,18 @@ function setupEventListeners() {
 
 // --- Tabs Logic ---
 async function loadCurrentTabs() {
-    currentTabs = await chrome.tabs.query({ currentWindow: true });
+    try {
+        const api = typeof browser !== 'undefined' ? browser : chrome;
+        currentTabs = await api.tabs.query({}) || [];
+    } catch (e) {
+        console.error("Error loading tabs:", e);
+        currentTabs = [];
+    }
     // Initial render: Just list them or group by domain? Let's group by default or show list.
     // For now: Show grouped by Context (Smart)
-    renderGroupedTabs();
+    if (currentTabs.length > 0) {
+        renderGroupedTabs();
+    }
 }
 
 function renderGroupedTabs() {

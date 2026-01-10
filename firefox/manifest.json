@@ -18,29 +18,29 @@
     ],
     "background": {
         "scripts": [
-            "src/background/background.js"
+            "../src/background/background.js"
         ],
         "persistent": false
     },
     "sidebar_action": {
         "default_title": "TabPaladin",
-        "default_panel": "src/sidepanel/sidepanel.html",
+        "default_panel": "../src/sidepanel/sidepanel.html",
         "default_icon": {
-            "16": "assets/icon16.png",
-            "48": "assets/icon48.png"
+            "16": "../assets/icon16.png",
+            "48": "../assets/icon48.png"
         }
     },
     "icons": {
-        "16": "assets/icon16.png",
-        "48": "assets/icon48.png",
-        "128": "assets/icon128.png"
+        "16": "../assets/icon16.png",
+        "48": "../assets/icon48.png",
+        "128": "../assets/icon128.png"
     },
     "browser_action": {
         "default_title": "Open TabPaladin Sidebar",
         "default_icon": {
-            "16": "assets/icon16.png",
-            "48": "assets/icon48.png",
-            "128": "assets/icon128.png"
+            "16": "../assets/icon16.png",
+            "48": "../assets/icon48.png",
+            "128": "../assets/icon128.png"
         }
     },
     "content_scripts": [
@@ -49,7 +49,7 @@
                 "<all_urls>"
             ],
             "js": [
-                "src/content/videoSeek.js"
+                "../src/content/videoSeek.js"
             ],
             "run_at": "document_idle"
         }
