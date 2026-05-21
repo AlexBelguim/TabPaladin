@@ -335,6 +335,7 @@ function cleanSnapshot(node) {
 
 // --- Quick-File Modal (proactive clipboard & inbox filing) ---
 const DISMISSED_KEY = 'tp_dismissed_urls';
+const SCANNED_CLIPBOARD_KEY = 'tp_scanned_clipboard_links';
 
 function normalizeUrl(u) {
     try {
@@ -359,6 +360,27 @@ function dismissUrl(url) {
     }
 }
 
+function getScannedClipboardLinks() {
+    try { return JSON.parse(localStorage.getItem(SCANNED_CLIPBOARD_KEY)) || []; }
+    catch (e) { return []; }
+}
+
+function addScannedClipboardLink(url, title) {
+    const list = getScannedClipboardLinks();
+    const norm = normalizeUrl(url);
+    if (!list.some(item => normalizeUrl(item.url) === norm)) {
+        list.push({ url, title, addedAt: Date.now() });
+        localStorage.setItem(SCANNED_CLIPBOARD_KEY, JSON.stringify(list));
+    }
+}
+
+function removeScannedClipboardLink(url) {
+    const list = getScannedClipboardLinks();
+    const norm = normalizeUrl(url);
+    const filtered = list.filter(item => normalizeUrl(item.url) !== norm);
+    localStorage.setItem(SCANNED_CLIPBOARD_KEY, JSON.stringify(filtered));
+}
+
 function isUrlInSnapshot(url, node) {
     if (!node) return false;
     if (node.type === 'bookmark' && normalizeUrl(node.url) === normalizeUrl(url)) return true;
@@ -373,7 +395,7 @@ function isUrlInSnapshot(url, node) {
 let activeQuickFileItems = [];
 let _lastClipboardScanTime = 0;
 
-async function checkUnfiledLinks() {
+async function checkUnfiledLinks(skipClipboardScan = false) {
     if (!state.snapshot) return;
     const dismissed = getDismissedUrls();
     const dismissedSet = new Set(dismissed.map(normalizeUrl));
@@ -389,34 +411,39 @@ async function checkUnfiledLinks() {
         }
     }
 
-    // 2. Process clipboard if permission is available and throttled (max once per 3s)
-    const now = Date.now();
-    if (now - _lastClipboardScanTime > 3000) {
-        _lastClipboardScanTime = now;
-        if (navigator.clipboard && navigator.clipboard.readText) {
-            try {
-                const text = await navigator.clipboard.readText();
-                const trimmed = (text || '').trim();
-                if (/^https?:\/\/\S+$/.test(trimmed)) {
-                    const normTrimmed = normalizeUrl(trimmed);
-                    if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(normTrimmed)) {
-                        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
-                            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+    // 2. Process historically scanned clipboard items
+    const clipboardLinks = getScannedClipboardLinks();
+    for (const item of clipboardLinks) {
+        const norm = normalizeUrl(item.url);
+        if (!isUrlInSnapshot(item.url, state.snapshot) && !dismissedSet.has(norm)) {
+            if (!unfiled.some(u => normalizeUrl(u.url) === norm)) {
+                unfiled.push({ url: item.url, title: item.title, fromClipboard: true });
+            }
+        } else {
+            removeScannedClipboardLink(item.url);
+        }
+    }
+
+    // 3. Process clipboard if permission is available and throttled (max once per 3s)
+    if (!skipClipboardScan) {
+        const now = Date.now();
+        if (now - _lastClipboardScanTime > 3000) {
+            _lastClipboardScanTime = now;
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                try {
+                    const text = await navigator.clipboard.readText();
+                    const trimmed = (text || '').trim();
+                    if (/^https?:\/\/\S+$/.test(trimmed)) {
+                        const normTrimmed = normalizeUrl(trimmed);
+                        if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(normTrimmed)) {
+                            addScannedClipboardLink(trimmed, trimmed);
+                            if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
+                                unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+                            }
                         }
                     }
-                }
-            } catch (e) {
-                // Silently swallow clipboard permission errors
-            }
-        }
-    } else {
-        // Preserve currently found clipboard items that are still unfiled/undismissed
-        const existingClipboardItems = activeQuickFileItems.filter(item => item.fromClipboard);
-        for (const item of existingClipboardItems) {
-            const norm = normalizeUrl(item.url);
-            if (!isUrlInSnapshot(item.url, state.snapshot) && !dismissedSet.has(norm)) {
-                if (!unfiled.some(u => normalizeUrl(u.url) === norm)) {
-                    unfiled.push(item);
+                } catch (e) {
+                    // Silently swallow clipboard permission errors
                 }
             }
         }
@@ -495,6 +522,7 @@ function renderQuickFileSheet() {
                     state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
                 }
                 dismissUrl(item.url);
+                removeScannedClipboardLink(item.url);
                 activeQuickFileItems.splice(index, 1);
                 renderQuickFileSheet();
                 updateInboxFab();
@@ -513,6 +541,7 @@ function renderQuickFileSheet() {
                     state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
                 }
                 dismissUrl(item.url);
+                removeScannedClipboardLink(item.url);
                 activeQuickFileItems.splice(index, 1);
                 renderQuickFileSheet();
                 updateInboxFab();
@@ -567,7 +596,10 @@ function saveSettings() {
 
 // --- Wire up ---
 window.addEventListener('DOMContentLoaded', () => {
-    $('clipBtn').addEventListener('click', async () => {
+    $('clipBtn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+
         // 1. Instantly read the clipboard before ANY microtask boundary or async call!
         // This satisfies WebKit's strict security engine in standalone mobile PWAs.
         if (!navigator.clipboard || !navigator.clipboard.readText) {
@@ -614,34 +646,46 @@ window.addEventListener('DOMContentLoaded', () => {
 
         const dismissed = getDismissedUrls();
         const dismissedSet = new Set(dismissed.map(normalizeUrl));
-        const unfiled = [...activeQuickFileItems];
 
-        // Explicit scan allows recovering previously dismissed clipboard URLs
         if (dismissedSet.has(normTrimmed)) {
-            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== normTrimmed);
-            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
+            showToast('This clipboard link was previously skipped.');
+            return;
         }
 
-        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
-            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
-            activeQuickFileItems = unfiled;
-            renderQuickFileSheet();
-            showToast('Unfiled link found in clipboard!');
+        // Add to persistent clipboard scan storage
+        addScannedClipboardLink(trimmed, trimmed);
+        
+        // Re-run the full checklist combining everything (skipping duplicate scan)
+        await checkUnfiledLinks(true);
+
+        // Check if our specific scanned item is now active in the sheet
+        if (activeQuickFileItems.some(item => normalizeUrl(item.url) === normTrimmed)) {
+            showToast('Unfiled link added from clipboard!');
         } else {
             showToast('Showing unfiled links bottom sheet.');
         }
     });
 
-    $('syncBtn').addEventListener('click', async () => {
+    $('syncBtn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
         await pullSnapshot();
         await refreshInbox();
         await checkUnfiledLinks();
     });
-    $('settingsBtn').addEventListener('click', openSettings);
+    $('settingsBtn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        openSettings();
+    });
     $('settings-close').addEventListener('click', () => hide($('settings-sheet')));
     $('cfg-save').addEventListener('click', saveSettings);
 
-    $('inbox-fab').addEventListener('click', openInbox);
+    $('inbox-fab').addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        openInbox();
+    });
     $('inbox-close').addEventListener('click', () => hide($('inbox-sheet')));
     $('dropHereBtn').addEventListener('click', dropHere);
 
