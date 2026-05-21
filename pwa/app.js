@@ -293,6 +293,15 @@ function cleanSnapshot(node) {
 // --- Quick-File Modal (proactive clipboard & inbox filing) ---
 const DISMISSED_KEY = 'tp_dismissed_urls';
 
+function normalizeUrl(u) {
+    try {
+        const parsed = new URL(u);
+        return parsed.origin + parsed.pathname.replace(/\/$/, '') + parsed.search + parsed.hash;
+    } catch (e) {
+        return (u || '').trim().replace(/\/$/, '');
+    }
+}
+
 function getDismissedUrls() {
     try { return JSON.parse(localStorage.getItem(DISMISSED_KEY)) || []; }
     catch (e) { return []; }
@@ -300,15 +309,16 @@ function getDismissedUrls() {
 
 function dismissUrl(url) {
     const list = getDismissedUrls();
-    if (!list.includes(url)) {
-        list.push(url);
+    const norm = normalizeUrl(url);
+    if (!list.includes(norm)) {
+        list.push(norm);
         localStorage.setItem(DISMISSED_KEY, JSON.stringify(list));
     }
 }
 
 function isUrlInSnapshot(url, node) {
     if (!node) return false;
-    if (node.type === 'bookmark' && node.url === url) return true;
+    if (node.type === 'bookmark' && normalizeUrl(node.url) === normalizeUrl(url)) return true;
     if (node.children) {
         for (const child of node.children) {
             if (isUrlInSnapshot(url, child)) return true;
@@ -318,36 +328,54 @@ function isUrlInSnapshot(url, node) {
 }
 
 let activeQuickFileItems = [];
+let _lastClipboardScanTime = 0;
 
 async function checkUnfiledLinks() {
     if (!state.snapshot) return;
     const dismissed = getDismissedUrls();
-    const dismissedSet = new Set(dismissed);
+    const dismissedSet = new Set(dismissed.map(normalizeUrl));
     const unfiled = [];
 
     // 1. Process shared inbox items
     for (const link of state.inbox) {
-        if (!isUrlInSnapshot(link.url, state.snapshot) && !dismissedSet.has(link.url)) {
-            if (!unfiled.some(item => item.url === link.url)) {
+        const norm = normalizeUrl(link.url);
+        if (!isUrlInSnapshot(link.url, state.snapshot) && !dismissedSet.has(norm)) {
+            if (!unfiled.some(item => normalizeUrl(item.url) === norm)) {
                 unfiled.push({ url: link.url, title: link.title || link.url, inboxId: link.id });
             }
         }
     }
 
-    // 2. Process clipboard if permission is available
-    if (navigator.clipboard && navigator.clipboard.readText) {
-        try {
-            const text = await navigator.clipboard.readText();
-            const trimmed = (text || '').trim();
-            if (/^https?:\/\/\S+$/.test(trimmed)) {
-                if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(trimmed)) {
-                    if (!unfiled.some(item => item.url === trimmed)) {
-                        unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+    // 2. Process clipboard if permission is available and throttled (max once per 3s)
+    const now = Date.now();
+    if (now - _lastClipboardScanTime > 3000) {
+        _lastClipboardScanTime = now;
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            try {
+                const text = await navigator.clipboard.readText();
+                const trimmed = (text || '').trim();
+                if (/^https?:\/\/\S+$/.test(trimmed)) {
+                    const normTrimmed = normalizeUrl(trimmed);
+                    if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(normTrimmed)) {
+                        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
+                            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+                        }
                     }
                 }
+            } catch (e) {
+                // Silently swallow clipboard permission errors
             }
-        } catch (e) {
-            // Silently swallow clipboard permission errors
+        }
+    } else {
+        // Preserve currently found clipboard items that are still unfiled/undismissed
+        const existingClipboardItems = activeQuickFileItems.filter(item => item.fromClipboard);
+        for (const item of existingClipboardItems) {
+            const norm = normalizeUrl(item.url);
+            if (!isUrlInSnapshot(item.url, state.snapshot) && !dismissedSet.has(norm)) {
+                if (!unfiled.some(u => normalizeUrl(u.url) === norm)) {
+                    unfiled.push(item);
+                }
+            }
         }
     }
 
@@ -510,6 +538,17 @@ window.addEventListener('DOMContentLoaded', () => {
     $('dropHereBtn').addEventListener('click', dropHere);
 
     $('quick-file-close').addEventListener('click', () => hide($('quick-file-sheet')));
+
+    // Global click listener to trigger clipboard scan using a valid user gesture context
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('.sheet')) return;
+        if (!$('settings-sheet').classList.contains('hidden')) return;
+        if (!$('inbox-sheet').classList.contains('hidden')) return;
+        
+        if (state.snapshot && $('quick-file-sheet').classList.contains('hidden')) {
+            checkUnfiledLinks().catch(() => {});
+        }
+    });
 
     bootstrap();
 
