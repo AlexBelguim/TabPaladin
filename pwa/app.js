@@ -701,6 +701,64 @@ window.addEventListener('DOMContentLoaded', () => {
         e.preventDefault();
         openSettings();
     });
+
+    $('newFolderBtn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+
+        if (!configured()) {
+            showToast('Please open settings (⚙) first.');
+            return;
+        }
+
+        if (!state.snapshot) {
+            showToast('Loading snapshot first…');
+            try {
+                await pullSnapshot();
+            } catch (err) {
+                showToast('Failed to pull snapshot: ' + err.message);
+                return;
+            }
+        }
+
+        const name = prompt('Enter new folder name:');
+        if (name === null) return; // User cancelled
+        const trimmed = name.trim();
+        if (!trimmed) {
+            showToast('Folder name cannot be empty.');
+            return;
+        }
+
+        const parentFolder = findNodeByPath(state.pathIds);
+        if (!parentFolder) {
+            showToast('Current folder not found.');
+            return;
+        }
+
+        const newFolder = {
+            type: 'folder',
+            title: trimmed,
+            children: []
+        };
+        assignIds(newFolder);
+        
+        parentFolder.children = parentFolder.children || [];
+        parentFolder.children.push(newFolder);
+
+        state.dirty = true;
+        renderView();
+
+        try {
+            $('status').textContent = 'Creating folder…';
+            await pushSnapshot();
+            showToast(`Folder "${trimmed}" created successfully!`);
+            $('status').textContent = '';
+        } catch (err) {
+            alert('Failed to save folder: ' + err.message);
+            $('status').textContent = '';
+        }
+    });
+
     $('settings-close').addEventListener('click', () => hide($('settings-sheet')));
     $('cfg-save').addEventListener('click', saveSettings);
 
