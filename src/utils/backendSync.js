@@ -157,8 +157,8 @@ export const BackendSync = {
         return res.json();
     },
 
-    // Safe/Smart pull: only replaces or updates the folders that are present in the snapshot,
-    // leaving all other local unsynced folders/bookmarks completely untouched!
+    // Destructive: replaces the contents of Bookmarks Bar / Other Bookmarks / Mobile
+    // with the snapshot's corresponding root children.
     async applyPull(snapshot) {
         if (!snapshot || !snapshot.children) throw new Error('Empty snapshot');
 
@@ -168,35 +168,13 @@ export const BackendSync = {
             if (c.nativeId) nativeMap.set(c.nativeId, c);
         }
 
-        // For each real browser root, update or recreate only the folders/bookmarks
-        // that are present in the snapshot.
+        // For each real browser root, clear it and recreate from the snapshot's matching native root.
         for (const localId of ['1', '2', '3']) {
             const snap = nativeMap.get(localId);
             if (!snap) continue;
             try {
-                // Get the current local children of that root folder
-                const localChildren = await api.bookmarks.getChildren(localId);
-                
-                // For each child in the snapshot, find if it already exists locally.
-                // If it does, we remove it, and recreate it from the snapshot.
-                for (const child of snap.children || []) {
-                    const existing = localChildren.find(c => c.title === child.title && !c.url);
-                    if (existing) {
-                        try {
-                            await api.bookmarks.removeTree(existing.id);
-                        } catch (e) {
-                            console.warn('Failed to remove local folder tree during update', existing.id, e);
-                        }
-                    }
-                    
-                    // Recreate this child
-                    if (child.type === 'folder') {
-                        const f = await api.bookmarks.create({ parentId: localId, title: child.title });
-                        await recreateChildren(f.id, child.children || []);
-                    } else if (child.type === 'bookmark') {
-                        await api.bookmarks.create({ parentId: localId, title: child.title, url: child.url });
-                    }
-                }
+                await emptyFolder(localId);
+                await recreateChildren(localId, snap.children || []);
             } catch (e) {
                 console.warn('Failed during pull apply for root', localId, e);
             }
