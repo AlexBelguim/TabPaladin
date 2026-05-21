@@ -357,9 +357,27 @@ ol {
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
   padding: 10px;
-  /* Reduced vertical padding */
-  margin-bottom: 12px;
   transition: transform 0.2s ease;
+}
+
+.group-card {
+  margin-bottom: 12px;
+}
+
+.workflow-item-wrapper {
+  margin-bottom: 12px;
+}
+
+#workflows-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0;
+}
+
+#workflows-list li {
+  list-style: none;
+  padding: 0;
 }
 
 .workflow-item {
@@ -371,6 +389,432 @@ ol {
 
 .workflow-item:hover {
   background-color: var(--surface-hover);
+}
+
+.wf-toggle {
+  user-select: none;
+}
+
+.wf-caret {
+  display: inline-block;
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  margin-right: 4px;
+}
+
+.workflow-body .wf-tab-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.wf-domain-group {
+  margin-bottom: 4px;
+}
+
+/* --- Source Folder List (Organize page, stacked cards) --- */
+.source-folder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Root grid: stacked by default, side-by-side columns when there are 2+ roots */
+.roots-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.roots-grid.multi {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.roots-grid.multi > .source-folder-card {
+  flex: 1 1 280px;
+  min-width: 0;
+  max-height: 80vh;
+  overflow-y: auto;
+  align-self: stretch;
+}
+
+.roots-grid.multi > .source-folder-card > .source-folder-header {
+  position: sticky;
+  top: 0;
+  background-color: var(--surface-color);
+  z-index: 2;
+}
+
+/* Open Tabs root (main view) */
+.open-tabs-card {
+  border-left: 3px solid var(--primary-color);
+}
+
+.open-tabs-card > .source-folder-header {
+  background-color: rgba(59, 130, 246, 0.08);
+}
+
+/* AI Group cards — nested inside Open Tabs */
+.ai-group-card {
+  border-left: 3px solid var(--accent-color);
+  margin-left: 0 !important; /* override .nested margin-left so it aligns with body padding */
+  margin-top: 6px;
+  margin-bottom: 6px;
+}
+
+.ai-group-card > .source-folder-header {
+  background-color: rgba(139, 92, 246, 0.10);
+}
+
+.open-tabs-ungrouped {
+  margin-bottom: 8px;
+}
+
+/* Main-view container reuses .source-folder-list flex column */
+.main-view {
+  display: block;
+}
+
+/* --- Settings: keyword chips --- */
+.kw-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.kw-category {
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  transition: border-color 0.15s;
+  position: relative;
+}
+
+.kw-category.dragging {
+  opacity: 0.5;
+}
+
+.kw-category.drop-above {
+  border-top: 2px solid var(--primary-color);
+}
+
+.kw-category.drop-below {
+  border-bottom: 2px solid var(--primary-color);
+}
+
+.kw-drag-handle {
+  display: inline-block;
+  cursor: grab;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 4px;
+  user-select: none;
+  letter-spacing: -2px;
+  margin-right: 4px;
+}
+
+.kw-drag-handle:hover {
+  color: var(--text-color);
+}
+
+.kw-drag-handle:active {
+  cursor: grabbing;
+}
+
+.kw-category-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.kw-category-head .kw-cat-name {
+  flex: 1;
+}
+
+.kw-cat-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #ddd;
+}
+
+.kw-delete-cat-btn {
+  padding: 2px 8px;
+  color: var(--danger-color);
+}
+
+.kw-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.kw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.kw-chip-default {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.kw-chip-custom {
+  background: rgba(59, 130, 246, 0.15);
+  color: var(--text-color);
+  border: 1px solid var(--primary-color);
+}
+
+.kw-chip-remove {
+  background: none;
+  border: none;
+  color: var(--text-color);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.kw-chip-remove:hover {
+  color: var(--danger-color);
+}
+
+.kw-add-input {
+  flex: 1 1 120px;
+  min-width: 120px;
+  padding: 3px 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px dashed var(--border-color);
+  border-radius: 12px;
+  color: var(--text-color);
+  font-size: 0.78rem;
+}
+
+.kw-add-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  border-style: solid;
+}
+
+.kw-add-cat-btn {
+  width: 100%;
+  border: 1px dashed var(--border-color);
+  padding: 10px;
+  margin-top: 4px;
+}
+
+.kw-add-cat-btn:hover {
+  border-color: var(--primary-color);
+  color: var(--text-color);
+}
+
+.source-folder-card {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  transition: border-color 0.15s ease;
+}
+
+.source-folder-card.selected {
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 1px var(--primary-color);
+}
+
+.source-folder-card.drop-hover {
+  border-color: var(--success-color);
+  background-color: rgba(16, 185, 129, 0.08);
+}
+
+.source-folder-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.source-folder-header:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.folder-drag-handle {
+  display: inline-block;
+  cursor: grab;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 2px;
+  user-select: none;
+  letter-spacing: -2px;
+}
+
+.folder-drag-handle:hover {
+  color: var(--text-color);
+}
+
+.folder-drag-handle:active {
+  cursor: grabbing;
+}
+
+.folder-caret {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  width: 12px;
+  display: inline-block;
+}
+
+.folder-icon {
+  font-size: 1.1rem;
+}
+
+.folder-title {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-stats {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.source-folder-body {
+  padding: 8px 12px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(0, 0, 0, 0.15);
+  border-bottom-left-radius: var(--radius-md);
+  border-bottom-right-radius: var(--radius-md);
+}
+
+.src-domain-group {
+  margin-bottom: 6px;
+}
+
+.src-domain-header {
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  font-weight: 600;
+  font-size: 0.85rem;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.domain-drag-handle {
+  display: inline-block;
+  cursor: grab;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 2px;
+  user-select: none;
+  letter-spacing: -2px;
+}
+
+.domain-drag-handle:hover {
+  color: var(--text-color);
+}
+
+.domain-drag-handle:active {
+  cursor: grabbing;
+}
+
+.domain-name {
+  flex: 1;
+}
+
+.src-domain-count {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.src-domain-group.dragging {
+  opacity: 0.5;
+}
+
+.src-tab-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 24px;
+  cursor: grab;
+  font-size: 0.85rem;
+  border-radius: 4px;
+}
+
+.src-tab-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.src-tab-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.src-tab-row.dragging {
+  opacity: 0.4;
+}
+
+/* Nested folder cards (rendered inside another card's body) */
+.source-folder-card.nested {
+  background-color: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.06);
+  border-left: 2px solid rgba(255, 255, 255, 0.1);
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.source-folder-card.nested .source-folder-header {
+  padding: 6px 10px;
+}
+
+.source-folder-card.dragging {
+  opacity: 0.5;
+  border-color: var(--accent-color);
+}
+
+/* Loose-files section above subfolder cards at the breadcrumb level */
+.src-top-loose {
+  background-color: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.src-top-loose-header {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  padding: 0 4px;
+}
+
+.src-empty-state {
+  color: var(--text-muted);
+  padding: 8px;
+  font-size: 0.85rem;
+  font-style: italic;
 }
 
 /* Draggable Items within Groups */

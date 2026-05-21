@@ -1,0 +1,27 @@
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Personal / local
+todo.md
+.claude/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Server runtime
+server/data/
+server/.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log

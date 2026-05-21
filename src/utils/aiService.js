@@ -123,6 +123,7 @@ JSON Output:
 
         } catch (e) {
             console.error("AI Service Exception:", e);
+            throw e;
         }
     },
 

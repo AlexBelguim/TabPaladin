@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>TabPaladin</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon128.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header id="topbar">
+    <h1>TabPaladin</h1>
+    <button id="syncBtn" class="ghost" title="Pull latest from sync server">↻</button>
+    <button id="settingsBtn" class="ghost" title="Settings">⚙</button>
+  </header>
+
+  <nav id="breadcrumb"></nav>
+
+  <main id="content">
+    <div id="status" class="empty">Loading…</div>
+  </main>
+
+  <div id="inbox-fab" class="hidden" title="Recent shared links">
+    📥 <span id="inbox-count">0</span>
+  </div>
+
+  <!-- Bottom modal: recent shared links inbox -->
+  <div id="inbox-sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-header">
+      <strong>Recent links</strong>
+      <button id="inbox-close" class="ghost">✕</button>
+    </div>
+    <div id="inbox-list" class="sheet-list"></div>
+    <div class="sheet-footer">
+      <button id="dropHereBtn" class="primary">Drop here</button>
+      <small id="dropHereHint" class="hint"></small>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-header">
+      <strong>Settings</strong>
+      <button id="settings-close" class="ghost">✕</button>
+    </div>
+    <div class="sheet-body">
+      <label class="field">
+        <span>Server URL</span>
+        <input id="cfg-url" type="url" placeholder="http://truenas.local:3000">
+      </label>
+      <label class="field">
+        <span>Auth token</span>
+        <input id="cfg-token" type="password" placeholder="paste TABPALADIN_TOKEN">
+      </label>
+      <button id="cfg-save" class="primary">Save</button>
+      <small class="hint">Stored in localStorage. Use HTTPS in production.</small>
+    </div>
+  </div>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>

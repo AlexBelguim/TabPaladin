@@ -4,7 +4,7 @@
 
 // Heuristic Keywords Configuration
 // Note: Shorter keywords should be used carefully or matched with boundaries.
-const CONTEXT_KEYWORDS = {
+export const CONTEXT_KEYWORDS = {
     "Gaming": ["gaming", "game", "minecraft", "league of legends", "csgo", "steam", "twitch", "discord", "gameplay", "walkthrough"],
     "Adult": ['nhentai', 'jav', 'porn', 'hentai', 'sex', 'xxx', 'adult', '18+', 'erotic', 'leaks', 'onlyfans', 'fansly'],
     "AI & Tech": ['comfyui', 'stable diffusion', 'diffusion', 'artificial intelligence', 'llm', 'lora', 'civitai', 'huggingface', 'tensor', 'neural', 'gpt', 'openai'],
@@ -101,28 +101,35 @@ export const TabGrouper = {
 
     /**
      * Groups items by Context (Heuristic/AI).
-     * @param {Array} items - Array of items.
-     * @param {Object} customKeywords - Optional map of { Category: [kw1, kw2] } to merge.
+     * @param {Array} items
+     * @param {Object} customKeywords - { Category: [kw1, kw2] } to merge with defaults.
+     * @param {Array<string>} [categoryOrder] - Optional order. First match wins, so this
+     *   controls priority when keywords overlap. Missing categories are appended at end.
      */
-    groupByContext: (items, customKeywords = {}) => {
-        // Merge Logic: Clone default, then push custom
-        // We do a shallow merge of arrays
-        const mergedMap = { ...CONTEXT_KEYWORDS };
+    groupByContext: (items, customKeywords = {}, categoryOrder = null) => {
+        const defaultCats = Object.keys(CONTEXT_KEYWORDS);
+        const customOnly = Object.keys(customKeywords).filter(c => !defaultCats.includes(c));
+        const knownCats = [...defaultCats, ...customOnly];
 
-        for (const [cat, kws] of Object.entries(customKeywords)) {
-            if (mergedMap[cat]) {
-                // De-dupe and merge
-                mergedMap[cat] = [...new Set([...mergedMap[cat], ...kws])];
-            } else {
-                mergedMap[cat] = kws;
-            }
+        // Final ordering: respect user-provided categoryOrder, then append anything missing.
+        const orderedCats = (Array.isArray(categoryOrder) && categoryOrder.length)
+            ? [
+                ...categoryOrder.filter(c => knownCats.includes(c)),
+                ...knownCats.filter(c => !categoryOrder.includes(c))
+            ]
+            : knownCats;
+
+        const mergedMap = {};
+        for (const cat of orderedCats) {
+            const defaults = CONTEXT_KEYWORDS[cat] || [];
+            const custom = customKeywords[cat] || [];
+            const merged = [...new Set([...defaults, ...custom])];
+            if (merged.length > 0) mergedMap[cat] = merged;
         }
 
         return items.reduce((groups, item) => {
             const context = getContext(item, mergedMap);
-            if (!groups[context]) {
-                groups[context] = [];
-            }
+            if (!groups[context]) groups[context] = [];
             groups[context].push(item);
             return groups;
         }, {});
@@ -132,12 +139,8 @@ export const TabGrouper = {
      * Smart Grouping: Tries context first, then domain for "Other", or keeps "Other".
      * This is the main function the UI will likely use.
      */
-    groupSmart: (items) => {
-        const byContext = TabGrouper.groupByContext(items);
-
-        // Optional: If "Other" is too large, break it down by domain?
-        // For now, let's just return the context grouping as the primary "Smart" view.
-        return byContext;
+    groupSmart: (items, customKeywords = {}, categoryOrder = null) => {
+        return TabGrouper.groupByContext(items, customKeywords, categoryOrder);
     },
 
     CONTEXT_SYNONYMS: CONTEXT_SYNONYMS

@@ -1,0 +1,21 @@
+services:
+  tabpaladin-sync:
+    container_name: tabpaladin-sync
+    build:
+      # Build context is the repo root so the Dockerfile can see ../pwa
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    volumes:
+      - ./data:/data
+      # Mount the PWA folder live so changes don't require rebuilds during dev.
+      - ../pwa:/app/pwa:ro
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+      - PWA_DIR=/app/pwa
+      # CHANGE THIS to a long random string. The extension uses the same value.
+      - AUTH_TOKEN=${TABPALADIN_TOKEN:-CHANGEME_LONG_RANDOM_STRING}
+      - MAX_SNAPSHOTS=${MAX_SNAPSHOTS:-200}

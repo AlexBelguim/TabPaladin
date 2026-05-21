@@ -1,5 +1,6 @@
 import { TabGrouper } from './tabGrouper.js';
 import { AIService } from './aiService.js';
+import { StorageManager } from './storageManager.js';
 
 
 export const BookmarkOrganizer = {
@@ -232,6 +233,12 @@ export const BookmarkOrganizer = {
     proposeSmartOrganization: async (folderIds) => {
         const proposals = { groups: [] };
 
+        // Build a global folder map up-front so the "global search fallback" branch
+        // below has something to look in. Scoped to the user's focused folders if set.
+        const settings = await StorageManager.getSettings();
+        const allowedIds = settings.focusedFolderIds || [];
+        const folderMap = await BookmarkOrganizer.getFolderMap(allowedIds.length ? allowedIds : null);
+
         // Helper: Find existing subfolder by name or synonyms
         async function findSubfolder(parentId, name, useSynonyms = false) {
             const children = await chrome.bookmarks.getChildren(parentId);
@@ -265,8 +272,6 @@ export const BookmarkOrganizer = {
 
             const rootPath = root.title || 'Root';
 
-            // Get Settings for Custom Keywords
-            const settings = await StorageManager.getSettings();
             const customKeywords = settings.customKeywords || {};
 
             // Group by Context (with Custom Keywords)
@@ -493,33 +498,29 @@ export const BookmarkOrganizer = {
         if (looseItems.length === 0) return { groups: [] };
 
         // 2. Get Context
-        // Respect Scope: Only show folders relevant to the user's selection
-        // FIXED: Use contextIds (Settings Scope) instead of folderIds (Source Scope)
-        // If contextIds is empty/null, it means "Global" (if logic handles null properly), 
-        // or we should default to '2' (Other Bookmarks) + '1' (Bar) if we want restricted default.
-        // getFolderMap(null) returns everything.
         const allStructure = await BookmarkOrganizer.getFolderMap(contextIds);
         const contextFolders = allStructure.map(f => ({ id: f.id, path: f.fullPath }));
 
+        // Pick a default root for NEW: proposals — first focused folder if available,
+        // otherwise first folder in scope, finally Other Bookmarks ('2').
+        const settings = await StorageManager.getSettings();
+        const focused = settings.focusedFolderIds || [];
+        const focusedRoot = focused.length
+            ? allStructure.find(f => f.id === focused[0])
+            : null;
+        const defaultRoot = focusedRoot || allStructure[0] || { id: '2', fullPath: 'Other Bookmarks' };
+
         // 3. Call AI
-        // Expected output: { "bookmarkId": "folderId" or "NEW:Category" }
-        let mapping;
-        try {
-            mapping = await AIService.organizeWithAI(looseItems, contextFolders, apiKey, hints);
-        } catch (e) {
-            console.error("AI Analysis Failed", e);
-            throw e;
-        }
+        const mapping = await AIService.organizeWithAI(looseItems, contextFolders, apiKey, hints);
 
         // 4. Convert AI Map to Proposals
-        const groups = {}; // Key: TargetID (or NewName), Value: ProposalObject
+        const groups = {};
 
         looseItems.forEach(item => {
-            const decision = mapping && mapping[item.id]; // Safety check
+            const decision = mapping && mapping[item.id];
             if (!decision || decision === 'SKIP') return;
 
             if (decision.startsWith('NEW:')) {
-                // Proposed New Category
                 const newCat = decision.replace('NEW:', '').trim();
                 const groupKey = `NEW_${newCat}`;
 
@@ -527,8 +528,8 @@ export const BookmarkOrganizer = {
                     groups[groupKey] = {
                         groupName: newCat,
                         action: 'CREATE',
-                        targetId: '2', // Default to Other Bookmarks (safe root)
-                        targetPath: 'Other bookmarks',
+                        targetId: defaultRoot.id,
+                        targetPath: defaultRoot.fullPath,
                         newSubfolder: newCat,
                         items: []
                     };
