@@ -163,10 +163,33 @@ export const BackendSync = {
     async applyPull(snapshot) {
         if (!snapshot || !snapshot.children) throw new Error('Empty snapshot');
 
+        // --- Diagnostic: log what we're about to apply so users can verify the snapshot is complete.
+        const summarize = (node, depth = 0) => {
+            if (!node) return { f: 0, b: 0 };
+            let f = node.type === 'folder' ? 1 : 0;
+            let b = node.type === 'bookmark' ? 1 : 0;
+            for (const c of node.children || []) {
+                const s = summarize(c, depth + 1);
+                f += s.f;
+                b += s.b;
+            }
+            return { f, b };
+        };
+        const totals = summarize(snapshot);
+        console.log('[TabPaladin Pull] incoming snapshot —',
+            'roots:', snapshot.children.map(c => `${c.title}(${c.nativeId || 'no-nativeId'}, ${(c.children || []).length} children)`).join(' | '),
+            '| total folders:', totals.f, '| total bookmarks:', totals.b);
+
         // Map snapshot root children by nativeId.
         const nativeMap = new Map();
+        const orphans = [];
         for (const c of snapshot.children) {
             if (c.nativeId) nativeMap.set(c.nativeId, c);
+            else orphans.push(c);
+        }
+        if (orphans.length > 0) {
+            console.warn('[TabPaladin Pull] snapshot has root children without nativeId (will be placed in Other Bookmarks):',
+                orphans.map(o => o.title));
         }
 
         // For each real browser root, clear it completely.
@@ -181,6 +204,11 @@ export const BackendSync = {
             } catch (e) {
                 console.warn('Failed during pull apply for root', localId, e);
             }
+        }
+
+        // Re-home orphan root children under Other Bookmarks ('2') so they aren't lost.
+        if (orphans.length > 0) {
+            await recreateChildren('2', orphans);
         }
     }
 };

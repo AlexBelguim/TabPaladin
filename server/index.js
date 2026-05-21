@@ -43,6 +43,14 @@ const app = express();
 app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: '50mb' }));
 
+// Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
+app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
+
 // --- Auth middleware (bearer token) ---
 function requireAuth(req, res, next) {
     if (!AUTH_TOKEN) return res.status(503).json({ error: 'Server not configured (AUTH_TOKEN missing).' });
