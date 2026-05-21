@@ -70,10 +70,11 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
             return null;
         }
 
-        // For folders: if not inside a selected parent, only keep if it has a focused descendant
-        // (or if it's the root '0' or native roots '1', '2', '3' to preserve structural roots)
-        const isStructural = ['0', '1', '2', '3'].includes(node.id);
-        if (!keepAll && !isStructural && !hasFocusedDescendant(node)) {
+        // For folders: if not inside a selected parent, only keep if it has a focused descendant.
+        // The virtual root '0' is always preserved. Other native roots ('1', '2', '3') are only kept
+        // if they or their descendants are targeted.
+        const isVirtualRoot = node.id === '0';
+        if (!keepAll && !isVirtualRoot && !hasFocusedDescendant(node)) {
             return null;
         }
 
@@ -83,8 +84,8 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
             if (res) serializedChildren.push(res);
         }
 
-        // For non-structural folders, we only keep them if they are selected or had children serialized
-        if (!keepAll && !isStructural && serializedChildren.length === 0) {
+        // For non-root folders, we only keep them if they are selected or had children serialized
+        if (!keepAll && !isVirtualRoot && serializedChildren.length === 0) {
             return null;
         }
 
@@ -168,13 +169,15 @@ export const BackendSync = {
             if (c.nativeId) nativeMap.set(c.nativeId, c);
         }
 
-        // For each real browser root, clear it and recreate from the snapshot's matching native root.
+        // For each real browser root, clear it completely.
+        // If the snapshot has matching native root children, recreate them.
         for (const localId of ['1', '2', '3']) {
-            const snap = nativeMap.get(localId);
-            if (!snap) continue;
             try {
                 await emptyFolder(localId);
-                await recreateChildren(localId, snap.children || []);
+                const snap = nativeMap.get(localId);
+                if (snap && snap.children) {
+                    await recreateChildren(localId, snap.children);
+                }
             } catch (e) {
                 console.warn('Failed during pull apply for root', localId, e);
             }
