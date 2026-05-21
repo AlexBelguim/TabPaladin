@@ -2951,7 +2951,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             
             updateMainStatus('Pushed at ' + new Date(ts).toLocaleString());
             alert('Push successful!');
-            await loadCurrentTabs();
+            location.reload();
         } catch (e) {
             updateMainStatus('Push failed: ' + e.message);
             alert('Push failed: ' + e.message);
@@ -2994,7 +2994,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             
             updateMainStatus('Pulled snapshot from ' + when);
             alert('Pull successful! Local bookmarks updated.');
-            await loadCurrentTabs();
+            location.reload();
         } catch (e) {
             updateMainStatus('Pull failed: ' + e.message);
             alert('Pull failed: ' + e.message);

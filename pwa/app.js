@@ -173,6 +173,19 @@ function renderView() {
     if (document.getElementById('quick-file-sheet') && !document.getElementById('quick-file-sheet').classList.contains('hidden')) {
         renderQuickFileSheet();
     }
+    updatePushBtnState();
+}
+
+function updatePushBtnState() {
+    const pushBtn = $('pushBtn');
+    if (!pushBtn) return;
+    if (state.dirty) {
+        pushBtn.classList.add('dirty');
+        pushBtn.title = "Push latest snapshot (pending local changes! ⬆️)";
+    } else {
+        pushBtn.classList.remove('dirty');
+        pushBtn.title = "Push latest snapshot to server ⬆️";
+    }
 }
 
 function renderBreadcrumb() {
@@ -703,13 +716,62 @@ window.addEventListener('DOMContentLoaded', () => {
         $('quick-file-paste-input').focus();
     });
 
-    $('syncBtn').addEventListener('click', async (e) => {
+    $('pullBtn').addEventListener('click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
-        await pullSnapshot();
-        await refreshInbox();
-        await checkUnfiledLinks();
+        if (!configured()) {
+            showToast('Please open settings (⚙) first.');
+            return;
+        }
+        try {
+            setStatus('Pulling…');
+            const data = await api('/api/pull');
+            if (!data.snapshot) {
+                setStatus('No snapshot on server yet.');
+                showToast('No snapshot on server yet.');
+                return;
+            }
+            state.snapshot = data.snapshot;
+            state.snapshotTimestamp = data.timestamp;
+            state.pathIds = [getRootId(state.snapshot)];
+            state.dirty = false;
+            
+            showToast('Snapshot pulled successfully! Refreshing...');
+            setStatus('Pulled successfully! Refreshing...');
+            setTimeout(() => {
+                location.reload();
+            }, 1000);
+        } catch (err) {
+            setStatus('Pull failed: ' + err.message);
+            showToast('Pull failed: ' + err.message);
+        }
     });
+
+    $('pushBtn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!configured()) {
+            showToast('Please open settings (⚙) first.');
+            return;
+        }
+        if (!state.snapshot) {
+            showToast('No snapshot loaded to push.');
+            return;
+        }
+        try {
+            setStatus('Pushing…');
+            await pushSnapshot();
+            showToast('Snapshot pushed successfully! Refreshing...');
+            setStatus('Pushed successfully! Refreshing...');
+            setTimeout(() => {
+                location.reload();
+            }, 1000);
+        } catch (err) {
+            setStatus('Push failed: ' + err.message);
+            showToast('Push failed: ' + err.message);
+        }
+    });
+
     $('settingsBtn').addEventListener('click', (e) => {
         e.stopPropagation();
         e.preventDefault();

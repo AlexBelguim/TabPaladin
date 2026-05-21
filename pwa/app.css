@@ -223,3 +223,26 @@ input:focus { outline: none; border-color: var(--primary); }
 .sheet-body .primary { width: 100%; padding: 12px; margin-top: 8px; }
 
 .hidden { display: none !important; }
+
+/* Premium glassmorphic pulse animation for dirty push button */
+@keyframes glass-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+    background: rgba(59, 130, 246, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 12px 4px rgba(59, 130, 246, 0.7);
+    background: rgba(59, 130, 246, 0.25);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+    background: rgba(59, 130, 246, 0.1);
+  }
+}
+
+button.ghost.dirty {
+  animation: glass-pulse 2s infinite ease-in-out;
+  border-radius: 8px;
+  color: #60a5fa !important;
+}
+
