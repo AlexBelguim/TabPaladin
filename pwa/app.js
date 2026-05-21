@@ -342,6 +342,7 @@ function cleanSnapshot(node) {
     const out = { type: node.type, title: node.title };
     if (node.url) out.url = node.url;
     if (node.dateAdded) out.dateAdded = node.dateAdded;
+    if (node.nativeId) out.nativeId = node.nativeId;
     if (node.children) out.children = node.children.map(cleanSnapshot);
     return out;
 }

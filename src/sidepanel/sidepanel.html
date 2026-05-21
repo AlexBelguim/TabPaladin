@@ -13,8 +13,12 @@
     <header style="display:flex; justify-content:space-between; align-items:center;">
       <h1><img src="../../assets/icon48.png" alt="TabPaladin Logo"
           style="height:24px; vertical-align:middle; margin-right:8px;">TabPaladin</h1>
-      <button id="settingsToggleBtn" class="sm-btn"
-        style="font-size:1.2rem; background:none; border:none; cursor:pointer;" title="Settings">⚙️</button>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <button id="mainPullBtn" class="sm-btn" title="Pull from Sync Server" style="padding: 4px 8px; font-size: 0.82rem; font-weight: 500; border: 1px solid rgba(245,158,11,0.3); background: rgba(245,158,11,0.05); border-radius: 6px; color: var(--warning-color); cursor: pointer; display: flex; align-items: center; gap: 3px;">⬇️ Pull</button>
+        <button id="mainPushBtn" class="sm-btn" title="Push to Sync Server" style="padding: 4px 8px; font-size: 0.82rem; font-weight: 500; border: 1px solid rgba(59,130,246,0.3); background: rgba(59,130,246,0.05); border-radius: 6px; color: var(--primary-color); cursor: pointer; display: flex; align-items: center; gap: 3px;">⬆️ Push</button>
+        <button id="settingsToggleBtn" class="sm-btn"
+          style="font-size:1.2rem; background:none; border:none; padding: 4px; cursor:pointer; margin-left: 2px;" title="Settings">⚙️</button>
+      </div>
     </header>
 
     <main>

@@ -2923,6 +2923,83 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         alert("Settings Saved!");
         closeSettings();
     });
+
+    // Main header Push and Pull event listeners
+    const mainStatus = document.getElementById('backend-status');
+    const updateMainStatus = (msg) => {
+        if (mainStatus) mainStatus.textContent = msg;
+    };
+
+    document.getElementById('mainPushBtn').addEventListener('click', async () => {
+        try {
+            const settings = await StorageManager.getSettings();
+            const cfg = settings.backend || {};
+            if (!cfg.url || !cfg.token) {
+                alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+                return;
+            }
+            if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
+            
+            updateMainStatus('Pushing…');
+            const focusedFolderIds = settings.focusedFolderIds || [];
+            const wfRoot = await findWorkflowRootSilent();
+            const workflowRootId = wfRoot ? wfRoot.id : null;
+            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
+            
+            const updated = { ...settings, backend: { ...cfg, lastSyncAt: ts, lastSyncKind: 'push' } };
+            await StorageManager.saveSettings(updated);
+            
+            updateMainStatus('Pushed at ' + new Date(ts).toLocaleString());
+            alert('Push successful!');
+            await loadCurrentTabs();
+        } catch (e) {
+            updateMainStatus('Push failed: ' + e.message);
+            alert('Push failed: ' + e.message);
+        }
+    });
+
+    document.getElementById('mainPullBtn').addEventListener('click', async () => {
+        try {
+            const settings = await StorageManager.getSettings();
+            const cfg = settings.backend || {};
+            if (!cfg.url || !cfg.token) {
+                alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+                return;
+            }
+            
+            updateMainStatus('Checking latest…');
+            const data = await BackendSync.pullLatestInfo(cfg);
+            if (!data || !data.snapshot) {
+                updateMainStatus('No snapshot on server yet.');
+                alert('No snapshot on server yet.');
+                return;
+            }
+            
+            const when = new Date(data.timestamp).toLocaleString();
+            const yes = confirm(
+                `Replace your local bookmarks with the snapshot from ${when}?\n\n` +
+                `This wipes the current contents of Bookmarks Bar / Other Bookmarks / Mobile and recreates them from the server snapshot.\n\n` +
+                `Tip: Push first if you have local changes you want to keep.`
+            );
+            if (!yes) {
+                updateMainStatus('Pull cancelled.');
+                return;
+            }
+            
+            updateMainStatus('Pulling…');
+            await BackendSync.applyPull(data.snapshot);
+            
+            const updated = { ...settings, backend: { ...cfg, lastSyncAt: data.timestamp, lastSyncKind: 'pull' } };
+            await StorageManager.saveSettings(updated);
+            
+            updateMainStatus('Pulled snapshot from ' + when);
+            alert('Pull successful! Local bookmarks updated.');
+            await loadCurrentTabs();
+        } catch (e) {
+            updateMainStatus('Pull failed: ' + e.message);
+            alert('Pull failed: ' + e.message);
+        }
+    });
 });
 
 function closeSettings() {
