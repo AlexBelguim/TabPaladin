@@ -19,8 +19,13 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
-function show(el) { el.classList.remove('hidden'); }
-function hide(el) { el.classList.add('hidden'); }
+function show(el) { if (el) el.classList.remove('hidden'); }
+function hide(el) { if (el) el.classList.add('hidden'); }
+
+function safeAddListener(id, event, cb) {
+    const el = $(id);
+    if (el) el.addEventListener(event, cb);
+}
 
 function setStatus(text) {
     const el = $('status');
@@ -190,6 +195,7 @@ function updatePushBtnState() {
 
 function renderBreadcrumb() {
     const bc = $('breadcrumb');
+    if (!bc) return;
     bc.innerHTML = '';
     state.pathIds.forEach((id, idx) => {
         const node = findNodeByPath(state.pathIds.slice(0, idx + 1));
@@ -214,6 +220,7 @@ function renderBreadcrumb() {
 
 function renderContent() {
     const root = $('content');
+    if (!root) return;
     root.innerHTML = '';
     const node = findNodeByPath(state.pathIds);
     if (!node) {
@@ -273,6 +280,7 @@ function escapeAttr(s) { return escapeHtml(s); }
 function updateInboxFab() {
     const fab = $('inbox-fab');
     const count = $('inbox-count');
+    if (!fab || !count) return;
     if (state.inbox.length === 0) { hide(fab); return; }
     count.textContent = state.inbox.length;
     show(fab);
@@ -280,6 +288,7 @@ function updateInboxFab() {
 
 function openInbox() {
     const list = $('inbox-list');
+    if (!list) return;
     list.innerHTML = '';
     if (state.inbox.length === 0) {
         list.innerHTML = '<div class="empty">No pending links. Share something from your phone to TabPaladin to add one.</div>';
@@ -311,7 +320,8 @@ function openInbox() {
         });
     }
     const currentFolder = findNodeByPath(state.pathIds);
-    $('dropHereHint').textContent = currentFolder ? `Will add to "${currentFolder.title || 'Bookmarks'}"` : '';
+    const hint = $('dropHereHint');
+    if (hint) hint.textContent = currentFolder ? `Will add to "${currentFolder.title || 'Bookmarks'}"` : '';
     show($('inbox-sheet'));
 }
 
@@ -488,6 +498,7 @@ function renderQuickFileSheet() {
     const sheet = $('quick-file-sheet');
     const list = $('quick-file-list');
     const hint = $('quick-file-hint');
+    if (!sheet || !list || !hint) return;
     
     const currentFolder = findNodeByPath(state.pathIds);
     hint.textContent = currentFolder 
@@ -619,14 +630,18 @@ async function processShareTargetIfAny() {
 
 // --- Settings modal ---
 function openSettings() {
-    $('cfg-url').value = state.config.url || '';
-    $('cfg-token').value = state.config.token || '';
+    const urlEl = $('cfg-url');
+    const tokenEl = $('cfg-token');
+    if (urlEl) urlEl.value = state.config.url || '';
+    if (tokenEl) tokenEl.value = state.config.token || '';
     show($('settings-sheet'));
 }
 
 function saveSettings() {
-    state.config.url = $('cfg-url').value.trim();
-    state.config.token = $('cfg-token').value.trim();
+    const urlEl = $('cfg-url');
+    const tokenEl = $('cfg-token');
+    if (urlEl) state.config.url = urlEl.value.trim();
+    if (tokenEl) state.config.token = tokenEl.value.trim();
     localStorage.setItem(LS.url, state.config.url);
     localStorage.setItem(LS.token, state.config.token);
     hide($('settings-sheet'));
@@ -635,7 +650,7 @@ function saveSettings() {
 
 // --- Wire up ---
 window.addEventListener('DOMContentLoaded', () => {
-    $('clipBtn').addEventListener('click', async (e) => {
+    safeAddListener('clipBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
 
@@ -716,7 +731,7 @@ window.addEventListener('DOMContentLoaded', () => {
         $('quick-file-paste-input').focus();
     });
 
-    $('pullBtn').addEventListener('click', async (e) => {
+    safeAddListener('pullBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
         if (!configured()) {
@@ -747,7 +762,7 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    $('pushBtn').addEventListener('click', async (e) => {
+    safeAddListener('pushBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
         if (!configured()) {
@@ -772,13 +787,13 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    $('settingsBtn').addEventListener('click', (e) => {
+    safeAddListener('settingsBtn', 'click', (e) => {
         e.stopPropagation();
         e.preventDefault();
         openSettings();
     });
 
-    $('newFolderBtn').addEventListener('click', async (e) => {
+    safeAddListener('newFolderBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
 
@@ -835,18 +850,18 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    $('settings-close').addEventListener('click', () => hide($('settings-sheet')));
-    $('cfg-save').addEventListener('click', saveSettings);
+    safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
+    safeAddListener('cfg-save', 'click', saveSettings);
 
-    $('inbox-fab').addEventListener('click', (e) => {
+    safeAddListener('inbox-fab', 'click', (e) => {
         e.stopPropagation();
         e.preventDefault();
         openInbox();
     });
-    $('inbox-close').addEventListener('click', () => hide($('inbox-sheet')));
-    $('dropHereBtn').addEventListener('click', dropHere);
+    safeAddListener('inbox-close', 'click', () => hide($('inbox-sheet')));
+    safeAddListener('dropHereBtn', 'click', dropHere);
 
-    $('quick-file-close').addEventListener('click', () => hide($('quick-file-sheet')));
+    safeAddListener('quick-file-close', 'click', () => hide($('quick-file-sheet')));
 
     const pasteInput = $('quick-file-paste-input');
     
@@ -903,31 +918,33 @@ window.addEventListener('DOMContentLoaded', () => {
         showToast('Unfiled link added!');
     }
 
-    pasteInput.addEventListener('paste', (e) => {
-        const text = (e.clipboardData || window.clipboardData).getData('text');
-        if (processPastedLink(text)) {
-            e.preventDefault();
-            pasteInput.value = '';
-        }
-    });
+    if (pasteInput) {
+        pasteInput.addEventListener('paste', (e) => {
+            const text = (e.clipboardData || window.clipboardData).getData('text');
+            if (processPastedLink(text)) {
+                e.preventDefault();
+                pasteInput.value = '';
+            }
+        });
 
-    pasteInput.addEventListener('input', () => {
-        const text = pasteInput.value;
-        if (processPastedLink(text)) {
-            pasteInput.value = '';
-        }
-    });
-
-    pasteInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
+        pasteInput.addEventListener('input', () => {
             const text = pasteInput.value;
             if (processPastedLink(text)) {
                 pasteInput.value = '';
-            } else if (text.trim()) {
-                showToast('Please enter a valid URL.');
             }
-        }
-    });
+        });
+
+        pasteInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const text = pasteInput.value;
+                if (processPastedLink(text)) {
+                    pasteInput.value = '';
+                } else if (text.trim()) {
+                    showToast('Please enter a valid URL.');
+                }
+            }
+        });
+    }
 
     // Global click listener to trigger clipboard scan using a valid user gesture context
     document.addEventListener('click', (e) => {
