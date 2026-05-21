@@ -926,10 +926,56 @@ let currentNavStack = []; // Stack of {id, title} for breadcrumbs.
 // Virtual root sentinel: shown when multiple focused folders are selected in settings.
 const VIRTUAL_ROOT_ID = '__virtual_root__';
 
+// Cache the duplicate count so the settings UI can surface it without re-querying.
+let _wfDuplicateCount = 0;
+
 async function findWorkflowRootSilent() {
     try {
+        // 1. Prefer the persisted ID so we always return the same folder, even if duplicates exist.
+        const settings = await StorageManager.getSettings();
+        const preferredId = settings && settings.workflowRootBookmarkId;
+        if (preferredId) {
+            try {
+                const node = (await chrome.bookmarks.get(preferredId))[0];
+                // Treat as valid if the bookmark still exists and is a folder.
+                if (node && !node.url) {
+                    // Still note any duplicates so the settings UI can warn.
+                    const titleMatches = await chrome.bookmarks.search({ title: node.title || 'TabPaladin Workflows' });
+                    const dupes = titleMatches.filter(m => !m.url && m.title === (node.title || 'TabPaladin Workflows'));
+                    _wfDuplicateCount = Math.max(0, dupes.length - 1);
+                    return node;
+                }
+            } catch (e) {
+                // Persisted ID gone — fall through and re-find.
+            }
+        }
+
+        // 2. Search by title; pick deterministically.
         const matches = await chrome.bookmarks.search({ title: 'TabPaladin Workflows' });
-        return matches.find(m => !m.url) || null;
+        const folders = matches.filter(m => !m.url && m.title === 'TabPaladin Workflows');
+        if (folders.length === 0) {
+            _wfDuplicateCount = 0;
+            return null;
+        }
+        _wfDuplicateCount = Math.max(0, folders.length - 1);
+
+        // Prefer the folder with the most children (likely the "real" workflows root).
+        let chosen = folders[0];
+        if (folders.length > 1) {
+            console.warn(`[TabPaladin] Multiple TabPaladin Workflows folders found (${folders.length}). Choosing the one with the most children. IDs:`,
+                folders.map(f => f.id));
+            let bestCount = -1;
+            for (const f of folders) {
+                const kids = await chrome.bookmarks.getChildren(f.id);
+                if (kids.length > bestCount) { bestCount = kids.length; chosen = f; }
+            }
+        }
+
+        // 3. Persist the choice so subsequent lookups are deterministic.
+        try {
+            await StorageManager.saveSettings({ ...settings, workflowRootBookmarkId: chosen.id });
+        } catch (e) { /* non-fatal */ }
+        return chosen;
     } catch (e) {
         return null;
     }
@@ -2452,10 +2498,15 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const icon = folder.isWorkflow ? '🛡️' : '📁';
             let subtitleHtml = '';
             if (folder.isWorkflow) {
-                // Build a dropdown of valid parents (the three real browser roots).
                 const parentOptionsHtml = (folders || []).map(f =>
                     `<option value="${f.id}" ${f.id === wfRoot.parentId ? 'selected' : ''}>${escapeHtml(f.title)}</option>`
                 ).join('');
+                const dupeWarningHtml = _wfDuplicateCount > 0
+                    ? `<div style="margin-top:4px; font-size:0.72rem; color:var(--warning-color); display:flex; align-items:center; gap:6px;">
+                           <span>⚠️ ${_wfDuplicateCount} duplicate Workflows folder(s) detected.</span>
+                           <button class="sm-btn wf-consolidate-btn" style="padding:2px 6px;">Consolidate</button>
+                       </div>`
+                    : '';
                 subtitleHtml = `
                     <div style="display:flex; align-items:center; gap:6px; margin-top:4px; font-size:0.72rem; color:var(--text-muted);">
                         <span>Located in:</span>
@@ -2464,6 +2515,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                             ${parentOptionsHtml}
                         </select>
                     </div>
+                    ${dupeWarningHtml}
                 `;
             }
             card.innerHTML = `
@@ -2492,6 +2544,35 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 catch (err) { alert('Export failed: ' + err.message); }
             });
 
+            // Workflows folder: Consolidate button — move children from duplicate
+            // TabPaladin Workflows folders into the chosen one, then delete duplicates.
+            const consolidateBtn = card.querySelector('.wf-consolidate-btn');
+            if (consolidateBtn && folder.isWorkflow) {
+                consolidateBtn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    if (!confirm(`Found ${_wfDuplicateCount} duplicate Workflows folder(s).\n\nMove their contents into "${folder.title}" and delete the duplicates?\n\nThis is irreversible.`)) return;
+                    try {
+                        const matches = await chrome.bookmarks.search({ title: 'TabPaladin Workflows' });
+                        const dupes = matches.filter(m => !m.url && m.title === 'TabPaladin Workflows' && m.id !== folder.id);
+                        for (const dupe of dupes) {
+                            const kids = await chrome.bookmarks.getChildren(dupe.id);
+                            for (const k of kids) {
+                                try { await chrome.bookmarks.move(k.id, { parentId: folder.id }); }
+                                catch (err) { console.warn('Failed to move during consolidate', k.id, err); }
+                            }
+                            try { await chrome.bookmarks.removeTree(dupe.id); }
+                            catch (err) { console.warn('Failed to remove duplicate', dupe.id, err); }
+                        }
+                        alert(`Consolidated ${dupes.length} duplicate folder(s).`);
+                        // Re-render settings so the warning clears and counts update.
+                        document.getElementById('settingsToggleBtn').click();
+                        document.getElementById('settingsToggleBtn').click();
+                    } catch (err) {
+                        alert('Consolidate failed: ' + err.message);
+                    }
+                });
+            }
+
             // Workflows folder: dropdown to move it between top-level roots.
             const locSel = card.querySelector('.wf-location-select');
             if (locSel && folder.isWorkflow) {
@@ -2504,6 +2585,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                     try {
                         await chrome.bookmarks.move(wfRoot.id, { parentId: newParentId });
                         currentParentId = newParentId;
+                        // Persist the ID so future lookups stick to this specific folder.
+                        const s = await StorageManager.getSettings();
+                        await StorageManager.saveSettings({ ...s, workflowRootBookmarkId: wfRoot.id });
                         console.log('[TabPaladin] Moved workflows folder to', newParentId);
                     } catch (err) {
                         alert('Move failed: ' + err.message);
