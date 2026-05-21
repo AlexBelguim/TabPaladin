@@ -164,12 +164,12 @@ export const BackendSync = {
         if (!snapshot || !snapshot.children) throw new Error('Empty snapshot');
 
         // --- Diagnostic: log what we're about to apply so users can verify the snapshot is complete.
-        const summarize = (node, depth = 0) => {
+        const summarize = (node) => {
             if (!node) return { f: 0, b: 0 };
             let f = node.type === 'folder' ? 1 : 0;
             let b = node.type === 'bookmark' ? 1 : 0;
             for (const c of node.children || []) {
-                const s = summarize(c, depth + 1);
+                const s = summarize(c);
                 f += s.f;
                 b += s.b;
             }
@@ -180,16 +180,31 @@ export const BackendSync = {
             'roots:', snapshot.children.map(c => `${c.title}(${c.nativeId || 'no-nativeId'}, ${(c.children || []).length} children)`).join(' | '),
             '| total folders:', totals.f, '| total bookmarks:', totals.b);
 
-        // Map snapshot root children by nativeId.
+        // Recovery for snapshots pushed before the nativeId fix: map by well-known root titles.
+        const TITLE_TO_NATIVE = {
+            'bookmarks bar': '1',
+            'bookmarks toolbar': '1',
+            'other bookmarks': '2',
+            'unfiled bookmarks': '2',
+            'mobile bookmarks': '3',
+            'mobile': '3'
+        };
+
+        // Map snapshot root children by nativeId — with title-based fallback.
         const nativeMap = new Map();
-        const orphans = [];
+        const stillOrphan = [];
         for (const c of snapshot.children) {
-            if (c.nativeId) nativeMap.set(c.nativeId, c);
-            else orphans.push(c);
-        }
-        if (orphans.length > 0) {
-            console.warn('[TabPaladin Pull] snapshot has root children without nativeId (will be placed in Other Bookmarks):',
-                orphans.map(o => o.title));
+            if (c.nativeId) {
+                nativeMap.set(c.nativeId, c);
+                continue;
+            }
+            const guess = TITLE_TO_NATIVE[(c.title || '').toLowerCase()];
+            if (guess && !nativeMap.has(guess)) {
+                console.log(`[TabPaladin Pull] recovering root by title "${c.title}" → nativeId ${guess}`);
+                nativeMap.set(guess, c);
+            } else {
+                stillOrphan.push(c);
+            }
         }
 
         // For each real browser root, clear it completely.
@@ -206,9 +221,12 @@ export const BackendSync = {
             }
         }
 
-        // Re-home orphan root children under Other Bookmarks ('2') so they aren't lost.
-        if (orphans.length > 0) {
-            await recreateChildren('2', orphans);
+        // Anything left orphan: merge its CHILDREN into Other Bookmarks (no nested wrapper folder).
+        for (const orphan of stillOrphan) {
+            console.warn('[TabPaladin Pull] unrecognized orphan, merging children into Other Bookmarks:', orphan.title);
+            if (orphan.children && orphan.children.length) {
+                await recreateChildren('2', orphan.children);
+            }
         }
     }
 };

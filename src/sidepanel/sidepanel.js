@@ -2924,82 +2924,84 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         closeSettings();
     });
 
-    // Main header Push and Pull event listeners
-    const mainStatus = document.getElementById('backend-status');
-    const updateMainStatus = (msg) => {
-        if (mainStatus) mainStatus.textContent = msg;
-    };
+});
 
-    document.getElementById('mainPushBtn').addEventListener('click', async () => {
-        try {
-            const settings = await StorageManager.getSettings();
-            const cfg = settings.backend || {};
-            if (!cfg.url || !cfg.token) {
-                alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
-                return;
-            }
-            if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
-            
-            updateMainStatus('Pushing…');
-            const focusedFolderIds = settings.focusedFolderIds || [];
-            const wfRoot = await findWorkflowRootSilent();
-            const workflowRootId = wfRoot ? wfRoot.id : null;
-            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
-            
-            const updated = { ...settings, backend: { ...cfg, lastSyncAt: ts, lastSyncKind: 'push' } };
-            await StorageManager.saveSettings(updated);
-            
-            updateMainStatus('Pushed at ' + new Date(ts).toLocaleString());
-            alert('Push successful!');
-            location.reload();
-        } catch (e) {
-            updateMainStatus('Push failed: ' + e.message);
-            alert('Push failed: ' + e.message);
-        }
-    });
+// --- Main header Push/Pull (registered at module load so they work without opening Settings first) ---
+function _mainStatusEl() { return document.getElementById('backend-status'); }
+function _updateMainStatus(msg) {
+    const el = _mainStatusEl();
+    if (el) el.textContent = msg;
+}
 
-    document.getElementById('mainPullBtn').addEventListener('click', async () => {
-        try {
-            const settings = await StorageManager.getSettings();
-            const cfg = settings.backend || {};
-            if (!cfg.url || !cfg.token) {
-                alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
-                return;
-            }
-            
-            updateMainStatus('Checking latest…');
-            const data = await BackendSync.pullLatestInfo(cfg);
-            if (!data || !data.snapshot) {
-                updateMainStatus('No snapshot on server yet.');
-                alert('No snapshot on server yet.');
-                return;
-            }
-            
-            const when = new Date(data.timestamp).toLocaleString();
-            const yes = confirm(
-                `Replace your local bookmarks with the snapshot from ${when}?\n\n` +
-                `This wipes the current contents of Bookmarks Bar / Other Bookmarks / Mobile and recreates them from the server snapshot.\n\n` +
-                `Tip: Push first if you have local changes you want to keep.`
-            );
-            if (!yes) {
-                updateMainStatus('Pull cancelled.');
-                return;
-            }
-            
-            updateMainStatus('Pulling…');
-            await BackendSync.applyPull(data.snapshot);
-            
-            const updated = { ...settings, backend: { ...cfg, lastSyncAt: data.timestamp, lastSyncKind: 'pull' } };
-            await StorageManager.saveSettings(updated);
-            
-            updateMainStatus('Pulled snapshot from ' + when);
-            alert('Pull successful! Local bookmarks updated.');
-            location.reload();
-        } catch (e) {
-            updateMainStatus('Pull failed: ' + e.message);
-            alert('Pull failed: ' + e.message);
+document.getElementById('mainPushBtn').addEventListener('click', async () => {
+    try {
+        const settings = await StorageManager.getSettings();
+        const cfg = settings.backend || {};
+        if (!cfg.url || !cfg.token) {
+            alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+            return;
         }
-    });
+        if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
+
+        _updateMainStatus('Pushing…');
+        const focusedFolderIds = settings.focusedFolderIds || [];
+        const wfRoot = await findWorkflowRootSilent();
+        const workflowRootId = wfRoot ? wfRoot.id : null;
+        const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
+
+        const updated = { ...settings, backend: { ...cfg, lastSyncAt: ts, lastSyncKind: 'push' } };
+        await StorageManager.saveSettings(updated);
+
+        _updateMainStatus('Pushed at ' + new Date(ts).toLocaleString());
+        alert('Push successful!');
+        location.reload();
+    } catch (e) {
+        _updateMainStatus('Push failed: ' + e.message);
+        alert('Push failed: ' + e.message);
+    }
+});
+
+document.getElementById('mainPullBtn').addEventListener('click', async () => {
+    try {
+        const settings = await StorageManager.getSettings();
+        const cfg = settings.backend || {};
+        if (!cfg.url || !cfg.token) {
+            alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+            return;
+        }
+
+        _updateMainStatus('Checking latest…');
+        const data = await BackendSync.pullLatestInfo(cfg);
+        if (!data || !data.snapshot) {
+            _updateMainStatus('No snapshot on server yet.');
+            alert('No snapshot on server yet.');
+            return;
+        }
+
+        const when = new Date(data.timestamp).toLocaleString();
+        const yes = confirm(
+            `Replace your local bookmarks with the snapshot from ${when}?\n\n` +
+            `This wipes the current contents of Bookmarks Bar / Other Bookmarks / Mobile and recreates them from the server snapshot.\n\n` +
+            `Tip: Push first if you have local changes you want to keep.`
+        );
+        if (!yes) {
+            _updateMainStatus('Pull cancelled.');
+            return;
+        }
+
+        _updateMainStatus('Pulling…');
+        await BackendSync.applyPull(data.snapshot);
+
+        const updated = { ...settings, backend: { ...cfg, lastSyncAt: data.timestamp, lastSyncKind: 'pull' } };
+        await StorageManager.saveSettings(updated);
+
+        _updateMainStatus('Pulled snapshot from ' + when);
+        alert('Pull successful! Local bookmarks updated.');
+        location.reload();
+    } catch (e) {
+        _updateMainStatus('Pull failed: ' + e.message);
+        alert('Pull failed: ' + e.message);
+    }
 });
 
 function closeSettings() {
