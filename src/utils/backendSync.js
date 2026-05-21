@@ -180,6 +180,31 @@ export const BackendSync = {
             'roots:', snapshot.children.map(c => `${c.title}(${c.nativeId || 'no-nativeId'}, ${(c.children || []).length} children)`).join(' | '),
             '| total folders:', totals.f, '| total bookmarks:', totals.b);
 
+        // Verbose diagnostic: list every folder path in the snapshot.
+        // Enable by running `localStorage.setItem('tp_pull_verbose', '1')` in DevTools.
+        // Or search a specific name: `localStorage.setItem('tp_pull_find', 'twitter')`.
+        try {
+            const verbose = localStorage.getItem('tp_pull_verbose') === '1';
+            const findKey = (localStorage.getItem('tp_pull_find') || '').toLowerCase();
+            const pathsOf = (node, path = []) => {
+                const out = [];
+                const curPath = (node.type === 'folder' || node.type === 'root') && node.title
+                    ? [...path, node.title]
+                    : path;
+                if (node.type === 'folder' && path.length > 0) out.push(curPath.join(' / '));
+                for (const c of node.children || []) out.push(...pathsOf(c, curPath));
+                return out;
+            };
+            if (verbose || findKey) {
+                const all = pathsOf(snapshot);
+                if (verbose) console.log('[TabPaladin Pull] all folder paths in snapshot:', all);
+                if (findKey) {
+                    const matches = all.filter(p => p.toLowerCase().includes(findKey));
+                    console.log(`[TabPaladin Pull] folder paths matching "${findKey}":`, matches);
+                }
+            }
+        } catch (e) { /* localStorage might be unavailable in some contexts */ }
+
         // Recovery for snapshots pushed before the nativeId fix: map by well-known root titles.
         const TITLE_TO_NATIVE = {
             'bookmarks bar': '1',
