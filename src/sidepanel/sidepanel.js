@@ -2366,7 +2366,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backend Sync</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
                 <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Server URL</div>
-                <input type="url" id="backend-url" value="${(settings.backend && settings.backend.url) || ''}" placeholder="http://truenas.local:3000" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
+                <input type="url" id="backend-url" value="${(settings.backend && settings.backend.url) || ''}" placeholder="http://truenas.local:18921" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
                 <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Auth Token</div>
                 <input type="password" id="backend-token" value="${(settings.backend && settings.backend.token) || ''}" placeholder="TABPALADIN_TOKEN" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
                 <div style="display:flex; gap:8px; margin-top:10px;">

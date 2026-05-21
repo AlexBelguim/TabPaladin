@@ -7,11 +7,11 @@ Tiny Node + SQLite backend for the TabPaladin extension and PWA.
 ```bash
 cd server
 # Set a long random token:
-echo 'TABPALADIN_TOKEN=replace-me-with-32-chars-of-random' > .env
+echo 'TABPALADIN_TOKEN=7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b' > .env
 docker compose up -d --build
 ```
 
-The server listens on `http://<host>:3000`. Configure the same `TABPALADIN_TOKEN`
+The server listens on `http://<host>:18921`. Configure the same `TABPALADIN_TOKEN`
 in the extension settings (Backend section) and you're synced.
 
 ## Endpoints

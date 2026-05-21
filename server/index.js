@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 18921);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PWA_DIR = process.env.PWA_DIR || path.resolve(__dirname, '..', 'pwa');

@@ -7,15 +7,15 @@ services:
       dockerfile: server/Dockerfile
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-3000}:3000"
+      - "${HOST_PORT:-18921}:18921"
     volumes:
       - ./data:/data
       # Mount the PWA folder live so changes don't require rebuilds during dev.
       - ../pwa:/app/pwa:ro
     environment:
-      - PORT=3000
+      - PORT=18921
       - DATA_DIR=/data
       - PWA_DIR=/app/pwa
       # CHANGE THIS to a long random string. The extension uses the same value.
-      - AUTH_TOKEN=${TABPALADIN_TOKEN:-CHANGEME_LONG_RANDOM_STRING}
+      - AUTH_TOKEN=${TABPALADIN_TOKEN:-7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b}
       - MAX_SNAPSHOTS=${MAX_SNAPSHOTS:-200}
