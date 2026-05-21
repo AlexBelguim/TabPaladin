@@ -450,7 +450,11 @@ async function checkUnfiledLinks(skipClipboardScan = false) {
     }
 
     activeQuickFileItems = unfiled;
-    renderQuickFileSheet();
+    const sheet = $('quick-file-sheet');
+    const isOpen = sheet && !sheet.classList.contains('hidden');
+    if (activeQuickFileItems.length > 0 || isOpen) {
+        renderQuickFileSheet();
+    }
 }
 
 function renderQuickFileSheet() {
@@ -458,100 +462,108 @@ function renderQuickFileSheet() {
     const list = $('quick-file-list');
     const hint = $('quick-file-hint');
     
-    if (activeQuickFileItems.length === 0) {
-        hide(sheet);
-        return;
-    }
-
     const currentFolder = findNodeByPath(state.pathIds);
     hint.textContent = currentFolder 
         ? `Will add to folder: "${currentFolder.title || 'Bookmarks'}"` 
         : 'Select a folder in the background to file these links.';
 
     list.innerHTML = '';
-    activeQuickFileItems.forEach((item, index) => {
-        const row = document.createElement('div');
-        row.className = 'row bookmark';
-        row.style.display = 'flex';
-        row.style.alignItems = 'center';
-        row.style.justifyContent = 'space-between';
-        row.style.gap = '10px';
-        row.style.background = 'rgba(255, 255, 255, 0.04)';
-        row.style.marginBottom = '6px';
-        row.style.padding = '10px 14px';
-
-        let domain = '';
-        try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch (e) {}
-        const favicon = domain
-            ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32" style="width:16px; height:16px; border-radius:3px; flex-shrink:0;">`
-            : '<span class="icon">🔖</span>';
-
-        row.innerHTML = `
-            <div style="display:flex; align-items:center; gap:10px; overflow:hidden; flex:1;">
-                ${favicon}
-                <div style="display:flex; flex-direction:column; overflow:hidden; text-align:left;">
-                    <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.88rem; color:var(--text);">${escapeHtml(item.title)}</strong>
-                    <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.75rem; color:var(--muted);">${escapeHtml(item.url)}</span>
-                </div>
-            </div>
-            <div style="display:flex; gap:6px; flex-shrink:0;">
-                <button class="place-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--success); color:white; border-radius:6px;">Place</button>
-                <button class="skip-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--surface-2); color:var(--text); border-radius:6px;">Skip</button>
+    
+    if (activeQuickFileItems.length === 0) {
+        list.innerHTML = `
+            <div class="empty" style="padding: 32px 16px; color: var(--muted); text-align: center; font-style: italic; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <span style="font-size: 2rem;">📥</span>
+                <span>No unfiled links queued.</span>
+                <span style="font-size: 0.8rem; font-style: normal; color: var(--primary); font-weight: 500;">
+                    Paste a link in the box above to add it!
+                </span>
             </div>
         `;
+    } else {
+        activeQuickFileItems.forEach((item, index) => {
+            const row = document.createElement('div');
+            row.className = 'row bookmark';
+            row.style.display = 'flex';
+            row.style.alignItems = 'center';
+            row.style.justifyContent = 'space-between';
+            row.style.gap = '10px';
+            row.style.background = 'rgba(255, 255, 255, 0.04)';
+            row.style.marginBottom = '6px';
+            row.style.padding = '10px 14px';
 
-        row.querySelector('.place-btn').addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const folder = findNodeByPath(state.pathIds);
-            if (!folder) {
-                alert('Please navigate to a folder in the background first.');
-                return;
-            }
-            // File locally
-            folder.children = folder.children || [];
-            folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
-            state.dirty = true;
-            renderView();
+            let domain = '';
+            try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch (e) {}
+            const favicon = domain
+                ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32" style="width:16px; height:16px; border-radius:3px; flex-shrink:0;">`
+                : '<span class="icon">🔖</span>';
 
-            try {
-                $('status').textContent = 'Saving…';
-                await pushSnapshot();
-                // Clear server shared link if it came from inbox
-                if (item.inboxId) {
-                    await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
-                    state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+            row.innerHTML = `
+                <div style="display:flex; align-items:center; gap:10px; overflow:hidden; flex:1;">
+                    ${favicon}
+                    <div style="display:flex; flex-direction:column; overflow:hidden; text-align:left;">
+                        <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.88rem; color:var(--text);">${escapeHtml(item.title)}</strong>
+                        <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.75rem; color:var(--muted);">${escapeHtml(item.url)}</span>
+                    </div>
+                </div>
+                <div style="display:flex; gap:6px; flex-shrink:0;">
+                    <button class="place-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--success); color:white; border-radius:6px;">Place</button>
+                    <button class="skip-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--surface-2); color:var(--text); border-radius:6px;">Skip</button>
+                </div>
+            `;
+
+            row.querySelector('.place-btn').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const folder = findNodeByPath(state.pathIds);
+                if (!folder) {
+                    alert('Please navigate to a folder in the background first.');
+                    return;
                 }
-                dismissUrl(item.url);
-                removeScannedClipboardLink(item.url);
-                activeQuickFileItems.splice(index, 1);
-                renderQuickFileSheet();
-                updateInboxFab();
-                $('status').textContent = '';
-            } catch (err) {
-                alert('Place failed: ' + err.message);
-                $('status').textContent = '';
-            }
-        });
+                // File locally
+                folder.children = folder.children || [];
+                folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
+                state.dirty = true;
+                renderView();
 
-        row.querySelector('.skip-btn').addEventListener('click', async (e) => {
-            e.stopPropagation();
-            try {
-                if (item.inboxId) {
-                    await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
-                    state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+                try {
+                    $('status').textContent = 'Saving…';
+                    await pushSnapshot();
+                    // Clear server shared link if it came from inbox
+                    if (item.inboxId) {
+                        await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
+                        state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+                    }
+                    dismissUrl(item.url);
+                    removeScannedClipboardLink(item.url);
+                    activeQuickFileItems.splice(index, 1);
+                    renderQuickFileSheet();
+                    updateInboxFab();
+                    $('status').textContent = '';
+                } catch (err) {
+                    alert('Place failed: ' + err.message);
+                    $('status').textContent = '';
                 }
-                dismissUrl(item.url);
-                removeScannedClipboardLink(item.url);
-                activeQuickFileItems.splice(index, 1);
-                renderQuickFileSheet();
-                updateInboxFab();
-            } catch (err) {
-                alert('Skip failed: ' + err.message);
-            }
-        });
+            });
 
-        list.appendChild(row);
-    });
+            row.querySelector('.skip-btn').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                try {
+                    if (item.inboxId) {
+                        await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
+                        state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+                    }
+                    dismissUrl(item.url);
+                    removeScannedClipboardLink(item.url);
+                    activeQuickFileItems.splice(index, 1);
+                    renderQuickFileSheet();
+                    updateInboxFab();
+                } catch (err) {
+                    alert('Skip failed: ' + err.message);
+                }
+            });
+
+            list.appendChild(row);
+        });
+    }
 
     show(sheet);
 }
@@ -603,7 +615,9 @@ window.addEventListener('DOMContentLoaded', () => {
         // 1. Instantly read the clipboard before ANY microtask boundary or async call!
         // This satisfies WebKit's strict security engine in standalone mobile PWAs.
         if (!navigator.clipboard || !navigator.clipboard.readText) {
-            showToast('Clipboard API not supported in this browser.');
+            showToast('Clipboard API not supported. Paste manually below.');
+            renderQuickFileSheet();
+            $('quick-file-paste-input').focus();
             return;
         }
 
@@ -611,14 +625,18 @@ window.addEventListener('DOMContentLoaded', () => {
         try {
             text = await navigator.clipboard.readText();
         } catch (e) {
-            showToast('Clipboard access denied. Please allow paste.');
+            showToast('Clipboard access denied. Paste manually below.');
+            renderQuickFileSheet();
+            $('quick-file-paste-input').focus();
             console.warn(e);
             return;
         }
 
         const trimmed = (text || '').trim();
         if (!trimmed || !/^https?:\/\/\S+$/.test(trimmed)) {
-            showToast('No valid URL found in your clipboard.');
+            showToast('No URL in clipboard. Paste manually below.');
+            renderQuickFileSheet();
+            $('quick-file-paste-input').focus();
             return;
         }
 
@@ -641,6 +659,8 @@ window.addEventListener('DOMContentLoaded', () => {
         const normTrimmed = normalizeUrl(trimmed);
         if (isUrlInSnapshot(trimmed, state.snapshot)) {
             showToast('Link is already filed in your bookmarks.');
+            renderQuickFileSheet();
+            $('quick-file-paste-input').focus();
             return;
         }
 
@@ -648,7 +668,9 @@ window.addEventListener('DOMContentLoaded', () => {
         const dismissedSet = new Set(dismissed.map(normalizeUrl));
 
         if (dismissedSet.has(normTrimmed)) {
-            showToast('This clipboard link was previously skipped.');
+            showToast('Previously skipped clipboard link. Paste manually if desired.');
+            renderQuickFileSheet();
+            $('quick-file-paste-input').focus();
             return;
         }
 
@@ -664,6 +686,7 @@ window.addEventListener('DOMContentLoaded', () => {
         } else {
             showToast('Showing unfiled links bottom sheet.');
         }
+        $('quick-file-paste-input').focus();
     });
 
     $('syncBtn').addEventListener('click', async (e) => {
@@ -690,6 +713,87 @@ window.addEventListener('DOMContentLoaded', () => {
     $('dropHereBtn').addEventListener('click', dropHere);
 
     $('quick-file-close').addEventListener('click', () => hide($('quick-file-sheet')));
+
+    const pasteInput = $('quick-file-paste-input');
+    
+    function processPastedLink(text) {
+        let trimmed = (text || '').trim();
+        if (!trimmed) return false;
+        
+        // Auto-prepend https:// if it looks like a domain without scheme
+        if (!/^https?:\/\//i.test(trimmed)) {
+            if (/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/.test(trimmed)) {
+                trimmed = 'https://' + trimmed;
+            }
+        }
+        
+        if (/^https?:\/\/\S+$/.test(trimmed)) {
+            if (!configured()) {
+                showToast('Please open settings (⚙) first.');
+                return false;
+            }
+            if (!state.snapshot) {
+                showToast('Pulling snapshot first…');
+                pullSnapshot().then(() => {
+                    handleScannedLink(trimmed);
+                }).catch(err => {
+                    showToast('Failed to pull snapshot: ' + err.message);
+                });
+                return true;
+            }
+            
+            handleScannedLink(trimmed);
+            return true;
+        }
+        return false;
+    }
+
+    function handleScannedLink(url) {
+        const norm = normalizeUrl(url);
+        if (isUrlInSnapshot(url, state.snapshot)) {
+            showToast('Link is already filed in your bookmarks.');
+            return;
+        }
+        
+        const dismissed = getDismissedUrls();
+        const dismissedSet = new Set(dismissed.map(normalizeUrl));
+        
+        // If it was previously dismissed/skipped, allow un-dismissing it on manual entry!
+        if (dismissedSet.has(norm)) {
+            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== norm);
+            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
+        }
+        
+        addScannedClipboardLink(url, url);
+        checkUnfiledLinks(true);
+        showToast('Unfiled link added!');
+    }
+
+    pasteInput.addEventListener('paste', (e) => {
+        const text = (e.clipboardData || window.clipboardData).getData('text');
+        if (processPastedLink(text)) {
+            e.preventDefault();
+            pasteInput.value = '';
+        }
+    });
+
+    pasteInput.addEventListener('input', () => {
+        const text = pasteInput.value;
+        if (processPastedLink(text)) {
+            pasteInput.value = '';
+        }
+    });
+
+    pasteInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            const text = pasteInput.value;
+            if (processPastedLink(text)) {
+                pasteInput.value = '';
+            } else if (text.trim()) {
+                showToast('Please enter a valid URL.');
+            }
+        }
+    });
 
     // Global click listener to trigger clipboard scan using a valid user gesture context
     document.addEventListener('click', (e) => {
