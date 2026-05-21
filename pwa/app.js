@@ -52,6 +52,7 @@ async function bootstrap() {
     }
     await pullSnapshot();
     await refreshInbox();
+    await checkUnfiledLinks();
 }
 
 async function pullSnapshot() {
@@ -114,6 +115,9 @@ function renderView() {
     renderBreadcrumb();
     renderContent();
     updateInboxFab();
+    if (document.getElementById('quick-file-sheet') && !document.getElementById('quick-file-sheet').classList.contains('hidden')) {
+        renderQuickFileSheet();
+    }
 }
 
 function renderBreadcrumb() {
@@ -286,6 +290,172 @@ function cleanSnapshot(node) {
     return out;
 }
 
+// --- Quick-File Modal (proactive clipboard & inbox filing) ---
+const DISMISSED_KEY = 'tp_dismissed_urls';
+
+function getDismissedUrls() {
+    try { return JSON.parse(localStorage.getItem(DISMISSED_KEY)) || []; }
+    catch (e) { return []; }
+}
+
+function dismissUrl(url) {
+    const list = getDismissedUrls();
+    if (!list.includes(url)) {
+        list.push(url);
+        localStorage.setItem(DISMISSED_KEY, JSON.stringify(list));
+    }
+}
+
+function isUrlInSnapshot(url, node) {
+    if (!node) return false;
+    if (node.type === 'bookmark' && node.url === url) return true;
+    if (node.children) {
+        for (const child of node.children) {
+            if (isUrlInSnapshot(url, child)) return true;
+        }
+    }
+    return false;
+}
+
+let activeQuickFileItems = [];
+
+async function checkUnfiledLinks() {
+    if (!state.snapshot) return;
+    const dismissed = getDismissedUrls();
+    const dismissedSet = new Set(dismissed);
+    const unfiled = [];
+
+    // 1. Process shared inbox items
+    for (const link of state.inbox) {
+        if (!isUrlInSnapshot(link.url, state.snapshot) && !dismissedSet.has(link.url)) {
+            if (!unfiled.some(item => item.url === link.url)) {
+                unfiled.push({ url: link.url, title: link.title || link.url, inboxId: link.id });
+            }
+        }
+    }
+
+    // 2. Process clipboard if permission is available
+    if (navigator.clipboard && navigator.clipboard.readText) {
+        try {
+            const text = await navigator.clipboard.readText();
+            const trimmed = (text || '').trim();
+            if (/^https?:\/\/\S+$/.test(trimmed)) {
+                if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(trimmed)) {
+                    if (!unfiled.some(item => item.url === trimmed)) {
+                        unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+                    }
+                }
+            }
+        } catch (e) {
+            // Silently swallow clipboard permission errors
+        }
+    }
+
+    activeQuickFileItems = unfiled;
+    renderQuickFileSheet();
+}
+
+function renderQuickFileSheet() {
+    const sheet = $('quick-file-sheet');
+    const list = $('quick-file-list');
+    const hint = $('quick-file-hint');
+    
+    if (activeQuickFileItems.length === 0) {
+        hide(sheet);
+        return;
+    }
+
+    const currentFolder = findNodeByPath(state.pathIds);
+    hint.textContent = currentFolder 
+        ? `Will add to folder: "${currentFolder.title || 'Bookmarks'}"` 
+        : 'Select a folder in the background to file these links.';
+
+    list.innerHTML = '';
+    activeQuickFileItems.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'row bookmark';
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.justifyContent = 'space-between';
+        row.style.gap = '10px';
+        row.style.background = 'rgba(255, 255, 255, 0.04)';
+        row.style.marginBottom = '6px';
+        row.style.padding = '10px 14px';
+
+        let domain = '';
+        try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch (e) {}
+        const favicon = domain
+            ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32" style="width:16px; height:16px; border-radius:3px; flex-shrink:0;">`
+            : '<span class="icon">🔖</span>';
+
+        row.innerHTML = `
+            <div style="display:flex; align-items:center; gap:10px; overflow:hidden; flex:1;">
+                ${favicon}
+                <div style="display:flex; flex-direction:column; overflow:hidden; text-align:left;">
+                    <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.88rem; color:var(--text);">${escapeHtml(item.title)}</strong>
+                    <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.75rem; color:var(--muted);">${escapeHtml(item.url)}</span>
+                </div>
+            </div>
+            <div style="display:flex; gap:6px; flex-shrink:0;">
+                <button class="place-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--success); color:white; border-radius:6px;">Place</button>
+                <button class="skip-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--surface-2); color:var(--text); border-radius:6px;">Skip</button>
+            </div>
+        `;
+
+        row.querySelector('.place-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const folder = findNodeByPath(state.pathIds);
+            if (!folder) {
+                alert('Please navigate to a folder in the background first.');
+                return;
+            }
+            // File locally
+            folder.children = folder.children || [];
+            folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
+            state.dirty = true;
+            renderView();
+
+            try {
+                $('status').textContent = 'Saving…';
+                await pushSnapshot();
+                // Clear server shared link if it came from inbox
+                if (item.inboxId) {
+                    await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
+                    state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+                }
+                dismissUrl(item.url);
+                activeQuickFileItems.splice(index, 1);
+                renderQuickFileSheet();
+                updateInboxFab();
+                $('status').textContent = '';
+            } catch (err) {
+                alert('Place failed: ' + err.message);
+                $('status').textContent = '';
+            }
+        });
+
+        row.querySelector('.skip-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                if (item.inboxId) {
+                    await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
+                    state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
+                }
+                dismissUrl(item.url);
+                activeQuickFileItems.splice(index, 1);
+                renderQuickFileSheet();
+                updateInboxFab();
+            } catch (err) {
+                alert('Skip failed: ' + err.message);
+            }
+        });
+
+        list.appendChild(row);
+    });
+
+    show(sheet);
+}
+
 // --- Share Target API ---
 // When the user shares a URL from another mobile app, the browser navigates to
 // /?share=1&title=...&text=...&url=... (configured in manifest). We capture and
@@ -329,6 +499,7 @@ window.addEventListener('DOMContentLoaded', () => {
     $('syncBtn').addEventListener('click', async () => {
         await pullSnapshot();
         await refreshInbox();
+        await checkUnfiledLinks();
     });
     $('settingsBtn').addEventListener('click', openSettings);
     $('settings-close').addEventListener('click', () => hide($('settings-sheet')));
@@ -338,9 +509,19 @@ window.addEventListener('DOMContentLoaded', () => {
     $('inbox-close').addEventListener('click', () => hide($('inbox-sheet')));
     $('dropHereBtn').addEventListener('click', dropHere);
 
+    $('quick-file-close').addEventListener('click', () => hide($('quick-file-sheet')));
+
     bootstrap();
 
     if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+});
+
+// Proactively scan clipboard and refresh inbox on window focus (perfect for returning to mobile PWA)
+window.addEventListener('focus', async () => {
+    if (configured() && state.snapshot) {
+        await refreshInbox();
+        await checkUnfiledLinks();
     }
 });

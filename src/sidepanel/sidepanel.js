@@ -2833,10 +2833,14 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     document.getElementById('backend-push-btn').addEventListener('click', async () => {
         const cfg = getBackendConfig();
         if (!cfg.url || !cfg.token) { alert('Server URL and token required.'); return; }
-        if (!confirm('Upload your full bookmark tree as a new snapshot on the server?')) return;
+        if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
         writeBackendStatus('Pushing…');
         try {
-            const ts = await BackendSync.push(cfg);
+            const settings = await StorageManager.getSettings();
+            const focusedFolderIds = settings.focusedFolderIds || [];
+            const wfRoot = await findWorkflowRootSilent();
+            const workflowRootId = wfRoot ? wfRoot.id : null;
+            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
             await persistBackendConfig({ lastSyncAt: ts, lastSyncKind: 'push' });
             writeBackendStatus('Pushed at ' + new Date(ts).toLocaleString());
         } catch (e) {

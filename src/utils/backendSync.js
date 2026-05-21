@@ -1,4 +1,4 @@
-// Backend sync — push/pull the entire bookmark tree to a TabPaladin sync server.
+// Backend sync — push/pull selected bookmark folders to a TabPaladin sync server.
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
@@ -28,13 +28,79 @@ function serializeNode(node) {
     };
 }
 
-async function fullBookmarkSnapshot() {
+async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null) {
     const tree = await api.bookmarks.getTree();
     const root = tree[0]; // virtual root with id '0'
+    
+    // If no focused folder IDs are selected and no workflowRootId, push everything (fallback)
+    if (focusedFolderIds.length === 0 && !workflowRootId) {
+        return {
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            ...serializeNode(root)
+        };
+    }
+
+    const focusedSet = new Set(focusedFolderIds);
+    if (workflowRootId) {
+        focusedSet.add(workflowRootId);
+    }
+
+    function hasFocusedDescendant(node) {
+        if (focusedSet.has(node.id)) return true;
+        if (node.children) {
+            return node.children.some(child => hasFocusedDescendant(child));
+        }
+        return false;
+    }
+
+    function serializeFilteredNode(node, insideSelected) {
+        const isSelected = focusedSet.has(node.id);
+        const keepAll = insideSelected || isSelected;
+
+        if (node.url) {
+            if (keepAll) {
+                return {
+                    type: 'bookmark',
+                    title: node.title,
+                    url: node.url,
+                    dateAdded: node.dateAdded
+                };
+            }
+            return null;
+        }
+
+        // For folders: if not inside a selected parent, only keep if it has a focused descendant
+        // (or if it's the root '0' or native roots '1', '2', '3' to preserve structural roots)
+        const isStructural = ['0', '1', '2', '3'].includes(node.id);
+        if (!keepAll && !isStructural && !hasFocusedDescendant(node)) {
+            return null;
+        }
+
+        const serializedChildren = [];
+        for (const child of node.children || []) {
+            const res = serializeFilteredNode(child, keepAll);
+            if (res) serializedChildren.push(res);
+        }
+
+        // For non-structural folders, we only keep them if they are selected or had children serialized
+        if (!keepAll && !isStructural && serializedChildren.length === 0) {
+            return null;
+        }
+
+        return {
+            type: node.id === '0' ? 'root' : 'folder',
+            title: node.title || '',
+            dateAdded: node.dateAdded,
+            nativeId: ['0', '1', '2', '3'].includes(node.id) ? node.id : undefined,
+            children: serializedChildren
+        };
+    }
+
     return {
         version: 1,
         exportedAt: new Date().toISOString(),
-        ...serializeNode(root)
+        ...serializeFilteredNode(root, false)
     };
 }
 
@@ -71,8 +137,8 @@ export const BackendSync = {
         return res.json();
     },
 
-    async push(config) {
-        const snapshot = await fullBookmarkSnapshot();
+    async push(config, focusedFolderIds = [], workflowRootId = null) {
+        const snapshot = await fullBookmarkSnapshot(focusedFolderIds, workflowRootId);
         const res = await fetch(trim(config.url) + '/api/push', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeader(config.token) },
@@ -91,8 +157,8 @@ export const BackendSync = {
         return res.json();
     },
 
-    // Destructive: replaces the contents of Bookmarks Bar / Other Bookmarks / Mobile
-    // with the snapshot's corresponding root children.
+    // Safe/Smart pull: only replaces or updates the folders that are present in the snapshot,
+    // leaving all other local unsynced folders/bookmarks completely untouched!
     async applyPull(snapshot) {
         if (!snapshot || !snapshot.children) throw new Error('Empty snapshot');
 
@@ -102,13 +168,35 @@ export const BackendSync = {
             if (c.nativeId) nativeMap.set(c.nativeId, c);
         }
 
-        // For each real browser root, clear it and recreate from the snapshot's matching native root.
+        // For each real browser root, update or recreate only the folders/bookmarks
+        // that are present in the snapshot.
         for (const localId of ['1', '2', '3']) {
             const snap = nativeMap.get(localId);
             if (!snap) continue;
             try {
-                await emptyFolder(localId);
-                await recreateChildren(localId, snap.children || []);
+                // Get the current local children of that root folder
+                const localChildren = await api.bookmarks.getChildren(localId);
+                
+                // For each child in the snapshot, find if it already exists locally.
+                // If it does, we remove it, and recreate it from the snapshot.
+                for (const child of snap.children || []) {
+                    const existing = localChildren.find(c => c.title === child.title && !c.url);
+                    if (existing) {
+                        try {
+                            await api.bookmarks.removeTree(existing.id);
+                        } catch (e) {
+                            console.warn('Failed to remove local folder tree during update', existing.id, e);
+                        }
+                    }
+                    
+                    // Recreate this child
+                    if (child.type === 'folder') {
+                        const f = await api.bookmarks.create({ parentId: localId, title: child.title });
+                        await recreateChildren(f.id, child.children || []);
+                    } else if (child.type === 'bookmark') {
+                        await api.bookmarks.create({ parentId: localId, title: child.title, url: child.url });
+                    }
+                }
             } catch (e) {
                 console.warn('Failed during pull apply for root', localId, e);
             }
