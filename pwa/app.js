@@ -568,65 +568,67 @@ function saveSettings() {
 // --- Wire up ---
 window.addEventListener('DOMContentLoaded', () => {
     $('clipBtn').addEventListener('click', async () => {
-        if (!configured()) {
-            showToast('Please open settings first.');
-            return;
-        }
-        if (!state.snapshot) {
-            showToast('Loading snapshot…');
-            await pullSnapshot();
-        }
-
-        showToast('Scanning clipboard…');
-        
-        let foundUnfiled = false;
-        const dismissed = getDismissedUrls();
-        const dismissedSet = new Set(dismissed.map(normalizeUrl));
-        const unfiled = [...activeQuickFileItems];
-
-        if (navigator.clipboard && navigator.clipboard.readText) {
-            try {
-                const text = await navigator.clipboard.readText();
-                const trimmed = (text || '').trim();
-                if (/^https?:\/\/\S+$/.test(trimmed)) {
-                    const normTrimmed = normalizeUrl(trimmed);
-                    if (!isUrlInSnapshot(trimmed, state.snapshot)) {
-                        // Explicit scan allows recovering previously dismissed clipboard URLs
-                        if (dismissedSet.has(normTrimmed)) {
-                            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== normTrimmed);
-                            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
-                        }
-                        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
-                            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
-                            foundUnfiled = true;
-                        }
-                    } else {
-                        showToast('Link is already filed in your bookmarks.');
-                        return;
-                    }
-                } else {
-                    showToast('No valid URL found in your clipboard.');
-                    return;
-                }
-            } catch (e) {
-                showToast('Clipboard access denied by browser.');
-                console.warn(e);
-                return;
-            }
-        } else {
+        // 1. Instantly read the clipboard before ANY microtask boundary or async call!
+        // This satisfies WebKit's strict security engine in standalone mobile PWAs.
+        if (!navigator.clipboard || !navigator.clipboard.readText) {
             showToast('Clipboard API not supported in this browser.');
             return;
         }
 
-        activeQuickFileItems = unfiled;
-        renderQuickFileSheet();
+        let text = '';
+        try {
+            text = await navigator.clipboard.readText();
+        } catch (e) {
+            showToast('Clipboard access denied. Please allow paste.');
+            console.warn(e);
+            return;
+        }
 
-        if (foundUnfiled) {
+        const trimmed = (text || '').trim();
+        if (!trimmed || !/^https?:\/\/\S+$/.test(trimmed)) {
+            showToast('No valid URL found in your clipboard.');
+            return;
+        }
+
+        if (!configured()) {
+            showToast('Please open settings (⚙) first.');
+            return;
+        }
+
+        if (!state.snapshot) {
+            showToast('Loading snapshot first…');
+            try {
+                await pullSnapshot();
+            } catch (err) {
+                showToast('Failed to pull snapshot: ' + err.message);
+                return;
+            }
+        }
+
+        // 2. Process the scanned URL
+        const normTrimmed = normalizeUrl(trimmed);
+        if (isUrlInSnapshot(trimmed, state.snapshot)) {
+            showToast('Link is already filed in your bookmarks.');
+            return;
+        }
+
+        const dismissed = getDismissedUrls();
+        const dismissedSet = new Set(dismissed.map(normalizeUrl));
+        const unfiled = [...activeQuickFileItems];
+
+        // Explicit scan allows recovering previously dismissed clipboard URLs
+        if (dismissedSet.has(normTrimmed)) {
+            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== normTrimmed);
+            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
+        }
+
+        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
+            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+            activeQuickFileItems = unfiled;
+            renderQuickFileSheet();
             showToast('Unfiled link found in clipboard!');
-        } else if (activeQuickFileItems.length > 0) {
-            showToast('Showing unfiled links bottom sheet.');
         } else {
-            showToast('No new unfiled links found.');
+            showToast('Showing unfiled links bottom sheet.');
         }
     });
 
