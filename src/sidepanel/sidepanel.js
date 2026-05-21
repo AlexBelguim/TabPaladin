@@ -296,6 +296,101 @@ async function getFolderPath(folderId) {
     return parts.join(' > ');
 }
 
+async function buildFolderPathsMap() {
+    const pathMap = new Map();
+    const tree = await chrome.bookmarks.getTree();
+    
+    function walk(node, parentPath = '') {
+        if (node.url) return; // ignore bookmarks
+        
+        let currentPath = '';
+        if (node.id === '0') {
+            currentPath = '';
+        } else {
+            const label = node.title ||
+                (node.id === '1' ? 'Bookmarks Bar' : node.id === '2' ? 'Other Bookmarks' : node.id === '3' ? 'Mobile' : '');
+            currentPath = parentPath ? `${parentPath} > ${label}` : label;
+            if (currentPath) {
+                pathMap.set(currentPath, node.id);
+            }
+        }
+        
+        if (node.children) {
+            for (const child of node.children) {
+                walk(child, currentPath);
+            }
+        }
+    }
+    
+    if (tree && tree[0]) {
+        walk(tree[0], '');
+    }
+    return pathMap;
+}
+
+async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
+    const settings = await StorageManager.getSettings();
+    const oldFocusedIds = settings.focusedFolderIds || [];
+    const oldWfRootId = settings.workflowRootBookmarkId;
+
+    // 1. Map old IDs to their absolute path names
+    const pathMap = {};
+    for (const id of oldFocusedIds) {
+        if (['1', '2', '3'].includes(id)) {
+            pathMap[id] = id;
+            continue;
+        }
+        const path = await getFolderPath(id);
+        if (path) {
+            pathMap[id] = path;
+        }
+    }
+
+    let wfRootPath = null;
+    if (oldWfRootId && !['1', '2', '3'].includes(oldWfRootId)) {
+        wfRootPath = await getFolderPath(oldWfRootId);
+    }
+
+    // 2. Perform the destructive pull
+    await BackendSync.applyPull(snapshot);
+
+    // 3. Traversal/Search the newly recreated tree to map paths back to new IDs
+    const newPathToIdMap = await buildFolderPathsMap();
+
+    // 4. Resolve the new IDs from the paths
+    const newFocusedIds = [];
+    for (const id of oldFocusedIds) {
+        if (['1', '2', '3'].includes(id)) {
+            newFocusedIds.push(id);
+            continue;
+        }
+        const path = pathMap[id];
+        if (path && newPathToIdMap.has(path)) {
+            newFocusedIds.push(newPathToIdMap.get(path));
+        } else {
+            console.warn(`[TabPaladin] Could not remap focused folder path: "${path}"`);
+        }
+    }
+
+    let newWfRootId = oldWfRootId;
+    if (wfRootPath && newPathToIdMap.has(wfRootPath)) {
+        newWfRootId = newPathToIdMap.get(wfRootPath);
+    }
+
+    // 5. Update settings
+    const updated = {
+        ...settings,
+        focusedFolderIds: newFocusedIds,
+        workflowRootBookmarkId: newWfRootId,
+        backend: {
+            ...cfg,
+            lastSyncAt: timestamp,
+            lastSyncKind: 'pull'
+        }
+    };
+    await StorageManager.saveSettings(updated);
+}
+
 // Module-level state for the main view (AI groups are mutable in-memory; tabs are sourced live).
 let mainViewState = {
     aiGroups: [],         // [{ id, name, items: [{tabId, url, title, favIconUrl}] }]
@@ -2986,11 +3081,13 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             );
             if (!yes) { writeBackendStatus('Pull cancelled.'); return; }
             writeBackendStatus('Pulling…');
-            await BackendSync.applyPull(data.snapshot);
-            await persistBackendConfig({ lastSyncAt: data.timestamp, lastSyncKind: 'pull' });
+            await applyPullAndRemapSettings(data.snapshot, cfg, data.timestamp);
             writeBackendStatus('Pulled snapshot from ' + when);
+            alert('Pull successful! Local bookmarks updated.');
+            location.reload();
         } catch (e) {
             writeBackendStatus('Pull failed: ' + e.message);
+            alert('Pull failed: ' + e.message);
         }
     });
 
@@ -3110,10 +3207,7 @@ document.getElementById('mainPullBtn').addEventListener('click', async () => {
         }
 
         _updateMainStatus('Pulling…');
-        await BackendSync.applyPull(data.snapshot);
-
-        const updated = { ...settings, backend: { ...cfg, lastSyncAt: data.timestamp, lastSyncKind: 'pull' } };
-        await StorageManager.saveSettings(updated);
+        await applyPullAndRemapSettings(data.snapshot, cfg, data.timestamp);
 
         _updateMainStatus('Pulled snapshot from ' + when);
         alert('Pull successful! Local bookmarks updated.');

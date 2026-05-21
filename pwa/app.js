@@ -812,6 +812,11 @@ window.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        if (state.pathIds.length <= 1) {
+            showToast('Please open Bookmarks Bar or Other Bookmarks before creating a folder.');
+            return;
+        }
+
         const name = prompt('Enter new folder name:');
         if (name === null) return; // User cancelled
         const trimmed = name.trim();

@@ -246,11 +246,16 @@ export const BackendSync = {
             }
         }
 
-        // Anything left orphan: merge its CHILDREN into Other Bookmarks (no nested wrapper folder).
+        // Anything left orphan: recreate as a folder inside Other Bookmarks ('2') to avoid losing it.
         for (const orphan of stillOrphan) {
-            console.warn('[TabPaladin Pull] unrecognized orphan, merging children into Other Bookmarks:', orphan.title);
-            if (orphan.children && orphan.children.length) {
-                await recreateChildren('2', orphan.children);
+            console.warn('[TabPaladin Pull] unrecognized orphan, recreating as folder under Other Bookmarks:', orphan.title);
+            try {
+                const f = await api.bookmarks.create({ parentId: '2', title: orphan.title || 'Folder' });
+                if (orphan.children && orphan.children.length) {
+                    await recreateChildren(f.id, orphan.children);
+                }
+            } catch (e) {
+                console.warn('Failed during pull apply for orphan root folder', orphan, e);
             }
         }
     }
