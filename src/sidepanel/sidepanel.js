@@ -2329,6 +2329,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <!-- 1. Source Folders (Grid Style) -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; text-transform:uppercase; letter-spacing:0.5px;">Target Folders</h3>
             <div id="settings-folder-toolbar" style="display:flex; gap:8px; margin-bottom:10px;">
+                <button class="sm-btn" id="addTargetBtn" title="Add an existing browser folder to your targets">＋ Add target</button>
                 <button class="sm-btn" id="folderImportBtn" title="Import a folder from a JSON file">📥 Import Folder</button>
                 <input type="file" id="folderImportFile" accept=".json" style="display:none">
             </div>
@@ -2402,20 +2403,34 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     grid.style.flexDirection = 'column';
     grid.style.gap = '8px';
 
-    // Build the list of "top-level" entries shown in the grid: real browser roots PLUS
-    // TabPaladin Workflows treated as a top-level (it's physically inside Other Bookmarks
-    // because the bookmarks API doesn't allow new root folders, but UX-wise it's a root).
+    // Build the list of "top-level" entries shown in the grid.
+    // Only show focused folders + the TabPaladin Workflows root, so browsers like Vivaldi
+    // don't drown the list with extras (Trash, Pinboard, Imported bookmarks, etc.).
+    // To add a NEW folder to your targets: use the "+ Add target" button.
     const wfRoot = await findWorkflowRootSilent();
-    const displayedFolders = [...(folders || [])];
-    if (wfRoot && !displayedFolders.find(f => f.id === wfRoot.id)) {
-        displayedFolders.push({
-            id: wfRoot.id,
-            title: wfRoot.title,
-            isWorkflow: true
-        });
+    const allTopLevel = folders || [];
+
+    function computeDisplayed() {
+        let list = allTopLevel.filter(f => mutableFocused.has(f.id));
+        if (mutableFocused.size === 0) {
+            const STANDARD_TITLES = new Set([
+                'Bookmarks bar', 'Bookmarks Bar', 'Bookmarks Toolbar', 'Bookmarks toolbar',
+                'Other bookmarks', 'Other Bookmarks',
+                'Mobile bookmarks', 'Mobile Bookmarks', 'Mobile'
+            ]);
+            list = allTopLevel.filter(f => STANDARD_TITLES.has(f.title));
+            if (list.length === 0) list = [...allTopLevel];
+        }
+        if (wfRoot && !list.find(f => f.id === wfRoot.id)) {
+            list.push({ id: wfRoot.id, title: wfRoot.title, isWorkflow: true });
+        }
+        return list;
     }
 
-    if (displayedFolders.length > 0) {
+    function renderFolderGrid() {
+        grid.innerHTML = '';
+        const displayedFolders = computeDisplayed();
+        if (displayedFolders.length === 0) return;
         displayedFolders.forEach(folder => {
             const isChecked = mutableFocused.has(folder.id);
             const card = document.createElement('div');
@@ -2500,6 +2515,27 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             grid.appendChild(card);
         });
     }
+
+    renderFolderGrid();
+
+    // "+ Add target" — pick an existing browser folder and add it to focused targets.
+    document.getElementById('addTargetBtn').addEventListener('click', () => {
+        const unfocused = allTopLevel.filter(f => !mutableFocused.has(f.id));
+        if (unfocused.length === 0) {
+            alert('All top-level browser folders are already in your targets.');
+            return;
+        }
+        const labels = unfocused.map((f, i) => `${i + 1}. ${f.title}`).join('\n');
+        const choice = prompt(`Pick a folder to add as a target:\n\n${labels}\n\nEnter the number:`);
+        if (!choice) return;
+        const idx = parseInt(choice.trim()) - 1;
+        if (isNaN(idx) || idx < 0 || idx >= unfocused.length) {
+            alert('Invalid choice.');
+            return;
+        }
+        mutableFocused.add(unfocused[idx].id);
+        renderFolderGrid();
+    });
 
     // Render non-top-level focused folders as removable rows (so user can see and unfocus them).
     async function renderExtraFocused() {
