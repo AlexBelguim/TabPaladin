@@ -22,6 +22,49 @@ const $ = (id) => document.getElementById(id);
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
 
+// Premium glassmorphic toast notification
+function showToast(message) {
+    const existing = document.getElementById('tp-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'tp-toast';
+    toast.style.position = 'fixed';
+    toast.style.bottom = '80px';
+    toast.style.left = '50%';
+    toast.style.transform = 'translateX(-50%)';
+    toast.style.background = 'rgba(30, 41, 59, 0.95)';
+    toast.style.color = '#f1f5f9';
+    toast.style.padding = '12px 20px';
+    toast.style.borderRadius = '12px';
+    toast.style.border = '1px solid #334155';
+    toast.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
+    toast.style.backdropFilter = 'blur(12px)';
+    toast.style.webkitBackdropFilter = 'blur(12px)';
+    toast.style.fontSize = '0.88rem';
+    toast.style.fontWeight = '500';
+    toast.style.zIndex = '2000';
+    toast.style.opacity = '0';
+    toast.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+    toast.style.textAlign = 'center';
+    toast.style.pointerEvents = 'none';
+    toast.style.whiteSpace = 'nowrap';
+    toast.textContent = message;
+
+    document.body.appendChild(toast);
+    
+    // Force layout reflow and trigger fade/slide up
+    toast.offsetHeight;
+    toast.style.opacity = '1';
+    toast.style.transform = 'translateX(-50%) translateY(-5px)';
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(-50%) translateY(5px)';
+        setTimeout(() => toast.remove(), 200);
+    }, 2500);
+}
+
 // --- Config ---
 function configured() { return state.config.url && state.config.token; }
 
@@ -524,6 +567,69 @@ function saveSettings() {
 
 // --- Wire up ---
 window.addEventListener('DOMContentLoaded', () => {
+    $('clipBtn').addEventListener('click', async () => {
+        if (!configured()) {
+            showToast('Please open settings first.');
+            return;
+        }
+        if (!state.snapshot) {
+            showToast('Loading snapshot…');
+            await pullSnapshot();
+        }
+
+        showToast('Scanning clipboard…');
+        
+        let foundUnfiled = false;
+        const dismissed = getDismissedUrls();
+        const dismissedSet = new Set(dismissed.map(normalizeUrl));
+        const unfiled = [...activeQuickFileItems];
+
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            try {
+                const text = await navigator.clipboard.readText();
+                const trimmed = (text || '').trim();
+                if (/^https?:\/\/\S+$/.test(trimmed)) {
+                    const normTrimmed = normalizeUrl(trimmed);
+                    if (!isUrlInSnapshot(trimmed, state.snapshot)) {
+                        // Explicit scan allows recovering previously dismissed clipboard URLs
+                        if (dismissedSet.has(normTrimmed)) {
+                            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== normTrimmed);
+                            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
+                        }
+                        if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
+                            unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
+                            foundUnfiled = true;
+                        }
+                    } else {
+                        showToast('Link is already filed in your bookmarks.');
+                        return;
+                    }
+                } else {
+                    showToast('No valid URL found in your clipboard.');
+                    return;
+                }
+            } catch (e) {
+                showToast('Clipboard access denied by browser.');
+                console.warn(e);
+                return;
+            }
+        } else {
+            showToast('Clipboard API not supported in this browser.');
+            return;
+        }
+
+        activeQuickFileItems = unfiled;
+        renderQuickFileSheet();
+
+        if (foundUnfiled) {
+            showToast('Unfiled link found in clipboard!');
+        } else if (activeQuickFileItems.length > 0) {
+            showToast('Showing unfiled links bottom sheet.');
+        } else {
+            showToast('No new unfiled links found.');
+        }
+    });
+
     $('syncBtn').addEventListener('click', async () => {
         await pullSnapshot();
         await refreshInbox();
