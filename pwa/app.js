@@ -22,6 +22,17 @@ const $ = (id) => document.getElementById(id);
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
 
+function setStatus(text) {
+    const el = $('status');
+    if (!el) return;
+    el.textContent = text;
+    if (text) {
+        show(el);
+    } else {
+        hide(el);
+    }
+}
+
 // Premium glassmorphic toast notification
 function showToast(message) {
     const existing = document.getElementById('tp-toast');
@@ -90,7 +101,7 @@ async function bootstrap() {
     await processShareTargetIfAny();
 
     if (!configured()) {
-        $('status').textContent = 'Open Settings (⚙) to configure your sync server.';
+        setStatus('Open Settings (⚙) to configure your sync server.');
         return;
     }
     await pullSnapshot();
@@ -100,10 +111,10 @@ async function bootstrap() {
 
 async function pullSnapshot() {
     try {
-        $('status').textContent = 'Pulling…';
+        setStatus('Pulling…');
         const data = await api('/api/pull');
         if (!data.snapshot) {
-            $('status').textContent = 'No snapshot on server yet. Use Push from the extension to upload your bookmarks.';
+            setStatus('No snapshot on server yet. Use Push from the extension to upload your bookmarks.');
             state.snapshot = null;
             return;
         }
@@ -113,7 +124,7 @@ async function pullSnapshot() {
         state.dirty = false;
         renderView();
     } catch (e) {
-        $('status').textContent = 'Pull failed: ' + e.message;
+        setStatus('Pull failed: ' + e.message);
     }
 }
 
@@ -155,6 +166,7 @@ function findNodeByPath(pathIds) {
 
 // --- Render ---
 function renderView() {
+    setStatus('');
     renderBreadcrumb();
     renderContent();
     updateInboxFab();
@@ -305,16 +317,17 @@ async function dropHere() {
 
     // Push the updated snapshot back to the server (clean of helper fields).
     try {
-        $('status').textContent = 'Saving…';
+        setStatus('Saving…');
         await pushSnapshot();
         // Clear the server inbox.
         await api('/api/shared', { method: 'DELETE' });
         state.inbox = [];
         updateInboxFab();
         hide($('inbox-sheet'));
-        $('status').textContent = '';
+        setStatus('');
     } catch (e) {
         alert('Push failed: ' + e.message + '\nLocal changes preserved; will retry next time you press Drop.');
+        setStatus('');
     }
 }
 
@@ -525,7 +538,7 @@ function renderQuickFileSheet() {
                 renderView();
 
                 try {
-                    $('status').textContent = 'Saving…';
+                    setStatus('Saving…');
                     await pushSnapshot();
                     // Clear server shared link if it came from inbox
                     if (item.inboxId) {
@@ -537,10 +550,10 @@ function renderQuickFileSheet() {
                     activeQuickFileItems.splice(index, 1);
                     renderQuickFileSheet();
                     updateInboxFab();
-                    $('status').textContent = '';
+                    setStatus('');
                 } catch (err) {
                     alert('Place failed: ' + err.message);
-                    $('status').textContent = '';
+                    setStatus('');
                 }
             });
 
@@ -749,13 +762,13 @@ window.addEventListener('DOMContentLoaded', () => {
         renderView();
 
         try {
-            $('status').textContent = 'Creating folder…';
+            setStatus('Creating folder…');
             await pushSnapshot();
             showToast(`Folder "${trimmed}" created successfully!`);
-            $('status').textContent = '';
+            setStatus('');
         } catch (err) {
             alert('Failed to save folder: ' + err.message);
-            $('status').textContent = '';
+            setStatus('');
         }
     });
 

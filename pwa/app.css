@@ -221,3 +221,5 @@ input:focus { outline: none; border-color: var(--primary); }
   margin-bottom: 4px;
 }
 .sheet-body .primary { width: 100%; padding: 12px; margin-top: 8px; }
+
+.hidden { display: none !important; }
