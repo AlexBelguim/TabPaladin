@@ -1298,7 +1298,7 @@ function renderFolderCard(sub, depth = 0) {
         ${openBtnHtml}
         <button class="sm-btn split-btn" title="Sort loose files in this folder" style="padding:2px 8px;">✨ Split</button>
         <button class="sm-btn new-subfolder-btn" title="Create a folder inside ${escapeHtml(sub.title)}" style="padding:2px 8px;">＋📁</button>
-        ${sub.parentId && sub.parentId !== '0' ? `<button class="sm-btn delete-folder-btn" title="Delete ${escapeHtml(sub.title)}" style="padding:2px 6px; color: #f87171;">🗑</button>` : ''}
+        <button class="sm-btn delete-folder-btn" title="Delete ${escapeHtml(sub.title)}" style="padding:2px 6px; color: #f87171;">🗑</button>
         ${drillBtnHtml}
         <input type="checkbox" class="source-select-check" title="Select for batch action (Analyze & Sort / Restructure)">
     `;
