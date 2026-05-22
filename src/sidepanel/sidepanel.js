@@ -1648,6 +1648,7 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
             <span class="src-domain-count">(${count})</span>
             <button class="sm-btn domain-open-all-btn" title="Open all in a new window" style="padding:2px 6px;">▶ All</button>
             ${open10Html}
+            <button class="sm-btn domain-delete-btn" title="Delete all ${count} bookmarks under this domain" style="padding:2px 6px; color: #f87171;">🗑</button>
         `;
         group.appendChild(header);
 
@@ -1663,6 +1664,26 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
                 await openBookmarksAsNewWindow(byDomain[d].slice(0, 10));
             });
         }
+
+        // Delete entire domain group click handler
+        header.querySelector('.domain-delete-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Delete all ${count} bookmarks under "${d}"?`)) return;
+            try {
+                for (const id of ids) {
+                    await chrome.bookmarks.remove(id);
+                }
+                group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+                group.style.opacity = '0';
+                group.style.transform = 'translateX(20px)';
+                setTimeout(async () => {
+                    group.remove();
+                    await refreshFolderBodyIfOpen(parentFolderId);
+                }, 200);
+            } catch (err) {
+                alert('Could not delete bookmarks: ' + err.message);
+            }
+        });
 
         // Middle click on the domain row opens all in a new window too.
         const ignoreOnInteractive = (e) => e.target.closest('button') || e.target.closest('input');
@@ -1694,7 +1715,8 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
             row.dataset.parentId = String(parentFolderId);
             row.innerHTML = `
                 <img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=16" width="16" height="16" style="flex-shrink:0;">
-                <span title="${escapeHtml(b.url)}">${escapeHtml(b.title || b.url)}</span>
+                <span title="${escapeHtml(b.url)}" style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(b.title || b.url)}</span>
+                <button class="sm-btn bookmark-delete-btn" title="Delete bookmark" style="padding:2px 6px; color: #f87171;">🗑</button>
             `;
             row.addEventListener('dragstart', (e) => {
                 e.dataTransfer.setData('text/tp-bookmark-id', String(b.id));
@@ -1704,6 +1726,39 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
                 e.stopPropagation();
             });
             row.addEventListener('dragend', () => row.classList.remove('dragging'));
+
+            // Delete individual bookmark click handler
+            row.querySelector('.bookmark-delete-btn').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (!confirm(`Delete bookmark "${b.title || b.url}"?`)) return;
+                try {
+                    await chrome.bookmarks.remove(b.id);
+                    row.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+                    row.style.opacity = '0';
+                    row.style.transform = 'translateX(20px)';
+                    setTimeout(async () => {
+                        row.remove();
+                        const siblings = group.querySelectorAll('.src-tab-row');
+                        if (siblings.length === 0) {
+                            group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+                            group.style.opacity = '0';
+                            group.style.transform = 'translateX(20px)';
+                            setTimeout(async () => {
+                                group.remove();
+                                await refreshFolderBodyIfOpen(parentFolderId);
+                            }, 200);
+                        } else {
+                            const countSpan = header.querySelector('.src-domain-count');
+                            if (countSpan) {
+                                countSpan.textContent = `(${siblings.length})`;
+                            }
+                            await refreshFolderBodyIfOpen(parentFolderId);
+                        }
+                    }, 200);
+                } catch (err) {
+                    alert('Could not delete bookmark: ' + err.message);
+                }
+            });
 
             // Middle-click on a bookmark row → open in a new background tab in the current window.
             row.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });

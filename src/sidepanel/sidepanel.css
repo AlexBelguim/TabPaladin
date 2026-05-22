@@ -870,3 +870,17 @@ ol {
   border-radius: var(--radius-md);
   margin-top: 10px;
 }
+
+/* --- Hover Delete Buttons --- */
+.src-domain-header .domain-delete-btn,
+.src-tab-row .bookmark-delete-btn {
+  opacity: 0;
+  transition: opacity 0.15s ease-in-out, transform 0.15s ease-in-out;
+  transform: scale(0.9);
+}
+
+.src-domain-header:hover .domain-delete-btn,
+.src-tab-row:hover .bookmark-delete-btn {
+  opacity: 1;
+  transform: scale(1);
+}
