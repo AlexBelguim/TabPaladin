@@ -8,36 +8,59 @@ function authHeader(token) {
 
 function trim(url) { return (url || '').replace(/\/$/, ''); }
 
-// Serialize a chrome.bookmarks node into the on-wire JSON shape.
-function serializeNode(node) {
-    if (node.url) {
-        return {
-            type: 'bookmark',
-            title: node.title,
-            url: node.url,
-            dateAdded: node.dateAdded
-        };
-    }
-    return {
-        type: node.id === '0' ? 'root' : 'folder',
-        title: node.title || '',
-        dateAdded: node.dateAdded,
-        // We preserve native browser IDs ('1', '2', '3') for root children so pull can map.
-        nativeId: ['0', '1', '2', '3'].includes(node.id) ? node.id : undefined,
-        children: (node.children || []).map(serializeNode)
+// Normalize root folder titles across browsers (Chrome, Opera, Firefox, Brave, Edge).
+// Returns a canonical key so "Other Bookmarks" (Chrome), "Other bookmarks" (Opera),
+// "Unfiled Bookmarks" (Firefox) all map to the same thing.
+function normalizeRootTitle(title) {
+    const t = (title || '').toLowerCase().trim();
+    const ALIASES = {
+        'bookmarks bar': 'bookmarks_bar',
+        'bookmarks toolbar': 'bookmarks_bar',
+        'favourites bar': 'bookmarks_bar',
+        'other bookmarks': 'other',
+        'unfiled bookmarks': 'other',
+        'mobile bookmarks': 'mobile',
+        'mobile': 'mobile',
     };
+    return ALIASES[t] || t;
 }
 
 async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null) {
     const tree = await api.bookmarks.getTree();
     const root = tree[0]; // virtual root with id '0'
-    
+
+    // Dynamically detect root folder IDs — works across Chrome, Opera, Brave, Edge, Firefox.
+    // Instead of hardcoding ['0','1','2','3'], we discover what the browser actually has.
+    const rootChildIds = new Set((root.children || []).map(c => String(c.id)));
+    rootChildIds.add(String(root.id)); // include virtual root '0'
+
+    // Inner serializer that uses the dynamically detected root IDs.
+    function serializeNodeInner(node) {
+        if (node.url) {
+            return {
+                type: 'bookmark',
+                title: node.title,
+                url: node.url,
+                dateAdded: node.dateAdded
+            };
+        }
+        const sid = String(node.id);
+        return {
+            type: sid === String(root.id) ? 'root' : 'folder',
+            title: node.title || '',
+            dateAdded: node.dateAdded,
+            // Preserve native browser IDs for root children so pull can map.
+            nativeId: rootChildIds.has(sid) ? sid : undefined,
+            children: (node.children || []).map(serializeNodeInner)
+        };
+    }
+
     // If no focused folder IDs are selected and no workflowRootId, push everything (fallback)
     if (focusedFolderIds.length === 0 && !workflowRootId) {
         return {
             version: 1,
             exportedAt: new Date().toISOString(),
-            ...serializeNode(root)
+            ...serializeNodeInner(root)
         };
     }
 
@@ -71,9 +94,10 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
         }
 
         // For folders: if not inside a selected parent, only keep if it has a focused descendant.
-        // The virtual root '0' is always preserved. Other native roots ('1', '2', '3') are only kept
+        // The virtual root is always preserved. Other native roots are only kept
         // if they or their descendants are targeted.
-        const isVirtualRoot = node.id === '0';
+        const sid = String(node.id);
+        const isVirtualRoot = sid === String(root.id);
         if (!keepAll && !isVirtualRoot && !hasFocusedDescendant(node)) {
             return null;
         }
@@ -90,10 +114,10 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
         }
 
         return {
-            type: node.id === '0' ? 'root' : 'folder',
+            type: isVirtualRoot ? 'root' : 'folder',
             title: node.title || '',
             dateAdded: node.dateAdded,
-            nativeId: ['0', '1', '2', '3'].includes(node.id) ? node.id : undefined,
+            nativeId: rootChildIds.has(sid) ? sid : undefined,
             children: serializedChildren
         };
     }
@@ -107,18 +131,29 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
 
 // Recreate children under an existing parent. Used during pull.
 async function recreateChildren(parentId, children) {
+    let created = 0;
+    let skipped = 0;
     for (const node of children || []) {
-        if (!node || typeof node !== 'object') continue;
+        if (!node || typeof node !== 'object') { skipped++; continue; }
         if (node.type === 'bookmark' && node.url) {
-            try { await api.bookmarks.create({ parentId, title: node.title || node.url, url: node.url }); }
-            catch (e) { console.warn('Failed to create bookmark', node, e); }
+            try {
+                await api.bookmarks.create({ parentId, title: node.title || node.url, url: node.url });
+                created++;
+            }
+            catch (e) { console.warn('[TabPaladin Pull] ❌ Failed to create bookmark:', node.title, e); }
         } else if (node.type === 'folder') {
             try {
                 const f = await api.bookmarks.create({ parentId, title: node.title || 'Folder' });
+                created++;
+                console.log(`[TabPaladin Pull]   📁 Created folder "${node.title}" (new id: ${f.id}) under parent ${parentId}`);
                 await recreateChildren(f.id, node.children || []);
-            } catch (e) { console.warn('Failed to create folder', node, e); }
+            } catch (e) { console.warn('[TabPaladin Pull] ❌ Failed to create folder:', node.title, e); }
+        } else {
+            console.warn(`[TabPaladin Pull] ⚠️ Skipping unknown node: type="${node.type}", title="${node.title}"`);
+            skipped++;
         }
     }
+    console.log(`[TabPaladin Pull] recreateChildren(parent=${parentId}): created ${created}, skipped ${skipped}, total ${(children || []).length}`);
 }
 
 // Empty a folder (used to wipe root children during destructive pull).
@@ -158,7 +193,7 @@ export const BackendSync = {
         return res.json();
     },
 
-    // Destructive: replaces the contents of Bookmarks Bar / Other Bookmarks / Mobile
+    // Destructive: replaces the contents of matched browser root folders
     // with the snapshot's corresponding root children.
     async applyPull(snapshot) {
         if (!snapshot || !snapshot.children) throw new Error('Empty snapshot');
@@ -177,12 +212,10 @@ export const BackendSync = {
         };
         const totals = summarize(snapshot);
         console.log('[TabPaladin Pull] incoming snapshot —',
-            'roots:', snapshot.children.map(c => `${c.title}(${c.nativeId || 'no-nativeId'}, ${(c.children || []).length} children)`).join(' | '),
+            'roots:', snapshot.children.map(c => `${c.title}(nativeId=${c.nativeId || 'none'}, ${(c.children || []).length} children)`).join(' | '),
             '| total folders:', totals.f, '| total bookmarks:', totals.b);
 
         // Verbose diagnostic: list every folder path in the snapshot.
-        // Enable by running `localStorage.setItem('tp_pull_verbose', '1')` in DevTools.
-        // Or search a specific name: `localStorage.setItem('tp_pull_find', 'twitter')`.
         try {
             const verbose = localStorage.getItem('tp_pull_verbose') === '1';
             const findKey = (localStorage.getItem('tp_pull_find') || '').toLowerCase();
@@ -205,58 +238,86 @@ export const BackendSync = {
             }
         } catch (e) { /* localStorage might be unavailable in some contexts */ }
 
-        // Recovery for snapshots pushed before the nativeId fix: map by well-known root titles.
-        const TITLE_TO_NATIVE = {
-            'bookmarks bar': '1',
-            'bookmarks toolbar': '1',
-            'other bookmarks': '2',
-            'unfiled bookmarks': '2',
-            'mobile bookmarks': '3',
-            'mobile': '3'
-        };
+        // --- Dynamically discover the browser's actual root folders ---
+        // This works for Chrome ('1','2','3'), Opera ('1','2','3','4','5',...), Firefox, Brave, Edge.
+        const browserRoots = await api.bookmarks.getChildren('0');
+        console.log('[TabPaladin Pull] Browser root folders:',
+            browserRoots.map(r => `"${r.title}"(id=${r.id})`).join(', '));
 
-        // Map snapshot root children by nativeId — with title-based fallback.
-        const nativeMap = new Map();
-        const stillOrphan = [];
-        for (const c of snapshot.children) {
-            if (c.nativeId) {
-                nativeMap.set(c.nativeId, c);
-                continue;
-            }
-            const guess = TITLE_TO_NATIVE[(c.title || '').toLowerCase()];
-            if (guess && !nativeMap.has(guess)) {
-                console.log(`[TabPaladin Pull] recovering root by title "${c.title}" → nativeId ${guess}`);
-                nativeMap.set(guess, c);
-            } else {
-                stillOrphan.push(c);
-            }
-        }
+        // --- Match each snapshot root child to an actual browser root ---
+        // Priority: 1) exact nativeId match, 2) normalized title match
+        const matched = new Map();     // browserRootId → snapChild
+        const usedSnapChildren = new Set();
 
-        // For each real browser root, clear it completely.
-        // If the snapshot has matching native root children, recreate them.
-        for (const localId of ['1', '2', '3']) {
-            try {
-                await emptyFolder(localId);
-                const snap = nativeMap.get(localId);
-                if (snap && snap.children) {
-                    await recreateChildren(localId, snap.children);
+        // Pass 1: match by nativeId (if the snapshot was pushed from the same browser, IDs match)
+        for (const snapChild of snapshot.children) {
+            if (snapChild.nativeId) {
+                const br = browserRoots.find(r => String(r.id) === String(snapChild.nativeId));
+                if (br && !matched.has(br.id)) {
+                    matched.set(br.id, snapChild);
+                    usedSnapChildren.add(snapChild);
+                    console.log(`[TabPaladin Pull] Matched snapshot "${snapChild.title}" → browser root "${br.title}" (by nativeId ${snapChild.nativeId})`);
                 }
-            } catch (e) {
-                console.warn('Failed during pull apply for root', localId, e);
             }
         }
 
-        // Anything left orphan: recreate as a folder inside Other Bookmarks ('2') to avoid losing it.
-        for (const orphan of stillOrphan) {
-            console.warn('[TabPaladin Pull] unrecognized orphan, recreating as folder under Other Bookmarks:', orphan.title);
-            try {
-                const f = await api.bookmarks.create({ parentId: '2', title: orphan.title || 'Folder' });
-                if (orphan.children && orphan.children.length) {
-                    await recreateChildren(f.id, orphan.children);
+        // Pass 2: match remaining snapshot children by normalized title
+        for (const snapChild of snapshot.children) {
+            if (usedSnapChildren.has(snapChild)) continue;
+            const snapNorm = normalizeRootTitle(snapChild.title);
+
+            for (const br of browserRoots) {
+                if (matched.has(br.id)) continue;
+                const brNorm = normalizeRootTitle(br.title);
+                if (snapNorm === brNorm) {
+                    matched.set(br.id, snapChild);
+                    usedSnapChildren.add(snapChild);
+                    console.log(`[TabPaladin Pull] Matched snapshot "${snapChild.title}" → browser root "${br.title}" (by title match, norm="${snapNorm}")`);
+                    break;
                 }
-            } catch (e) {
-                console.warn('Failed during pull apply for orphan root folder', orphan, e);
             }
         }
+
+        // Collect orphan snapshot children that couldn't match any browser root
+        const orphanSnapChildren = snapshot.children.filter(c => !usedSnapChildren.has(c));
+
+        // --- Apply: for each matched browser root, empty it and recreate from snapshot ---
+        for (const [browserRootId, snapChild] of matched) {
+            const br = browserRoots.find(r => r.id === browserRootId);
+            try {
+                console.log(`[TabPaladin Pull] --- Processing browser root "${br.title}" (id=${br.id}) ← snapshot "${snapChild.title}" ---`);
+                await emptyFolder(br.id);
+                if (snapChild.children && snapChild.children.length) {
+                    console.log(`[TabPaladin Pull] Recreating ${snapChild.children.length} children...`);
+                    await recreateChildren(br.id, snapChild.children);
+                }
+                // Verify
+                const verify = await api.bookmarks.getChildren(br.id);
+                console.log(`[TabPaladin Pull] VERIFY "${br.title}": ${verify.length} children now exist`);
+            } catch (e) {
+                console.warn(`[TabPaladin Pull] ❌ Failed during pull for root "${br.title}" (id=${br.id})`, e);
+            }
+        }
+
+        // --- Handle orphan snapshot children: put them under the "Other Bookmarks" equivalent ---
+        if (orphanSnapChildren.length > 0) {
+            // Find the browser's "Other Bookmarks" equivalent
+            const otherRoot = browserRoots.find(r => normalizeRootTitle(r.title) === 'other')
+                || browserRoots[browserRoots.length - 1]; // last resort fallback
+
+            for (const orphan of orphanSnapChildren) {
+                console.warn(`[TabPaladin Pull] Orphan snapshot root "${orphan.title}" → recreating under "${otherRoot.title}" (id=${otherRoot.id})`);
+                try {
+                    const f = await api.bookmarks.create({ parentId: otherRoot.id, title: orphan.title || 'Folder' });
+                    if (orphan.children && orphan.children.length) {
+                        await recreateChildren(f.id, orphan.children);
+                    }
+                } catch (e) {
+                    console.warn('[TabPaladin Pull] ❌ Failed during pull for orphan root folder', orphan.title, e);
+                }
+            }
+        }
+
+        console.log('[TabPaladin Pull] ✅ Pull complete.');
     }
 };

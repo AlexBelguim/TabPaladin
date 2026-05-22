@@ -333,10 +333,14 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     const oldFocusedIds = settings.focusedFolderIds || [];
     const oldWfRootId = settings.workflowRootBookmarkId;
 
-    // 1. Map old IDs to their absolute path names
+    // Dynamically discover browser root folder IDs (works for Chrome, Opera, Brave, Edge, Firefox).
+    const tree = await chrome.bookmarks.getTree();
+    const browserRootIds = new Set((tree[0].children || []).map(c => String(c.id)));
+
+    // 1. Map old IDs to their absolute path names (browser roots keep their ID directly)
     const pathMap = {};
     for (const id of oldFocusedIds) {
-        if (['1', '2', '3'].includes(id)) {
+        if (browserRootIds.has(id)) {
             pathMap[id] = id;
             continue;
         }
@@ -347,7 +351,7 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     }
 
     let wfRootPath = null;
-    if (oldWfRootId && !['1', '2', '3'].includes(oldWfRootId)) {
+    if (oldWfRootId && !browserRootIds.has(oldWfRootId)) {
         wfRootPath = await getFolderPath(oldWfRootId);
     }
 
@@ -360,7 +364,7 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     // 4. Resolve the new IDs from the paths
     const newFocusedIds = [];
     for (const id of oldFocusedIds) {
-        if (['1', '2', '3'].includes(id)) {
+        if (browserRootIds.has(id)) {
             newFocusedIds.push(id);
             continue;
         }
