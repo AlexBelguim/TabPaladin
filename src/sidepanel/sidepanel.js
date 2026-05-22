@@ -1289,6 +1289,11 @@ function renderFolderCard(sub, depth = 0) {
     const drillBtnHtml = sub.isWorkflow
         ? ''
         : `<button class="sm-btn drill-btn" title="Enter ${escapeHtml(sub.title)}" style="padding:2px 8px;">›</button>`;
+    const showDelete = sub.parentId && sub.parentId !== '0';
+    const deleteBtnHtml = showDelete
+        ? `<button class="sm-btn delete-folder-btn" title="Delete ${escapeHtml(sub.title)}" style="padding:2px 6px; color: #f87171;">🗑</button>`
+        : '';
+
     header.innerHTML = `
         <span class="folder-drag-handle" title="Drag to move folder" draggable="true">⋮⋮</span>
         <span class="folder-caret">▶</span>
@@ -1298,7 +1303,7 @@ function renderFolderCard(sub, depth = 0) {
         ${openBtnHtml}
         <button class="sm-btn split-btn" title="Sort loose files in this folder" style="padding:2px 8px;">✨ Split</button>
         <button class="sm-btn new-subfolder-btn" title="Create a folder inside ${escapeHtml(sub.title)}" style="padding:2px 8px;">＋📁</button>
-        <button class="sm-btn delete-folder-btn" title="Delete ${escapeHtml(sub.title)}" style="padding:2px 6px; color: #f87171;">🗑</button>
+        ${deleteBtnHtml}
         ${drillBtnHtml}
         <input type="checkbox" class="source-select-check" title="Select for batch action (Analyze & Sort / Restructure)">
     `;
@@ -1374,24 +1379,27 @@ function renderFolderCard(sub, depth = 0) {
     });
 
     // Delete folder button — removes this folder and all its contents.
-    header.querySelector('.delete-folder-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const totalItems = (sub.folderCount || 0) + (sub.fileCount || 0);
-        const msg = totalItems > 0
-            ? `Delete "${sub.title}" and all its contents (${totalItems} items)?`
-            : `Delete empty folder "${sub.title}"?`;
-        if (!confirm(msg)) return;
-        try {
-            await chrome.bookmarks.removeTree(sub.id);
-            // Remove the card from the DOM with a quick fade-out.
-            card.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
-            card.style.opacity = '0';
-            card.style.transform = 'translateX(20px)';
-            setTimeout(() => card.remove(), 200);
-        } catch (err) {
-            alert('Could not delete folder: ' + err.message);
-        }
-    });
+    const deleteBtn = header.querySelector('.delete-folder-btn');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const totalItems = (sub.folderCount || 0) + (sub.fileCount || 0);
+            const msg = totalItems > 0
+                ? `Delete "${sub.title}" and all its contents (${totalItems} items)?`
+                : `Delete empty folder "${sub.title}"?`;
+            if (!confirm(msg)) return;
+            try {
+                await chrome.bookmarks.removeTree(sub.id);
+                // Remove the card from the DOM with a quick fade-out.
+                card.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+                card.style.opacity = '0';
+                card.style.transform = 'translateX(20px)';
+                setTimeout(() => card.remove(), 200);
+            } catch (err) {
+                alert('Could not delete folder: ' + err.message);
+            }
+        });
+    }
 
     // Checkbox: select for batch Analyze/Restructure.
     const checkbox = header.querySelector('.source-select-check');
