@@ -884,3 +884,69 @@ ol {
   opacity: 1;
   transform: scale(1);
 }
+/* --- Notes --- */
+.note-list-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 6px);
+  margin-bottom: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+
+.note-list-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.note-item-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-item-snippet {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-preview {
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 6px);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  word-wrap: break-word;
+}
+
+.note-wikilink {
+  color: var(--primary-color, #3b82f6);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.note-wikilink:hover {
+  text-decoration: underline;
+}
+
+.note-urllink {
+  color: var(--primary-color, #3b82f6);
+  word-break: break-all;
+}
+
+.note-backlinks {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+  font-size: 0.8rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}

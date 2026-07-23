@@ -28,6 +28,7 @@
           Bookmarks</button>
         <button id="viewWorkflowsBtn" class="primary-btn" style="background-color: #6366f1;">View Workflows</button>
         <button id="saveWorkflowBtn" class="primary-btn" style="background-color: #f59e0b;">Create Workflow 💾</button>
+        <button id="viewNotesBtn" class="primary-btn" style="background-color: #0ea5e9;">📝 Notes</button>
       </section>
 
       <section id="groups-container">
@@ -99,6 +100,35 @@
         <ul id="workflows-list">
           <!-- Workflows will be listed here -->
         </ul>
+      </section>
+
+      <section id="notes-container"
+        style="display:none; border-top:1px solid #ddd; margin-top:16px; padding-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <h2 style="margin:0;">Notes</h2>
+          <button id="newNoteBtn" class="sm-btn" title="Create a new note"
+            style="padding:4px 8px; font-size:0.85rem;">+ New Note</button>
+        </div>
+        <input type="text" id="notesSearchInput" placeholder="Search notes..."
+          style="width:100%; padding:8px; margin-bottom:10px; background:rgba(0,0,0,0.2); border:1px solid #374151; color:white; border-radius:6px; font-size:0.9rem;">
+        <ul id="notes-list" style="list-style:none; padding:0; margin:0;">
+          <!-- Notes will be listed here -->
+        </ul>
+
+        <div id="note-editor" style="display:none; margin-top:12px;">
+          <input type="text" id="noteTitleInput" placeholder="Note title"
+            style="width:100%; padding:8px; margin-bottom:8px; background:rgba(0,0,0,0.2); border:1px solid #374151; color:white; border-radius:6px; font-size:0.95rem; font-weight:600;">
+          <textarea id="noteContentInput" rows="10" placeholder="Write here… Link notes with [[Note Title]] and paste URLs to link pages."
+            style="width:100%; padding:8px; background:rgba(0,0,0,0.2); border:1px solid #374151; color:white; border-radius:6px; font-size:0.9rem; resize:vertical; font-family:inherit;"></textarea>
+          <div id="notePreview" class="note-preview" style="display:none;"></div>
+          <div style="display:flex; gap:6px; margin-top:8px;">
+            <button id="saveNoteBtn" class="sm-btn primary-btn" style="flex:1; padding:6px;">Save</button>
+            <button id="previewNoteBtn" class="sm-btn" style="flex:1; padding:6px;">Preview</button>
+            <button id="deleteNoteBtn" class="sm-btn" style="flex:1; padding:6px; color:#ef4444;">Delete</button>
+          </div>
+          <button id="closeNoteEditorBtn" class="sm-btn"
+            style="width:100%; margin-top:5px; border:none; color:#666;">Back to list</button>
+        </div>
       </section>
 
       <section id="settings-container"

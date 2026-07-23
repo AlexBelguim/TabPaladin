@@ -25,7 +25,7 @@ function normalizeRootTitle(title) {
     return ALIASES[t] || t;
 }
 
-async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null) {
+async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null, notesRootId = null) {
     const tree = await api.bookmarks.getTree();
     const root = tree[0]; // virtual root with id '0'
 
@@ -56,7 +56,7 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
     }
 
     // If no focused folder IDs are selected and no workflowRootId, push everything (fallback)
-    if (focusedFolderIds.length === 0 && !workflowRootId) {
+    if (focusedFolderIds.length === 0 && !workflowRootId && !notesRootId) {
         return {
             version: 1,
             exportedAt: new Date().toISOString(),
@@ -67,6 +67,9 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
     const focusedSet = new Set(focusedFolderIds);
     if (workflowRootId) {
         focusedSet.add(workflowRootId);
+    }
+    if (notesRootId) {
+        focusedSet.add(notesRootId);
     }
 
     function hasFocusedDescendant(node) {
@@ -173,8 +176,8 @@ export const BackendSync = {
         return res.json();
     },
 
-    async push(config, focusedFolderIds = [], workflowRootId = null) {
-        const snapshot = await fullBookmarkSnapshot(focusedFolderIds, workflowRootId);
+    async push(config, focusedFolderIds = [], workflowRootId = null, notesRootId = null) {
+        const snapshot = await fullBookmarkSnapshot(focusedFolderIds, workflowRootId, notesRootId);
         const res = await fetch(trim(config.url) + '/api/push', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeader(config.token) },

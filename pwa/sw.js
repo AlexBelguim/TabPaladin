@@ -1,5 +1,5 @@
 // Minimal service worker — caches the app shell, lets the network handle data.
-const SHELL_CACHE = 'tp-shell-v2';
+const SHELL_CACHE = 'tp-shell-v3';
 const SHELL = [
     '/',
     '/index.html',

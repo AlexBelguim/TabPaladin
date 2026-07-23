@@ -246,3 +246,65 @@ button.ghost.dirty {
   color: #60a5fa !important;
 }
 
+
+/* --- Notes --- */
+.row.note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.row.note .note-row-text {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex: 1;
+}
+
+.row.note .title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row.note .snippet {
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.note-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.note-detail textarea {
+  width: 100%;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: inherit;
+  font-family: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.note-detail textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.note-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.note-actions .primary { flex: 1; }
+.note-actions button.danger { background: var(--danger); color: #fff; }

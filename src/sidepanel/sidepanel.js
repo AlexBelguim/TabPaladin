@@ -11,6 +11,7 @@ import { StorageManager } from '../utils/storageManager.js';
 import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
 import { AIService } from '../utils/aiService.js';
 import { BackendSync } from '../utils/backendSync.js';
+import { NotesManager } from '../utils/notesManager.js';
 
 // --- State ---
 let currentTabs = [];
@@ -45,6 +46,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending = setTimeout(async () => {
                 pending = null;
                 await loadWorkflows();
+                // Keep the notes list in sync too when that view is open.
+                if (document.getElementById('notes-container').style.display === 'block') {
+                    await loadNotes();
+                }
             }, 250);
         };
     })();
@@ -332,6 +337,7 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     const settings = await StorageManager.getSettings();
     const oldFocusedIds = settings.focusedFolderIds || [];
     const oldWfRootId = settings.workflowRootBookmarkId;
+    const oldNotesRootId = settings.notesRootBookmarkId;
 
     // Dynamically discover browser root folder IDs (works for Chrome, Opera, Brave, Edge, Firefox).
     const tree = await chrome.bookmarks.getTree();
@@ -353,6 +359,11 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     let wfRootPath = null;
     if (oldWfRootId && !browserRootIds.has(oldWfRootId)) {
         wfRootPath = await getFolderPath(oldWfRootId);
+    }
+
+    let notesRootPath = null;
+    if (oldNotesRootId && !browserRootIds.has(oldNotesRootId)) {
+        notesRootPath = await getFolderPath(oldNotesRootId);
     }
 
     // 2. Perform the destructive pull
@@ -381,11 +392,17 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
         newWfRootId = newPathToIdMap.get(wfRootPath);
     }
 
+    let newNotesRootId = oldNotesRootId;
+    if (notesRootPath && newPathToIdMap.has(notesRootPath)) {
+        newNotesRootId = newPathToIdMap.get(notesRootPath);
+    }
+
     // 5. Update settings
     const updated = {
         ...settings,
         focusedFolderIds: newFocusedIds,
         workflowRootBookmarkId: newWfRootId,
+        notesRootBookmarkId: newNotesRootId,
         backend: {
             ...cfg,
             lastSyncAt: timestamp,
@@ -1030,51 +1047,12 @@ let _wfDuplicateCount = 0;
 
 async function findWorkflowRootSilent() {
     try {
-        // 1. Prefer the persisted ID so we always return the same folder, even if duplicates exist.
-        const settings = await StorageManager.getSettings();
-        const preferredId = settings && settings.workflowRootBookmarkId;
-        if (preferredId) {
-            try {
-                const node = (await chrome.bookmarks.get(preferredId))[0];
-                // Treat as valid if the bookmark still exists and is a folder.
-                if (node && !node.url) {
-                    // Still note any duplicates so the settings UI can warn.
-                    const titleMatches = await chrome.bookmarks.search({ title: node.title || 'TabPaladin Workflows' });
-                    const dupes = titleMatches.filter(m => !m.url && m.title === (node.title || 'TabPaladin Workflows'));
-                    _wfDuplicateCount = Math.max(0, dupes.length - 1);
-                    return node;
-                }
-            } catch (e) {
-                // Persisted ID gone — fall through and re-find.
-            }
-        }
-
-        // 2. Search by title; pick deterministically.
-        const matches = await chrome.bookmarks.search({ title: 'TabPaladin Workflows' });
-        const folders = matches.filter(m => !m.url && m.title === 'TabPaladin Workflows');
-        if (folders.length === 0) {
-            _wfDuplicateCount = 0;
-            return null;
-        }
-        _wfDuplicateCount = Math.max(0, folders.length - 1);
-
-        // Prefer the folder with the most children (likely the "real" workflows root).
-        let chosen = folders[0];
-        if (folders.length > 1) {
-            console.warn(`[TabPaladin] Multiple TabPaladin Workflows folders found (${folders.length}). Choosing the one with the most children. IDs:`,
-                folders.map(f => f.id));
-            let bestCount = -1;
-            for (const f of folders) {
-                const kids = await chrome.bookmarks.getChildren(f.id);
-                if (kids.length > bestCount) { bestCount = kids.length; chosen = f; }
-            }
-        }
-
-        // 3. Persist the choice so subsequent lookups are deterministic.
-        try {
-            await StorageManager.saveSettings({ ...settings, workflowRootBookmarkId: chosen.id });
-        } catch (e) { /* non-fatal */ }
-        return chosen;
+        // Delegate to StorageManager so save and render always resolve the same
+        // workflows root (previously two different resolvers could pick
+        // different folders when duplicates existed).
+        const root = await StorageManager.findWorkflowRoot();
+        _wfDuplicateCount = StorageManager.getWorkflowRootDuplicateCount();
+        return root;
     } catch (e) {
         return null;
     }
@@ -1889,6 +1867,7 @@ document.getElementById('viewWorkflowsBtn').addEventListener('click', async () =
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('settings-container').style.display = 'none';
     document.getElementById('groups-container').style.display = 'none';
+    document.getElementById('notes-container').style.display = 'none';
     document.getElementById('workflows-container').style.display = 'block';
 
     await loadWorkflows(); // Ensure workflows are refreshed
@@ -1900,9 +1879,185 @@ document.getElementById('groupTabsBtn').addEventListener('click', async () => {
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('settings-container').style.display = 'none';
     document.getElementById('workflows-container').style.display = 'none';
+    document.getElementById('notes-container').style.display = 'none';
     document.getElementById('groups-container').style.display = 'block';
 
     await loadCurrentTabs();
+});
+
+// --- Notes Logic ---
+let currentNotes = [];
+let activeNoteId = null;
+
+async function loadNotes() {
+    currentNotes = await NotesManager.listNotes();
+    renderNotesList(document.getElementById('notesSearchInput').value.trim());
+}
+
+function renderNotesList(filter = '') {
+    const list = document.getElementById('notes-list');
+    list.innerHTML = '';
+    const q = filter.toLowerCase();
+    const shown = currentNotes.filter(n =>
+        !q || n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
+
+    if (shown.length === 0) {
+        list.innerHTML = '<li class="empty-state">No notes yet.</li>';
+        return;
+    }
+    for (const note of shown) {
+        const li = document.createElement('li');
+        li.className = 'note-list-item';
+        const snippet = note.content.replace(/\s+/g, ' ').trim().slice(0, 80);
+        li.innerHTML = `
+            <div class="note-item-title">${escapeHtml(note.title)}</div>
+            ${snippet ? `<div class="note-item-snippet">${escapeHtml(snippet)}</div>` : ''}
+        `;
+        li.addEventListener('click', () => openNoteInEditor(note));
+        list.appendChild(li);
+    }
+}
+
+function openNoteInEditor(note) {
+    activeNoteId = note.id || null;
+    document.getElementById('noteTitleInput').value = note.title || '';
+    document.getElementById('noteContentInput').value = note.content || '';
+    document.getElementById('note-editor').style.display = 'block';
+    document.getElementById('notes-list').style.display = 'none';
+    document.getElementById('notesSearchInput').style.display = 'none';
+    setNotePreviewMode(false);
+}
+
+function closeNoteEditor() {
+    activeNoteId = null;
+    document.getElementById('note-editor').style.display = 'none';
+    document.getElementById('notes-list').style.display = 'block';
+    document.getElementById('notesSearchInput').style.display = 'block';
+}
+
+function setNotePreviewMode(previewOn) {
+    document.getElementById('noteContentInput').style.display = previewOn ? 'none' : 'block';
+    document.getElementById('notePreview').style.display = previewOn ? 'block' : 'none';
+    document.getElementById('previewNoteBtn').textContent = previewOn ? 'Edit' : 'Preview';
+}
+
+// Render note content as safe HTML: [[wiki-links]] become clickable chips,
+// bare URLs become links, everything else is escaped text.
+function renderNoteContentHtml(content) {
+    let html = escapeHtml(content);
+    html = html.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
+        `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
+    html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
+        `<a href="$1" class="note-urllink" title="Open in new tab">$1</a>`);
+    return html.replace(/\n/g, '<br>');
+}
+
+async function renderNotePreview() {
+    const preview = document.getElementById('notePreview');
+    const title = document.getElementById('noteTitleInput').value.trim();
+    const content = document.getElementById('noteContentInput').value;
+
+    let html = `<div class="note-preview-body">${renderNoteContentHtml(content) || '<span style="color:var(--text-muted);">Empty note.</span>'}</div>`;
+
+    if (title) {
+        const backlinks = await NotesManager.getBacklinks(title, activeNoteId);
+        if (backlinks.length > 0) {
+            const items = backlinks.map(n =>
+                `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title)}</span>`
+            ).join(' ');
+            html += `<div class="note-backlinks"><span style="color:var(--text-muted);">Linked from:</span> ${items}</div>`;
+        }
+    }
+    preview.innerHTML = html;
+}
+
+document.getElementById('viewNotesBtn').addEventListener('click', async () => {
+    // Switch Views
+    document.getElementById('organizer-source-container').style.display = 'none';
+    document.getElementById('organizer-container').style.display = 'none';
+    document.getElementById('settings-container').style.display = 'none';
+    document.getElementById('groups-container').style.display = 'none';
+    document.getElementById('workflows-container').style.display = 'none';
+    document.getElementById('notes-container').style.display = 'block';
+    closeNoteEditor();
+
+    await loadNotes();
+});
+
+document.getElementById('notesSearchInput').addEventListener('input', (e) => {
+    renderNotesList(e.target.value.trim());
+});
+
+document.getElementById('newNoteBtn').addEventListener('click', () => {
+    openNoteInEditor({ id: null, title: '', content: '' });
+    document.getElementById('noteTitleInput').focus();
+});
+
+document.getElementById('saveNoteBtn').addEventListener('click', async () => {
+    const title = document.getElementById('noteTitleInput').value.trim() || 'Untitled';
+    const content = document.getElementById('noteContentInput').value;
+    try {
+        if (activeNoteId) {
+            await NotesManager.updateNote(activeNoteId, { title, content });
+        } else {
+            const created = await NotesManager.createNote(title, content);
+            activeNoteId = created.id;
+        }
+        await loadNotes();
+        if (document.getElementById('notePreview').style.display === 'block') {
+            await renderNotePreview();
+        }
+    } catch (err) {
+        console.error('Save note error:', err);
+        alert('Error saving note: ' + err.message);
+    }
+});
+
+document.getElementById('deleteNoteBtn').addEventListener('click', async () => {
+    if (!activeNoteId) { closeNoteEditor(); return; }
+    const title = document.getElementById('noteTitleInput').value.trim() || 'Untitled';
+    if (!confirm(`Delete note "${title}"?`)) return;
+    try {
+        await NotesManager.deleteNote(activeNoteId);
+        closeNoteEditor();
+        await loadNotes();
+    } catch (err) {
+        console.error('Delete note error:', err);
+        alert('Error deleting note: ' + err.message);
+    }
+});
+
+document.getElementById('previewNoteBtn').addEventListener('click', async () => {
+    const turningOn = document.getElementById('notePreview').style.display !== 'block';
+    if (turningOn) await renderNotePreview();
+    setNotePreviewMode(turningOn);
+});
+
+document.getElementById('closeNoteEditorBtn').addEventListener('click', async () => {
+    closeNoteEditor();
+    await loadNotes();
+});
+
+// Clicks inside the preview: wiki-links navigate between notes, URLs open tabs.
+document.getElementById('notePreview').addEventListener('click', async (e) => {
+    const urlLink = e.target.closest('.note-urllink');
+    if (urlLink) {
+        e.preventDefault();
+        await chrome.tabs.create({ url: urlLink.getAttribute('href') });
+        return;
+    }
+    const wiki = e.target.closest('.note-wikilink');
+    if (!wiki) return;
+    // dataset.target is entity-decoded by the HTML parser, so it holds the raw title.
+    const target = wiki.dataset.target;
+    const note = currentNotes.find(n => n.title === target);
+    if (note) {
+        openNoteInEditor(note);
+        await renderNotePreview();
+        setNotePreviewMode(true);
+    } else if (confirm(`Note "${target}" doesn't exist. Create it?`)) {
+        openNoteInEditor({ id: null, title: target, content: '' });
+    }
 });
 
 // AI Grouping for TABS
@@ -2005,6 +2160,7 @@ document.getElementById('organizeBookmarksBtn').addEventListener('click', async 
         document.getElementById('groups-container').style.display = 'none';
         document.getElementById('organizer-source-container').style.display = 'block';
         document.getElementById('organizer-container').style.display = 'none';
+        document.getElementById('notes-container').style.display = 'none';
     } catch (err) {
         console.error("Organize Bookmarks Error:", err);
         alert("Error opening organizer: " + err.message);
@@ -2541,6 +2697,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     document.getElementById('workflows-container').style.display = 'none';
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('organizer-source-container').style.display = 'none';
+    document.getElementById('notes-container').style.display = 'none';
 
     const container = document.getElementById('settings-container');
     container.style.display = 'block';
@@ -3143,7 +3300,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const focusedFolderIds = settings.focusedFolderIds || [];
             const wfRoot = await findWorkflowRootSilent();
             const workflowRootId = wfRoot ? wfRoot.id : null;
-            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
+            const notesRoot = await NotesManager.findNotesRoot();
+            const notesRootId = notesRoot ? notesRoot.id : null;
+            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId, notesRootId);
             await persistBackendConfig({ lastSyncAt: ts, lastSyncKind: 'push' });
             writeBackendStatus('Pushed at ' + new Date(ts).toLocaleString());
         } catch (e) {
@@ -3252,7 +3411,9 @@ document.getElementById('mainPushBtn').addEventListener('click', async () => {
         const focusedFolderIds = settings.focusedFolderIds || [];
         const wfRoot = await findWorkflowRootSilent();
         const workflowRootId = wfRoot ? wfRoot.id : null;
-        const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId);
+        const notesRoot = await NotesManager.findNotesRoot();
+        const notesRootId = notesRoot ? notesRoot.id : null;
+        const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId, notesRootId);
 
         const updated = { ...settings, backend: { ...cfg, lastSyncAt: ts, lastSyncKind: 'push' } };
         await StorageManager.saveSettings(updated);
@@ -3313,6 +3474,7 @@ function closeSettings() {
     document.getElementById('workflows-container').style.display = 'none';
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('organizer-source-container').style.display = 'none';
+    document.getElementById('notes-container').style.display = 'none';
 
     // Reload tabs in case settings changed context logic
     loadCurrentTabs();

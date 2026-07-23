@@ -14,7 +14,9 @@ const state = {
     snapshotTimestamp: null,
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
-    dirty: false              // unsaved local edits to the snapshot
+    dirty: false,             // unsaved local edits to the snapshot
+    openNoteId: null,         // _pwaId of the note open in the detail view
+    editingNewNote: false     // detail view is editing a not-yet-created note
 };
 
 const $ = (id) => document.getElementById(id);
@@ -206,6 +208,8 @@ function renderBreadcrumb() {
         a.addEventListener('click', (e) => {
             e.preventDefault();
             state.pathIds = state.pathIds.slice(0, idx + 1);
+            state.openNoteId = null;
+            state.editingNewNote = false;
             renderView();
         });
         bc.appendChild(a);
@@ -225,6 +229,11 @@ function renderContent() {
     const node = findNodeByPath(state.pathIds);
     if (!node) {
         root.innerHTML = '<div class="empty">Folder not found.</div>';
+        return;
+    }
+    // The notes folder gets its own editor UI instead of generic bookmark rows.
+    if (isNotesFolder(node)) {
+        renderNotesView(root, node);
         return;
     }
     const children = node.children || [];
@@ -251,6 +260,8 @@ function renderFolderRow(folder) {
     `;
     row.addEventListener('click', () => {
         state.pathIds = [...state.pathIds, folder._pwaId];
+        state.openNoteId = null;
+        state.editingNewNote = false;
         renderView();
     });
     return row;
@@ -275,6 +286,198 @@ function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 function escapeAttr(s) { return escapeHtml(s); }
+
+// --- Notes ---
+// Notes live in the "TabPaladin Notes" folder as bookmarks whose url is a
+// data:application/json payload — same format the extension writes.
+const NOTES_ROOT_TITLE = 'TabPaladin Notes';
+const NOTE_DATA_PREFIX = 'data:application/json,';
+
+function isNotesFolder(node) {
+    return node && (node.type === 'folder' || node.type === 'root') && node.title === NOTES_ROOT_TITLE;
+}
+
+function isNoteBookmark(b) {
+    return b && b.type === 'bookmark' && typeof b.url === 'string'
+        && b.url.startsWith(NOTE_DATA_PREFIX) && b.title !== '__tabpaladin_meta__';
+}
+
+function decodeNote(b) {
+    try {
+        const p = JSON.parse(decodeURIComponent(b.url.slice(NOTE_DATA_PREFIX.length)));
+        return { content: p.content || '', createdAt: p.createdAt || null, updatedAt: p.updatedAt || null };
+    } catch (e) {
+        return { content: '', createdAt: null, updatedAt: null };
+    }
+}
+
+function encodeNoteUrl({ content, createdAt, updatedAt }) {
+    return NOTE_DATA_PREFIX + encodeURIComponent(JSON.stringify({ v: 1, content, createdAt, updatedAt }));
+}
+
+// Locate the notes folder (root → browser root → TabPaladin Notes) with its path.
+function findNotesFolderWithPath() {
+    if (!state.snapshot) return null;
+    for (const rootChild of state.snapshot.children || []) {
+        if (isNotesFolder(rootChild)) {
+            return { node: rootChild, path: [state.snapshot._pwaId, rootChild._pwaId] };
+        }
+        for (const c of rootChild.children || []) {
+            if (isNotesFolder(c)) {
+                return { node: c, path: [state.snapshot._pwaId, rootChild._pwaId, c._pwaId] };
+            }
+        }
+    }
+    return null;
+}
+
+// Replace [[oldTitle]] with [[newTitle]] inside a content string.
+function rewriteWikiLink(content, oldTitle, newTitle) {
+    const escaped = oldTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return content.replace(new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`, 'g'), `[[${newTitle}]]`);
+}
+
+function renderNotesView(container, folder) {
+    // Detail view (existing note or a new one being composed)
+    if (state.editingNewNote || state.openNoteId) {
+        const note = state.editingNewNote
+            ? null
+            : (folder.children || []).find(c => c._pwaId === state.openNoteId && isNoteBookmark(c));
+        if (!state.editingNewNote && !note) {
+            state.openNoteId = null; // note vanished — fall back to the list
+        } else {
+            renderNoteDetail(container, folder, note);
+            return;
+        }
+    }
+
+    container.innerHTML = '';
+    const addBtn = document.createElement('button');
+    addBtn.className = 'primary';
+    addBtn.style.marginBottom = '10px';
+    addBtn.textContent = '+ New Note';
+    addBtn.addEventListener('click', () => {
+        state.editingNewNote = true;
+        state.openNoteId = null;
+        renderView();
+    });
+    container.appendChild(addBtn);
+
+    const notes = (folder.children || []).filter(isNoteBookmark);
+    if (notes.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No notes yet.';
+        container.appendChild(empty);
+        return;
+    }
+    for (const note of notes) {
+        const meta = decodeNote(note);
+        const snippet = meta.content.replace(/\s+/g, ' ').trim().slice(0, 80);
+        const row = document.createElement('div');
+        row.className = 'row note';
+        row.innerHTML = `
+            <span class="icon">📝</span>
+            <div class="note-row-text">
+                <span class="title">${escapeHtml(note.title || 'Untitled')}</span>
+                ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
+            </div>
+        `;
+        row.addEventListener('click', () => {
+            state.openNoteId = note._pwaId;
+            state.editingNewNote = false;
+            renderView();
+        });
+        container.appendChild(row);
+    }
+}
+
+function renderNoteDetail(container, folder, note) {
+    const meta = note ? decodeNote(note) : { content: '', createdAt: null, updatedAt: null };
+    container.innerHTML = `
+        <div class="note-detail">
+            <input id="note-title-input" type="text" placeholder="Note title"
+                   value="${escapeAttr(note ? note.title || '' : '')}">
+            <textarea id="note-body-input" rows="14"
+                      placeholder="Write here… Link notes with [[Note Title]].">${escapeHtml(meta.content)}</textarea>
+            <div class="note-actions">
+                <button id="note-save-btn" class="primary">Save</button>
+                <button id="note-back-btn">Back</button>
+                ${note ? '<button id="note-delete-btn" class="danger">Delete</button>' : ''}
+            </div>
+        </div>
+    `;
+
+    container.querySelector('#note-back-btn').addEventListener('click', () => {
+        state.openNoteId = null;
+        state.editingNewNote = false;
+        renderView();
+    });
+
+    container.querySelector('#note-save-btn').addEventListener('click', async () => {
+        const title = container.querySelector('#note-title-input').value.trim() || 'Untitled';
+        const content = container.querySelector('#note-body-input').value;
+        const now = new Date().toISOString();
+        const oldTitle = note ? note.title : null;
+
+        if (note) {
+            note.title = title;
+            note.url = encodeNoteUrl({ content, createdAt: meta.createdAt || now, updatedAt: now });
+        } else {
+            note = { type: 'bookmark', title, url: encodeNoteUrl({ content, createdAt: now, updatedAt: now }) };
+            assignIds(note);
+            folder.children = folder.children || [];
+            folder.children.push(note);
+            state.openNoteId = note._pwaId;
+            state.editingNewNote = false;
+        }
+
+        // Rename: rewrite [[Old Title]] links in sibling notes so they don't break.
+        if (oldTitle && oldTitle !== title) {
+            for (const sibling of (folder.children || []).filter(isNoteBookmark)) {
+                if (sibling._pwaId === note._pwaId) continue;
+                const sMeta = decodeNote(sibling);
+                const rewritten = rewriteWikiLink(sMeta.content, oldTitle, title);
+                if (rewritten !== sMeta.content) {
+                    sibling.url = encodeNoteUrl({ content: rewritten, createdAt: sMeta.createdAt || now, updatedAt: now });
+                }
+            }
+        }
+
+        state.dirty = true;
+        try {
+            setStatus('Saving…');
+            await pushSnapshot();
+            showToast('Note saved.');
+            setStatus('');
+        } catch (e) {
+            alert('Save failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
+            setStatus('');
+        }
+        renderView();
+    });
+
+    const deleteBtn = container.querySelector('#note-delete-btn');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', async () => {
+            if (!confirm(`Delete note "${note.title || 'Untitled'}"?`)) return;
+            folder.children = (folder.children || []).filter(c => c._pwaId !== note._pwaId);
+            state.openNoteId = null;
+            state.dirty = true;
+            try {
+                setStatus('Saving…');
+                await pushSnapshot();
+                showToast('Note deleted.');
+                setStatus('');
+            } catch (e) {
+                alert('Delete failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
+                setStatus('');
+            }
+            renderView();
+        });
+    }
+}
+
 
 // --- Inbox modal ---
 function updateInboxFab() {
@@ -853,6 +1056,53 @@ window.addEventListener('DOMContentLoaded', () => {
             alert('Failed to save folder: ' + err.message);
             setStatus('');
         }
+    });
+
+    safeAddListener('notesBtn', 'click', async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!configured()) {
+            showToast('Please open settings (⚙) first.');
+            return;
+        }
+        if (!state.snapshot) {
+            showToast('Loading snapshot first…');
+            try {
+                await pullSnapshot();
+            } catch (err) {
+                showToast('Failed to pull snapshot: ' + err.message);
+                return;
+            }
+        }
+
+        let found = findNotesFolderWithPath();
+        if (!found) {
+            if (!confirm('No "TabPaladin Notes" folder in the synced snapshot yet. Create it?')) return;
+            // Put it under the "Other Bookmarks" equivalent, falling back to the last root.
+            const roots = state.snapshot.children || [];
+            const parent = roots.find(r => /other|unfiled/i.test(r.title || '')) || roots[roots.length - 1];
+            if (!parent) { showToast('No root folder available.'); return; }
+            const folder = { type: 'folder', title: NOTES_ROOT_TITLE, children: [] };
+            assignIds(folder);
+            parent.children = parent.children || [];
+            parent.children.push(folder);
+            state.dirty = true;
+            try {
+                setStatus('Creating notes folder…');
+                await pushSnapshot();
+                setStatus('');
+            } catch (err) {
+                alert('Failed to create notes folder: ' + err.message);
+                setStatus('');
+                return;
+            }
+            found = { node: folder, path: [state.snapshot._pwaId, parent._pwaId, folder._pwaId] };
+        }
+
+        state.pathIds = found.path;
+        state.openNoteId = null;
+        state.editingNewNote = false;
+        renderView();
     });
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));

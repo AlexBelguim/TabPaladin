@@ -6,35 +6,115 @@ const WORKFLOW_ROOT_TITLE = 'TabPaladin Workflows';
 // Lives at the top of each workflow folder, has a non-http url so users can't accidentally open it.
 const META_TITLE = '__tabpaladin_meta__';
 
-let rootFolderCache = null;
+// Resolved root folders, keyed by the settings key that persists their id
+// (e.g. 'workflowRootBookmarkId', 'notesRootBookmarkId').
+const rootFolderCaches = new Map();
+// Number of *extra* "TabPaladin Workflows" folders found during the last full
+// resolution (0 = no duplicates). Surfaced in the settings UI.
+let workflowRootDuplicateCount = 0;
 
-async function findOrCreateRoot() {
-    if (rootFolderCache) {
+async function persistRootId(settingsKey, id, settings) {
+    try {
+        await StorageManager.saveSettings({ ...settings, [settingsKey]: id });
+    } catch (e) { /* non-fatal */ }
+}
+
+async function countDuplicateFolders(title) {
+    try {
+        const matches = await api.bookmarks.search({ title });
+        return Math.max(0, matches.filter(m => !m.url && m.title === title).length - 1);
+    } catch (e) {
+        return 0;
+    }
+}
+
+/**
+ * Single source of truth for an app-managed root folder (workflows, notes).
+ * Every caller (save, list, render, settings) must resolve through this so
+ * they never disagree about which folder is "the" root.
+ *
+ * Resolution order:
+ *   1. Verified in-memory cache.
+ *   2. The persisted settings[settingsKey], if it still exists.
+ *   3. Exact-title bookmark search; with duplicates, the folder holding the
+ *      most children wins. The choice is persisted.
+ *   4. With create=true, a new folder under Other Bookmarks (id '2').
+ *
+ * Returns null when nothing exists and create=false.
+ */
+async function resolveRootFolder({ title, settingsKey, create = false }) {
+    const cached = rootFolderCaches.get(settingsKey);
+    if (cached) {
         // Verify it still exists
         try {
-            const check = await api.bookmarks.get(rootFolderCache.id);
-            if (check && check[0]) return rootFolderCache;
+            const check = await api.bookmarks.get(cached.id);
+            if (check && check[0]) return cached;
         } catch (e) {
-            rootFolderCache = null;
+            // fall through
+        }
+        rootFolderCaches.delete(settingsKey);
+    }
+
+    const settings = await StorageManager.getSettings();
+    const preferredId = settings && settings[settingsKey];
+    if (preferredId) {
+        try {
+            const node = (await api.bookmarks.get(preferredId))[0];
+            if (node && !node.url) {
+                rootFolderCaches.set(settingsKey, node);
+                if (title === WORKFLOW_ROOT_TITLE) {
+                    workflowRootDuplicateCount = await countDuplicateFolders(node.title || title);
+                }
+                return node;
+            }
+        } catch (e) {
+            // Persisted folder gone — fall through and re-resolve.
         }
     }
 
-    // Search "Other Bookmarks" (id '2') for an existing root folder.
-    // Search API is the most reliable cross-browser way.
-    const matches = await api.bookmarks.search({ title: WORKFLOW_ROOT_TITLE });
-    const existing = matches.find(m => !m.url);
-    if (existing) {
-        rootFolderCache = existing;
-        return existing;
+    // bookmarks.search is token-based and can return near-matches like
+    // "TabPaladin Workflows backup" — require an exact title match.
+    const matches = await api.bookmarks.search({ title });
+    const folders = matches.filter(m => !m.url && m.title === title);
+    if (title === WORKFLOW_ROOT_TITLE) {
+        workflowRootDuplicateCount = Math.max(0, folders.length - 1);
+    }
+
+    let chosen = folders[0] || null;
+    if (folders.length > 1) {
+        // Prefer the folder with the most children (likely the "real" root).
+        let bestCount = -1;
+        for (const f of folders) {
+            const kids = await api.bookmarks.getChildren(f.id);
+            if (kids.length > bestCount) { bestCount = kids.length; chosen = f; }
+        }
     }
 
     // Create under Other Bookmarks. '2' is the standard id on both Chrome and Firefox.
-    const created = await api.bookmarks.create({
-        parentId: '2',
-        title: WORKFLOW_ROOT_TITLE
+    if (!chosen && create) {
+        chosen = await api.bookmarks.create({
+            parentId: '2',
+            title
+        });
+    }
+
+    if (chosen) {
+        rootFolderCaches.set(settingsKey, chosen);
+        await persistRootId(settingsKey, chosen.id, settings);
+    }
+    return chosen;
+}
+
+async function resolveWorkflowRoot({ create = false } = {}) {
+    return resolveRootFolder({
+        title: WORKFLOW_ROOT_TITLE,
+        settingsKey: 'workflowRootBookmarkId',
+        create
     });
-    rootFolderCache = created;
-    return created;
+}
+
+async function findOrCreateRoot() {
+    return resolveWorkflowRoot({ create: true });
 }
 
 function isMetaNode(node) {
@@ -275,5 +355,10 @@ export const StorageManager = {
      * Expose helpers for callers that need them.
      */
     getWorkflowRoot: findOrCreateRoot,
+    // Resolve the workflows root without creating it (null when absent).
+    findWorkflowRoot: () => resolveWorkflowRoot({ create: false }),
+    getWorkflowRootDuplicateCount: () => workflowRootDuplicateCount,
+    // Generic root-folder resolver, also used by the notes feature.
+    resolveRootFolder,
     META_TITLE
 };
