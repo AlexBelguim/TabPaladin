@@ -408,7 +408,13 @@ app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
 
 // --- PWA static files ---
 if (fs.existsSync(PWA_DIR)) {
-    app.use('/', express.static(PWA_DIR));
+    // no-cache: browsers/proxies may store but must revalidate (ETag → cheap
+    // 304s). Prevents stale app shells; deploys must show up immediately.
+    app.use('/', express.static(PWA_DIR, {
+        setHeaders: (res) => {
+            res.set('Cache-Control', 'no-cache');
+        }
+    }));
 } else {
     app.get('/', (req, res) => {
         res.type('text/plain').send('TabPaladin Sync server. PWA directory not found at ' + PWA_DIR);

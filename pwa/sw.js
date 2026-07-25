@@ -1,12 +1,13 @@
 // Minimal service worker — network-first for the app shell so updates roll
 // out immediately; the cache is only an offline fallback. API/LLM calls
 // always go to the network.
-const SHELL_CACHE = 'tp-shell-v10';
+// Release ritual: bump v11 here AND the ?v=11 queries in index.html together.
+const SHELL_CACHE = 'tp-shell-v11';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css',
-    '/app.js',
+    '/app.css?v=11',
+    '/app.js?v=11',
     '/manifest.webmanifest',
     '/icons/icon128.png'
 ];
