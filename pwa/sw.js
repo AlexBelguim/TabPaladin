@@ -1,5 +1,7 @@
-// Minimal service worker — caches the app shell, lets the network handle data.
-const SHELL_CACHE = 'tp-shell-v9';
+// Minimal service worker — network-first for the app shell so updates roll
+// out immediately; the cache is only an offline fallback. API/LLM calls
+// always go to the network.
+const SHELL_CACHE = 'tp-shell-v10';
 const SHELL = [
     '/',
     '/index.html',
@@ -27,7 +29,16 @@ self.addEventListener('fetch', (event) => {
     const url = new URL(req.url);
     // Never cache API calls or LLM share links — always go to network.
     if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/llm/')) return;
+    // Network-first: fresh files when online, cached copy when offline.
     event.respondWith(
-        caches.match(req).then(hit => hit || fetch(req).catch(() => caches.match('/index.html')))
+        fetch(req)
+            .then(res => {
+                if (res.ok && url.origin === self.location.origin) {
+                    const copy = res.clone();
+                    caches.open(SHELL_CACHE).then(c => c.put(req, copy));
+                }
+                return res;
+            })
+            .catch(() => caches.match(req).then(hit => hit || caches.match('/index.html')))
     );
 });
