@@ -76,12 +76,23 @@ export const NotesManager = {
     listNotes: async () => {
         const root = await findNotesRoot();
         if (!root) return [];
-        const children = await api.bookmarks.getChildren(root.id);
         const notes = [];
-        for (const c of children) {
-            const note = parseNoteNode(c);
-            if (note) notes.push(note);
-        }
+        // Direct children are loose notes; subfolders are notebooks
+        // (created by the PWA), so recurse one level and tag each note
+        // with its notebook title.
+        const walk = async (parentId, notebook) => {
+            const children = await api.bookmarks.getChildren(parentId);
+            for (const c of children) {
+                const note = parseNoteNode(c);
+                if (note) {
+                    note.notebook = notebook;
+                    notes.push(note);
+                } else if (!c.url) {
+                    await walk(c.id, c.title || notebook);
+                }
+            }
+        };
+        await walk(root.id, null);
         // Most recently updated first.
         notes.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
         return notes;

@@ -1910,7 +1910,7 @@ function renderNotesList(filter = '') {
         li.className = 'note-list-item';
         const snippet = note.content.replace(/\s+/g, ' ').trim().slice(0, 80);
         li.innerHTML = `
-            <div class="note-item-title">${escapeHtml(note.title)}</div>
+            <div class="note-item-title">${escapeHtml(note.title)}${note.notebook ? ` <span class="note-item-notebook">${escapeHtml(note.notebook)}</span>` : ''}</div>
             ${snippet ? `<div class="note-item-snippet">${escapeHtml(snippet)}</div>` : ''}
         `;
         li.addEventListener('click', () => openNoteInEditor(note));

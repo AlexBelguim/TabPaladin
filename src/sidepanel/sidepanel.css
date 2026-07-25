@@ -915,6 +915,16 @@ ol {
   white-space: nowrap;
 }
 
+.note-item-notebook {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: #0ea5e9;
+  background: rgba(14, 165, 233, 0.12);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
 .note-preview {
   padding: 10px;
   background: rgba(0, 0, 0, 0.15);
