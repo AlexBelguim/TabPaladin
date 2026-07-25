@@ -205,8 +205,8 @@ function getValidShareToken(req, res) {
 
 // --- LLM share links ---
 // POST /api/share creates a 1-hour link the user can paste into any LLM chat.
-// GET /llm/:token (no auth) serves the notes + instructions as markdown.
-// POST /llm/:token/propose (no auth) queues a note for human approval.
+// GET /llm/:token (no auth) serves the notes + instructions as plain text.
+// POST /llm/:token/propose (no auth, also POST /llm/:token) queues a note for human approval.
 app.post('/api/share', requireAuth, (req, res) => {
     db.prepare('DELETE FROM share_tokens WHERE expires_at <= ?').run(new Date().toISOString());
     const token = crypto.randomUUID();
@@ -224,26 +224,33 @@ app.get('/llm/:token', (req, res) => {
     const notes = folder ? (folder.children || []).filter(isNoteBookmark) : [];
     const proposeUrl = `${req.protocol}://${req.get('host')}/llm/${req.params.token}/propose`;
 
+    // Plain text, not text/markdown: some LLM fetch tools refuse text/markdown responses.
     let md = `# TabPaladin Notes — shared context for an LLM assistant\n\n`;
-    md += `## Instructions (READ CAREFULLY BEFORE DOING ANYTHING)\n\n`;
+    md += `!!! TO CREATE OR EDIT A NOTE, SEND THIS REQUEST (this is the ONLY way to write) !!!\n\n`;
+    md += `POST ${proposeUrl}\n`;
+    md += `Content-Type: application/json\n\n`;
+    md += `{"title": "Note Title", "content": "# Note Title\\n\\n...full note body..."}\n\n`;
+    md += `(A POST to this page's own URL with the same JSON body also works.)\n\n`;
+    md += `---\n\n## Instructions (READ CAREFULLY BEFORE DOING ANYTHING)\n\n`;
     md += `- You are viewing the user's personal note collection via a temporary link.\n`;
     md += `- Notes are plain markdown-ish text. A line starting with \`# \` is the note's title; notes reference each other with wikilinks like [[Note Title]]. Keep this styling when writing notes.\n`;
     md += `- You CANNOT create or edit notes directly. ALWAYS ask the user for approval first:\n`;
     md += `  1. Tell the user what you want to write and get their confirmation.\n`;
-    md += `  2. Send an HTTP POST request to ${proposeUrl} with a JSON body: {"title": "Note Title", "content": "# Note Title\\n\\n...full note body..."}\n`;
+    md += `  2. POST the proposal to ${proposeUrl} as shown at the top of this page.\n`;
     md += `     - "title": max 200 chars. "content": max 100 KB, start it with a \`# <title>\` heading line.\n`;
     md += `     - If a note with the same title already exists, the proposal REPLACES its content upon approval — include the full new content, not a diff.\n`;
-    md += `  3. After posting, tell the user the note is waiting for their approval in the TabPaladin app. NEVER claim a note was saved or changed before the user approves it there.\n\n`;
+    md += `  3. After posting, tell the user the note is waiting for their approval in the TabPaladin app. NEVER claim a note was saved or changed before the user approves it there.\n`;
+    md += `- If your tools cannot send POST requests, output the full note (title + content) as a markdown code block so the user can paste it into the app themselves.\n\n`;
     md += `---\n\n## Existing notes (${notes.length})\n\n`;
     if (notes.length === 0) md += `(no notes yet)\n\n`;
     for (const n of notes) {
         const meta = decodeNote(n);
         md += `### ${n.title || 'Untitled'}\n\n${meta.content || '(empty)'}\n\n---\n\n`;
     }
-    res.type('text/markdown; charset=utf-8').send(md);
+    res.type('text/plain; charset=utf-8').send(md);
 });
 
-app.post('/llm/:token/propose', express.json({ limit: '1mb' }), (req, res) => {
+function handleProposal(req, res) {
     if (!getValidShareToken(req, res)) return;
     const { title, content } = req.body || {};
     if (typeof title !== 'string' || !title.trim() || title.length > 200) {
@@ -259,7 +266,11 @@ app.post('/llm/:token/propose', express.json({ limit: '1mb' }), (req, res) => {
         status: 'pending_approval',
         message: 'Proposal stored. It only becomes a note after the user approves it in the TabPaladin app — tell them it is waiting for approval.'
     });
-});
+}
+
+app.post('/llm/:token/propose', express.json({ limit: '1mb' }), handleProposal);
+// Some LLMs guess POST on the share URL itself — accept it as an alias.
+app.post('/llm/:token', express.json({ limit: '1mb' }), handleProposal);
 
 // --- Note proposals (auth, consumed by the PWA) ---
 app.get('/api/proposals', requireAuth, (req, res) => {
