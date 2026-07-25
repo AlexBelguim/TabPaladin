@@ -81,6 +81,40 @@ input:focus { outline: none; border-color: var(--primary); }
   -webkit-text-fill-color: transparent;
 }
 
+/* --- Topbar overflow menu --- */
+#menu-wrap { position: relative; }
+
+#menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 190px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 50;
+}
+
+#menu .menu-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 0.85rem;
+  padding: 9px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+#menu .menu-item:hover { background: var(--surface-2); }
+
+#menu .menu-item.has-items { color: var(--primary); }
+
 /* --- Breadcrumb --- */
 #breadcrumb {
   display: flex;
@@ -282,33 +316,69 @@ button.ghost.dirty {
   text-overflow: ellipsis;
 }
 
-.note-detail {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 720px;
-  width: 100%;
-  margin: 0 auto;
-}
+/* Fullscreen note page: no bookmark chrome while a note is open */
+body.note-open #breadcrumb { display: none; }
 
-/* Full-bleed black reading page when a note is open (like a minimal note app) */
-.notes-section.detail-open {
-  border-top: none;
-  padding-top: 0;
-  margin-top: 4px;
-}
-
-.notes-section.detail-open .note-detail {
-  max-width: none;
+.note-page {
   background: #000;
   margin: 0 -16px;
-  padding: 20px 20px 80px;
-  min-height: 78vh;
-  border-radius: 0;
+  padding: 8px 20px 80px;
+  min-height: 82vh;
 }
 
+.note-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0 10px;
+}
+
+.note-topbar button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 1.1rem;
+  padding: 6px 8px;
+}
+
+.note-topbar button:hover { color: var(--text); }
+
+.note-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.note-menu-wrap { position: relative; }
+
+#note-menu-pop {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 180px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 50;
+}
+
+#note-menu-pop .menu-item {
+  text-align: left;
+  font-size: 0.85rem;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+#note-menu-pop button.danger { background: var(--danger); color: #fff; }
+
 /* Note-app look: the editor is a page, not an input box */
-.note-detail textarea {
+.note-page textarea {
   width: 100%;
   padding: 4px 2px;
   background: transparent;
@@ -319,21 +389,13 @@ button.ghost.dirty {
   font-family: inherit;
   line-height: 1.8;
   resize: none;
-  min-height: 50vh;
+  min-height: 60vh;
 }
 
-.note-detail textarea:focus {
+.note-page textarea:focus {
   outline: none;
   border: none;
 }
-
-.note-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.note-actions .primary { flex: 1; }
-.note-actions button.danger { background: var(--danger); color: #fff; }
 
 /* --- Notes section (root view) --- */
 .notes-section {
@@ -442,24 +504,11 @@ button.ghost.dirty {
 
 .import-actions { margin-top: 10px; }
 
-/* --- Obsidian-style editor: edit/preview toggle + preview --- */
-.note-edit-toggle {
-  display: flex;
-  gap: 6px;
-}
-
-.note-edit-toggle button {
-  font-size: 0.78rem;
-  padding: 5px 12px;
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--muted);
-}
-
-.note-edit-toggle button.active {
-  background: var(--surface-2);
-  color: var(--text);
-  border-color: var(--primary);
+/* --- Notes section while a note is open: strip list chrome --- */
+.notes-section.detail-open {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
 }
 
 .note-preview-body {
@@ -473,6 +522,19 @@ button.ghost.dirty {
 .note-preview-body h1 { font-size: 1.75rem; font-weight: 700; margin: 0.1em 0 0.5em; }
 .note-preview-body h2 { font-size: 1.3rem; font-weight: 700; margin: 0.9em 0 0.3em; }
 .note-preview-body h3 { font-size: 1.1rem; font-weight: 600; margin: 0.9em 0 0.3em; }
+.note-preview-body h4,
+.note-preview-body h5,
+.note-preview-body h6 { font-size: 1rem; font-weight: 600; margin: 0.9em 0 0.3em; }
+
+.note-preview-body p { margin: 0.35em 0; }
+
+.note-preview-body ul,
+.note-preview-body ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+
+.note-preview-body li { margin: 0.15em 0; }
 
 .note-wikilink {
   color: var(--primary);

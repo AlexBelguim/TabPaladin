@@ -286,6 +286,7 @@ function findNodeByPath(pathIds) {
 // --- Render ---
 function renderView() {
     setStatus('');
+    document.body.classList.toggle('note-open', Boolean(state.openNoteId || state.editingNewNote));
     renderBreadcrumb();
     renderContent();
     updateInboxFab();
@@ -338,6 +339,11 @@ function renderContent() {
     const root = $('content');
     if (!root) return;
     root.innerHTML = '';
+    // An open note is a fullscreen page — no bookmark chrome around it.
+    if (state.openNoteId || state.editingNewNote) {
+        renderNotesSection(root);
+        return;
+    }
     const node = findNodeByPath(state.pathIds);
     if (!node) {
         root.innerHTML = '<div class="empty">Folder not found.</div>';
@@ -931,21 +937,59 @@ function renderNotesView(container, folder) {
     }
 }
 
-// Render note content as safe HTML: # headings, **bold**, *italic*,
-// [[wiki-links]] as clickable chips, bare URLs as links. Everything else is
-// escaped text. Zero-dependency, mirrors the extension sidepanel renderer.
-function renderNotePreviewHtml(content) {
-    let html = escapeHtml(content);
-    html = html.replace(/^### (.*)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^## (.*)$/gm, '<h2>$1</h2>');
-    html = html.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+// Render note content as safe HTML, GitHub/Obsidian-style: # headings,
+// real - and 1. lists, **bold**, *italic*, [[wiki-links]] as clickable
+// chips, bare URLs as links. Everything else is escaped text.
+// Zero-dependency, mirrors the extension sidepanel renderer.
+function renderNoteInline(escapedLine) {
+    let html = escapedLine;
     html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
     html = html.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
         `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
     html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
         `<a href="$1" class="note-urllink" target="_blank" rel="noopener">$1</a>`);
-    return html.replace(/\n/g, '<br>');
+    return html;
+}
+
+function renderNotePreviewHtml(content) {
+    const out = [];
+    let listTag = null; // 'ul' | 'ol' | null
+    const closeList = () => {
+        if (listTag) { out.push(`</${listTag}>`); listTag = null; }
+    };
+    for (const rawLine of String(content || '').split('\n')) {
+        const line = escapeHtml(rawLine);
+        const trimmed = line.trim();
+        if (!trimmed) { closeList(); continue; }
+
+        const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+        if (heading) {
+            closeList();
+            const level = heading[1].length;
+            out.push(`<h${level}>${renderNoteInline(heading[2])}</h${level}>`);
+            continue;
+        }
+
+        const bullet = rawLine.match(/^\s*[-*]\s+(.+)$/);
+        if (bullet) {
+            if (listTag !== 'ul') { closeList(); out.push('<ul>'); listTag = 'ul'; }
+            out.push(`<li>${renderNoteInline(escapeHtml(bullet[1]))}</li>`);
+            continue;
+        }
+
+        const numbered = rawLine.match(/^\s*\d+[.)]\s+(.+)$/);
+        if (numbered) {
+            if (listTag !== 'ol') { closeList(); out.push('<ol>'); listTag = 'ol'; }
+            out.push(`<li>${renderNoteInline(escapeHtml(numbered[1]))}</li>`);
+            continue;
+        }
+
+        closeList();
+        out.push(`<p>${renderNoteInline(line)}</p>`);
+    }
+    closeList();
+    return out.join('\n');
 }
 
 // Notes whose content links to [[title]] (excluding the note itself), across all notebooks.
@@ -958,42 +1002,50 @@ function getNoteBacklinks(title, excludeId) {
         .map(e => e.note);
 }
 
-// Obsidian-style: one editor for the whole note; the first "# " heading is the title.
+// Obsidian-style: reading view renders markdown; the pencil switches to an
+// editor styled exactly like the page. The first "# " heading is the title.
 function renderNoteDetail(container, folder, note) {
     const meta = note
         ? decodeNote(note)
         : { content: state.newNotePrefill || '', createdAt: null, updatedAt: null };
     state.newNotePrefill = null;
     container.innerHTML = `
-        <div class="note-detail">
-            <div class="note-edit-toggle">
-                <button id="note-mode-edit" class="active">Edit</button>
-                <button id="note-mode-preview">Preview</button>
+        <div class="note-page">
+            <div class="note-topbar">
+                <button id="note-back-btn" title="Back to notes">←</button>
+                <div class="note-topbar-right">
+                    <button id="note-edit-btn" title="Edit">✏️</button>
+                    <button id="note-save-btn" class="hidden" title="Save">✓</button>
+                    <button id="note-cancel-btn" class="hidden" title="Discard changes">✕</button>
+                    <div class="note-menu-wrap">
+                        <button id="note-menu-btn" title="More">⋯</button>
+                        <div id="note-menu-pop" class="hidden">
+                            ${note ? '<select id="note-move-select" class="note-move" title="Move to notebook"></select>' : ''}
+                            ${note ? '<button id="note-delete-btn" class="danger menu-item">Delete note</button>' : ''}
+                        </div>
+                    </div>
+                </div>
             </div>
-            <textarea id="note-body-input" rows="14"
+            <div id="note-preview" class="note-preview-body"></div>
+            <textarea id="note-body-input" class="hidden"
                       placeholder="# Note title&#10;&#10;Write here… Link notes with [[Note Title]].">${escapeHtml(meta.content)}</textarea>
-            <div id="note-preview" class="hidden"></div>
-            <div class="note-actions">
-                <button id="note-save-btn" class="primary">Save</button>
-                <button id="note-back-btn">← Notes</button>
-                ${note ? '<select id="note-move-select" class="note-move" title="Move to notebook"></select>' : ''}
-                ${note ? '<button id="note-delete-btn" class="danger">Delete</button>' : ''}
-            </div>
         </div>
     `;
 
     const textarea = container.querySelector('#note-body-input');
     const previewEl = container.querySelector('#note-preview');
-    const editModeBtn = container.querySelector('#note-mode-edit');
-    const previewModeBtn = container.querySelector('#note-mode-preview');
+    const editBtn = container.querySelector('#note-edit-btn');
+    const saveBtn = container.querySelector('#note-save-btn');
+    const cancelBtn = container.querySelector('#note-cancel-btn');
+    const menuBtn = container.querySelector('#note-menu-btn');
+    const menuPop = container.querySelector('#note-menu-pop');
 
     // Grow the editor with the content — a note page, not a fixed input box.
     const autogrow = () => {
         textarea.style.height = 'auto';
-        textarea.style.height = Math.max(textarea.scrollHeight, Math.round(window.innerHeight * 0.5)) + 'px';
+        textarea.style.height = Math.max(textarea.scrollHeight, Math.round(window.innerHeight * 0.6)) + 'px';
     };
     textarea.addEventListener('input', autogrow);
-    autogrow();
 
     // Title comes from the first "# " heading; falls back to the stored title.
     function currentTitle() {
@@ -1003,7 +1055,6 @@ function renderNoteDetail(container, folder, note) {
     }
 
     function openNoteByTitle(title) {
-        if (textarea.value !== meta.content && !confirm('Discard unsaved changes?')) return;
         const found = allNotes().find(e => e.note.title === title);
         if (found) {
             state.openNoteId = found.note._pwaId;
@@ -1018,14 +1069,9 @@ function renderNoteDetail(container, folder, note) {
         renderView();
     }
 
-    function setMode(preview) {
-        editModeBtn.classList.toggle('active', !preview);
-        previewModeBtn.classList.toggle('active', preview);
-        textarea.classList.toggle('hidden', preview);
-        previewEl.classList.toggle('hidden', !preview);
-        if (!preview) return;
+    function renderReadingView() {
         const body = renderNotePreviewHtml(textarea.value);
-        let html = `<div class="note-preview-body">${body || '<span style="color:var(--muted);">Empty note.</span>'}</div>`;
+        let html = body || '<span style="color:var(--muted);">Empty note. Tap ✏️ to write.</span>';
         const backlinks = getNoteBacklinks(currentTitle(), note ? note._pwaId : null);
         if (backlinks.length > 0) {
             const items = backlinks.map(n =>
@@ -1036,15 +1082,47 @@ function renderNoteDetail(container, folder, note) {
         previewEl.innerHTML = html;
     }
 
-    editModeBtn.addEventListener('click', () => setMode(false));
-    previewModeBtn.addEventListener('click', () => setMode(true));
+    function setMode(edit) {
+        editBtn.classList.toggle('hidden', edit);
+        saveBtn.classList.toggle('hidden', !edit);
+        cancelBtn.classList.toggle('hidden', !edit);
+        textarea.classList.toggle('hidden', !edit);
+        previewEl.classList.toggle('hidden', edit);
+        if (edit) {
+            autogrow();
+            textarea.focus();
+        } else {
+            renderReadingView();
+        }
+    }
+
+    editBtn.addEventListener('click', () => setMode(true));
+    cancelBtn.addEventListener('click', () => {
+        if (textarea.value !== meta.content && !confirm('Discard unsaved changes?')) return;
+        textarea.value = meta.content;
+        if (note) {
+            setMode(false);
+        } else {
+            // Cancelling a brand-new note leaves the page entirely.
+            state.editingNewNote = false;
+            state.openNoteId = null;
+            state.newNoteParentId = null;
+            renderView();
+        }
+    });
     previewEl.addEventListener('click', (e) => {
         const link = e.target.closest('.note-wikilink');
         if (link && link.dataset.target) openNoteByTitle(link.dataset.target);
     });
 
+    menuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        menuPop.classList.toggle('hidden');
+    });
+    document.addEventListener('click', () => menuPop.classList.add('hidden'));
+
     // Existing notes open in reading mode (like a note app); new notes in edit mode.
-    if (note) setMode(true);
+    setMode(!note);
 
     container.querySelector('#note-back-btn').addEventListener('click', () => {
         state.openNoteId = null;
@@ -1088,7 +1166,7 @@ function renderNoteDetail(container, folder, note) {
         });
     }
 
-    container.querySelector('#note-save-btn').addEventListener('click', async () => {
+    saveBtn.addEventListener('click', async () => {
         const content = textarea.value;
         const title = currentTitle();
         const now = new Date().toISOString();
@@ -1105,6 +1183,7 @@ function renderNoteDetail(container, folder, note) {
             state.openNoteId = note._pwaId;
             state.editingNewNote = false;
         }
+        meta.content = content;
 
         // Rename: rewrite [[Old Title]] links in all other notes so they don't break.
         if (oldTitle && oldTitle !== title) {
@@ -1127,14 +1206,12 @@ function renderNoteDetail(container, folder, note) {
             await pushSnapshot();
             showToast('Note saved.');
             setStatus('');
-            // Back to the notes list after a successful save.
-            state.openNoteId = null;
-            state.editingNewNote = false;
+            // Stay on the note, back in reading mode.
+            setMode(false);
         } catch (e) {
             alert('Save failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
             setStatus('');
         }
-        renderView();
     });
 
     const deleteBtn = container.querySelector('#note-delete-btn');
@@ -1384,7 +1461,7 @@ function updateClipBtnBadge() {
     if (!btn) return;
     const n = activeQuickFileItems.length;
     btn.classList.toggle('has-items', n > 0);
-    btn.textContent = n > 0 ? `📋 ${n}` : '📋';
+    btn.textContent = n > 0 ? `📋 Unfiled links (${n})` : '📋 Unfiled links';
     btn.title = n > 0
         ? `${n} unfiled link${n > 1 ? 's' : ''} — tap to review`
         : 'Scan clipboard for unfiled links';
@@ -1691,7 +1768,22 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('settingsBtn', 'click', (e) => {
         e.stopPropagation();
         e.preventDefault();
+        hide($('menu'));
         openSettings();
+    });
+
+    safeAddListener('menuBtn', 'click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        $('menu').classList.toggle('hidden');
+    });
+    // Menu items close the menu; clicks elsewhere dismiss it.
+    $('menu').addEventListener('click', () => hide($('menu')));
+    document.addEventListener('click', (e) => {
+        const menu = $('menu');
+        if (menu && !menu.classList.contains('hidden') && !e.target.closest('#menu-wrap')) {
+            hide(menu);
+        }
     });
 
     safeAddListener('newFolderBtn', 'click', async (e) => {

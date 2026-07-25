@@ -12,12 +12,17 @@
 <body>
   <header id="topbar">
     <h1>TabPaladin</h1>
-    <button id="clipBtn" class="ghost" title="Scan clipboard for unfiled links">📋</button>
-    <button id="newFolderBtn" class="ghost" title="Create new folder here">📁+</button>
     <button id="notesBtn" class="ghost" title="Open notes">📝</button>
-    <button id="pullBtn" class="ghost" title="Pull latest from sync server">⬇️</button>
     <button id="pushBtn" class="ghost" title="Push latest to sync server">⬆️</button>
-    <button id="settingsBtn" class="ghost" title="Settings">⚙</button>
+    <div id="menu-wrap">
+      <button id="menuBtn" class="ghost" title="Menu">⋯</button>
+      <div id="menu" class="hidden">
+        <button id="clipBtn" class="menu-item" title="Scan clipboard for unfiled links">📋 Unfiled links</button>
+        <button id="newFolderBtn" class="menu-item" title="Create new folder here">📁+ New folder</button>
+        <button id="pullBtn" class="menu-item" title="Pull latest from sync server">⬇️ Pull</button>
+        <button id="settingsBtn" class="menu-item" title="Settings">⚙ Settings</button>
+      </div>
+    </div>
   </header>
 
   <nav id="breadcrumb"></nav>
