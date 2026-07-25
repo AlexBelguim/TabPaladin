@@ -19,7 +19,8 @@ const state = {
     editingNewNote: false,    // detail view is editing a not-yet-created note
     newNotePrefill: null,     // optional pre-filled content for a new note (e.g. from a wikilink)
     newNoteParentId: null,    // _pwaId of the notebook a new note is filed into (null = notes root)
-    proposals: []             // pending LLM note proposals awaiting approval
+    proposals: [],            // pending LLM note proposals awaiting approval
+    importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
 };
 
 const $ = (id) => document.getElementById(id);
@@ -127,6 +128,44 @@ async function bootstrap() {
 // presses Save. First "# " heading becomes the title, as usual.
 async function processImportHashIfAny() {
     const raw = location.hash.slice(1);
+
+    // Multi-note batch: #notes=<percent-encoded JSON array of {"content","notebook"?}>
+    if (raw.startsWith('notes=')) {
+        history.replaceState(null, '', location.pathname);
+        let items = null;
+        try { items = JSON.parse(decodeURIComponent(raw.slice(6))); } catch (e) { /* invalid */ }
+        if (!Array.isArray(items) || items.length === 0) {
+            showToast('Import link could not be decoded.');
+            return;
+        }
+        const notes = items
+            .filter(it => it && typeof it.content === 'string' && it.content.trim())
+            .map(it => ({ content: it.content, notebook: typeof it.notebook === 'string' && it.notebook.trim() ? it.notebook.trim() : null }));
+        if (notes.length === 0) {
+            showToast('Import link contained no notes.');
+            return;
+        }
+        state.importBatch = { kind: 'notes', items: notes };
+        renderView();
+        showToast('Review the import, then press Import.');
+        return;
+    }
+
+    // Reorder: #reorder=<percent-encoded JSON array of note titles>
+    if (raw.startsWith('reorder=')) {
+        history.replaceState(null, '', location.pathname);
+        let order = null;
+        try { order = JSON.parse(decodeURIComponent(raw.slice(8))); } catch (e) { /* invalid */ }
+        if (!Array.isArray(order) || order.length === 0) {
+            showToast('Reorder link could not be decoded.');
+            return;
+        }
+        state.importBatch = { kind: 'reorder', order: order.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim()) };
+        renderView();
+        showToast('Review the new order, then press Apply.');
+        return;
+    }
+
     if (!raw.startsWith('note=')) return;
     history.replaceState(null, '', location.pathname); // consume: refresh must not re-import
 
@@ -535,6 +574,7 @@ function renderNotesSection(root) {
             }
         }
         if (state.editingNewNote || note) {
+            section.classList.add('detail-open');
             renderNoteDetail(section, parent, note);
             root.appendChild(section);
             return;
@@ -571,6 +611,10 @@ function renderNotesSection(root) {
     });
     header.appendChild(newBtn);
     section.appendChild(header);
+
+    if (state.importBatch) {
+        section.appendChild(renderImportBlock());
+    }
 
     if (state.proposals.length > 0) {
         section.appendChild(renderProposalsBlock());
@@ -692,12 +736,19 @@ function renderProposalsBlock() {
     block.appendChild(heading);
 
     for (const p of state.proposals) {
-        const snippet = (p.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        let title = p.title;
+        let snippet = (p.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        if (p.kind === 'reorder') {
+            title = '🔀 Reorder notes';
+            let order = [];
+            try { order = JSON.parse(p.content); } catch (e) { /* corrupt */ }
+            snippet = order.join(' → ');
+        }
         const item = document.createElement('div');
         item.className = 'proposal';
         item.innerHTML = `
             <div class="proposal-text">
-                <span class="title">${escapeHtml(p.title)}${p.notebook ? ` <span class="notebook-badge">📓 ${escapeHtml(p.notebook)}</span>` : ''}</span>
+                <span class="title">${escapeHtml(title)}${p.notebook ? ` <span class="notebook-badge">📓 ${escapeHtml(p.notebook)}</span>` : ''}</span>
                 ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
             </div>
             <div class="proposal-actions">
@@ -718,8 +769,8 @@ async function resolveProposal(p, approve) {
         await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
         setStatus('');
         if (approve) {
-            showToast(`Note "${p.title}" added.`);
-            await pullSnapshot(); // server applied the note — pull it down
+            showToast(p.kind === 'reorder' ? 'New order applied.' : `Note "${p.title}" added.`);
+            await pullSnapshot(); // server applied the change — pull it down
         } else {
             showToast('Proposal rejected.');
         }
@@ -729,6 +780,112 @@ async function resolveProposal(p, approve) {
         setStatus('');
         alert('Action failed: ' + e.message);
     }
+}
+
+// --- Import links (#notes / #reorder): review block in the notes section ---
+function renderImportBlock() {
+    const batch = state.importBatch;
+    const block = document.createElement('div');
+    block.className = 'proposals import-batch';
+    const heading = document.createElement('div');
+    heading.className = 'proposals-title';
+    heading.textContent = batch.kind === 'reorder'
+        ? `📥 Review new order (${batch.order.length} notes)`
+        : `📥 Review import (${batch.items.length} note${batch.items.length > 1 ? 's' : ''})`;
+    block.appendChild(heading);
+
+    const list = document.createElement('div');
+    list.className = 'import-list';
+    if (batch.kind === 'reorder') {
+        list.innerHTML = batch.order
+            .map((t, i) => `<div class="import-item">${i + 1}. ${escapeHtml(t)}</div>`)
+            .join('');
+    } else {
+        list.innerHTML = batch.items.map(it => {
+            const m = it.content.match(/^#\s+(.+?)\s*$/m);
+            const t = m ? m[1].trim() : 'Untitled';
+            return `<div class="import-item">📝 ${escapeHtml(t)}${it.notebook ? ` <span class="notebook-badge">📓 ${escapeHtml(it.notebook)}</span>` : ''}</div>`;
+        }).join('');
+    }
+    block.appendChild(list);
+
+    const actions = document.createElement('div');
+    actions.className = 'proposal-actions import-actions';
+    const okBtn = document.createElement('button');
+    okBtn.className = 'primary';
+    okBtn.textContent = batch.kind === 'reorder' ? 'Apply order' : 'Import';
+    okBtn.addEventListener('click', applyImportBatch);
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Discard';
+    cancelBtn.addEventListener('click', () => { state.importBatch = null; renderView(); });
+    actions.appendChild(okBtn);
+    actions.appendChild(cancelBtn);
+    block.appendChild(actions);
+    return block;
+}
+
+async function applyImportBatch() {
+    const batch = state.importBatch;
+    if (!batch) return;
+    const found = await ensureNotesFolder();
+    if (!found) return;
+    const now = new Date().toISOString();
+
+    if (batch.kind === 'reorder') {
+        applyNoteOrder(found.node, batch.order);
+    } else {
+        for (const it of batch.items) {
+            let parent = found.node;
+            if (it.notebook) {
+                parent = (found.node.children || []).find(c =>
+                    (c.type === 'folder' || c.type === 'root') && c.title === it.notebook);
+                if (!parent) {
+                    parent = { type: 'folder', title: it.notebook, children: [] };
+                    assignIds(parent);
+                    found.node.children = found.node.children || [];
+                    found.node.children.push(parent);
+                }
+            }
+            const m = it.content.match(/^#\s+(.+?)\s*$/m);
+            const title = (m ? m[1].trim() : '') || 'Untitled';
+            const note = { type: 'bookmark', title, url: encodeNoteUrl({ content: it.content, createdAt: now, updatedAt: now }) };
+            assignIds(note);
+            parent.children = parent.children || [];
+            parent.children.push(note);
+        }
+    }
+
+    state.importBatch = null;
+    state.dirty = true;
+    try {
+        setStatus('Saving…');
+        await pushSnapshot();
+        showToast(batch.kind === 'reorder'
+            ? 'Notes reordered.'
+            : `Imported ${batch.items.length} note${batch.items.length > 1 ? 's' : ''}.`);
+        setStatus('');
+    } catch (e) {
+        alert('Import failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
+        setStatus('');
+    }
+    renderView();
+}
+
+// Sort note children in every folder under the notes root to match the given
+// list of titles; unlisted notes keep their relative order at the end.
+function applyNoteOrder(notesRoot, order) {
+    const idx = new Map(order.map((t, i) => [t, i]));
+    const rank = (n) => (idx.has(n.title) ? idx.get(n.title) : Infinity);
+    const sortFolder = (folder) => {
+        const kids = folder.children || [];
+        const sortedNotes = kids.filter(isNoteBookmark).sort((a, b) => rank(a) - rank(b));
+        let ni = 0;
+        folder.children = kids.map(c => isNoteBookmark(c) ? sortedNotes[ni++] : c);
+        for (const c of folder.children) {
+            if (c && (c.type === 'folder' || c.type === 'root')) sortFolder(c);
+        }
+    };
+    sortFolder(notesRoot);
 }
 
 function renderNotesView(container, folder) {
@@ -818,7 +975,7 @@ function renderNoteDetail(container, folder, note) {
             <div id="note-preview" class="hidden"></div>
             <div class="note-actions">
                 <button id="note-save-btn" class="primary">Save</button>
-                <button id="note-back-btn">Back</button>
+                <button id="note-back-btn">← Notes</button>
                 ${note ? '<select id="note-move-select" class="note-move" title="Move to notebook"></select>' : ''}
                 ${note ? '<button id="note-delete-btn" class="danger">Delete</button>' : ''}
             </div>
@@ -829,6 +986,14 @@ function renderNoteDetail(container, folder, note) {
     const previewEl = container.querySelector('#note-preview');
     const editModeBtn = container.querySelector('#note-mode-edit');
     const previewModeBtn = container.querySelector('#note-mode-preview');
+
+    // Grow the editor with the content — a note page, not a fixed input box.
+    const autogrow = () => {
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.max(textarea.scrollHeight, Math.round(window.innerHeight * 0.5)) + 'px';
+    };
+    textarea.addEventListener('input', autogrow);
+    autogrow();
 
     // Title comes from the first "# " heading; falls back to the stored title.
     function currentTitle() {
@@ -877,6 +1042,9 @@ function renderNoteDetail(container, folder, note) {
         const link = e.target.closest('.note-wikilink');
         if (link && link.dataset.target) openNoteByTitle(link.dataset.target);
     });
+
+    // Existing notes open in reading mode (like a note app); new notes in edit mode.
+    if (note) setMode(true);
 
     container.querySelector('#note-back-btn').addEventListener('click', () => {
         state.openNoteId = null;
@@ -959,6 +1127,9 @@ function renderNoteDetail(container, folder, note) {
             await pushSnapshot();
             showToast('Note saved.');
             setStatus('');
+            // Back to the notes list after a successful save.
+            state.openNoteId = null;
+            state.editingNewNote = false;
         } catch (e) {
             alert('Save failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
             setStatus('');
@@ -1199,14 +1370,33 @@ async function checkUnfiledLinks(skipClipboardScan = false) {
     }
 
     activeQuickFileItems = unfiled;
+    updateClipBtnBadge();
+    // Never auto-open the sheet — the 📋 button badge shows the count instead.
     const sheet = $('quick-file-sheet');
     const isOpen = sheet && !sheet.classList.contains('hidden');
-    if (activeQuickFileItems.length > 0 || isOpen) {
+    if (isOpen) {
         renderQuickFileSheet();
     }
 }
 
+function updateClipBtnBadge() {
+    const btn = $('clipBtn');
+    if (!btn) return;
+    const n = activeQuickFileItems.length;
+    btn.classList.toggle('has-items', n > 0);
+    btn.textContent = n > 0 ? `📋 ${n}` : '📋';
+    btn.title = n > 0
+        ? `${n} unfiled link${n > 1 ? 's' : ''} — tap to review`
+        : 'Scan clipboard for unfiled links';
+}
+
+function openQuickFileSheet() {
+    renderQuickFileSheet();
+    show($('quick-file-sheet'));
+}
+
 function renderQuickFileSheet() {
+    updateClipBtnBadge();
     const sheet = $('quick-file-sheet');
     const list = $('quick-file-list');
     const hint = $('quick-file-hint');
@@ -1314,8 +1504,6 @@ function renderQuickFileSheet() {
             list.appendChild(row);
         });
     }
-
-    show(sheet);
 }
 
 // --- Share Target API ---
@@ -1370,7 +1558,7 @@ window.addEventListener('DOMContentLoaded', () => {
         // This satisfies WebKit's strict security engine in standalone mobile PWAs.
         if (!navigator.clipboard || !navigator.clipboard.readText) {
             showToast('Clipboard API not supported. Paste manually below.');
-            renderQuickFileSheet();
+            openQuickFileSheet();
             $('quick-file-paste-input').focus();
             return;
         }
@@ -1380,7 +1568,7 @@ window.addEventListener('DOMContentLoaded', () => {
             text = await navigator.clipboard.readText();
         } catch (e) {
             showToast('Clipboard access denied. Paste manually below.');
-            renderQuickFileSheet();
+            openQuickFileSheet();
             $('quick-file-paste-input').focus();
             console.warn(e);
             return;
@@ -1389,7 +1577,7 @@ window.addEventListener('DOMContentLoaded', () => {
         const trimmed = (text || '').trim();
         if (!trimmed || !/^https?:\/\/\S+$/.test(trimmed)) {
             showToast('No URL in clipboard. Paste manually below.');
-            renderQuickFileSheet();
+            openQuickFileSheet();
             $('quick-file-paste-input').focus();
             return;
         }
@@ -1413,7 +1601,7 @@ window.addEventListener('DOMContentLoaded', () => {
         const normTrimmed = normalizeUrl(trimmed);
         if (isUrlInSnapshot(trimmed, state.snapshot)) {
             showToast('Link is already filed in your bookmarks.');
-            renderQuickFileSheet();
+            openQuickFileSheet();
             $('quick-file-paste-input').focus();
             return;
         }
@@ -1423,7 +1611,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
         if (dismissedSet.has(normTrimmed)) {
             showToast('Previously skipped clipboard link. Paste manually if desired.');
-            renderQuickFileSheet();
+            openQuickFileSheet();
             $('quick-file-paste-input').focus();
             return;
         }
@@ -1440,6 +1628,7 @@ window.addEventListener('DOMContentLoaded', () => {
         } else {
             showToast('Showing unfiled links bottom sheet.');
         }
+        openQuickFileSheet();
         $('quick-file-paste-input').focus();
     });
 

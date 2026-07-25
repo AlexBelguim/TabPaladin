@@ -41,6 +41,11 @@ button.primary { background: var(--primary); }
 button.primary:hover { background: var(--primary-hover); }
 button.ghost { background: transparent; padding: 6px 10px; }
 button.ghost:hover { background: rgba(255,255,255,0.05); }
+button.ghost.has-items {
+  color: #60a5fa;
+  font-weight: 700;
+  background: rgba(59, 130, 246, 0.15);
+}
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 input[type="url"], input[type="password"], input[type="text"] {
@@ -281,24 +286,45 @@ button.ghost.dirty {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
 }
 
+/* Full-bleed black reading page when a note is open (like a minimal note app) */
+.notes-section.detail-open {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 4px;
+}
+
+.notes-section.detail-open .note-detail {
+  max-width: none;
+  background: #000;
+  margin: 0 -16px;
+  padding: 20px 20px 80px;
+  min-height: 78vh;
+  border-radius: 0;
+}
+
+/* Note-app look: the editor is a page, not an input box */
 .note-detail textarea {
   width: 100%;
-  padding: 10px 12px;
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  padding: 4px 2px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   color: var(--text);
-  font-size: inherit;
+  font-size: 1.05rem;
   font-family: inherit;
-  line-height: 1.5;
-  resize: vertical;
+  line-height: 1.8;
+  resize: none;
+  min-height: 50vh;
 }
 
 .note-detail textarea:focus {
   outline: none;
-  border-color: var(--primary);
+  border: none;
 }
 
 .note-actions {
@@ -311,16 +337,20 @@ button.ghost.dirty {
 
 /* --- Notes section (root view) --- */
 .notes-section {
-  margin-top: 22px;
+  margin-top: 24px;
   border-top: 1px solid var(--border);
-  padding-top: 6px;
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .notes-section-header {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
-  margin: 8px 0 10px;
+  margin: 0 0 4px;
 }
 
 .notes-section-header h2 {
@@ -395,6 +425,23 @@ button.ghost.dirty {
   padding: 5px 10px;
 }
 
+.import-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border-top: 1px solid rgba(245, 158, 11, 0.2);
+  padding-top: 6px;
+}
+
+.import-item {
+  font-size: 0.84rem;
+  padding: 3px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.import-actions { margin-top: 10px; }
+
 /* --- Obsidian-style editor: edit/preview toggle + preview --- */
 .note-edit-toggle {
   display: flex;
@@ -416,18 +463,16 @@ button.ghost.dirty {
 }
 
 .note-preview-body {
-  padding: 12px 14px;
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  line-height: 1.6;
-  min-height: 280px;
+  padding: 4px 2px;
+  font-size: 1.05rem;
+  line-height: 1.8;
+  min-height: 50vh;
   overflow-wrap: anywhere;
 }
 
-.note-preview-body h1 { font-size: 1.35rem; margin: 0.3em 0 0.4em; }
-.note-preview-body h2 { font-size: 1.15rem; margin: 0.8em 0 0.3em; }
-.note-preview-body h3 { font-size: 1rem; margin: 0.8em 0 0.3em; }
+.note-preview-body h1 { font-size: 1.75rem; font-weight: 700; margin: 0.1em 0 0.5em; }
+.note-preview-body h2 { font-size: 1.3rem; font-weight: 700; margin: 0.9em 0 0.3em; }
+.note-preview-body h3 { font-size: 1.1rem; font-weight: 600; margin: 0.9em 0 0.3em; }
 
 .note-wikilink {
   color: var(--primary);
@@ -452,10 +497,11 @@ button.ghost.dirty {
 .notebook {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 10px;
-  padding: 4px 10px 8px;
+  padding: 4px 10px 10px;
   background: rgba(255, 255, 255, 0.02);
 }
+
+.notebook .row.note { margin-top: 6px; }
 
 .notebook summary {
   cursor: pointer;

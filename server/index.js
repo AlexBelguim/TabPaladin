@@ -55,6 +55,7 @@ db.exec(`
 
 // Migrations for existing databases.
 try { db.prepare('ALTER TABLE note_proposals ADD COLUMN notebook TEXT').run(); } catch (e) { /* column already exists */ }
+try { db.prepare("ALTER TABLE note_proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'").run(); } catch (e) { /* column already exists */ }
 
 const app = express();
 app.set('trust proxy', true); // so req.protocol reflects X-Forwarded-Proto behind a reverse proxy
@@ -206,6 +207,23 @@ function collectNotes(folder, notebook, out = []) {
     return out;
 }
 
+// Sort note children in every folder under (and including) the notes root to
+// match the given list of titles; unlisted notes keep their relative order last.
+function applyNoteOrder(notesRoot, order) {
+    const idx = new Map(order.map((t, i) => [t, i]));
+    const rank = (n) => (idx.has(n.title) ? idx.get(n.title) : Infinity);
+    const sortFolder = (folder) => {
+        const kids = folder.children || [];
+        const sortedNotes = kids.filter(isNoteBookmark).sort((a, b) => rank(a) - rank(b));
+        let ni = 0;
+        folder.children = kids.map(c => isNoteBookmark(c) ? sortedNotes[ni++] : c);
+        for (const c of folder.children) {
+            if (c && (c.type === 'folder' || c.type === 'root')) sortFolder(c);
+        }
+    };
+    sortFolder(notesRoot);
+}
+
 function getValidShareToken(req, res) {
     const row = db.prepare('SELECT token, expires_at FROM share_tokens WHERE token = ?').get(req.params.token);
     if (!row || Date.parse(row.expires_at) <= Date.now()) {
@@ -254,9 +272,12 @@ app.get('/llm/:token', (req, res) => {
     md += `     - "title": max 200 chars. "content": max 100 KB, start it with a \`# <title>\` heading line.\n`;
     md += `     - If a note with the same title already exists, the proposal REPLACES its content upon approval — include the full new content, not a diff.\n`;
     md += `  3. After posting, tell the user the note is waiting for their approval in the TabPaladin app. NEVER claim a note was saved or changed before the user approves it there.\n`;
-    md += `- If your tools cannot send POST requests, give the user a clickable review link instead. Format:\n`;
-    md += `  ${origin}/#note=<the full note markdown, percent-encoded>\n`;
-    md += `  - Start the markdown with a \`# <title>\` heading. Percent-encode AT MINIMUM: % as %25, newline as %0A, space as %20, & as %26, # as %23, ? as %3F.\n`;
+    md += `- To REORDER existing notes, POST to the same URL: {"action": "reorder", "order": ["Title 1", "Title 2", "..."]} — every note title in the desired order (per notebook and for loose notes). Also requires user approval.\n`;
+    md += `- If your tools cannot send POST requests, give the user a clickable review link instead. Formats:\n`;
+    md += `  - One note: ${origin}/#note=<the full note markdown, percent-encoded>\n`;
+    md += `  - Multiple notes at once: ${origin}/#notes=<percent-encoded JSON array like [{"content":"# Title\\n\\nbody","notebook":"optional"},...]>\n`;
+    md += `  - Reorder notes: ${origin}/#reorder=<percent-encoded JSON array of note titles, e.g. ["Title 1","Title 2"]>\n`;
+    md += `  - Start each note's markdown with a \`# <title>\` heading. Percent-encode AT MINIMUM: % as %25, newline as %0A, space as %20, & as %26, # as %23, ? as %3F.\n`;
     md += `  - Optionally append &notebook=<name> (also percent-encoded) to file the note in a notebook.\n`;
     md += `  - Example: ${origin}/#note=%23%20Shopping%0A%0A-%20milk&notebook=Recipes\n`;
     md += `  - The link opens a review screen in the user's app; nothing is saved until they press Save. Present it as a clickable markdown link like [Review and save this note](URL).\n\n`;
@@ -276,7 +297,23 @@ app.get('/llm/:token', (req, res) => {
 
 function handleProposal(req, res) {
     if (!getValidShareToken(req, res)) return;
-    const { title, content, notebook } = req.body || {};
+    const { title, content, notebook, action, order } = req.body || {};
+
+    // Reorder proposal: {"action":"reorder","order":["Title 1","Title 2",...]}
+    if (action === 'reorder') {
+        if (!Array.isArray(order) || order.length === 0 || order.length > 500
+            || !order.every(t => typeof t === 'string' && t.trim() && t.length <= 200)) {
+            return res.status(400).json({ error: 'Invalid "order" (array of 1-500 note titles).' });
+        }
+        db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+            .run('Reorder notes', JSON.stringify(order.map(t => t.trim())), null, 'reorder', new Date().toISOString());
+        return res.json({
+            ok: true,
+            status: 'pending_approval',
+            message: 'Reorder proposal stored. It only applies after the user approves it in the TabPaladin app — tell them it is waiting for approval.'
+        });
+    }
+
     if (typeof title !== 'string' || !title.trim() || title.length > 200) {
         return res.status(400).json({ error: 'Missing or invalid "title" (non-empty string, max 200 chars).' });
     }
@@ -286,8 +323,8 @@ function handleProposal(req, res) {
     if (notebook != null && (typeof notebook !== 'string' || !notebook.trim() || notebook.length > 100)) {
         return res.status(400).json({ error: 'Invalid "notebook" (string, max 100 chars).' });
     }
-    db.prepare('INSERT INTO note_proposals (title, content, notebook, created_at) VALUES (?, ?, ?, ?)')
-        .run(title.trim(), content, notebook ? notebook.trim() : null, new Date().toISOString());
+    db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(title.trim(), content, notebook ? notebook.trim() : null, 'note', new Date().toISOString());
     res.json({
         ok: true,
         status: 'pending_approval',
@@ -301,12 +338,12 @@ app.post('/llm/:token', express.json({ limit: '1mb' }), handleProposal);
 
 // --- Note proposals (auth, consumed by the PWA) ---
 app.get('/api/proposals', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, title, content, notebook, created_at FROM note_proposals ORDER BY created_at DESC').all();
+    const rows = db.prepare('SELECT id, title, content, notebook, kind, created_at FROM note_proposals ORDER BY created_at DESC').all();
     res.json({ ok: true, proposals: rows });
 });
 
 app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
-    const prop = db.prepare('SELECT id, title, content, notebook FROM note_proposals WHERE id = ?').get(req.params.id);
+    const prop = db.prepare('SELECT id, title, content, notebook, kind FROM note_proposals WHERE id = ?').get(req.params.id);
     if (!prop) return res.status(404).json({ error: 'Proposal not found' });
     const snapshot = latestSnapshot();
     if (!snapshot) return res.status(409).json({ error: 'No snapshot on server yet.' });
@@ -322,26 +359,34 @@ app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
         parent.children.push(folder);
     }
 
-    // File into the requested notebook (subfolder), creating it if missing.
-    let target = folder;
-    if (prop.notebook) {
-        target = (folder.children || []).find(c => (c.type === 'folder' || c.type === 'root') && c.title === prop.notebook);
-        if (!target) {
-            target = { type: 'folder', title: prop.notebook, children: [] };
-            folder.children = folder.children || [];
-            folder.children.push(target);
-        }
-    }
-
     const now = new Date().toISOString();
-    const existing = (target.children || []).find(c => isNoteBookmark(c) && c.title === prop.title)
-        || collectNotes(folder, null).find(e => e.bookmark.title === prop.title)?.bookmark;
-    if (existing) {
-        const meta = decodeNote(existing);
-        existing.url = encodeNoteUrl({ content: prop.content, createdAt: meta.createdAt || now, updatedAt: now });
+
+    if (prop.kind === 'reorder') {
+        let order = null;
+        try { order = JSON.parse(prop.content); } catch (e) { /* corrupt */ }
+        if (!Array.isArray(order)) return res.status(400).json({ error: 'Corrupt reorder proposal.' });
+        applyNoteOrder(folder, order);
     } else {
-        target.children = target.children || [];
-        target.children.push({ type: 'bookmark', title: prop.title, url: encodeNoteUrl({ content: prop.content, createdAt: now, updatedAt: now }) });
+        // File into the requested notebook (subfolder), creating it if missing.
+        let target = folder;
+        if (prop.notebook) {
+            target = (folder.children || []).find(c => (c.type === 'folder' || c.type === 'root') && c.title === prop.notebook);
+            if (!target) {
+                target = { type: 'folder', title: prop.notebook, children: [] };
+                folder.children = folder.children || [];
+                folder.children.push(target);
+            }
+        }
+
+        const existing = (target.children || []).find(c => isNoteBookmark(c) && c.title === prop.title)
+            || collectNotes(folder, null).find(e => e.bookmark.title === prop.title)?.bookmark;
+        if (existing) {
+            const meta = decodeNote(existing);
+            existing.url = encodeNoteUrl({ content: prop.content, createdAt: meta.createdAt || now, updatedAt: now });
+        } else {
+            target.children = target.children || [];
+            target.children.push({ type: 'bookmark', title: prop.title, url: encodeNoteUrl({ content: prop.content, createdAt: now, updatedAt: now }) });
+        }
     }
 
     // Store as a new snapshot so history keeps the pre-approval state.
