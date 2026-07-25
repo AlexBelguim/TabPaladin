@@ -16,7 +16,9 @@ const state = {
     inbox: [],                // [{id, url, title}]
     dirty: false,             // unsaved local edits to the snapshot
     openNoteId: null,         // _pwaId of the note open in the detail view
-    editingNewNote: false     // detail view is editing a not-yet-created note
+    editingNewNote: false,    // detail view is editing a not-yet-created note
+    newNotePrefill: null,     // optional pre-filled content for a new note (e.g. from a wikilink)
+    proposals: []             // pending LLM note proposals awaiting approval
 };
 
 const $ = (id) => document.getElementById(id);
@@ -113,6 +115,7 @@ async function bootstrap() {
     }
     await pullSnapshot();
     await refreshInbox();
+    await refreshProposals();
     await checkUnfiledLinks();
 }
 
@@ -142,6 +145,15 @@ async function refreshInbox() {
         updateInboxFab();
     } catch (e) {
         console.warn('Inbox fetch failed', e);
+    }
+}
+
+async function refreshProposals() {
+    try {
+        const data = await api('/api/proposals');
+        state.proposals = data.proposals || [];
+    } catch (e) {
+        console.warn('Proposals fetch failed', e);
     }
 }
 
@@ -237,15 +249,22 @@ function renderContent() {
         return;
     }
     const children = node.children || [];
-    if (children.length === 0) {
+    // The notes folder is never shown among the bookmarks — notes live in their
+    // own section on the root view instead.
+    const folders = children.filter(c => (c.type === 'folder' || c.type === 'root') && !isNotesFolder(c));
+    const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && c.title !== '__tabpaladin_meta__');
+
+    if (folders.length === 0 && bookmarks.length === 0 && state.pathIds.length > 1) {
         root.innerHTML = '<div class="empty">Empty folder.</div>';
         return;
     }
-    const folders = children.filter(c => c.type === 'folder' || c.type === 'root');
-    const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && c.title !== '__tabpaladin_meta__');
 
     folders.forEach(f => root.appendChild(renderFolderRow(f)));
     bookmarks.forEach(b => root.appendChild(renderBookmarkRow(b)));
+
+    if (state.pathIds.length === 1) {
+        renderNotesSection(root);
+    }
 }
 
 function renderFolderRow(folder) {
@@ -337,6 +356,187 @@ function rewriteWikiLink(content, oldTitle, newTitle) {
     return content.replace(new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`, 'g'), `[[${newTitle}]]`);
 }
 
+// Locate the notes folder, offering to create + push it if missing.
+// Returns { node, path } or null.
+async function ensureNotesFolder() {
+    if (!configured()) {
+        showToast('Please open settings (⚙) first.');
+        return null;
+    }
+    if (!state.snapshot) {
+        showToast('Loading snapshot first…');
+        try {
+            await pullSnapshot();
+        } catch (err) {
+            showToast('Failed to pull snapshot: ' + err.message);
+            return null;
+        }
+    }
+    if (!state.snapshot) return null;
+
+    const existing = findNotesFolderWithPath();
+    if (existing) return existing;
+
+    if (!confirm('No "TabPaladin Notes" folder in the synced snapshot yet. Create it?')) return null;
+    // Put it under the "Other Bookmarks" equivalent, falling back to the last root.
+    const roots = state.snapshot.children || [];
+    const parent = roots.find(r => /other|unfiled/i.test(r.title || '')) || roots[roots.length - 1];
+    if (!parent) { showToast('No root folder available.'); return null; }
+    const folder = { type: 'folder', title: NOTES_ROOT_TITLE, children: [] };
+    assignIds(folder);
+    parent.children = parent.children || [];
+    parent.children.push(folder);
+    state.dirty = true;
+    try {
+        setStatus('Creating notes folder…');
+        await pushSnapshot();
+        setStatus('');
+    } catch (err) {
+        alert('Failed to create notes folder: ' + err.message);
+        setStatus('');
+        return null;
+    }
+    return { node: folder, path: [state.snapshot._pwaId, parent._pwaId, folder._pwaId] };
+}
+
+function buildNoteRow(note, onOpen) {
+    const meta = decodeNote(note);
+    const snippet = meta.content.replace(/\s+/g, ' ').trim().slice(0, 80);
+    const row = document.createElement('div');
+    row.className = 'row note';
+    row.innerHTML = `
+        <span class="icon">📝</span>
+        <div class="note-row-text">
+            <span class="title">${escapeHtml(note.title || 'Untitled')}</span>
+            ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
+        </div>
+    `;
+    row.addEventListener('click', onOpen);
+    return row;
+}
+
+// --- Notes section (root view): notes live under the bookmarks, not in the tree ---
+function renderNotesSection(root) {
+    const section = document.createElement('div');
+    section.className = 'notes-section';
+    section.id = 'notes-section';
+
+    const header = document.createElement('div');
+    header.className = 'notes-section-header';
+    const title = document.createElement('h2');
+    title.textContent = '📝 Notes';
+    header.appendChild(title);
+
+    const shareBtn = document.createElement('button');
+    shareBtn.textContent = '🔗 Share with LLM';
+    shareBtn.title = 'Create a 1-hour link with your notes + instructions to paste into any LLM chat';
+    shareBtn.addEventListener('click', createShareLink);
+    header.appendChild(shareBtn);
+
+    const newBtn = document.createElement('button');
+    newBtn.textContent = '+ New Note';
+    newBtn.addEventListener('click', async () => {
+        const found = await ensureNotesFolder();
+        if (!found) return;
+        state.pathIds = found.path;
+        state.openNoteId = null;
+        state.editingNewNote = true;
+        renderView();
+    });
+    header.appendChild(newBtn);
+    section.appendChild(header);
+
+    if (state.proposals.length > 0) {
+        section.appendChild(renderProposalsBlock());
+    }
+
+    const found = findNotesFolderWithPath();
+    const notes = found ? (found.node.children || []).filter(isNoteBookmark) : [];
+    if (notes.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No notes yet.';
+        section.appendChild(empty);
+    } else {
+        for (const note of notes) {
+            section.appendChild(buildNoteRow(note, () => {
+                state.pathIds = found.path;
+                state.openNoteId = note._pwaId;
+                state.editingNewNote = false;
+                renderView();
+            }));
+        }
+    }
+    root.appendChild(section);
+}
+
+// --- LLM share link ---
+async function createShareLink() {
+    try {
+        setStatus('Creating share link…');
+        const data = await api('/api/share', { method: 'POST' });
+        setStatus('');
+        try {
+            await navigator.clipboard.writeText(data.url);
+            showToast('Link copied — expires in 1 hour.');
+        } catch (e) {
+            window.prompt('Copy this link (expires in 1 hour):', data.url);
+        }
+    } catch (e) {
+        setStatus('');
+        alert('Failed to create share link: ' + e.message);
+    }
+}
+
+// --- Pending LLM note proposals ---
+function renderProposalsBlock() {
+    const block = document.createElement('div');
+    block.className = 'proposals';
+    const heading = document.createElement('div');
+    heading.className = 'proposals-title';
+    heading.textContent = `⏳ Pending approval (${state.proposals.length})`;
+    block.appendChild(heading);
+
+    for (const p of state.proposals) {
+        const snippet = (p.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const item = document.createElement('div');
+        item.className = 'proposal';
+        item.innerHTML = `
+            <div class="proposal-text">
+                <span class="title">${escapeHtml(p.title)}</span>
+                ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
+            </div>
+            <div class="proposal-actions">
+                <button class="primary proposal-approve">Approve</button>
+                <button class="proposal-reject">Reject</button>
+            </div>
+        `;
+        item.querySelector('.proposal-approve').addEventListener('click', () => resolveProposal(p, true));
+        item.querySelector('.proposal-reject').addEventListener('click', () => resolveProposal(p, false));
+        block.appendChild(item);
+    }
+    return block;
+}
+
+async function resolveProposal(p, approve) {
+    try {
+        setStatus(approve ? 'Approving…' : 'Rejecting…');
+        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+        setStatus('');
+        if (approve) {
+            showToast(`Note "${p.title}" added.`);
+            await pullSnapshot(); // server applied the note — pull it down
+        } else {
+            showToast('Proposal rejected.');
+        }
+        await refreshProposals();
+        renderView();
+    } catch (e) {
+        setStatus('');
+        alert('Action failed: ' + e.message);
+    }
+}
+
 function renderNotesView(container, folder) {
     // Detail view (existing note or a new one being composed)
     if (state.editingNewNote || state.openNoteId) {
@@ -372,34 +572,55 @@ function renderNotesView(container, folder) {
         return;
     }
     for (const note of notes) {
-        const meta = decodeNote(note);
-        const snippet = meta.content.replace(/\s+/g, ' ').trim().slice(0, 80);
-        const row = document.createElement('div');
-        row.className = 'row note';
-        row.innerHTML = `
-            <span class="icon">📝</span>
-            <div class="note-row-text">
-                <span class="title">${escapeHtml(note.title || 'Untitled')}</span>
-                ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
-            </div>
-        `;
-        row.addEventListener('click', () => {
+        container.appendChild(buildNoteRow(note, () => {
             state.openNoteId = note._pwaId;
             state.editingNewNote = false;
             renderView();
-        });
-        container.appendChild(row);
+        }));
     }
 }
 
+// Render note content as safe HTML: # headings, **bold**, *italic*,
+// [[wiki-links]] as clickable chips, bare URLs as links. Everything else is
+// escaped text. Zero-dependency, mirrors the extension sidepanel renderer.
+function renderNotePreviewHtml(content) {
+    let html = escapeHtml(content);
+    html = html.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+    html = html.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
+        `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
+    html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
+        `<a href="$1" class="note-urllink" target="_blank" rel="noopener">$1</a>`);
+    return html.replace(/\n/g, '<br>');
+}
+
+// Notes whose content links to [[title]] (excluding the note itself).
+function getNoteBacklinks(folder, title, excludeId) {
+    if (!title) return [];
+    const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`);
+    return (folder.children || []).filter(c =>
+        isNoteBookmark(c) && c._pwaId !== excludeId && re.test(decodeNote(c).content));
+}
+
+// Obsidian-style: one editor for the whole note; the first "# " heading is the title.
 function renderNoteDetail(container, folder, note) {
-    const meta = note ? decodeNote(note) : { content: '', createdAt: null, updatedAt: null };
+    const meta = note
+        ? decodeNote(note)
+        : { content: state.newNotePrefill || '', createdAt: null, updatedAt: null };
+    state.newNotePrefill = null;
     container.innerHTML = `
         <div class="note-detail">
-            <input id="note-title-input" type="text" placeholder="Note title"
-                   value="${escapeAttr(note ? note.title || '' : '')}">
+            <div class="note-edit-toggle">
+                <button id="note-mode-edit" class="active">Edit</button>
+                <button id="note-mode-preview">Preview</button>
+            </div>
             <textarea id="note-body-input" rows="14"
-                      placeholder="Write here… Link notes with [[Note Title]].">${escapeHtml(meta.content)}</textarea>
+                      placeholder="# Note title&#10;&#10;Write here… Link notes with [[Note Title]].">${escapeHtml(meta.content)}</textarea>
+            <div id="note-preview" class="hidden"></div>
             <div class="note-actions">
                 <button id="note-save-btn" class="primary">Save</button>
                 <button id="note-back-btn">Back</button>
@@ -408,6 +629,58 @@ function renderNoteDetail(container, folder, note) {
         </div>
     `;
 
+    const textarea = container.querySelector('#note-body-input');
+    const previewEl = container.querySelector('#note-preview');
+    const editModeBtn = container.querySelector('#note-mode-edit');
+    const previewModeBtn = container.querySelector('#note-mode-preview');
+
+    // Title comes from the first "# " heading; falls back to the stored title.
+    function currentTitle() {
+        const m = textarea.value.match(/^#\s+(.+?)\s*$/m);
+        if (m) return m[1].trim();
+        return (note && note.title) || 'Untitled';
+    }
+
+    function openNoteByTitle(title) {
+        if (textarea.value !== meta.content && !confirm('Discard unsaved changes?')) return;
+        const target = (folder.children || []).find(c => isNoteBookmark(c) && c.title === title);
+        if (target) {
+            state.openNoteId = target._pwaId;
+            state.editingNewNote = false;
+        } else {
+            // A link to a missing note starts a new one, Obsidian-style.
+            state.openNoteId = null;
+            state.editingNewNote = true;
+            state.newNotePrefill = `# ${title}\n\n`;
+        }
+        renderView();
+    }
+
+    function setMode(preview) {
+        editModeBtn.classList.toggle('active', !preview);
+        previewModeBtn.classList.toggle('active', preview);
+        textarea.classList.toggle('hidden', preview);
+        previewEl.classList.toggle('hidden', !preview);
+        if (!preview) return;
+        const body = renderNotePreviewHtml(textarea.value);
+        let html = `<div class="note-preview-body">${body || '<span style="color:var(--muted);">Empty note.</span>'}</div>`;
+        const backlinks = getNoteBacklinks(folder, currentTitle(), note ? note._pwaId : null);
+        if (backlinks.length > 0) {
+            const items = backlinks.map(n =>
+                `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title)}</span>`
+            ).join(' ');
+            html += `<div class="note-backlinks"><span style="color:var(--muted);">Linked from:</span> ${items}</div>`;
+        }
+        previewEl.innerHTML = html;
+    }
+
+    editModeBtn.addEventListener('click', () => setMode(false));
+    previewModeBtn.addEventListener('click', () => setMode(true));
+    previewEl.addEventListener('click', (e) => {
+        const link = e.target.closest('.note-wikilink');
+        if (link && link.dataset.target) openNoteByTitle(link.dataset.target);
+    });
+
     container.querySelector('#note-back-btn').addEventListener('click', () => {
         state.openNoteId = null;
         state.editingNewNote = false;
@@ -415,8 +688,8 @@ function renderNoteDetail(container, folder, note) {
     });
 
     container.querySelector('#note-save-btn').addEventListener('click', async () => {
-        const title = container.querySelector('#note-title-input').value.trim() || 'Untitled';
-        const content = container.querySelector('#note-body-input').value;
+        const content = textarea.value;
+        const title = currentTitle();
         const now = new Date().toISOString();
         const oldTitle = note ? note.title : null;
 
@@ -1061,48 +1334,15 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('notesBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
-        if (!configured()) {
-            showToast('Please open settings (⚙) first.');
-            return;
-        }
-        if (!state.snapshot) {
-            showToast('Loading snapshot first…');
-            try {
-                await pullSnapshot();
-            } catch (err) {
-                showToast('Failed to pull snapshot: ' + err.message);
-                return;
-            }
-        }
-
-        let found = findNotesFolderWithPath();
-        if (!found) {
-            if (!confirm('No "TabPaladin Notes" folder in the synced snapshot yet. Create it?')) return;
-            // Put it under the "Other Bookmarks" equivalent, falling back to the last root.
-            const roots = state.snapshot.children || [];
-            const parent = roots.find(r => /other|unfiled/i.test(r.title || '')) || roots[roots.length - 1];
-            if (!parent) { showToast('No root folder available.'); return; }
-            const folder = { type: 'folder', title: NOTES_ROOT_TITLE, children: [] };
-            assignIds(folder);
-            parent.children = parent.children || [];
-            parent.children.push(folder);
-            state.dirty = true;
-            try {
-                setStatus('Creating notes folder…');
-                await pushSnapshot();
-                setStatus('');
-            } catch (err) {
-                alert('Failed to create notes folder: ' + err.message);
-                setStatus('');
-                return;
-            }
-            found = { node: folder, path: [state.snapshot._pwaId, parent._pwaId, folder._pwaId] };
-        }
-
-        state.pathIds = found.path;
+        const found = await ensureNotesFolder();
+        if (!found) return;
+        // Notes live in their own section on the root view — jump there.
+        state.pathIds = [state.snapshot._pwaId];
         state.openNoteId = null;
         state.editingNewNote = false;
         renderView();
+        const sec = document.getElementById('notes-section');
+        if (sec) sec.scrollIntoView({ behavior: 'smooth' });
     });
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));

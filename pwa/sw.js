@@ -1,5 +1,5 @@
 // Minimal service worker — caches the app shell, lets the network handle data.
-const SHELL_CACHE = 'tp-shell-v3';
+const SHELL_CACHE = 'tp-shell-v4';
 const SHELL = [
     '/',
     '/index.html',
@@ -25,8 +25,8 @@ self.addEventListener('fetch', (event) => {
     const req = event.request;
     if (req.method !== 'GET') return;
     const url = new URL(req.url);
-    // Never cache API calls — always go to network.
-    if (url.pathname.startsWith('/api/')) return;
+    // Never cache API calls or LLM share links — always go to network.
+    if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/llm/')) return;
     event.respondWith(
         caches.match(req).then(hit => hit || fetch(req).catch(() => caches.match('/index.html')))
     );

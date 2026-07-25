@@ -16,7 +16,7 @@ in the extension settings (Backend section) and you're synced.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/health`.
+All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -29,7 +29,25 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | POST | `/api/shared` | add `{ url, title? }` |
 | DELETE | `/api/shared/:id` | remove one inbox entry |
 | DELETE | `/api/shared` | clear inbox |
+| POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`) |
+| GET | `/api/proposals` | list pending LLM note proposals |
+| POST | `/api/proposals/:id/approve` | apply a proposal to the latest snapshot (new snapshot row) |
+| POST | `/api/proposals/:id/reject` | discard a proposal |
+| GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
+| POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content }` for approval |
 | GET | `/` (and other paths) | serves the PWA |
+
+## LLM share links
+
+The PWA's "🔗 Share with LLM" button calls `POST /api/share` and copies a link
+like `https://<host>/llm/<token>`. Paste it into any LLM chat with web access:
+the LLM can read all notes plus instructions (note styling, `[[wikilinks]]`, and
+that it must **never edit directly** — it can only `POST .../propose`). The
+proposal lands in the PWA's *Pending approval* block; approving applies it to
+the snapshot (creating or replacing the note with that title).
+
+Links expire after 1 hour by default; override with `SHARE_TTL_MINUTES`.
+Unauthenticated routes expose only the notes folder, never the full snapshot.
 
 ## TLS
 
