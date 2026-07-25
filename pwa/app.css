@@ -447,3 +447,68 @@ button.ghost.dirty {
   border-top: 1px solid var(--border);
   font-size: 0.8rem;
 }
+
+/* --- Notebooks (note groups) --- */
+.notebook {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 10px;
+  padding: 4px 10px 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.notebook summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  list-style: none;
+}
+
+.notebook summary::-webkit-details-marker { display: none; }
+
+.notebook summary::before {
+  content: '▸';
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+
+.notebook[open] summary::before { transform: rotate(90deg); }
+
+.notebook summary .notebook-name { flex: 1; }
+
+.notebook summary .count {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.notebook .notebook-add {
+  font-size: 0.74rem;
+  padding: 4px 10px;
+  margin: 2px 0 8px;
+  color: var(--muted);
+}
+
+.notebook-badge {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--primary);
+  background: rgba(59, 130, 246, 0.12);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+select.note-move {
+  background: var(--surface-2);
+  color: var(--text);
+  border: none;
+  border-radius: 8px;
+  padding: 8px 6px;
+  font-size: 0.78rem;
+  max-width: 130px;
+}

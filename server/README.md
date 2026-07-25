@@ -34,7 +34,7 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | POST | `/api/proposals/:id/approve` | apply a proposal to the latest snapshot (new snapshot row) |
 | POST | `/api/proposals/:id/reject` | discard a proposal |
 | GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
-| POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content }` for approval |
+| POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content, notebook? }` for approval |
 | GET | `/` (and other paths) | serves the PWA |
 
 ## LLM share links
@@ -48,6 +48,15 @@ the snapshot (creating or replacing the note with that title).
 
 Links expire after 1 hour by default; override with `SHARE_TTL_MINUTES`.
 Unauthenticated routes expose only the notes folder, never the full snapshot.
+
+Notes are grouped into **notebooks** (subfolders of `TabPaladin Notes`);
+proposals can include an optional `"notebook"` field and the share page lists
+notes grouped by notebook.
+
+For LLM chats that cannot POST, the share page also teaches a universal
+review link: `https://<host>/#note=<percent-encoded markdown>[&notebook=<name>]`.
+The fragment never reaches the server — the PWA opens the note in its editor
+for review and only stores it when the user presses Save.
 
 ## TLS
 
