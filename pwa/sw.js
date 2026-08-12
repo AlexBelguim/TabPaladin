@@ -2,14 +2,14 @@
 // out immediately; the cache is only an offline fallback. API/LLM calls
 // always go to the network.
 // Release ritual: bump v11 here AND the ?v=11 queries in index.html together.
-const SHELL_CACHE = 'tp-shell-v11';
+const SHELL_CACHE = 'tp-shell-v12';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=11',
-    '/app.js?v=11',
+    '/app.css?v=12',
+    '/app.js?v=12',
     '/manifest.webmanifest',
-    '/icons/icon128.png'
+    '/icons/icon192.png'
 ];
 
 self.addEventListener('install', (event) => {
