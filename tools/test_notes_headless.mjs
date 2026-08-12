@@ -155,5 +155,105 @@ check('notes serialized as data-url bookmarks',
 const roundTripped = JSON.parse(decodeURIComponent(snapNotes.children[0].url.slice('data:application/json,'.length)));
 check('note content survives snapshot round-trip', roundTripped.content === 'new content [[Gamma]]');
 
+// --- Root-folder identity ------------------------------------------------
+// A bookmark id is only meaningful inside the tree that produced it. These
+// cover the states where the extension used to bind to the wrong folder and
+// silently show no notes while the PWA showed them all.
+
+// 12. A persisted id that now points at an unrelated folder must be rejected.
+const notesRootId = storageData.settings.notesRootBookmarkId;
+const decoy = makeNode({ parentId: '2', title: 'Recipes' });
+makeNode({ parentId: decoy.id, title: 'Soup', url: 'https://soup.example/' });
+storageData.settings = { ...storageData.settings, notesRootBookmarkId: decoy.id };
+StorageManager.resetRootCache();
+const reresolved = await NotesManager.findNotesRoot();
+check('stale root id pointing at a foreign folder is rejected',
+    reresolved && reresolved.id === notesRootId && reresolved.title === 'TabPaladin Notes');
+check('rejected id is replaced by the real one in settings',
+    storageData.settings.notesRootBookmarkId === notesRootId);
+check('notes are still visible after the mixup',
+    (await NotesManager.listNotes()).some(n => n.title === 'Alpha'));
+const afterMixup = await NotesManager.createNote('Filed correctly', 'x');
+check('new notes land in the notes root, not the foreign folder',
+    childrenOf(notesRootId).some(c => c.id === afterMixup.id) &&
+    !childrenOf(decoy.id).some(c => c.id === afterMixup.id));
+await NotesManager.deleteNote(afterMixup.id);
+
+// 13. A second "TabPaladin Notes" folder (extension and PWA each made one)
+// must not hide either side's notes.
+const strayRoot = makeNode({ parentId: '1', title: 'TabPaladin Notes' });
+makeNode({
+    parentId: strayRoot.id,
+    title: 'Phone Note',
+    url: 'data:application/json,' + encodeURIComponent(JSON.stringify(
+        { v: 1, content: 'written on the phone', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }))
+});
+StorageManager.resetRootCache();
+const merged = await NotesManager.listNotes();
+check('notes from a duplicate root are listed too',
+    merged.some(n => n.title === 'Phone Note') && merged.some(n => n.title === 'Alpha'));
+// Three by now: the real one, the empty duplicate from step 8, and this stray.
+check('every duplicate root is reported', (await NotesManager.findAllNotesRoots()).length === 3);
+check('canonical root is still the persisted one',
+    (await NotesManager.findNotesRoot()).id === notesRootId);
+check('no duplicate note entries', new Set(merged.map(n => n.id)).size === merged.length);
+
+// --- Markdown task lists -------------------------------------------------
+
+// 14. Parsing
+check('parses an unchecked task', (() => {
+    const t = NotesManager.parseTaskLine('- [ ] buy milk');
+    return t && t.checked === false && t.label === 'buy milk' && t.indent === 0;
+})());
+check('parses a checked task (lower and upper case)',
+    NotesManager.parseTaskLine('- [x] done').checked === true &&
+    NotesManager.parseTaskLine('- [X] done').checked === true);
+check('parses * bullets and indentation', (() => {
+    const t = NotesManager.parseTaskLine('    * [ ] nested');
+    return t && t.indent === 4 && t.label === 'nested';
+})());
+check('a plain bullet is not a task', NotesManager.parseTaskLine('- just a bullet') === null);
+check('prose mentioning [ ] is not a task', NotesManager.parseTaskLine('an array [ ] literal') === null);
+
+// 15. Toggling writes back without disturbing the rest of the note
+const doc = [
+    '# Shopping',
+    '',
+    '- [ ] milk',
+    '- [x] eggs',
+    '  - [ ] the good ones',
+    '- not a task',
+    'trailing prose with [[Link]]'
+].join('\n');
+const t1 = NotesManager.toggleTaskAtLine(doc, 2);
+check('unchecked -> checked', t1.split('\n')[2] === '- [x] milk');
+check('toggle leaves every other line byte-identical', (() => {
+    const a = doc.split('\n'), b = t1.split('\n');
+    return a.length === b.length && a.every((l, i) => i === 2 || l === b[i]);
+})());
+const t2 = NotesManager.toggleTaskAtLine(t1, 3);
+check('checked -> unchecked', t2.split('\n')[3] === '- [ ] eggs');
+const t3 = NotesManager.toggleTaskAtLine(doc, 4);
+check('indented task keeps its indentation', t3.split('\n')[4] === '  - [x] the good ones');
+check('toggling a non-task line is a no-op', NotesManager.toggleTaskAtLine(doc, 5) === doc);
+check('toggling out of range is a no-op',
+    NotesManager.toggleTaskAtLine(doc, 99) === doc && NotesManager.toggleTaskAtLine(doc, -1) === doc);
+check('round trip returns the original', NotesManager.toggleTaskAtLine(t1, 2) === doc);
+check('empty content is safe', NotesManager.toggleTaskAtLine('', 0) === '' && NotesManager.toggleTaskAtLine(null, 0) === '');
+check('* bullet toggles too', NotesManager.toggleTaskAtLine('* [ ] a', 0) === '* [x] a');
+check('CRLF content keeps its carriage returns',
+    NotesManager.toggleTaskAtLine('- [ ] a\r\n- [ ] b', 0) === '- [x] a\r\n- [ ] b');
+check('label content is untouched by the toggle',
+    NotesManager.toggleTaskAtLine('- [ ] pay $5 [50%] — see [[Note]]', 0) ===
+    '- [x] pay $5 [50%] — see [[Note]]');
+
+// 16. A toggle persisted through the store survives the round trip
+const taskNote = await NotesManager.createNote('Tasks', '- [ ] one\n- [ ] two');
+await NotesManager.updateNote(taskNote.id, {
+    content: NotesManager.toggleTaskAtLine(taskNote.content, 1)
+});
+const storedTasks = (await NotesManager.listNotes()).find(n => n.id === taskNote.id);
+check('toggled task persists through create/update/list', storedTasks.content === '- [ ] one\n- [x] two');
+
 console.log(failures === 0 ? '\nALL TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

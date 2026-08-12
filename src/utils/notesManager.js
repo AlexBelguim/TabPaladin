@@ -27,6 +27,28 @@ async function findOrCreateNotesRoot() {
     });
 }
 
+// Every folder literally titled "TabPaladin Notes". Normally one; a second
+// appears when the extension and the PWA each created their own before the
+// two ever synced. Reading from all of them means notes written on the phone
+// are never invisible here just because the roots disagree — writes still go
+// to the canonical root that resolveRootFolder picks.
+async function findAllNotesRoots() {
+    let folders = [];
+    try {
+        const matches = await api.bookmarks.search({ title: NOTES_ROOT_TITLE });
+        folders = matches.filter(m => !m.url && m.title === NOTES_ROOT_TITLE);
+    } catch (e) {
+        folders = [];
+    }
+    const canonical = await findNotesRoot();
+    const seen = new Set();
+    const out = [];
+    for (const f of [canonical, ...folders]) {
+        if (f && !seen.has(f.id)) { seen.add(f.id); out.push(f); }
+    }
+    return out;
+}
+
 function buildNoteUrl(payload) {
     return DATA_PREFIX + encodeURIComponent(JSON.stringify(payload));
 }
@@ -61,6 +83,30 @@ function parseLinks(content) {
     return { wiki, urls };
 }
 
+// Markdown task list: "- [ ] thing" / "- [x] thing" (also "* [ ]").
+// Captures indent, the marker character and the label.
+const TASK_LINE_RE = /^(\s*)[-*]\s+\[([ xX])\]\s?(.*)$/;
+
+function parseTaskLine(line) {
+    const m = String(line).match(TASK_LINE_RE);
+    if (!m) return null;
+    return { indent: m[1].length, checked: m[2].toLowerCase() === 'x', label: m[3] };
+}
+
+// Flip the checkbox on one line, byte-for-byte preserving everything else —
+// indentation, the bullet character, the label, and every other line.
+function toggleTaskAtLine(content, lineIndex) {
+    const text = String(content == null ? '' : content);
+    const lines = text.split('\n');
+    if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= lines.length) return text;
+    const line = lines[lineIndex];
+    // Only the "[ ]" box itself is rewritten; the rest of the line is untouched.
+    const m = line.match(/^(\s*[-*]\s+\[)([ xX])(\])/);
+    if (!m) return text;
+    lines[lineIndex] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + line.slice(m[1].length + 1);
+    return lines.join('\n');
+}
+
 // Replace [[oldTitle]] with [[newTitle]] inside a content string.
 function rewriteWikiLink(content, oldTitle, newTitle) {
     const escaped = oldTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -70,13 +116,18 @@ function rewriteWikiLink(content, oldTitle, newTitle) {
 export const NotesManager = {
     NOTES_ROOT_TITLE,
     parseLinks,
+    parseTaskLine,
+    toggleTaskAtLine,
 
     findNotesRoot,
 
+    findAllNotesRoots,
+
     listNotes: async () => {
-        const root = await findNotesRoot();
-        if (!root) return [];
+        const roots = await findAllNotesRoots();
+        if (roots.length === 0) return [];
         const notes = [];
+        const seen = new Set();
         // Direct children are loose notes; subfolders are notebooks
         // (created by the PWA), so recurse one level and tag each note
         // with its notebook title.
@@ -85,6 +136,8 @@ export const NotesManager = {
             for (const c of children) {
                 const note = parseNoteNode(c);
                 if (note) {
+                    if (seen.has(note.id)) continue;
+                    seen.add(note.id);
                     note.notebook = notebook;
                     notes.push(note);
                 } else if (!c.url) {
@@ -92,7 +145,14 @@ export const NotesManager = {
                 }
             }
         };
-        await walk(root.id, null);
+        for (const root of roots) {
+            try {
+                await walk(root.id, null);
+            } catch (e) {
+                // A duplicate root that vanished mid-read shouldn't lose the rest.
+                console.warn('[TabPaladin Notes] could not read notes root', root.id, e);
+            }
+        }
         // Most recently updated first.
         notes.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
         return notes;

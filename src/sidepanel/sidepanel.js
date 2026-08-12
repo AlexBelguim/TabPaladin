@@ -369,6 +369,10 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     // 2. Perform the destructive pull
     await BackendSync.applyPull(snapshot);
 
+    // Every bookmark was just deleted and recreated, so any cached root id
+    // refers to a node that no longer exists.
+    StorageManager.resetRootCache();
+
     // 3. Traversal/Search the newly recreated tree to map paths back to new IDs
     const newPathToIdMap = await buildFolderPathsMap();
 
@@ -1941,15 +1945,33 @@ function setNotePreviewMode(previewOn) {
     document.getElementById('previewNoteBtn').textContent = previewOn ? 'Edit' : 'Preview';
 }
 
-// Render note content as safe HTML: [[wiki-links]] become clickable chips,
-// bare URLs become links, everything else is escaped text.
-function renderNoteContentHtml(content) {
-    let html = escapeHtml(content);
-    html = html.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
+// Inline markup shared by every line: [[wiki-links]] become clickable chips
+// and bare URLs become links. Takes already-escaped text.
+function renderNoteInlineHtml(escaped) {
+    let html = escaped.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
         `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
     html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
         `<a href="$1" class="note-urllink" title="Open in new tab">$1</a>`);
-    return html.replace(/\n/g, '<br>');
+    return html;
+}
+
+// Render note content as safe HTML. "- [ ] thing" / "- [x] thing" become real
+// checkboxes carrying their source line number, so toggling one edits exactly
+// that line of the stored markdown. Everything else is escaped text.
+// Styles are inline so this doesn't depend on sidepanel.css.
+function renderNoteContentHtml(content) {
+    return String(content == null ? '' : content).split('\n').map((raw, i) => {
+        const task = NotesManager.parseTaskLine(raw);
+        if (!task) return renderNoteInlineHtml(escapeHtml(raw));
+        const label = renderNoteInlineHtml(escapeHtml(task.label));
+        const done = task.checked;
+        return `<label class="note-task" style="display:inline-flex; align-items:flex-start; gap:6px;` +
+            ` margin-left:${task.indent * 12}px; cursor:pointer;">` +
+            `<input type="checkbox" class="note-task-box" data-line="${i}"${done ? ' checked' : ''}` +
+            ` style="margin:2px 0 0 0; cursor:pointer; flex:none;">` +
+            `<span${done ? ' style="text-decoration:line-through; opacity:0.6;"' : ''}>${label}</span>` +
+            `</label>`;
+    }).join('<br>');
 }
 
 async function renderNotePreview() {
@@ -2038,8 +2060,31 @@ document.getElementById('closeNoteEditorBtn').addEventListener('click', async ()
     await loadNotes();
 });
 
-// Clicks inside the preview: wiki-links navigate between notes, URLs open tabs.
+// Clicks inside the preview: task checkboxes toggle, wiki-links navigate
+// between notes, URLs open tabs.
 document.getElementById('notePreview').addEventListener('click', async (e) => {
+    const box = e.target.closest('.note-task-box');
+    if (box) {
+        const textarea = document.getElementById('noteContentInput');
+        const updated = NotesManager.toggleTaskAtLine(textarea.value, Number(box.dataset.line));
+        if (updated === textarea.value) return;
+        textarea.value = updated;
+        try {
+            // A note that hasn't been saved yet just updates in place; the
+            // user's Save writes it. An existing note persists immediately,
+            // the way ticking a box in a notes app should behave.
+            if (activeNoteId) {
+                await NotesManager.updateNote(activeNoteId, { content: updated });
+                await loadNotes();
+            }
+            await renderNotePreview();
+        } catch (err) {
+            console.error('Toggle task error:', err);
+            alert('Error updating task: ' + err.message);
+        }
+        return;
+    }
+
     const urlLink = e.target.closest('.note-urllink');
     if (urlLink) {
         e.preventDefault();
@@ -3370,7 +3415,11 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const existing = await StorageManager.getSettings();
         const backendUrl = document.getElementById('backend-url').value.trim();
         const backendToken = document.getElementById('backend-token').value.trim();
+        // Spread `existing` first: this form doesn't own every setting. The
+        // resolved workflow/notes root ids live here too, and dropping them
+        // unbinds the notes root every time the user saves settings.
         const newSettings = {
+            ...existing,
             focusedFolderIds,
             customKeywords: cleanCustom,
             categoryOrder: mutableState.categoryOrder || null,

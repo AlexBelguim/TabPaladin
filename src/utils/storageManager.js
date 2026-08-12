@@ -45,10 +45,12 @@ async function countDuplicateFolders(title) {
 async function resolveRootFolder({ title, settingsKey, create = false }) {
     const cached = rootFolderCaches.get(settingsKey);
     if (cached) {
-        // Verify it still exists
+        // Verify it still exists *and* is still the folder we think it is —
+        // the id may have been recycled onto something else since we cached it.
         try {
             const check = await api.bookmarks.get(cached.id);
-            if (check && check[0]) return cached;
+            const fresh = check && check[0];
+            if (fresh && !fresh.url && fresh.title === title) return fresh;
         } catch (e) {
             // fall through
         }
@@ -60,12 +62,22 @@ async function resolveRootFolder({ title, settingsKey, create = false }) {
     if (preferredId) {
         try {
             const node = (await api.bookmarks.get(preferredId))[0];
-            if (node && !node.url) {
+            // The id alone isn't enough: bookmark ids are only meaningful within
+            // the tree that produced them, so a persisted id can end up on some
+            // unrelated folder (a destructive pull recreates every node, users
+            // reorganize, profiles get restored). Binding to it silently would
+            // hide every note and file new ones into a stranger's folder, so the
+            // title has to match too.
+            if (node && !node.url && node.title === title) {
                 rootFolderCaches.set(settingsKey, node);
                 if (title === WORKFLOW_ROOT_TITLE) {
                     workflowRootDuplicateCount = await countDuplicateFolders(node.title || title);
                 }
                 return node;
+            }
+            if (node && node.title !== title) {
+                console.warn(`[TabPaladin] Persisted ${settingsKey}=${preferredId} now points at ` +
+                    `"${node.title}", not "${title}" — re-resolving by title.`);
             }
         } catch (e) {
             // Persisted folder gone — fall through and re-resolve.
@@ -360,5 +372,9 @@ export const StorageManager = {
     getWorkflowRootDuplicateCount: () => workflowRootDuplicateCount,
     // Generic root-folder resolver, also used by the notes feature.
     resolveRootFolder,
+    // Drop the in-memory root cache. Call after anything that rebuilds the
+    // bookmark tree wholesale (a destructive pull), since every cached id is
+    // then meaningless.
+    resetRootCache: () => rootFolderCaches.clear(),
     META_TITLE
 };

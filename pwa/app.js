@@ -462,6 +462,28 @@ function rewriteWikiLink(content, oldTitle, newTitle) {
     return content.replace(new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`, 'g'), `[[${newTitle}]]`);
 }
 
+// Markdown task lists — mirrors NotesManager.parseTaskLine/toggleTaskAtLine in
+// the extension. The PWA is served standalone and can't import from src/.
+const TASK_LINE_RE = /^(\s*)[-*]\s+\[([ xX])\]\s?(.*)$/;
+
+function parseTaskLine(line) {
+    const m = String(line).match(TASK_LINE_RE);
+    if (!m) return null;
+    return { indent: m[1].length, checked: m[2].toLowerCase() === 'x', label: m[3] };
+}
+
+// Flip one checkbox, leaving every other character of the note untouched.
+function toggleTaskAtLine(content, lineIndex) {
+    const text = String(content == null ? '' : content);
+    const lines = text.split('\n');
+    if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= lines.length) return text;
+    const line = lines[lineIndex];
+    const m = line.match(/^(\s*[-*]\s+\[)([ xX])(\])/);
+    if (!m) return text;
+    lines[lineIndex] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + line.slice(m[1].length + 1);
+    return lines.join('\n');
+}
+
 // Locate the notes folder, offering to create + push it if missing.
 // Returns { node, path } or null.
 async function ensureNotesFolder() {
@@ -483,26 +505,17 @@ async function ensureNotesFolder() {
     const existing = findNotesFolderWithPath();
     if (existing) return existing;
 
-    if (!confirm('No "TabPaladin Notes" folder in the synced snapshot yet. Create it?')) return null;
-    // Put it under the "Other Bookmarks" equivalent, falling back to the last root.
-    const roots = state.snapshot.children || [];
-    const parent = roots.find(r => /other|unfiled/i.test(r.title || '')) || roots[roots.length - 1];
-    if (!parent) { showToast('No root folder available.'); return null; }
-    const folder = { type: 'folder', title: NOTES_ROOT_TITLE, children: [] };
-    assignIds(folder);
-    parent.children = parent.children || [];
-    parent.children.push(folder);
-    state.dirty = true;
-    try {
-        setStatus('Creating notes folder…');
-        await pushSnapshot();
-        setStatus('');
-    } catch (err) {
-        alert('Failed to create notes folder: ' + err.message);
-        setStatus('');
-        return null;
-    }
-    return { node: folder, path: [state.snapshot._pwaId, parent._pwaId, folder._pwaId] };
+    // The PWA never creates the notes root.
+    //
+    // It used to, guessing at the extension's location by native id and then
+    // by title. When the guess missed — localized root names, a browser whose
+    // "Other Bookmarks" carries a different native id, a snapshot pushed from
+    // a second browser — the two ended up with a notes root each, neither
+    // seeing the other's notes, and pulls stacked more. One creator removes
+    // the whole class of problem: the extension owns root creation, the PWA
+    // only ever reads and writes inside a root that already exists.
+    showToast('No notes folder yet — open TabPaladin on your computer and create a note there first, then pull.');
+    return null;
 }
 
 function buildNoteRow(note, onOpen) {
@@ -958,10 +971,26 @@ function renderNotePreviewHtml(content) {
     const closeList = () => {
         if (listTag) { out.push(`</${listTag}>`); listTag = null; }
     };
-    for (const rawLine of String(content || '').split('\n')) {
+    const lines = String(content || '').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
         const line = escapeHtml(rawLine);
         const trimmed = line.trim();
         if (!trimmed) { closeList(); continue; }
+
+        // Task items before the plain-bullet rule — "- [ ] x" is also a bullet.
+        // data-line ties the box back to its source line for the write-back.
+        const task = parseTaskLine(rawLine);
+        if (task) {
+            if (listTag !== 'ul') { closeList(); out.push('<ul class="note-tasks">'); listTag = 'ul'; }
+            out.push(
+                `<li class="note-task${task.checked ? ' done' : ''}"` +
+                (task.indent ? ` style="margin-left:${task.indent * 12}px"` : '') + '>' +
+                `<input type="checkbox" class="note-task-box" data-line="${i}"${task.checked ? ' checked' : ''}>` +
+                `<span>${renderNoteInline(escapeHtml(task.label))}</span></li>`
+            );
+            continue;
+        }
 
         const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
         if (heading) {
@@ -1110,7 +1139,30 @@ function renderNoteDetail(container, folder, note) {
             renderView();
         }
     });
-    previewEl.addEventListener('click', (e) => {
+    previewEl.addEventListener('click', async (e) => {
+        const box = e.target.closest('.note-task-box');
+        if (box) {
+            const updated = toggleTaskAtLine(textarea.value, Number(box.dataset.line));
+            if (updated === textarea.value) return;
+            textarea.value = updated;
+            renderReadingView();
+            // A note that isn't saved yet just updates in place; the user's ✓
+            // writes it. An existing note syncs the tick straight away.
+            if (!note) return;
+            const now = new Date().toISOString();
+            note.url = encodeNoteUrl({ content: updated, createdAt: meta.createdAt || now, updatedAt: now });
+            meta.content = updated;
+            state.dirty = true;
+            try {
+                setStatus('Saving…');
+                await pushSnapshot();
+                setStatus('');
+            } catch (err) {
+                setStatus('');
+                showToast('Save failed: ' + err.message + ' — use ⬆️ to retry.');
+            }
+            return;
+        }
         const link = e.target.closest('.note-wikilink');
         if (link && link.dataset.target) openNoteByTitle(link.dataset.target);
     });

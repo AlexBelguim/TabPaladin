@@ -536,6 +536,29 @@ body.note-open #breadcrumb { display: none; }
 
 .note-preview-body li { margin: 0.15em 0; }
 
+/* Markdown task lists: real checkboxes, sized for thumbs. */
+.note-preview-body li.note-task {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0.25em 0 0.25em -1.4em;
+}
+
+.note-preview-body li.note-task .note-task-box {
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  flex: none;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.note-preview-body li.note-task.done > span {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
 .note-wikilink {
   color: var(--primary);
   background: rgba(59, 130, 246, 0.12);
