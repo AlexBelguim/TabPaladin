@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TabPaladin</title>
+  <!-- sidepanel.css still owns every component style; app.css only undoes the
+       narrow-column layout and adds the home screen. One source of truth. -->
+  <link rel="stylesheet" href="../sidepanel/sidepanel.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+
+<body class="tp-app">
+  <div class="container">
+    <header class="tp-topbar">
+      <div class="tp-brand">
+        <img src="../../assets/icon48.png" alt="">
+        <h1>TabPaladin</h1>
+      </div>
+      <div class="tp-topbar-actions">
+        <button id="mainPullBtn" class="sm-btn tp-pull" title="Pull from Sync Server">⬇️ Pull</button>
+        <button id="mainPushBtn" class="sm-btn tp-push" title="Push to Sync Server">⬆️ Push</button>
+        <button id="settingsToggleBtn" class="sm-btn tp-gear" title="Settings">⚙️</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- ============ HOME ============ -->
+      <section id="home-container">
+        <div class="home-search-block">
+          <div class="home-search">
+            <span class="home-search-mark" aria-hidden="true">Q</span>
+            <input id="homeSearchInput" type="text" autocomplete="off" spellcheck="false"
+              placeholder="Search DuckDuckGo or type a URL" aria-label="Search DuckDuckGo or type a URL">
+            <span class="home-search-kbd">Enter</span>
+          </div>
+        </div>
+
+        <div class="home-pins">
+          <div class="home-section-head">
+            <h3>Pinned</h3>
+          </div>
+          <div id="pins-grid" class="pins-grid"></div>
+        </div>
+      </section>
+
+      <section id="actions" class="action-grid">
+        <button id="groupTabsBtn" class="primary-btn">Group Open Tabs</button>
+        <button id="organizeBookmarksBtn" class="primary-btn" style="background-color: #10b981;">Organize
+          Bookmarks</button>
+        <button id="viewWorkflowsBtn" class="primary-btn" style="background-color: #6366f1;">View Workflows</button>
+        <button id="saveWorkflowBtn" class="primary-btn" style="background-color: #f59e0b;">Create Workflow 💾</button>
+        <button id="viewNotesBtn" class="primary-btn" style="background-color: #0ea5e9;">📝 Notes</button>
+      </section>
+
+      <section id="home-recents" class="home-recents">
+        <div class="home-panel">
+          <div class="home-section-head"><h3>Recent workflows</h3></div>
+          <div id="recent-workflows"></div>
+        </div>
+        <div class="home-panel">
+          <div class="home-section-head"><h3>Recent notes</h3></div>
+          <div id="recent-notes"></div>
+        </div>
+      </section>
+
+      <section id="groups-container">
+        <p class="empty-state">No tabs grouped yet.</p>
+      </section>
+
+      <section id="organizer-source-container" style="display:none;">
+        <h2>Select Folders to Clean</h2>
+        <div id="source-list" class="source-grid" style="margin-bottom:12px;"></div>
+
+        <div style="margin-bottom:10px;">
+          <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">AI Hints (Optional)</label>
+          <input type="text" id="aiHintsInput" placeholder="e.g. pop, kpop, fitness, react..." class="tp-field">
+        </div>
+
+        <div style="display:flex; gap:8px; margin-bottom:8px;">
+          <button id="analyzeBtn" class="primary-btn" style="flex:1;">✨ Analyze &amp; Sort</button>
+          <button id="restructureBtn" class="primary-btn" style="flex:1; background-color: #8b5cf6;"
+            title="Revamp the entire folder structure">🏗️ Restructure</button>
+        </div>
+        <button id="cancelSourceBtn" class="sm-btn tp-back">Cancel</button>
+      </section>
+
+      <section id="organizer-container" style="display:none;">
+        <h2>Bookmark Proposals</h2>
+
+        <div id="ai-regroup-controls">
+          <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">✨ Refine with AI
+            (Optional)</label>
+          <div class="input-group">
+            <input type="text" id="aiTabsHintsInput" placeholder="Hints e.g. Work, News...">
+            <button id="aiGroupTabsBtn" class="primary-btn">Re-Group</button>
+          </div>
+        </div>
+
+        <div id="proposals-list"></div>
+        <label id="closeAfterApplyWrapper" style="display:none; align-items:center; gap:8px; padding:8px 4px; margin-top:8px; font-size:0.85rem; color:var(--text-muted); cursor:pointer;">
+          <input type="checkbox" id="closeAfterApplyToggle" checked>
+          <span>Close filed tabs after saving</span>
+        </label>
+        <button id="applyOrganizerBtn" class="primary-btn" style="margin-top:10px;">Apply Changes</button>
+        <button id="cancelOrganizerBtn" class="sm-btn tp-back">Back</button>
+      </section>
+
+      <section id="workflows-container" style="display:none;">
+        <div class="tp-section-head">
+          <h2>Saved Workflows</h2>
+          <div style="display:flex; gap:6px;">
+            <button id="importWorkflowsBtn" class="sm-btn" title="Import workflows from JSON">📥 Import</button>
+            <button id="exportAllWorkflowsBtn" class="sm-btn" title="Export all workflows to JSON">📤 Export All</button>
+          </div>
+        </div>
+        <input type="file" id="importFileInput" accept=".json" style="display:none;">
+        <ul id="workflows-list"></ul>
+      </section>
+
+      <!-- Notes: editor and preview side by side, which the side panel never
+           had room for. sidepanel.js drives both; .notes-split just lays them out. -->
+      <section id="notes-container" style="display:none;">
+        <div class="tp-section-head">
+          <h2>Notes</h2>
+          <button id="newNoteBtn" class="sm-btn" title="Create a new note">+ New Note</button>
+        </div>
+        <input type="text" id="notesSearchInput" placeholder="Search notes..." class="tp-field">
+        <div class="notes-split">
+          <ul id="notes-list"></ul>
+          <div id="note-editor" style="display:none;">
+            <input type="text" id="noteTitleInput" placeholder="Note title" class="tp-field tp-note-title">
+            <div class="note-panes">
+              <textarea id="noteContentInput" rows="18"
+                placeholder="Write here… Link notes with [[Note Title]] and paste URLs to link pages."></textarea>
+              <div id="notePreview" class="note-preview" style="display:none;"></div>
+            </div>
+            <div class="note-actions">
+              <button id="saveNoteBtn" class="sm-btn primary-btn">Save</button>
+              <button id="previewNoteBtn" class="sm-btn">Preview</button>
+              <button id="deleteNoteBtn" class="sm-btn tp-danger">Delete</button>
+            </div>
+            <button id="closeNoteEditorBtn" class="sm-btn tp-back">Back to list</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="settings-container" style="display:none;">
+        <h2>Extension Settings</h2>
+        <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">Select folders to analyze for Smart
+          Grouping and Organization.</p>
+        <div id="settings-folder-list"></div>
+        <button id="saveSettingsBtn" class="primary-btn">Save Settings</button>
+        <button id="closeSettingsBtn" class="sm-btn tp-back">Close</button>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="../sidepanel/sidepanel.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+
+</html>

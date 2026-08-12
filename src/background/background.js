@@ -1,35 +1,49 @@
-// Background script: handles sidebar wiring + workflow auto-sync.
+// Background script: opens the app page + workflow auto-sync.
 // Compatible with both Chrome (service worker) and Firefox (event page).
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
 const TRACK_STORE_KEY = 'tpOpenWorkflowTabs'; // { [tabId]: { workflowId, bookmarkId } }
+const APP_PAGE = 'src/app/app.html';
 
 console.log("TabPaladin background script loaded.");
 
-// --- Sidebar wiring ---
-if (api.sidePanel && typeof api.sidePanel.setPanelBehavior === 'function') {
-    api.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
-        .catch((error) => console.error("TabPaladin: Failed to set panel behavior:", error));
-}
-
-if (api.sidebarAction && typeof api.sidebarAction.toggle === 'function' && api.browserAction) {
-    api.browserAction.onClicked.addListener(() => {
-        api.sidebarAction.toggle();
-    });
+// --- Opening the app ---
+//
+// The toolbar icon opens a full browser tab. This used to call
+// sidePanel.setPanelBehavior({ openPanelOnActionClick: true }), and that is
+// worth knowing about: while it is set, action.onClicked never fires in Chrome,
+// because the click is consumed by the panel. Adding the listener below without
+// removing those calls looks like the listener is simply broken.
+//
+// Reuse an existing tab rather than piling up copies — this is a workspace, not
+// a document.
+async function openApp() {
+    const url = api.runtime.getURL(APP_PAGE);
+    try {
+        const existing = await api.tabs.query({ url });
+        if (existing && existing.length) {
+            await api.tabs.update(existing[0].id, { active: true });
+            if (existing[0].windowId != null && api.windows) {
+                await api.windows.update(existing[0].windowId, { focused: true });
+            }
+            return;
+        }
+    } catch (e) {
+        // tabs.query needs the "tabs" permission; fall through and just open one.
+    }
+    await api.tabs.create({ url });
 }
 
 if (api.action && api.action.onClicked) {
-    api.action.onClicked.addListener(() => {
-        api.tabs.create({ url: api.runtime.getURL("src/sidepanel/sidepanel.html") });
-    });
+    api.action.onClicked.addListener(openApp);
+} else if (api.browserAction && api.browserAction.onClicked) {
+    // Firefox MV2 naming.
+    api.browserAction.onClicked.addListener(openApp);
 }
 
 api.runtime.onInstalled.addListener(() => {
     console.log("TabPaladin installed.");
-    if (api.sidePanel && typeof api.sidePanel.setPanelBehavior === 'function') {
-        api.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-    }
     // Clear stale tracking from previous session
     api.storage.local.remove(TRACK_STORE_KEY).catch(() => {});
 });

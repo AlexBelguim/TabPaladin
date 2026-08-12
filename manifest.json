@@ -8,14 +8,10 @@
     "tabs",
     "bookmarks",
     "storage",
-    "sidePanel",
     "downloads"
   ],
   "background": {
     "service_worker": "src/background/background.js"
-  },
-  "side_panel": {
-    "default_path": "src/sidepanel/sidepanel.html"
   },
   "icons": {
     "16": "assets/icon16.png",
