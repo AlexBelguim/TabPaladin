@@ -643,3 +643,104 @@ select.note-move {
   font-size: 0.78rem;
   max-width: 130px;
 }
+
+/* ---------- home: search + pinned links ---------- */
+/* Mirrors the extension's home screen. Tiles are four across at 390px, where
+   the extension gets six — same pins, same order, just fewer per row. */
+.home-block {
+  padding: 4px 0 14px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.home-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 11px 13px;
+}
+
+.home-search:focus-within {
+  border-color: var(--primary);
+}
+
+.home-search-mark {
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #de5833;
+  color: #fff;
+  font-size: 0.56rem;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.home-search input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-family: inherit;
+  -webkit-appearance: none;
+}
+
+.home-search input::placeholder { color: var(--muted); }
+
+.home-head {
+  margin: 14px 0 8px;
+  font-size: 0.7rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.pins-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.pin-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.66rem;
+  min-width: 0;
+}
+
+.pin-tile:active { border-color: var(--primary); }
+
+.pin-fav {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 0.74rem;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.pin-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

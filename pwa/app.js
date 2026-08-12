@@ -355,10 +355,17 @@ function renderContent() {
         return;
     }
     const children = node.children || [];
-    // The notes folder is never shown among the bookmarks — notes live in their
-    // own section on the root view instead.
-    const folders = children.filter(c => (c.type === 'folder' || c.type === 'root') && !isNotesFolder(c));
+    // Neither the notes nor the pins folder is shown among the bookmarks —
+    // notes get their own section on the root view, pins get the home tiles.
+    const folders = children.filter(c => (c.type === 'folder' || c.type === 'root')
+        && !isNotesFolder(c) && !isPinsFolder(c));
     const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && c.title !== '__tabpaladin_meta__');
+
+    // Search and pins lead the root view — the landing state, same as the
+    // extension's home screen.
+    if (state.pathIds.length === 1) {
+        renderHome(root);
+    }
 
     if (folders.length === 0 && bookmarks.length === 0 && state.pathIds.length > 1) {
         root.innerHTML = '<div class="empty">Empty folder.</div>';
@@ -417,6 +424,111 @@ function escapeAttr(s) { return escapeHtml(s); }
 // data:application/json payload — same format the extension writes.
 const NOTES_ROOT_TITLE = 'TabPaladin Notes';
 const NOTE_DATA_PREFIX = 'data:application/json,';
+
+// Pinned links. Mirrors src/utils/pinsManager.js on the extension side — same
+// folder title, same plain-bookmark storage — but read from the synced snapshot
+// instead of chrome.bookmarks, because the PWA has no bookmarks API. Like the
+// notes root, the PWA never creates it: pin something on the computer first.
+const PINS_ROOT_TITLE = 'TabPaladin Pinned';
+const DDG = 'https://duckduckgo.com/?q=';
+
+function isPinsFolder(node) {
+    return node && (node.type === 'folder' || node.type === 'root') && node.title === PINS_ROOT_TITLE;
+}
+
+function findPinsFolder() {
+    if (!state.snapshot) return null;
+    for (const rootChild of state.snapshot.children || []) {
+        if (isPinsFolder(rootChild)) return rootChild;
+        for (const c of rootChild.children || []) {
+            if (isPinsFolder(c)) return c;
+        }
+    }
+    return null;
+}
+
+function hostOf(url) {
+    try {
+        return new URL(url).hostname.replace(/^www\./, '');
+    } catch (e) {
+        return '';
+    }
+}
+
+function initialsFor(title, url) {
+    const source = (title || hostOf(url) || '?').trim();
+    const words = source.split(/[\s._-]+/).filter(Boolean);
+    if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
+    return source.slice(0, 2).toUpperCase();
+}
+
+// Same hash as the extension so a pin keeps its colour across devices.
+function colorFor(url) {
+    const key = hostOf(url) || url || '';
+    let h = 0;
+    for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) % 360;
+    if (h > 25 && h < 45) h = (h + 60) % 360;
+    return `hsl(${h} 55% 42%)`;
+}
+
+// A bare domain goes to the site; anything with a space, or without a dot, is
+// a query. Same rule as the extension's home screen.
+function searchTargetFor(text) {
+    const t = String(text || '').trim();
+    if (!t) return null;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return t;
+    if (!/\s/.test(t) && /^[^.]+\.[^.]{2,}/.test(t)) return 'https://' + t;
+    return DDG + encodeURIComponent(t);
+}
+
+function renderHome(root) {
+    const wrap = document.createElement('div');
+    wrap.className = 'home-block';
+
+    const search = document.createElement('div');
+    search.className = 'home-search';
+    search.innerHTML =
+        '<span class="home-search-mark" aria-hidden="true">Q</span>' +
+        '<input id="homeSearchInput" type="search" autocomplete="off" spellcheck="false" ' +
+        'placeholder="Search DuckDuckGo" aria-label="Search DuckDuckGo">';
+    search.querySelector('input').addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const target = searchTargetFor(e.target.value);
+        if (!target) return;
+        e.target.value = '';
+        e.target.blur();
+        window.open(target, '_blank', 'noopener');
+    });
+    wrap.appendChild(search);
+
+    const pinsFolder = findPinsFolder();
+    const pins = (pinsFolder?.children || []).filter(c => c.type === 'bookmark' && c.url);
+    if (pins.length) {
+        const head = document.createElement('div');
+        head.className = 'home-head';
+        head.textContent = 'Pinned';
+        wrap.appendChild(head);
+
+        const grid = document.createElement('div');
+        grid.className = 'pins-grid';
+        for (const p of pins) {
+            const tile = document.createElement('a');
+            tile.className = 'pin-tile';
+            tile.href = p.url;
+            tile.target = '_blank';
+            tile.rel = 'noopener';
+            tile.title = p.url;
+            tile.innerHTML =
+                `<span class="pin-fav" style="background:${colorFor(p.url)}">${escapeHtml(initialsFor(p.title, p.url))}</span>` +
+                `<span class="pin-name">${escapeHtml(p.title || hostOf(p.url))}</span>`;
+            grid.appendChild(tile);
+        }
+        wrap.appendChild(grid);
+    }
+
+    root.appendChild(wrap);
+}
 
 function isNotesFolder(node) {
     return node && (node.type === 'folder' || node.type === 'root') && node.title === NOTES_ROOT_TITLE;
