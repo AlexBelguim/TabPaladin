@@ -55,81 +55,27 @@ async function fullBookmarkSnapshot(focusedFolderIds = [], workflowRootId = null
         };
     }
 
-    // If no focused folder IDs are selected and no workflowRootId, push everything (fallback)
-    if (focusedFolderIds.length === 0 && !workflowRootId && !notesRootId) {
-        return {
-            version: 1,
-            exportedAt: new Date().toISOString(),
-            ...serializeNodeInner(root)
-        };
-    }
-
-    const focusedSet = new Set(focusedFolderIds);
-    if (workflowRootId) {
-        focusedSet.add(workflowRootId);
-    }
-    if (notesRootId) {
-        focusedSet.add(notesRootId);
-    }
-
-    function hasFocusedDescendant(node) {
-        if (focusedSet.has(node.id)) return true;
-        if (node.children) {
-            return node.children.some(child => hasFocusedDescendant(child));
-        }
-        return false;
-    }
-
-    function serializeFilteredNode(node, insideSelected) {
-        const isSelected = focusedSet.has(node.id);
-        const keepAll = insideSelected || isSelected;
-
-        if (node.url) {
-            if (keepAll) {
-                return {
-                    type: 'bookmark',
-                    title: node.title,
-                    url: node.url,
-                    dateAdded: node.dateAdded
-                };
-            }
-            return null;
-        }
-
-        // For folders: if not inside a selected parent, only keep if it has a focused descendant.
-        // The virtual root is always preserved. Other native roots are only kept
-        // if they or their descendants are targeted.
-        const sid = String(node.id);
-        const isVirtualRoot = sid === String(root.id);
-        if (!keepAll && !isVirtualRoot && !hasFocusedDescendant(node)) {
-            return null;
-        }
-
-        const serializedChildren = [];
-        for (const child of node.children || []) {
-            const res = serializeFilteredNode(child, keepAll);
-            if (res) serializedChildren.push(res);
-        }
-
-        // For non-root folders, we only keep them if they are selected or had children serialized
-        if (!keepAll && !isVirtualRoot && serializedChildren.length === 0) {
-            return null;
-        }
-
-        return {
-            type: isVirtualRoot ? 'root' : 'folder',
-            title: node.title || '',
-            dateAdded: node.dateAdded,
-            nativeId: rootChildIds.has(sid) ? sid : undefined,
-            children: serializedChildren
-        };
+    // Always push the whole tree.
+    //
+    // Pull replaces a matched root's entire contents, so a filtered push made
+    // the two directions disagree about what a snapshot means: push a subset,
+    // pull it back, and the root got replaced by that subset. Everything the
+    // filter dropped was deleted on the next device to pull. Push and pull are
+    // now both whole-tree, which is the only pairing where a round trip is
+    // lossless.
+    //
+    // The focus arguments are kept so existing callers still work, but they no
+    // longer narrow the snapshot.
+    if (focusedFolderIds.length || workflowRootId || notesRootId) {
+        console.log('[TabPaladin Push] Focus arguments ignored — pushing the full tree.');
     }
 
     return {
         version: 1,
         exportedAt: new Date().toISOString(),
-        ...serializeFilteredNode(root, false)
+        ...serializeNodeInner(root)
     };
+
 }
 
 // Recreate children under an existing parent. Used during pull.
@@ -287,13 +233,27 @@ export const BackendSync = {
         // --- Apply: for each matched browser root, empty it and recreate from snapshot ---
         for (const [browserRootId, snapChild] of matched) {
             const br = browserRoots.find(r => r.id === browserRootId);
+            const incoming = (snapChild.children || []).length;
+
+            // Never empty a root we aren't going to refill.
+            //
+            // The wipe used to be unconditional while the restore was guarded by
+            // this same count, so a snapshot carrying an empty root child deleted
+            // everything under the matching browser root and put nothing back —
+            // removeTree on every folder, including bookmarks that had nothing to
+            // do with TabPaladin. push() accepts focusedFolderIds, so a partial
+            // push followed by a pull is enough to trigger it.
+            if (incoming === 0) {
+                console.warn(`[TabPaladin Pull] SKIPPING "${br.title}" (id=${br.id}) — the snapshot has 0 ` +
+                    `children for it. Emptying it would delete its contents and restore nothing.`);
+                continue;
+            }
+
             try {
                 console.log(`[TabPaladin Pull] --- Processing browser root "${br.title}" (id=${br.id}) ← snapshot "${snapChild.title}" ---`);
                 await emptyFolder(br.id);
-                if (snapChild.children && snapChild.children.length) {
-                    console.log(`[TabPaladin Pull] Recreating ${snapChild.children.length} children...`);
-                    await recreateChildren(br.id, snapChild.children);
-                }
+                console.log(`[TabPaladin Pull] Recreating ${incoming} children...`);
+                await recreateChildren(br.id, snapChild.children);
                 // Verify
                 const verify = await api.bookmarks.getChildren(br.id);
                 console.log(`[TabPaladin Pull] VERIFY "${br.title}": ${verify.length} children now exist`);
@@ -308,15 +268,39 @@ export const BackendSync = {
             const otherRoot = browserRoots.find(r => normalizeRootTitle(r.title) === 'other')
                 || browserRoots[browserRoots.length - 1]; // last resort fallback
 
+            const existingUnderOther = await api.bookmarks.getChildren(otherRoot.id);
+
             for (const orphan of orphanSnapChildren) {
-                console.warn(`[TabPaladin Pull] Orphan snapshot root "${orphan.title}" → recreating under "${otherRoot.title}" (id=${otherRoot.id})`);
+                const title = orphan.title || 'Folder';
+                const incoming = (orphan.children || []).length;
+                if (incoming === 0) {
+                    console.warn(`[TabPaladin Pull] Skipping empty orphan root "${title}".`);
+                    continue;
+                }
+
                 try {
-                    const f = await api.bookmarks.create({ parentId: otherRoot.id, title: orphan.title || 'Folder' });
-                    if (orphan.children && orphan.children.length) {
-                        await recreateChildren(f.id, orphan.children);
+                    // Reuse a folder of the same name if one is already here.
+                    //
+                    // This used to create unconditionally, so an orphan that never
+                    // matched a browser root — easy to hit, since root names differ
+                    // between Chrome and Firefox and matching is by normalized
+                    // title — spawned a fresh copy on *every* pull. Each copy
+                    // brought its own "TabPaladin Workflows" inside it, and
+                    // resolveRootFolder then picked between them by child count,
+                    // so saves landed in whichever was winning that day. That is
+                    // the workflows-splitting-into-multiple-folders symptom.
+                    let target = existingUnderOther.find(c => !c.url && c.title === title);
+                    if (target) {
+                        console.warn(`[TabPaladin Pull] Orphan snapshot root "${title}" → reusing existing folder (id=${target.id}) under "${otherRoot.title}"`);
+                        await emptyFolder(target.id);
+                    } else {
+                        console.warn(`[TabPaladin Pull] Orphan snapshot root "${title}" → creating under "${otherRoot.title}" (id=${otherRoot.id})`);
+                        target = await api.bookmarks.create({ parentId: otherRoot.id, title });
+                        existingUnderOther.push(target);
                     }
+                    await recreateChildren(target.id, orphan.children);
                 } catch (e) {
-                    console.warn('[TabPaladin Pull] ❌ Failed during pull for orphan root folder', orphan.title, e);
+                    console.warn('[TabPaladin Pull] ❌ Failed during pull for orphan root folder', title, e);
                 }
             }
         }
