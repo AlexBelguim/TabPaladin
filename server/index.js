@@ -14,10 +14,6 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PWA_DIR = process.env.PWA_DIR || path.resolve(__dirname, '..', 'pwa');
 const MAX_SNAPSHOTS = Number(process.env.MAX_SNAPSHOTS || 200);
 
-if (!AUTH_TOKEN) {
-    console.warn('[TabPaladin] WARNING: AUTH_TOKEN env var is empty — every request will be rejected.');
-}
-
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'sync.db'));
 db.pragma('journal_mode = WAL');
@@ -51,6 +47,25 @@ db.exec(`
         content TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
+
+    -- Login. Single account in practice, but a table so the constraint is the
+    -- product decision rather than the schema.
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    -- Sessions issued by /api/login. Long-lived on purpose: this is a personal
+    -- sync server on a private tailnet, and being logged out of your phone
+    -- every week is how people end up disabling auth altogether.
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 `);
 
 // Migrations for existing databases.
@@ -70,20 +85,172 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-// --- Auth middleware (bearer token) ---
+// --- Passwords ---
+//
+// scrypt from node:crypto rather than bcrypt/argon2, so logging in adds no
+// dependency to a server whose whole point is being easy to self-host.
+const SCRYPT_KEYLEN = 64;
+const SESSION_DAYS = Number(process.env.SESSION_DAYS || 180);
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+    const derived = crypto.scryptSync(String(password), salt, SCRYPT_KEYLEN).toString('hex');
+    return `scrypt:${salt}:${derived}`;
+}
+
+function verifyPassword(password, stored) {
+    const parts = String(stored || '').split(':');
+    if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+    const [, salt, expected] = parts;
+    const actual = crypto.scryptSync(String(password), salt, SCRYPT_KEYLEN).toString('hex');
+    const a = Buffer.from(actual, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    // Length check first: timingSafeEqual throws on a mismatch.
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Constant-time compare for the legacy shared token, so it can't be guessed a
+// character at a time by timing the response.
+function sameSecret(a, b) {
+    const x = Buffer.from(String(a));
+    const y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+
+function issueSession(username) {
+    const token = crypto.randomBytes(32).toString('hex');
+    const now = new Date();
+    const expires = new Date(now.getTime() + SESSION_DAYS * 86400000);
+    db.prepare('INSERT INTO sessions (token, username, created_at, expires_at) VALUES (?, ?, ?, ?)')
+        .run(token, username, now.toISOString(), expires.toISOString());
+    // Opportunistic cleanup — no scheduler needed for a handful of rows.
+    db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now.toISOString());
+    return { token, expiresAt: expires.toISOString() };
+}
+
+function sessionFor(token) {
+    const row = db.prepare('SELECT username, expires_at FROM sessions WHERE token = ?').get(token);
+    if (!row) return null;
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+        db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+        return null;
+    }
+    return row;
+}
+
+// --- Auth middleware ---
+//
+// Accepts a session token from /api/login, or the legacy AUTH_TOKEN. The legacy
+// path stays so an extension that hasn't been updated keeps syncing while you
+// migrate — losing sync the moment the server updates would be worse than the
+// shared secret it replaces. Drop AUTH_TOKEN from the environment once every
+// client has logged in, and only sessions will work.
 function requireAuth(req, res, next) {
-    if (!AUTH_TOKEN) return res.status(503).json({ error: 'Server not configured (AUTH_TOKEN missing).' });
     const hdr = req.headers.authorization || '';
     const m = hdr.match(/^Bearer\s+(.+)$/);
-    if (!m || m[1] !== AUTH_TOKEN) {
-        return res.status(401).json({ error: 'Unauthorized' });
+    if (!m) return res.status(401).json({ error: 'Unauthorized' });
+    const presented = m[1];
+
+    const session = sessionFor(presented);
+    if (session) {
+        req.username = session.username;
+        return next();
     }
-    next();
+
+    if (AUTH_TOKEN && sameSecret(presented, AUTH_TOKEN)) {
+        req.username = null; // legacy shared-token caller
+        return next();
+    }
+
+    if (!AUTH_TOKEN && userCount() === 0) {
+        return res.status(503).json({ error: 'Server not configured — no account exists yet.' });
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
 }
+
+// --- Auth endpoints ---
+
+// Unauthenticated on purpose: a client needs to know whether to show a login
+// form or a first-run setup form before it has any credentials. Leaks only
+// whether an account exists, which the login form already implies.
+app.get('/api/auth/status', (req, res) => {
+    res.json({
+        ok: true,
+        hasAccount: userCount() > 0,
+        legacyTokenEnabled: Boolean(AUTH_TOKEN)
+    });
+});
+
+// First-run: create the one account. Allowed while no account exists, or with
+// the legacy token, so an existing deployment can set a password without
+// shelling into the container.
+app.post('/api/auth/setup', (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+    if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+
+    const hasAccount = userCount() > 0;
+    if (hasAccount) {
+        const hdr = req.headers.authorization || '';
+        const m = hdr.match(/^Bearer\s+(.+)$/);
+        const viaLegacy = m && AUTH_TOKEN && sameSecret(m[1], AUTH_TOKEN);
+        const viaSession = m && sessionFor(m[1]);
+        if (!viaLegacy && !viaSession) {
+            return res.status(403).json({ error: 'An account already exists.' });
+        }
+        db.prepare('DELETE FROM users').run();
+        db.prepare('DELETE FROM sessions').run(); // old sessions must not survive a password change
+    }
+
+    db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+        .run(String(username), hashPassword(password), new Date().toISOString());
+
+    const session = issueSession(String(username));
+    res.json({ ok: true, username: String(username), ...session });
+});
+
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+
+    const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(String(username));
+    // Hash even when the user is unknown, so a missing account and a wrong
+    // password take the same time and can't be told apart.
+    const ok = row
+        ? verifyPassword(password, row.password_hash)
+        : (hashPassword(password), false);
+    if (!ok) return res.status(401).json({ error: 'Wrong username or password.' });
+
+    const session = issueSession(row.username);
+    res.json({ ok: true, username: row.username, ...session });
+});
+
+app.post('/api/logout', requireAuth, (req, res) => {
+    const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/);
+    if (m) db.prepare('DELETE FROM sessions WHERE token = ?').run(m[1]);
+    res.json({ ok: true });
+});
+
+app.post('/api/auth/password', requireAuth, (req, res) => {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 8) {
+        return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    }
+    const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(req.username || '');
+    if (!row) return res.status(400).json({ error: 'No account to change.' });
+    if (!verifyPassword(currentPassword, row.password_hash)) {
+        return res.status(401).json({ error: 'Current password is wrong.' });
+    }
+    db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(hashPassword(newPassword), row.username);
+    db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+    const session = issueSession(row.username);
+    res.json({ ok: true, ...session });
+});
 
 // --- Health (no auth) ---
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, version: 1, configured: Boolean(AUTH_TOKEN) });
+    res.json({ ok: true, version: 1, configured: Boolean(AUTH_TOKEN) || userCount() > 0 });
 });
 
 // --- Snapshots: push & pull ---
@@ -422,7 +589,14 @@ if (fs.existsSync(PWA_DIR)) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[TabPaladin] Server listening on :${PORT} (auth ${AUTH_TOKEN ? 'configured' : 'MISSING'})`);
+    const accounts = userCount();
+    const modes = [];
+    if (accounts > 0) modes.push('login');
+    if (AUTH_TOKEN) modes.push('legacy token');
+    console.log(`[TabPaladin] Server listening on :${PORT} (auth: ${modes.join(' + ') || 'NONE — open /api/auth/setup to create an account'})`);
+    if (accounts > 0 && AUTH_TOKEN) {
+        console.log('[TabPaladin] Both auth modes are on. Once every client has logged in, remove AUTH_TOKEN so only the login works.');
+    }
     console.log(`[TabPaladin] PWA served from ${PWA_DIR}`);
     console.log(`[TabPaladin] Data dir ${DATA_DIR}`);
 });

@@ -744,3 +744,21 @@ select.note-move {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---------- sign in ---------- */
+.hint.error { color: var(--danger); }
+
+.ghost-block {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+#auth-signed-out .field + .field { margin-top: 8px; }
+#auth-signed-out .hint { display: block; margin: 6px 0; }

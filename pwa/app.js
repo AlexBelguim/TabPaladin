@@ -5,11 +5,19 @@
 
 const LS = {
     url: 'tp_pwa_url',
-    token: 'tp_pwa_token'
+    token: 'tp_pwa_token',   // now a session token from /api/login, not a shared secret
+    username: 'tp_pwa_user'
 };
 
 const state = {
-    config: { url: localStorage.getItem(LS.url) || '', token: localStorage.getItem(LS.token) || '' },
+    config: {
+        // Falls back to wherever this PWA is served from, because that is the
+        // backend — the server hosts it. Only needs setting by hand if you host
+        // the PWA somewhere other than the sync server.
+        url: localStorage.getItem(LS.url)
+            || ((location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : ''),
+        token: localStorage.getItem(LS.token) || ''
+    },
     snapshot: null,           // bookmark tree root: { type:'root', children: [...] }
     snapshotTimestamp: null,
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
@@ -100,6 +108,16 @@ async function api(path, opts = {}) {
             ...(opts.headers || {})
         }
     });
+    if (res.status === 401) {
+        // The session expired or was revoked — say so plainly and send the user
+        // to sign in, rather than surfacing a bare 401 from somewhere deep in
+        // the app.
+        state.config.token = '';
+        localStorage.removeItem(LS.token);
+        setStatus('Session expired — sign in again.');
+        try { refreshAuthUi(); show($('settings-sheet')); } catch (e) { /* pre-DOM */ }
+        throw new Error('Signed out');
+    }
     if (!res.ok) {
         const t = await res.text().catch(() => '');
         throw new Error(`${res.status} ${res.statusText}: ${t}`);
@@ -1769,22 +1787,140 @@ async function processShareTargetIfAny() {
     }
 }
 
-// --- Settings modal ---
+// --- Settings / sign in ---
+//
+// The token field is gone: you sign in with a username and password and the
+// server hands back a session token, which is what actually goes in the
+// Authorization header. Same wire format as before, so nothing downstream of
+// api() changed — only how the token is obtained.
 function openSettings() {
     const urlEl = $('cfg-url');
-    const tokenEl = $('cfg-token');
-    if (urlEl) urlEl.value = state.config.url || '';
-    if (tokenEl) tokenEl.value = state.config.token || '';
+    if (urlEl) urlEl.value = state.config.url || defaultServerUrl();
+    refreshAuthUi();
     show($('settings-sheet'));
 }
 
-function saveSettings() {
+// The server serves this PWA, so when you opened it you were already talking to
+// the backend. Defaulting to that origin means the URL only ever needs typing
+// if you host the PWA somewhere else.
+function defaultServerUrl() {
+    try {
+        if (location.protocol === 'http:' || location.protocol === 'https:') return location.origin;
+    } catch (e) { /* file:// or similar */ }
+    return '';
+}
+
+function currentServerUrl() {
     const urlEl = $('cfg-url');
-    const tokenEl = $('cfg-token');
-    if (urlEl) state.config.url = urlEl.value.trim();
-    if (tokenEl) state.config.token = tokenEl.value.trim();
-    localStorage.setItem(LS.url, state.config.url);
-    localStorage.setItem(LS.token, state.config.token);
+    const typed = urlEl ? urlEl.value.trim() : '';
+    return (typed || state.config.url || defaultServerUrl()).replace(/\/$/, '');
+}
+
+function refreshAuthUi() {
+    const signedIn = Boolean(state.config.token);
+    const inEl = $('auth-signed-in');
+    const outEl = $('auth-signed-out');
+    if (inEl) inEl.classList.toggle('hidden', !signedIn);
+    if (outEl) outEl.classList.toggle('hidden', signedIn);
+    const who = $('auth-username-label');
+    if (who) who.textContent = localStorage.getItem(LS.username) || '';
+    const setupHint = $('auth-setup-hint');
+    if (setupHint) setupHint.classList.add('hidden');
+    if (!signedIn) probeAuthStatus();
+}
+
+// Tells the user whether to sign in or create the first account.
+async function probeAuthStatus() {
+    const base = currentServerUrl();
+    if (!base) return;
+    try {
+        const res = await fetch(base + '/api/auth/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        const hint = $('auth-setup-hint');
+        const btn = $('auth-submit');
+        if (!data.hasAccount) {
+            if (hint) {
+                hint.textContent = 'No account on this server yet — the details you enter will create it.';
+                hint.classList.remove('hidden');
+            }
+            if (btn) btn.textContent = 'Create account';
+        } else if (btn) {
+            btn.textContent = 'Sign in';
+        }
+    } catch (e) {
+        // Server unreachable; the sign-in attempt will report it properly.
+    }
+}
+
+async function submitAuth() {
+    const base = currentServerUrl();
+    const username = ($('cfg-username')?.value || '').trim();
+    const password = $('cfg-password')?.value || '';
+    const err = $('auth-error');
+    const setErr = (m) => {
+        if (!err) return;
+        err.textContent = m || '';
+        err.classList.toggle('hidden', !m);
+    };
+    setErr('');
+
+    if (!base) return setErr('Enter the server address first.');
+    if (!username || !password) return setErr('Username and password are both required.');
+
+    let hasAccount = true;
+    try {
+        const s = await fetch(base + '/api/auth/status').then(r => r.json());
+        hasAccount = Boolean(s.hasAccount);
+    } catch (e) {
+        return setErr("Can't reach that server. Check the address, and that Tailscale is connected.");
+    }
+
+    try {
+        const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return setErr(data.error || `Sign in failed (HTTP ${res.status}).`);
+
+        state.config.url = base;
+        state.config.token = data.token;
+        localStorage.setItem(LS.url, base);
+        localStorage.setItem(LS.token, data.token);
+        localStorage.setItem(LS.username, data.username || username);
+        if ($('cfg-password')) $('cfg-password').value = '';
+        refreshAuthUi();
+        hide($('settings-sheet'));
+        bootstrap();
+    } catch (e) {
+        setErr('Sign in failed: ' + e.message);
+    }
+}
+
+async function signOut() {
+    const base = currentServerUrl();
+    // Best effort — the local token is cleared either way, so a server that is
+    // unreachable can't leave you stuck signed in on the device.
+    try {
+        await fetch(base + '/api/logout', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + state.config.token }
+        });
+    } catch (e) { /* ignore */ }
+    state.config.token = '';
+    localStorage.removeItem(LS.token);
+    localStorage.removeItem(LS.username);
+    state.snapshot = null;
+    refreshAuthUi();
+    setStatus('Signed out.');
+}
+
+function saveSettings() {
+    const base = currentServerUrl();
+    state.config.url = base;
+    localStorage.setItem(LS.url, base);
     hide($('settings-sheet'));
     bootstrap();
 }
@@ -2028,6 +2164,12 @@ window.addEventListener('DOMContentLoaded', () => {
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
+    safeAddListener('auth-submit', 'click', submitAuth);
+    safeAddListener('auth-signout', 'click', signOut);
+    // Enter in the password field signs in, which is what everyone expects.
+    safeAddListener('cfg-password', 'keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); submitAuth(); }
+    });
 
     safeAddListener('inbox-fab', 'click', (e) => {
         e.stopPropagation();

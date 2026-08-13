@@ -74,15 +74,30 @@
     </div>
     <div class="sheet-body">
       <label class="field">
-        <span>Server URL</span>
-        <input id="cfg-url" type="url" placeholder="http://truenas.local:18921">
+        <span>Server</span>
+        <input id="cfg-url" type="url" placeholder="https://nas.tailnet.ts.net">
       </label>
-      <label class="field">
-        <span>Auth token</span>
-        <input id="cfg-token" type="password" placeholder="paste TABPALADIN_TOKEN">
-      </label>
-      <button id="cfg-save" class="primary">Save</button>
-      <small class="hint">Stored in localStorage. Use HTTPS in production.</small>
+      <small class="hint">Defaults to wherever this app is served from — you only need to change it if you host the app somewhere else.</small>
+
+      <div id="auth-signed-out">
+        <label class="field">
+          <span>Username</span>
+          <input id="cfg-username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="cfg-password" type="password" autocomplete="current-password">
+        </label>
+        <small id="auth-setup-hint" class="hint hidden"></small>
+        <small id="auth-error" class="hint error hidden"></small>
+        <button id="auth-submit" class="primary">Sign in</button>
+      </div>
+
+      <div id="auth-signed-in" class="hidden">
+        <p class="hint">Signed in as <strong id="auth-username-label"></strong>.</p>
+        <button id="cfg-save" class="primary">Save server</button>
+        <button id="auth-signout" class="ghost-block">Sign out</button>
+      </div>
     </div>
   </div>
 

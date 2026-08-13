@@ -12,6 +12,7 @@ import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
 import { AIService } from '../utils/aiService.js';
 import { BackendSync } from '../utils/backendSync.js';
 import { NotesManager } from '../utils/notesManager.js';
+import { resolveServerUrl } from '../utils/config.js';
 
 // --- State ---
 let currentTabs = [];
@@ -2797,10 +2798,30 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <!-- 4. Backend Sync -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backend Sync</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
-                <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Server URL</div>
-                <input type="url" id="backend-url" value="${(settings.backend && settings.backend.url) || ''}" placeholder="http://truenas.local:18921" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
-                <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Auth Token</div>
-                <input type="password" id="backend-token" value="${(settings.backend && settings.backend.token) || ''}" placeholder="TABPALADIN_TOKEN" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
+                <!-- URL and token are no longer typed. The address comes from
+                     src/utils/config.js, and the token is a session issued by
+                     signing in. Both stay as hidden inputs so the existing
+                     push/pull/test code keeps reading them exactly as before. -->
+                <input type="hidden" id="backend-url" value="${resolveServerUrl(settings.backend && settings.backend.url)}">
+                <input type="hidden" id="backend-token" value="${(settings.backend && settings.backend.token) || ''}">
+
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                    Server: <code style="color:#93c5fd;">${resolveServerUrl(settings.backend && settings.backend.url)}</code>
+                </div>
+
+                <div id="backend-signed-in" style="display:${(settings.backend && settings.backend.token) ? 'block' : 'none'}; margin-bottom:10px;">
+                    <div style="font-size:0.85rem; color:#ccc;">Signed in as <strong>${(settings.backend && settings.backend.username) || 'unknown'}</strong></div>
+                    <button id="backend-signout-btn" class="sm-btn" style="margin-top:8px; width:100%;">Sign out</button>
+                </div>
+
+                <div id="backend-signed-out" style="display:${(settings.backend && settings.backend.token) ? 'none' : 'block'}; margin-bottom:10px;">
+                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Username</div>
+                    <input type="text" id="backend-username" autocomplete="username" value="${(settings.backend && settings.backend.username) || ''}" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Password</div>
+                    <input type="password" id="backend-password" autocomplete="current-password" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                    <div id="backend-auth-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
+                    <button id="backend-signin-btn" class="primary-btn" style="width:100%;">Sign in</button>
+                </div>
                 <div style="display:flex; gap:8px; margin-top:10px;">
                     <button id="backend-test-btn" class="sm-btn" style="flex:1;">⚡ Test</button>
                     <button id="backend-push-btn" class="sm-btn" style="flex:1; background:rgba(59,130,246,0.2); border:1px solid var(--primary-color);">⬆ Push</button>
@@ -3312,7 +3333,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     // Backend sync buttons
     const backendStatus = document.getElementById('backend-status');
     const getBackendConfig = () => ({
-        url: document.getElementById('backend-url').value.trim(),
+        // resolveServerUrl keeps the hardcoded default authoritative even if the
+        // hidden field is somehow empty.
+        url: resolveServerUrl(document.getElementById('backend-url').value),
         token: document.getElementById('backend-token').value.trim()
     });
     const writeBackendStatus = (msg) => { backendStatus.textContent = msg; };
@@ -3322,6 +3345,80 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const updated = { ...current, backend: { ...(current.backend || {}), ...cfg, ...extras } };
         await StorageManager.saveSettings(updated);
     };
+
+    // --- Sign in / out ---
+    const authError = (msg) => {
+        const el = document.getElementById('backend-auth-error');
+        if (el) el.textContent = msg || '';
+    };
+    const setSignedInUi = (signedIn, username) => {
+        const inEl = document.getElementById('backend-signed-in');
+        const outEl = document.getElementById('backend-signed-out');
+        if (inEl) inEl.style.display = signedIn ? 'block' : 'none';
+        if (outEl) outEl.style.display = signedIn ? 'none' : 'block';
+        const strong = inEl && inEl.querySelector('strong');
+        if (signedIn && strong && username) strong.textContent = username;
+    };
+
+    const doSignIn = async () => {
+        const base = getBackendConfig().url;
+        const username = (document.getElementById('backend-username')?.value || '').trim();
+        const password = document.getElementById('backend-password')?.value || '';
+        authError('');
+        if (!username || !password) { authError('Username and password are both required.'); return; }
+
+        // Ask first whether an account exists, so the very first sign-in creates
+        // it instead of failing with "wrong password" against an empty server.
+        let hasAccount = true;
+        try {
+            const s = await fetch(base + '/api/auth/status').then(r => r.json());
+            hasAccount = Boolean(s.hasAccount);
+        } catch (e) {
+            authError(`Can't reach ${base} — is it up?`);
+            return;
+        }
+
+        try {
+            const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { authError(data.error || `Sign in failed (HTTP ${res.status}).`); return; }
+
+            document.getElementById('backend-token').value = data.token;
+            const pw = document.getElementById('backend-password');
+            if (pw) pw.value = '';
+            await persistBackendConfig({ username: data.username || username });
+            setSignedInUi(true, data.username || username);
+            writeBackendStatus('Signed in.');
+        } catch (e) {
+            authError('Sign in failed: ' + e.message);
+        }
+    };
+
+    const doSignOut = async () => {
+        const cfg = getBackendConfig();
+        // Best effort — the local token is cleared either way, so an unreachable
+        // server can't leave you stuck signed in on this machine.
+        try {
+            await fetch(cfg.url + '/api/logout', {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + cfg.token }
+            });
+        } catch (e) { /* ignore */ }
+        document.getElementById('backend-token').value = '';
+        await persistBackendConfig({});
+        setSignedInUi(false);
+        writeBackendStatus('Signed out.');
+    };
+
+    document.getElementById('backend-signin-btn')?.addEventListener('click', doSignIn);
+    document.getElementById('backend-signout-btn')?.addEventListener('click', doSignOut);
+    document.getElementById('backend-password')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); doSignIn(); }
+    });
 
     document.getElementById('backend-test-btn').addEventListener('click', async () => {
         const cfg = getBackendConfig();
@@ -3337,7 +3434,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
     document.getElementById('backend-push-btn').addEventListener('click', async () => {
         const cfg = getBackendConfig();
-        if (!cfg.url || !cfg.token) { alert('Server URL and token required.'); return; }
+        if (!cfg.token) { alert('Not signed in. Open Settings and sign in to the sync server.'); return; }
         if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
         writeBackendStatus('Pushing…');
         try {
@@ -3357,7 +3454,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
     document.getElementById('backend-pull-btn').addEventListener('click', async () => {
         const cfg = getBackendConfig();
-        if (!cfg.url || !cfg.token) { alert('Server URL and token required.'); return; }
+        if (!cfg.token) { alert('Not signed in. Open Settings and sign in to the sync server.'); return; }
         writeBackendStatus('Checking latest…');
         try {
             const data = await BackendSync.pullLatestInfo(cfg);
@@ -3450,8 +3547,8 @@ document.getElementById('mainPushBtn').addEventListener('click', async () => {
     try {
         const settings = await StorageManager.getSettings();
         const cfg = settings.backend || {};
-        if (!cfg.url || !cfg.token) {
-            alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+        if (!cfg.token) {
+            alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
             return;
         }
         if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
@@ -3480,8 +3577,8 @@ document.getElementById('mainPullBtn').addEventListener('click', async () => {
     try {
         const settings = await StorageManager.getSettings();
         const cfg = settings.backend || {};
-        if (!cfg.url || !cfg.token) {
-            alert('Sync server URL and token are not configured. Open Settings (⚙️) to set them up.');
+        if (!cfg.token) {
+            alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
             return;
         }
 
