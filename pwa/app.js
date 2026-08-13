@@ -545,7 +545,89 @@ function renderHome(root) {
         wrap.appendChild(grid);
     }
 
+    // Quick actions. These delegate to the existing topbar/menu buttons rather
+    // than re-implementing their handlers — the phone gets bigger targets for
+    // the same four things, and there is still one code path per action.
+    const actionsHead = document.createElement('div');
+    actionsHead.className = 'home-head';
+    actionsHead.textContent = 'Quick actions';
+    wrap.appendChild(actionsHead);
+
+    const actions = document.createElement('div');
+    actions.className = 'home-actions';
+    const ACTIONS = [
+        { label: '📝 Notes', cls: 'a-notes', delegate: 'notesBtn' },
+        { label: '📋 Unfiled links', cls: 'a-clip', delegate: 'clipBtn' },
+        { label: '⬇️ Pull', cls: 'a-pull', delegate: 'pullBtn' },
+        { label: '⬆️ Push', cls: 'a-push', delegate: 'pushBtn' }
+    ];
+    for (const a of ACTIONS) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'home-action ' + a.cls;
+        btn.textContent = a.label;
+        btn.addEventListener('click', () => {
+            const target = document.getElementById(a.delegate);
+            if (target) target.click();
+        });
+        actions.appendChild(btn);
+    }
+    wrap.appendChild(actions);
+
+    // Recent notes, with open-task counts read from the markdown.
+    const notesFolder = findNotesFolderWithPath();
+    const recent = collectRecentNotes(notesFolder?.node).slice(0, 4);
+    if (recent.length) {
+        const head = document.createElement('div');
+        head.className = 'home-head';
+        head.textContent = 'Recent notes';
+        wrap.appendChild(head);
+
+        const panel = document.createElement('div');
+        panel.className = 'home-panel';
+        for (const n of recent) {
+            const row = document.createElement('div');
+            row.className = 'home-note-row';
+            const left = document.createElement('span');
+            left.className = 'home-note-title';
+            left.textContent = n.title;
+            const right = document.createElement('span');
+            right.className = 'home-note-meta';
+            right.textContent = n.total ? `${n.open} of ${n.total} open` : '';
+            row.append(left, right);
+            row.addEventListener('click', () => {
+                state.openNoteId = n.id;
+                state.editingNewNote = false;
+                renderView();
+            });
+            panel.appendChild(row);
+        }
+        wrap.appendChild(panel);
+    }
+
     root.appendChild(wrap);
+}
+
+// Notes anywhere under the notes root, newest-looking first, with task counts.
+function collectRecentNotes(node, out = []) {
+    if (!node) return out;
+    for (const child of node.children || []) {
+        if (isNoteBookmark(child)) {
+            const { content } = decodeNote(child);
+            let open = 0;
+            let total = 0;
+            for (const line of String(content).split(/\r?\n/)) {
+                const task = parseTaskLine(line);
+                if (!task) continue;
+                total++;
+                if (!task.checked) open++;
+            }
+            out.push({ id: child._pwaId, title: child.title || 'Untitled', open, total });
+        } else if (child.type === 'folder') {
+            collectRecentNotes(child, out);
+        }
+    }
+    return out;
 }
 
 function isNotesFolder(node) {
@@ -2164,14 +2246,31 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // The wordmark goes home: close any open note and return to the root view,
     // which is where search and the pinned tiles live.
-    safeAddListener('brand-home', 'click', () => {
+    const goHome = () => {
         if (!state.snapshot) return;
         state.openNoteId = null;
         state.editingNewNote = false;
         state.pathIds = [state.snapshot._pwaId];
         renderView();
         window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
+    };
+    safeAddListener('brand-home', 'click', goHome);
+
+    // Bottom tab bar. Notes/Inbox/Settings delegate to the controls that
+    // already exist so there is still one handler per action.
+    const nav = document.getElementById('bottom-nav');
+    if (nav) {
+        nav.addEventListener('click', (e) => {
+            const btn = e.target.closest('button[data-nav]');
+            if (!btn) return;
+            for (const b of nav.querySelectorAll('button')) b.classList.toggle('on', b === btn);
+            const dest = btn.dataset.nav;
+            if (dest === 'home') goHome();
+            else if (dest === 'notes') document.getElementById('notesBtn')?.click();
+            else if (dest === 'inbox') openInbox();
+            else if (dest === 'settings') document.getElementById('settingsBtn')?.click();
+        });
+    }
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);

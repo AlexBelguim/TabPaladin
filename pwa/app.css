@@ -784,3 +784,82 @@ select.note-move {
 #brand-home img { border-radius: 5px; flex-shrink: 0; }
 #brand-home h1 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #brand-home:active { background: var(--surface-2); }
+
+/* ---------- home: quick actions + recent notes ---------- */
+.home-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.home-action {
+  padding: 13px 11px;
+  border-radius: 9px;
+  border: none;
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: inherit;
+  text-align: left;
+}
+
+.home-action.a-notes { background: #0ea5e9; }
+.home-action.a-clip  { background: var(--success); }
+.home-action.a-pull  { background: #f59e0b; }
+.home-action.a-push  { background: var(--primary); }
+.home-action:active { filter: brightness(0.9); }
+
+.home-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+}
+
+.home-note-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+  font-size: 0.85rem;
+}
+
+.home-note-row:last-child { border-bottom: none; }
+.home-note-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-note-meta { color: var(--muted); font-size: 0.72rem; flex-shrink: 0; }
+
+/* ---------- bottom tab bar ---------- */
+#bottom-nav {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  background: #0b1120;
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom);
+  z-index: 40;
+}
+
+#bottom-nav button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 9px 0 11px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 0.63rem;
+  font-family: inherit;
+}
+
+#bottom-nav button.on { color: #93c5fd; }
+#bottom-nav .bn-i { font-size: 1.05rem; line-height: 1; }
+
+/* Keep the last rows clear of the bar. */
+body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+#inbox-fab { bottom: calc(74px + env(safe-area-inset-bottom)); }
