@@ -762,3 +762,25 @@ select.note-move {
 
 #auth-signed-out .field + .field { margin-top: 8px; }
 #auth-signed-out .hint { display: block; margin: 6px 0; }
+
+/* Wordmark doubles as the way home. */
+#brand-home {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 4px 6px;
+  margin-left: -6px;
+  border-radius: 8px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+#brand-home img { border-radius: 5px; flex-shrink: 0; }
+#brand-home h1 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#brand-home:active { background: var(--surface-2); }

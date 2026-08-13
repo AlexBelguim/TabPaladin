@@ -374,6 +374,23 @@ async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
     // refers to a node that no longer exists.
     StorageManager.resetRootCache();
 
+    // Heal duplicate app roots straight away.
+    //
+    // A pull recreates exactly what the snapshot holds, so if the snapshot
+    // itself carries two "TabPaladin Workflows" folders, consolidating by hand
+    // fixes only the local copy and the duplicate is back on the next sync.
+    // That is why the warning kept reappearing after every pull. Merging here
+    // ends the loop regardless of how the second folder got there, and the next
+    // push writes the healed tree back so the snapshot stops carrying it.
+    for (const rootTitle of ['TabPaladin Workflows', 'TabPaladin Notes', 'TabPaladin Pinned']) {
+        try {
+            const merged = await StorageManager.consolidateDuplicateRoots(rootTitle);
+            if (merged > 0) console.log(`[TabPaladin Pull] Merged ${merged} duplicate "${rootTitle}" folder(s).`);
+        } catch (e) {
+            console.warn('[TabPaladin Pull] Could not consolidate', rootTitle, e);
+        }
+    }
+
     // 3. Traversal/Search the newly recreated tree to map paths back to new IDs
     const newPathToIdMap = await buildFolderPathsMap();
 

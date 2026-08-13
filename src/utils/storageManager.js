@@ -376,5 +376,65 @@ export const StorageManager = {
     // bookmark tree wholesale (a destructive pull), since every cached id is
     // then meaningless.
     resetRootCache: () => rootFolderCaches.clear(),
+
+    /**
+     * Merge every duplicate folder of `title` into one, moving their children
+     * across and deleting the emptied husks. Returns the number merged.
+     *
+     * This is what the Consolidate button in settings does, as a function, so a
+     * pull can do it automatically. Duplicates keep coming back because a pull
+     * faithfully recreates whatever the snapshot holds — if the snapshot itself
+     * carries two workflow roots, consolidating locally fixes nothing the next
+     * time you sync. Healing after every pull makes the recurrence a non-event
+     * whatever put the second folder there.
+     *
+     * The survivor is the folder with the most children, matching how
+     * resolveRootFolder picks, so the two never disagree about which is "the"
+     * root.
+     */
+    consolidateDuplicateRoots: async (title) => {
+        let folders;
+        try {
+            const matches = await api.bookmarks.search({ title });
+            folders = matches.filter(m => !m.url && m.title === title);
+        } catch (e) {
+            return 0;
+        }
+        if (folders.length < 2) return 0;
+
+        const counts = new Map();
+        for (const f of folders) {
+            try { counts.set(f.id, (await api.bookmarks.getChildren(f.id)).length); }
+            catch (e) { counts.set(f.id, -1); }
+        }
+        const keep = folders.reduce((best, f) => (counts.get(f.id) > counts.get(best.id) ? f : best), folders[0]);
+
+        let merged = 0;
+        for (const dupe of folders) {
+            if (dupe.id === keep.id) continue;
+            try {
+                const kids = await api.bookmarks.getChildren(dupe.id);
+                for (const k of kids) {
+                    try { await api.bookmarks.move(k.id, { parentId: keep.id }); }
+                    catch (e) { console.warn('[TabPaladin] consolidate: could not move', k.id, e); }
+                }
+                // Only remove once empty — never delete content we failed to move.
+                const left = await api.bookmarks.getChildren(dupe.id);
+                if (left.length === 0) {
+                    await api.bookmarks.removeTree(dupe.id);
+                    merged++;
+                } else {
+                    console.warn(`[TabPaladin] consolidate: leaving "${title}" ${dupe.id}, ${left.length} child(ren) would not move.`);
+                }
+            } catch (e) {
+                console.warn('[TabPaladin] consolidate failed for', dupe.id, e);
+            }
+        }
+        if (merged > 0) {
+            rootFolderCaches.clear();
+            workflowRootDuplicateCount = 0;
+        }
+        return merged;
+    },
     META_TITLE
 };

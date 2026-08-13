@@ -19,6 +19,33 @@ body.tp-app .container {
     padding: 0 24px 64px;
 }
 
+/* The tabs-and-suggestions grid breaks out of the container.
+ *
+ * 1180px suits the home screen — a centred search box and readable rows — but
+ * it is the wrong shape for a column per bookmark root next to a list of 49
+ * open tabs, which just gets three cramped columns and a lot of empty page.
+ * Full-bleed for that one section only, so the rest keeps its measure. */
+body.tp-app #groups-container {
+    width: calc(100vw - 48px);
+    max-width: calc(100vw - 48px);
+    margin-left: calc(-50vw + 50% + 24px);
+}
+
+@media (max-width: 680px) {
+    body.tp-app #groups-container {
+        width: calc(100vw - 28px);
+        max-width: calc(100vw - 28px);
+        margin-left: calc(-50vw + 50% + 14px);
+    }
+}
+
+/* With real width available, let the columns grow rather than sitting at their
+   280px basis with dead space between them. */
+body.tp-app .roots-grid.multi > .source-folder-card {
+    flex: 1 1 340px;
+    max-height: none;
+}
+
 /* ---------- top bar ---------- */
 .tp-topbar {
     display: flex;
@@ -34,6 +61,24 @@ body.tp-app .container {
     display: flex;
     align-items: center;
     gap: 10px;
+    /* It's a button now — strip the chrome so it still reads as a wordmark. */
+    background: none;
+    border: none;
+    padding: 4px 6px;
+    margin-left: -6px;
+    border-radius: 8px;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+}
+
+.tp-brand:hover {
+    background: var(--surface-hover);
+}
+
+.tp-brand:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
 }
 
 .tp-brand img {

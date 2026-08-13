@@ -2162,6 +2162,17 @@ window.addEventListener('DOMContentLoaded', () => {
         if (sec) sec.scrollIntoView({ behavior: 'smooth' });
     });
 
+    // The wordmark goes home: close any open note and return to the root view,
+    // which is where search and the pinned tiles live.
+    safeAddListener('brand-home', 'click', () => {
+        if (!state.snapshot) return;
+        state.openNoteId = null;
+        state.editingNewNote = false;
+        state.pathIds = [state.snapshot._pwaId];
+        renderView();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
     safeAddListener('auth-submit', 'click', submitAuth);

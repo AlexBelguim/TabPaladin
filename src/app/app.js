@@ -46,6 +46,20 @@ function watchViews() {
     syncHomeVisibility();
 }
 
+// The wordmark is the way back. Every view is a section sidepanel.js shows by
+// writing style.display, so closing them all is what "go home" means here.
+function goHome() {
+    for (const id of VIEW_IDS) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    }
+    const groups = document.getElementById('groups-container');
+    if (groups) groups.style.display = '';
+    syncHomeVisibility();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.dispatchEvent(new CustomEvent('tabpaladin:home-refresh'));
+}
+
 async function boot() {
     try {
         await initHome();
@@ -53,6 +67,7 @@ async function boot() {
         console.error('[TabPaladin] Home failed to start', e);
     }
     watchViews();
+    document.getElementById('tp-home-link')?.addEventListener('click', goHome);
 }
 
 if (document.readyState === 'loading') {
