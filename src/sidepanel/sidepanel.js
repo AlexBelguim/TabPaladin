@@ -2021,23 +2021,77 @@ function renderNoteInlineHtml(escaped) {
     return html;
 }
 
-// Render note content as safe HTML. "- [ ] thing" / "- [x] thing" become real
-// checkboxes carrying their source line number, so toggling one edits exactly
-// that line of the stored markdown. Everything else is escaped text.
-// Styles are inline so this doesn't depend on sidepanel.css.
-function renderNoteContentHtml(content) {
-    return String(content == null ? '' : content).split('\n').map((raw, i) => {
+// Inline markdown: **bold**, *italic*, `code`. Applied after escaping, so the
+// patterns only ever see safe text.
+function renderNoteEmphasis(html) {
+    return html
+        .replace(/`([^`]+)`/g, '<code class="note-code">$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+}
+
+// Render note content as HTML.
+//
+// Tasks become real checkboxes carrying their source line number, so toggling
+// one edits exactly that line of the stored markdown. Headings, bullets and
+// emphasis render too — previously everything except tasks and links came out
+// as escaped text, so a note full of "## Meat" and "- 260 g soy sauce" read as
+// raw markdown with only the checkboxes working.
+//
+// `skipTitle` drops a leading "# Heading" that just repeats the note's title,
+// which is otherwise shown twice: once in the title field, once at the top of
+// the body.
+function renderNoteContentHtml(content, skipTitle = '') {
+    const lines = String(content == null ? '' : content).split('\n');
+    const out = [];
+    let inList = false;
+    let titleDropped = false;
+
+    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+
+    lines.forEach((raw, i) => {
         const task = NotesManager.parseTaskLine(raw);
-        if (!task) return renderNoteInlineHtml(escapeHtml(raw));
-        const label = renderNoteInlineHtml(escapeHtml(task.label));
-        const done = task.checked;
-        return `<label class="note-task" style="display:inline-flex; align-items:flex-start; gap:6px;` +
-            ` margin-left:${task.indent * 12}px; cursor:pointer;">` +
-            `<input type="checkbox" class="note-task-box" data-line="${i}"${done ? ' checked' : ''}` +
-            ` style="margin:2px 0 0 0; cursor:pointer; flex:none;">` +
-            `<span${done ? ' style="text-decoration:line-through; opacity:0.6;"' : ''}>${label}</span>` +
-            `</label>`;
-    }).join('<br>');
+        if (task) {
+            closeList();
+            const label = renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(task.label)));
+            out.push(
+                `<label class="note-task"${task.indent ? ` style="margin-left:${task.indent * 14}px;"` : ''}>` +
+                `<input type="checkbox" class="note-task-box" data-line="${i}"${task.checked ? ' checked' : ''}>` +
+                `<span class="note-task-label${task.checked ? ' done' : ''}">${label}</span>` +
+                `</label>`
+            );
+            return;
+        }
+
+        const heading = raw.match(/^(#{1,4})\s+(.*)$/);
+        if (heading) {
+            closeList();
+            const text = heading[2].trim();
+            // A leading H1 echoing the title is noise, not content.
+            if (!titleDropped && heading[1].length === 1 && skipTitle
+                && text.toLowerCase() === skipTitle.toLowerCase()) {
+                titleDropped = true;
+                return;
+            }
+            const level = Math.min(heading[1].length + 1, 5); // h1 -> h2, so page structure stays sane
+            out.push(`<h${level} class="note-h">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(text)))}</h${level}>`);
+            return;
+        }
+
+        const bullet = raw.match(/^(\s*)[-*]\s+(.*)$/);
+        if (bullet) {
+            if (!inList) { out.push('<ul class="note-list">'); inList = true; }
+            out.push(`<li>${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(bullet[2])))}</li>`);
+            return;
+        }
+
+        closeList();
+        if (raw.trim() === '') { out.push('<div class="note-gap"></div>'); return; }
+        out.push(`<p class="note-p">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(raw)))}</p>`);
+    });
+
+    closeList();
+    return out.join('');
 }
 
 async function renderNotePreview() {
@@ -2045,7 +2099,7 @@ async function renderNotePreview() {
     const title = document.getElementById('noteTitleInput').value.trim();
     const content = document.getElementById('noteContentInput').value;
 
-    let html = `<div class="note-preview-body">${renderNoteContentHtml(content) || '<span style="color:var(--text-muted);">Empty note.</span>'}</div>`;
+    let html = `<div class="note-preview-body">${renderNoteContentHtml(content, title) || '<span style="color:var(--text-muted);">Empty note.</span>'}</div>`;
 
     if (title) {
         const backlinks = await NotesManager.getBacklinks(title, activeNoteId);

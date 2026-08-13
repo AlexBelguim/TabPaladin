@@ -493,10 +493,117 @@ body.tp-app #note-editor { width: 100%; }
     align-items: start;
 }
 
-/* With preview hidden, the textarea takes the whole width. */
+/* Only one pane is ever visible, so the grid must collapse either way. The
+   earlier rule only handled a hidden preview; in reading mode it is the
+   textarea that is hidden, which left the note rendering into half the width
+   with an empty column beside it. */
 .note-panes:has(#notePreview[style*="display:none"]),
-.note-panes:has(#notePreview[style*="display: none"]) {
+.note-panes:has(#notePreview[style*="display: none"]),
+.note-panes:has(#noteContentInput[style*="display:none"]),
+.note-panes:has(#noteContentInput[style*="display: none"]) {
     grid-template-columns: minmax(0, 1fr);
+}
+
+/* ---------- rendered note ---------- */
+body.tp-app .note-preview {
+    padding: 18px 22px;
+    background: rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    line-height: 1.65;
+    /* No reading measure. Prose would be easier to read capped around 78ch,
+       but these notes are mostly short lines — ingredients, steps, tasks —
+       where a cap just recreates the half-empty page it was meant to fix. */
+}
+
+.note-preview .note-h {
+    margin: 22px 0 8px;
+    line-height: 1.25;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+}
+
+.note-preview .note-h:first-child { margin-top: 0; }
+.note-preview h2.note-h { font-size: 1.35rem; }
+.note-preview h3.note-h { font-size: 1.1rem; color: var(--text-color); }
+.note-preview h4.note-h,
+.note-preview h5.note-h {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+}
+
+.note-preview .note-p { margin: 0 0 10px; }
+.note-preview .note-gap { height: 8px; }
+
+.note-preview .note-list {
+    margin: 0 0 12px;
+    padding-left: 22px;
+}
+
+.note-preview .note-list li { margin: 3px 0; }
+
+.note-preview .note-code {
+    font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+    font-size: 0.88em;
+    background: rgba(255, 255, 255, 0.07);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+
+/* ---------- task checkboxes ---------- */
+.note-preview .note-task {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 5px 0;
+    cursor: pointer;
+}
+
+.note-preview .note-task-box {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    margin: 1px 0 0;
+    flex: none;
+    border: 2px solid var(--text-muted);
+    border-radius: 5px;
+    background: transparent;
+    cursor: pointer;
+    position: relative;
+    transition: background-color 0.12s, border-color 0.12s;
+}
+
+.note-preview .note-task:hover .note-task-box { border-color: var(--primary-color); }
+
+.note-preview .note-task-box:checked {
+    background: var(--success-color);
+    border-color: var(--success-color);
+}
+
+/* Drawn rather than a glyph, so it sits identically on every platform. */
+.note-preview .note-task-box:checked::after {
+    content: "";
+    position: absolute;
+    left: 5px;
+    top: 1px;
+    width: 4px;
+    height: 9px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+.note-preview .note-task-box:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.note-preview .note-task-label.done {
+    text-decoration: line-through;
+    color: var(--text-muted);
 }
 
 body.tp-app #noteContentInput {
