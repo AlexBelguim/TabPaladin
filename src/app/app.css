@@ -426,6 +426,55 @@ body.tp-app #notes-list {
     overflow-y: auto;
 }
 
+/* Browse mode. With no note open the editor is hidden, which left a 260px
+   column of notes beside three-quarters of empty page. Give the list the whole
+   width as a card grid; it collapses back to a sidebar the moment a note is
+   opened for editing. */
+.notes-split:has(#note-editor[style*="display:none"]),
+.notes-split:has(#note-editor[style*="display: none"]) {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.notes-split:has(#note-editor[style*="display:none"]) #notes-list,
+.notes-split:has(#note-editor[style*="display: none"]) #notes-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 10px;
+    max-height: none;
+    overflow-y: visible;
+}
+
+/* Notebook headings own their row rather than sitting in the flow as a card. */
+.note-group-head {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 14px 0 2px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.note-group-head:first-child { margin-top: 0; }
+
+.note-group-count {
+    letter-spacing: 0;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+/* Fallback where :has() is unavailable — a wider column still beats a narrow
+   one stranded beside nothing. */
+@supports not selector(:has(*)) {
+    .notes-split { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); }
+}
+
 .note-panes {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

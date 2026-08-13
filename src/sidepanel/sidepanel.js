@@ -1933,16 +1933,47 @@ function renderNotesList(filter = '') {
         list.innerHTML = '<li class="empty-state">No notes yet.</li>';
         return;
     }
+
+    // Grouped by notebook, because a flat list of every note across every
+    // notebook is only browsable while you have very few. Notes filed directly
+    // in the root have no notebook and lead, since they belong to no group.
+    const groups = new Map();
     for (const note of shown) {
+        const key = note.notebook || '';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(note);
+    }
+    const names = [...groups.keys()].sort((a, b) => {
+        if (a === '') return -1;
+        if (b === '') return 1;
+        return a.localeCompare(b);
+    });
+
+    const renderNote = (note) => {
         const li = document.createElement('li');
         li.className = 'note-list-item';
         const snippet = note.content.replace(/\s+/g, ' ').trim().slice(0, 80);
+        // The notebook name is the heading now, so repeating it on every card
+        // would just be noise.
         li.innerHTML = `
-            <div class="note-item-title">${escapeHtml(note.title)}${note.notebook ? ` <span class="note-item-notebook">${escapeHtml(note.notebook)}</span>` : ''}</div>
+            <div class="note-item-title">${escapeHtml(note.title)}</div>
             ${snippet ? `<div class="note-item-snippet">${escapeHtml(snippet)}</div>` : ''}
         `;
         li.addEventListener('click', () => openNoteInEditor(note));
-        list.appendChild(li);
+        return li;
+    };
+
+    for (const name of names) {
+        const notes = groups.get(name);
+        // With everything in one notebook, a single heading says nothing.
+        if (names.length > 1) {
+            const head = document.createElement('li');
+            head.className = 'note-group-head';
+            head.innerHTML =
+                `<span>${escapeHtml(name || 'Ungrouped')}</span><span class="note-group-count">${notes.length}</span>`;
+            list.appendChild(head);
+        }
+        for (const note of notes) list.appendChild(renderNote(note));
     }
 }
 
