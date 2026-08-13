@@ -86,9 +86,14 @@ function parseLinks(content) {
     return { wiki, urls };
 }
 
-// Markdown task list: "- [ ] thing" / "- [x] thing" (also "* [ ]").
-// Captures indent, the marker character and the label.
-const TASK_LINE_RE = /^(\s*)[-*]\s+\[([ xX])\]\s?(.*)$/;
+// Markdown task list: "- [ ] thing" / "- [x] thing" (also "* [ ]"), and a
+// bare "[ ] thing" with no list marker at all.
+//
+// Strict GitHub markdown wants the bullet, but people type the box on its own
+// and then wonder why nothing is clickable — so the bullet is optional here.
+// It stays captured so toggling can rewrite only the box and leave the rest of
+// the line, bullet or not, byte-for-byte intact.
+const TASK_LINE_RE = /^(\s*)(?:[-*]\s+)?\[([ xX])\]\s?(.*)$/;
 
 function parseTaskLine(line) {
     const m = String(line).match(TASK_LINE_RE);
@@ -104,7 +109,7 @@ function toggleTaskAtLine(content, lineIndex) {
     if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= lines.length) return text;
     const line = lines[lineIndex];
     // Only the "[ ]" box itself is rewritten; the rest of the line is untouched.
-    const m = line.match(/^(\s*[-*]\s+\[)([ xX])(\])/);
+    const m = line.match(/^(\s*(?:[-*]\s+)?\[)([ xX])(\])/);
     if (!m) return text;
     lines[lineIndex] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + line.slice(m[1].length + 1);
     return lines.join('\n');

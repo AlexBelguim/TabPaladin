@@ -685,7 +685,11 @@ function rewriteWikiLink(content, oldTitle, newTitle) {
 
 // Markdown task lists — mirrors NotesManager.parseTaskLine/toggleTaskAtLine in
 // the extension. The PWA is served standalone and can't import from src/.
-const TASK_LINE_RE = /^(\s*)[-*]\s+\[([ xX])\]\s?(.*)$/;
+// The list marker is optional: a bare "[ ] thing" is treated as a task too,
+// because that is how people actually type them. Kept identical to
+// src/utils/notesManager.js — the two implementations must agree or a note
+// toggles on one device and not the other.
+const TASK_LINE_RE = /^(\s*)(?:[-*]\s+)?\[([ xX])\]\s?(.*)$/;
 
 function parseTaskLine(line) {
     const m = String(line).match(TASK_LINE_RE);
@@ -699,7 +703,7 @@ function toggleTaskAtLine(content, lineIndex) {
     const lines = text.split('\n');
     if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= lines.length) return text;
     const line = lines[lineIndex];
-    const m = line.match(/^(\s*[-*]\s+\[)([ xX])(\])/);
+    const m = line.match(/^(\s*(?:[-*]\s+)?\[)([ xX])(\])/);
     if (!m) return text;
     lines[lineIndex] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + line.slice(m[1].length + 1);
     return lines.join('\n');

@@ -469,6 +469,17 @@ body.tp-app #notes-list {
     color: var(--text-muted);
 }
 
+/* Editing. openNoteInEditor hides the list, which left the grid holding an
+   empty 260px column and an editor squeezed beside it — the note ended up in a
+   narrow strip with most of the page blank. With the list gone the editor
+   takes the whole width. */
+.notes-split:has(#notes-list[style*="display:none"]),
+.notes-split:has(#notes-list[style*="display: none"]) {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+body.tp-app #note-editor { width: 100%; }
+
 /* Fallback where :has() is unavailable — a wider column still beats a narrow
    one stranded beside nothing. */
 @supports not selector(:has(*)) {

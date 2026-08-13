@@ -1977,14 +1977,25 @@ function renderNotesList(filter = '') {
     }
 }
 
-function openNoteInEditor(note) {
+// readMode=false for a brand new note: there is nothing to read yet, and you
+// came here to type.
+async function openNoteInEditor(note, readMode = true) {
     activeNoteId = note.id || null;
     document.getElementById('noteTitleInput').value = note.title || '';
     document.getElementById('noteContentInput').value = note.content || '';
     document.getElementById('note-editor').style.display = 'block';
     document.getElementById('notes-list').style.display = 'none';
     document.getElementById('notesSearchInput').style.display = 'none';
-    setNotePreviewMode(false);
+    // Opens as a reading page, not a textarea. Most of the time you are here to
+    // read the note or tick something off, and checkboxes only render in the
+    // preview — landing in raw markdown made the note look like it had no
+    // working tasks at all. "Edit" is one click away.
+    if (readMode) {
+        await renderNotePreview();
+        setNotePreviewMode(true);
+    } else {
+        setNotePreviewMode(false);
+    }
 }
 
 function closeNoteEditor() {
@@ -2066,7 +2077,7 @@ document.getElementById('notesSearchInput').addEventListener('input', (e) => {
 });
 
 document.getElementById('newNoteBtn').addEventListener('click', () => {
-    openNoteInEditor({ id: null, title: '', content: '' });
+    openNoteInEditor({ id: null, title: '', content: '' }, false);
     document.getElementById('noteTitleInput').focus();
 });
 
