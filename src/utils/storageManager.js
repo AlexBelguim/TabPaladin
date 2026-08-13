@@ -39,16 +39,40 @@ function buildMarkerUrl(payload) {
     return ROOT_MARKER_PREFIX + encodeURIComponent(JSON.stringify(payload));
 }
 
+// Reads the marker, and collapses extras down to one.
+//
+// A parse failure used to mean "no marker", so the caller wrote another one —
+// and a marker that has been through a push/pull round trip is re-encoded, so
+// it stopped parsing and a fresh marker piled up on every resolve. The node's
+// existence is now what counts; the payload is best-effort. Anything past the
+// first is removed so they cannot accumulate again.
 async function readRootMarker(folderId) {
+    let markers;
     try {
         const children = await api.bookmarks.getChildren(folderId);
-        const node = children.find(c => c.title === ROOT_MARKER_TITLE && c.url);
-        if (!node) return null;
-        const parsed = JSON.parse(decodeURIComponent(node.url.slice(ROOT_MARKER_PREFIX.length)));
-        return { nodeId: node.id, rootId: parsed.rootId, createdAt: parsed.createdAt || null };
+        markers = children.filter(c => c.title === ROOT_MARKER_TITLE && c.url);
     } catch (e) {
         return null;
     }
+    if (markers.length === 0) return null;
+
+    for (const extra of markers.slice(1)) {
+        try { await api.bookmarks.remove(extra.id); } catch (e) { /* ignore */ }
+    }
+
+    const node = markers[0];
+    let parsed = {};
+    try {
+        parsed = JSON.parse(decodeURIComponent(node.url.slice(ROOT_MARKER_PREFIX.length)));
+    } catch (e) {
+        try { parsed = JSON.parse(node.url.slice(ROOT_MARKER_PREFIX.length)); } catch (e2) { parsed = {}; }
+    }
+    return {
+        nodeId: node.id,
+        rootId: parsed.rootId || null,
+        // Undated markers still count as markers; they just lose ties.
+        createdAt: parsed.createdAt || null
+    };
 }
 
 async function writeRootMarker(folderId, settingsKey, createdAt) {
@@ -72,20 +96,60 @@ async function writeRootMarker(folderId, settingsKey, createdAt) {
     }
 }
 
+// Do two folders hold the same thing? Compared by the set of child titles,
+// which is enough to recognise the copy-of-a-copy case without walking the
+// whole subtree.
+async function sameContents(aId, bId) {
+    try {
+        const [a, b] = await Promise.all([api.bookmarks.getChildren(aId), api.bookmarks.getChildren(bId)]);
+        if (a.length !== b.length) return false;
+        const key = (n) => (n.url ? 'b|' + n.title + '|' + n.url : 'f|' + n.title);
+        const setA = new Set(a.map(key));
+        return b.every(n => setA.has(key(n)));
+    } catch (e) {
+        return false;
+    }
+}
+
 // Move everything out of `from` into `keep`, then delete `from` — but only if
 // it actually emptied. Never destroy content we failed to move.
+//
+// Duplicates that arise from syncing are copies of each other, not disjoint
+// halves. Moving blindly therefore concatenated them: four workflows became
+// eight, then sixteen, growing on every cycle. So a child whose twin already
+// exists in the keeper is dropped rather than moved — but only when the two
+// genuinely match, so two workflows that merely share a name are both kept.
 async function absorbFolder(from, keepId) {
     let moved = 0;
+    let skipped = 0;
     const kids = await api.bookmarks.getChildren(from.id);
+    const existing = await api.bookmarks.getChildren(keepId);
+
     for (const k of kids) {
         // The loser's marker is dropped, not carried across.
         if (k.title === ROOT_MARKER_TITLE && k.url) {
             try { await api.bookmarks.remove(k.id); } catch (e) { /* ignore */ }
             continue;
         }
-        try { await api.bookmarks.move(k.id, { parentId: keepId }); moved++; }
-        catch (e) { console.warn('[TabPaladin] could not move during merge', k.id, e); }
+
+        const twin = existing.find(e => e.title === k.title && Boolean(e.url) === Boolean(k.url)
+            && (k.url ? e.url === k.url : true));
+        if (twin && (k.url || await sameContents(k.id, twin.id))) {
+            try {
+                if (k.url) await api.bookmarks.remove(k.id);
+                else await api.bookmarks.removeTree(k.id);
+                skipped++;
+            } catch (e) { console.warn('[TabPaladin] could not drop duplicate', k.id, e); }
+            continue;
+        }
+
+        try {
+            await api.bookmarks.move(k.id, { parentId: keepId });
+            existing.push(k);
+            moved++;
+        } catch (e) { console.warn('[TabPaladin] could not move during merge', k.id, e); }
     }
+    if (skipped) console.log(`[TabPaladin] Dropped ${skipped} duplicate item(s) already present in the keeper.`);
     const left = await api.bookmarks.getChildren(from.id);
     if (left.length === 0) {
         try { await api.bookmarks.removeTree(from.id); return moved; }
@@ -94,6 +158,36 @@ async function absorbFolder(from, keepId) {
         console.warn(`[TabPaladin] leaving duplicate "${from.title}" (${from.id}); ${left.length} child(ren) would not move.`);
     }
     return moved;
+}
+
+// Remove twins that are already side by side inside one root.
+//
+// Repairs trees that an earlier build doubled: the merge used to concatenate
+// copies, so a root can hold two of every workflow. Only exact twins go —
+// identical title and, for folders, an identical set of children — so two
+// workflows that merely share a name both survive.
+async function dedupeWithin(folderId) {
+    let removed = 0;
+    let children;
+    try { children = await api.bookmarks.getChildren(folderId); } catch (e) { return 0; }
+
+    const kept = [];
+    for (const c of children) {
+        if (c.title === ROOT_MARKER_TITLE && c.url) continue; // readRootMarker owns these
+        const twin = kept.find(k => k.title === c.title && Boolean(k.url) === Boolean(c.url)
+            && (c.url ? k.url === c.url : true));
+        if (twin && (c.url || await sameContents(c.id, twin.id))) {
+            try {
+                if (c.url) await api.bookmarks.remove(c.id);
+                else await api.bookmarks.removeTree(c.id);
+                removed++;
+            } catch (e) { console.warn('[TabPaladin] could not remove twin', c.id, e); }
+            continue;
+        }
+        kept.push(c);
+    }
+    if (removed) console.log(`[TabPaladin] Removed ${removed} duplicated item(s) inside the root.`);
+    return removed;
 }
 
 async function countDuplicateFolders(title) {
@@ -200,8 +294,12 @@ async function resolveRootFolder({ title, settingsKey, create = false }) {
     }
 
     if (chosen) {
+        // Clear out twins sitting side by side, including any left behind by
+        // the build that concatenated instead of deduplicating.
+        await dedupeWithin(chosen.id);
         // Stamp anything that isn't marked yet, so the next resolve has a
         // stable identity to compare rather than counting children again.
+        // readRootMarker also collapses extra markers down to one.
         if (!(await readRootMarker(chosen.id))) {
             await writeRootMarker(chosen.id, settingsKey);
         }

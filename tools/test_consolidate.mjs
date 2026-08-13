@@ -183,6 +183,69 @@ check('only one marker survives the merge',
     [...nodes.values()].filter(n => n.title === MARKER).length === 1,
     `${[...nodes.values()].filter(n => n.title === MARKER).length} markers`);
 
+// ---------------------------------------------------------------------------
+// 9. The real-world shape: two roots holding COPIES of the same workflows.
+//    Merging must not concatenate them — that is what turned 4 workflows into
+//    8, then 16, on every sync cycle.
+// ---------------------------------------------------------------------------
+const WF = ['Video', 'chaturbate.com', 'dddd', 'monday'];
+const buildRoot = (parentId) => {
+    const root = mk({ parentId, title: TITLE });
+    for (const name of WF) {
+        const f = mk({ parentId: root.id, title: name });
+        mk({ parentId: f.id, title: name + ' tab', url: 'https://example.com/' + name });
+    }
+    return root;
+};
+
+reset();
+const copyA = buildRoot('2');
+buildRoot('1'); // an identical second root, as a pull would recreate
+
+got = await resolve();
+let names = kids(got.id).filter(k => k.title !== MARKER).map(k => k.title).sort();
+check('identical roots merge without duplicating workflows',
+    names.length === 4, `${names.length} workflows: ${names.join(', ')}`);
+check('the four originals are all present',
+    JSON.stringify(names) === JSON.stringify([...WF].sort()), names.join(', '));
+check('only one root survives',
+    [...nodes.values()].filter(n => n.title === TITLE).length === 1);
+
+// Repeat the cycle — it must stay at four, not grow.
+buildRoot('1');
+got = await resolve();
+names = kids(got.id).filter(k => k.title !== MARKER).map(k => k.title).sort();
+check('a second cycle does not grow the list', names.length === 4, `${names.length} workflows`);
+
+// 10. Same name, different contents — both must survive.
+reset();
+const rootX = mk({ parentId: '2', title: TITLE });
+const wfX = mk({ parentId: rootX.id, title: 'monday' });
+mk({ parentId: wfX.id, title: 'a', url: 'https://a.example' });
+const rootY = mk({ parentId: '1', title: TITLE });
+const wfY = mk({ parentId: rootY.id, title: 'monday' });
+mk({ parentId: wfY.id, title: 'b', url: 'https://b.example' });
+mk({ parentId: wfY.id, title: 'c', url: 'https://c.example' });
+
+got = await resolve();
+const mondays = kids(got.id).filter(k => k.title === 'monday');
+check('same-named workflows with different tabs are both kept',
+    mondays.length === 2, `${mondays.length} "monday" folders (want 2)`);
+
+// 11. Stray markers collapse to one.
+reset();
+const rootM = mk({ parentId: '2', title: TITLE });
+for (let i = 0; i < 4; i++) {
+    mk({
+        parentId: rootM.id, title: MARKER,
+        url: 'data:application/json,' + encodeURIComponent(JSON.stringify({ v: 1, rootId: 'x' + i }))
+    });
+}
+await resolve();
+check('extra markers are collapsed to one',
+    kids(rootM.id).filter(k => k.title === MARKER).length === 1,
+    `${kids(rootM.id).filter(k => k.title === MARKER).length} markers`);
+
 let failed = 0;
 console.log('\n--- consolidate ---');
 for (const r of results) {
