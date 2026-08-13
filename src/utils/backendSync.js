@@ -17,8 +17,17 @@ function normalizeRootTitle(title) {
         'bookmarks bar': 'bookmarks_bar',
         'bookmarks toolbar': 'bookmarks_bar',
         'favourites bar': 'bookmarks_bar',
+        'favorites bar': 'bookmarks_bar',
         'other bookmarks': 'other',
         'unfiled bookmarks': 'other',
+        // Opera calls it this, and its absence here is what produced duplicate
+        // workflow roots: a snapshot pushed from Chrome carries "Other
+        // Bookmarks" (-> other) which matched nothing on Opera, so the whole
+        // subtree became an orphan and got recreated somewhere else on every
+        // single pull. Opera also exposes Speed Dials, Pinboard, Trash and
+        // friends, which are deliberately left unaliased — they have no
+        // counterpart elsewhere and should never absorb another browser's root.
+        'unsorted bookmarks': 'other',
         'mobile bookmarks': 'mobile',
         'mobile': 'mobile',
     };
@@ -264,13 +273,26 @@ export const BackendSync = {
 
         // --- Handle orphan snapshot children: put them under the "Other Bookmarks" equivalent ---
         if (orphanSnapChildren.length > 0) {
-            // Find the browser's "Other Bookmarks" equivalent
+            // Find the browser's "Other Bookmarks" equivalent.
+            //
+            // The old fallback was browserRoots[length - 1], which on Opera is
+            // whatever happens to sort last — Trash or Unsynchronized Pinboard.
+            // Recreating a subtree there is worse than not recreating it, so
+            // prefer 'other', then the bookmarks bar, and otherwise refuse.
             const otherRoot = browserRoots.find(r => normalizeRootTitle(r.title) === 'other')
-                || browserRoots[browserRoots.length - 1]; // last resort fallback
+                || browserRoots.find(r => normalizeRootTitle(r.title) === 'bookmarks_bar')
+                || null;
 
-            const existingUnderOther = await api.bookmarks.getChildren(otherRoot.id);
+            if (!otherRoot) {
+                console.warn('[TabPaladin Pull] No "other" or bookmarks-bar root to hold orphans; skipping ' +
+                    `${orphanSnapChildren.length} unmatched snapshot root(s): ` +
+                    orphanSnapChildren.map(o => `"${o.title}"`).join(', '));
+            }
+
+            const existingUnderOther = otherRoot ? await api.bookmarks.getChildren(otherRoot.id) : [];
 
             for (const orphan of orphanSnapChildren) {
+                if (!otherRoot) break;
                 const title = orphan.title || 'Folder';
                 const incoming = (orphan.children || []).length;
                 if (incoming === 0) {

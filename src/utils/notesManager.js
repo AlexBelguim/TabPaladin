@@ -55,6 +55,9 @@ function buildNoteUrl(payload) {
 
 function parseNoteNode(node) {
     if (!node || !node.url || !node.url.startsWith(DATA_PREFIX)) return null;
+    // The root-identity marker is also a data: bookmark and lives in this
+    // folder. It is bookkeeping, not a note.
+    if (node.title === '__tabpaladin_root__') return null;
     let payload = {};
     try {
         payload = JSON.parse(decodeURIComponent(node.url.slice(DATA_PREFIX.length)));

@@ -61,6 +61,8 @@ export function colorFor(url) {
 
 function toPin(node) {
     if (!node || !node.url) return null;
+    // Root-identity bookkeeping, not something the user pinned.
+    if (node.title === '__tabpaladin_root__') return null;
     return {
         id: node.id,
         title: node.title || hostOf(node.url) || node.url,

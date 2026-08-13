@@ -36,6 +36,14 @@ globalThis.chrome = {
             Object.assign(n, changes);
             return n;
         },
+        // Needed since resolveRootFolder merges duplicate roots by moving their
+        // children across.
+        move: async (id, { parentId }) => {
+            const n = nodes.get(String(id));
+            if (!n) throw new Error('not found');
+            n.parentId = String(parentId);
+            return n;
+        },
         remove: async (id) => { nodes.delete(String(id)); },
         removeTree: async (id) => {
             const kill = (nid) => { childrenOf(nid).forEach(c => kill(c.id)); nodes.delete(nid); };
@@ -150,9 +158,13 @@ const snapTitles = (snapOther.children || []).map(c => c.title);
 check('snapshot includes workflows root', snapTitles.includes('TabPaladin Workflows'));
 check('snapshot includes notes root', snapTitles.includes('TabPaladin Notes'));
 const snapNotes = snapOther.children.find(c => c.title === 'TabPaladin Notes');
+// The root now also carries a __tabpaladin_root__ identity marker, which is
+// itself a data: bookmark. It is bookkeeping, not a note, and is filtered out
+// here exactly as parseNoteNode filters it in the app.
+const snapNoteBookmarks = (snapNotes.children || []).filter(c => c.title !== '__tabpaladin_root__');
 check('notes serialized as data-url bookmarks',
-    snapNotes.children.length === 1 && snapNotes.children.every(c => c.type === 'bookmark' && c.url.startsWith('data:application/json,')));
-const roundTripped = JSON.parse(decodeURIComponent(snapNotes.children[0].url.slice('data:application/json,'.length)));
+    snapNoteBookmarks.length === 1 && snapNoteBookmarks.every(c => c.type === 'bookmark' && c.url.startsWith('data:application/json,')));
+const roundTripped = JSON.parse(decodeURIComponent(snapNoteBookmarks[0].url.slice('data:application/json,'.length)));
 check('note content survives snapshot round-trip', roundTripped.content === 'new content [[Gamma]]');
 
 // --- Root-folder identity ------------------------------------------------
@@ -192,8 +204,13 @@ StorageManager.resetRootCache();
 const merged = await NotesManager.listNotes();
 check('notes from a duplicate root are listed too',
     merged.some(n => n.title === 'Phone Note') && merged.some(n => n.title === 'Alpha'));
-// Three by now: the real one, the empty duplicate from step 8, and this stray.
-check('every duplicate root is reported', (await NotesManager.findAllNotesRoots()).length === 3);
+// Behaviour change: duplicates used to be tolerated and read around, so this
+// asserted that all three were *reported*. resolveRootFolder now merges them
+// the moment it sees them, so by the time anything lists notes there is one
+// root left — which is why the Consolidate warning stopped coming back. The
+// stray's notes are not lost; they moved, as the check above proves.
+check('duplicate roots are merged away, not merely reported',
+    (await NotesManager.findAllNotesRoots()).length === 1);
 check('canonical root is still the persisted one',
     (await NotesManager.findNotesRoot()).id === notesRootId);
 check('no duplicate note entries', new Set(merged.map(n => n.id)).size === merged.length);

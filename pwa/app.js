@@ -636,7 +636,10 @@ function isNotesFolder(node) {
 
 function isNoteBookmark(b) {
     return b && b.type === 'bookmark' && typeof b.url === 'string'
-        && b.url.startsWith(NOTE_DATA_PREFIX) && b.title !== '__tabpaladin_meta__';
+        && b.url.startsWith(NOTE_DATA_PREFIX)
+        && b.title !== '__tabpaladin_meta__'
+        // Root-identity marker written by the extension — bookkeeping, not a note.
+        && b.title !== '__tabpaladin_root__';
 }
 
 function decodeNote(b) {

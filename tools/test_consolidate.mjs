@@ -120,6 +120,69 @@ merged = await StorageManager.consolidateDuplicateRoots(TITLE);
 check('near-miss title is left alone', nodes.has(decoy.id) && kids(decoy.id).length === 1,
     nodes.has(decoy.id) ? 'backup folder intact' : 'BACKUP DELETED');
 
+// ---------------------------------------------------------------------------
+// resolveRootFolder heals on every call, and identity comes from a marker
+// rather than a title, so the winner does not change as folders diverge.
+// ---------------------------------------------------------------------------
+const MARKER = '__tabpaladin_root__';
+const markerOf = (folderId) => kids(folderId).find(k => k.title === MARKER);
+const resolve = () => StorageManager.resolveRootFolder({
+    title: TITLE, settingsKey: 'workflowRootBookmarkId', create: true
+});
+
+// 6. First resolve stamps a marker.
+reset();
+const only = mk({ parentId: '2', title: TITLE });
+mk({ parentId: only.id, title: 'w1' });
+let got = await resolve();
+check('resolve stamps a marker on an unmarked root', !!markerOf(only.id) && got.id === only.id,
+    markerOf(only.id) ? 'marker written' : 'NO MARKER');
+
+// 7. Two roots are merged by resolve itself, without anyone calling consolidate.
+reset();
+const r1 = mk({ parentId: '2', title: TITLE });
+mk({ parentId: r1.id, title: 'alpha' });
+const r2 = mk({ parentId: '1', title: TITLE });
+mk({ parentId: r2.id, title: 'beta' });
+mk({ parentId: r2.id, title: 'gamma' });
+
+got = await resolve();
+let left = [...nodes.values()].filter(n => n.title === TITLE);
+check('resolve merges duplicates by itself', left.length === 1, `${left.length} roots left`);
+check('all workflows survive the merge',
+    kids(got.id).filter(k => k.title !== MARKER).length === 3,
+    `${kids(got.id).filter(k => k.title !== MARKER).length} workflows (want 3)`);
+
+// 8. The older marker wins even when the other folder has more children —
+//    the case that used to flip, because the old rule was "most children".
+reset();
+const oldRoot = mk({ parentId: '2', title: TITLE });
+mk({ parentId: oldRoot.id, title: 'just one' });
+mk({
+    parentId: oldRoot.id, title: MARKER,
+    url: 'data:application/json,' + encodeURIComponent(JSON.stringify({
+        v: 1, rootId: 'aaa', createdAt: '2024-01-01T00:00:00.000Z'
+    }))
+});
+const newRoot = mk({ parentId: '1', title: TITLE });
+for (const t of ['a', 'b', 'c', 'd']) mk({ parentId: newRoot.id, title: t });
+mk({
+    parentId: newRoot.id, title: MARKER,
+    url: 'data:application/json,' + encodeURIComponent(JSON.stringify({
+        v: 1, rootId: 'bbb', createdAt: '2025-06-01T00:00:00.000Z'
+    }))
+});
+
+got = await resolve();
+check('older marker wins over the fuller folder', got.id === oldRoot.id,
+    got.id === oldRoot.id ? 'kept the original root' : 'kept the newer one');
+check('nothing is lost when the smaller folder wins',
+    kids(got.id).filter(k => k.title !== MARKER).length === 5,
+    `${kids(got.id).filter(k => k.title !== MARKER).length} workflows (want 5)`);
+check('only one marker survives the merge',
+    [...nodes.values()].filter(n => n.title === MARKER).length === 1,
+    `${[...nodes.values()].filter(n => n.title === MARKER).length} markers`);
+
 let failed = 0;
 console.log('\n--- consolidate ---');
 for (const r of results) {
