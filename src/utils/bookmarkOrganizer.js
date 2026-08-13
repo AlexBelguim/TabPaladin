@@ -39,7 +39,11 @@ export const BookmarkOrganizer = {
             if (!subTree || subTree.length === 0) return null;
 
             const root = subTree[0];
-            const looseCount = root.children ? root.children.filter(c => c.url).length : 0;
+            // TabPaladin's own sentinels are bookkeeping, not files the user
+            // filed — counting them is why a workflows root reported "4 files"
+            // when those four were nothing but root markers.
+            const isInternal = (c) => c.title === '__tabpaladin_meta__' || c.title === '__tabpaladin_root__';
+            const looseCount = root.children ? root.children.filter(c => c.url && !isInternal(c)).length : 0;
             const subfolders = root.children ? root.children.filter(c => !c.url) : [];
 
             return {
@@ -48,7 +52,7 @@ export const BookmarkOrganizer = {
                 looseCount,
                 subfolders: subfolders.map(f => {
                     const children = f.children || [];
-                    const fileCount = children.filter(c => c.url).length;
+                    const fileCount = children.filter(c => c.url && !isInternal(c)).length;
                     const folderCount = children.filter(c => !c.url).length;
                     return {
                         id: f.id,

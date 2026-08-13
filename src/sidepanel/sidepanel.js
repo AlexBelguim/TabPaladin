@@ -1080,10 +1080,16 @@ async function findWorkflowRootSilent() {
     }
 }
 
-// Hide internal meta sentinel bookmarks from rendering.
+// Hide internal sentinel bookmarks from rendering. Both are bookkeeping the
+// user never asked for: the per-workflow meta record, and the root-identity
+// marker that stops duplicate roots reappearing.
 const TP_META_TITLE = '__tabpaladin_meta__';
+const TP_ROOT_MARKER_TITLE = '__tabpaladin_root__';
+function isInternalBookmark(node) {
+    return !!node && (node.title === TP_META_TITLE || node.title === TP_ROOT_MARKER_TITLE);
+}
 function isVisibleBookmark(node) {
-    return node && node.url && node.title !== TP_META_TITLE;
+    return node && node.url && !isInternalBookmark(node);
 }
 
 // Open an array of bookmark-shaped {url, title} items as tabs in a new window.
@@ -1842,7 +1848,7 @@ async function refreshFolderBodyIfOpen(folderId) {
         try {
             const children = await chrome.bookmarks.getChildren(folderId);
             const folderCount = children.filter(c => !c.url).length;
-            const fileCount = children.filter(c => c.url).length;
+            const fileCount = children.filter(isVisibleBookmark).length;
             const statsEl = card.querySelector('.folder-stats');
             if (statsEl) {
                 const parts = [];

@@ -377,7 +377,7 @@ function renderContent() {
     // notes get their own section on the root view, pins get the home tiles.
     const folders = children.filter(c => (c.type === 'folder' || c.type === 'root')
         && !isNotesFolder(c) && !isPinsFolder(c));
-    const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && c.title !== '__tabpaladin_meta__');
+    const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && !isInternalNode(c));
 
     // Search and pins lead the root view — the landing state, same as the
     // extension's home screen.
@@ -402,7 +402,7 @@ function renderFolderRow(folder) {
     const row = document.createElement('div');
     row.className = 'row folder';
     const subfolders = (folder.children || []).filter(c => c.type === 'folder');
-    const bms = (folder.children || []).filter(c => c.type === 'bookmark' && c.title !== '__tabpaladin_meta__');
+    const bms = (folder.children || []).filter(c => c.type === 'bookmark' && !isInternalNode(c));
     row.innerHTML = `
         <span class="icon">📁</span>
         <span class="title">${escapeHtml(folder.title || '(unnamed)')}</span>
@@ -632,6 +632,12 @@ function collectRecentNotes(node, out = []) {
 
 function isNotesFolder(node) {
     return node && (node.type === 'folder' || node.type === 'root') && node.title === NOTES_ROOT_TITLE;
+}
+
+// TabPaladin's own sentinels: the per-workflow meta record and the root
+// identity marker. Bookkeeping, never shown as bookmarks.
+function isInternalNode(node) {
+    return !!node && (node.title === '__tabpaladin_meta__' || node.title === '__tabpaladin_root__');
 }
 
 function isNoteBookmark(b) {
