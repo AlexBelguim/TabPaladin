@@ -50,18 +50,17 @@ function openPin(url) {
     if (target) window.open(target, '_blank', 'noopener');
 }
 
-// Icon sources, best-privacy first. Each is tried in turn and the first that
-// loads wins; if none do, the initials underneath stay visible.
+// Icon sources, tried in turn; the first that loads wins, and if none do the
+// initials underneath stay visible.
 //
 //   1. Chrome's own favicon cache — nothing leaves the machine, but it only
 //      has an icon for sites already visited in this profile, and it is absent
 //      entirely on Firefox.
-//   2. The site's own /favicon.ico — no third party, but plenty of sites serve
-//      their icon from a path declared in <link rel="icon"> instead, so this
-//      404s more often than you would expect.
-//   3. DuckDuckGo's icon service — reliable, and the one that tells someone
-//      else what you have pinned. Last on purpose, and DDG rather than Google
-//      because it is already the search engine this app sends you to.
+//   2. Google's icon service — the same source the bookmark lists in the side
+//      panel have always used. An earlier version of this avoided it on
+//      privacy grounds and reached for the site's own /favicon.ico instead,
+//      but the side panel was already sending Google every bookmarked host, so
+//      the stance cost reliability here and bought nothing anywhere.
 function faviconSources(pageUrl) {
     const target = withScheme(pageUrl);
     if (!target) return [];
@@ -77,17 +76,20 @@ function faviconSources(pageUrl) {
 
     try {
         const host = new URL(target).hostname;
-        out.push(new URL('/favicon.ico', target).href);
         if (host && host.includes('.')) {
-            out.push(`https://icons.duckduckgo.com/ip3/${host}.ico`);
+            out.push(`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`);
         }
     } catch (e) { /* unparseable — initials only */ }
 
     return out;
 }
 
-// Walks the sources until one loads. Nothing is shown until then, so a failing
-// source never flashes a broken image over the initials.
+// Walks the sources until one loads. The image is transparent rather than
+// display:none until then, so a failing source never flashes a broken icon
+// over the initials — and, unlike display:none, it keeps a layout box. That
+// distinction is the whole bug this once had: the image was also loading="lazy",
+// and a lazy image with no box is never fetched, so neither load nor error ever
+// fired and the chain below never started. No lazy here for the same reason.
 function attachFavicon(favEl, pageUrl) {
     const sources = faviconSources(pageUrl);
     if (sources.length === 0) return;
@@ -96,9 +98,8 @@ function attachFavicon(favEl, pageUrl) {
     const img = document.createElement('img');
     img.className = 'pin-favimg';
     img.alt = '';
-    img.loading = 'lazy';
     img.referrerPolicy = 'no-referrer';
-    img.style.display = 'none';
+    img.style.opacity = '0';
 
     img.addEventListener('error', () => {
         i += 1;
@@ -108,7 +109,7 @@ function attachFavicon(favEl, pageUrl) {
     img.addEventListener('load', () => {
         // A service that answers with a 1x1 placeholder is not an icon.
         if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
-        img.style.display = '';
+        img.style.opacity = '';
         favEl.textContent = '';
         favEl.style.background = 'transparent';
     });
