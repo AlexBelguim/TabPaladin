@@ -36,13 +36,29 @@ function submitSearch(raw) {
 // and nothing leaves the machine — unlike hotlinking each site or asking a
 // third-party icon service, either of which would tell someone else what you
 // have pinned. Firefox has no such endpoint, so it falls back to initials.
+// A pin saved before add() started normalising, or typed as a bare host, has
+// no scheme — and a scheme-less string resolves against the extension origin
+// rather than the web. Both opening and the favicon lookup need the real URL.
+function withScheme(url) {
+    const s = String(url || '').trim();
+    if (!s) return '';
+    return /^[a-z][a-z0-9+.-]*:/i.test(s) ? s : `https://${s}`;
+}
+
+function openPin(url) {
+    const target = withScheme(url);
+    if (target) window.open(target, '_blank', 'noopener');
+}
+
 function faviconUrl(pageUrl) {
     try {
         const api = typeof browser !== 'undefined' ? browser : chrome;
         if (!api.runtime || !api.runtime.getURL) return null;
         const base = api.runtime.getURL('/_favicon/');
         if (!base.startsWith('chrome-extension://')) return null;
-        return `${base}?pageUrl=${encodeURIComponent(pageUrl)}&size=64`;
+        const target = withScheme(pageUrl);
+        if (!target) return null;
+        return `${base}?pageUrl=${encodeURIComponent(target)}&size=64`;
     } catch (e) {
         return null;
     }
@@ -52,6 +68,10 @@ function pinTile(pin) {
     const el = document.createElement('div');
     el.className = 'pin-tile';
     el.dataset.id = pin.id;
+    // The URL lives here, not in title. title now carries the label, and the
+    // click handler used to read title as the destination — which opened the
+    // pin's *name* as a relative path under the extension origin.
+    el.dataset.url = pin.url;
     el.tabIndex = 0;
     // The label lives here rather than under the tile: a grid of unlabelled
     // icons is unusable without sight or a hover.
@@ -246,12 +266,12 @@ export async function initHome() {
             }
             if (e.target.closest('.pin-add')) { await promptAndPin(); return; }
             const tile = e.target.closest('.pin-tile');
-            if (tile && tile.title) window.open(tile.title, '_blank');
+            if (tile) openPin(tile.dataset.url);
         });
         grid.addEventListener('keydown', (e) => {
             if (e.key !== 'Enter') return;
             const tile = e.target.closest('.pin-tile');
-            if (tile && !tile.classList.contains('pin-add') && tile.title) window.open(tile.title, '_blank');
+            if (tile && !tile.classList.contains('pin-add')) openPin(tile.dataset.url);
         });
     }
 

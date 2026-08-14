@@ -559,7 +559,11 @@ function renderHome(root) {
         for (const p of pins) {
             const tile = document.createElement('a');
             tile.className = 'pin-tile';
-            tile.href = p.url;
+            // A pin saved as a bare host has no scheme, and a scheme-less href
+            // resolves against this app's origin instead of the web.
+            tile.href = /^[a-z][a-z0-9+.-]*:/i.test(String(p.url).trim())
+                ? p.url
+                : `https://${String(p.url).trim()}`;
             tile.target = '_blank';
             tile.rel = 'noopener';
             // Icon only. The name lives in title/aria-label so the tile is
@@ -587,7 +591,7 @@ function renderHome(root) {
                 img.referrerPolicy = 'no-referrer';
                 img.addEventListener('error', () => img.remove());
                 img.addEventListener('load', () => { fav.textContent = ''; fav.style.background = 'transparent'; });
-                try { img.src = new URL('/favicon.ico', p.url).href; } catch (e) { /* leave initials */ }
+                try { img.src = new URL('/favicon.ico', tile.href).href; } catch (e) { /* leave initials */ }
                 fav.appendChild(img);
             }
             tile.appendChild(fav);
