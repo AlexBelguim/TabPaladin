@@ -568,8 +568,29 @@ function renderHome(root) {
             const label = p.title || hostOf(p.url) || p.url;
             tile.title = label;
             tile.setAttribute('aria-label', label);
-            tile.innerHTML =
-                `<span class="pin-fav" style="background:${colorFor(p.url)}">${escapeHtml(initialsFor(p.title, p.url))}</span>`;
+
+            const fav = document.createElement('span');
+            fav.className = 'pin-fav';
+            fav.style.background = colorFor(p.url);
+            fav.textContent = initialsFor(p.title, p.url);
+
+            // Straight from the site's own /favicon.ico. No extension API here,
+            // and routing through an icon service would hand a third party the
+            // list of everything you have pinned — the site itself already
+            // knows you visit it. Initials show through if it 404s.
+            const host = hostOf(p.url);
+            if (host) {
+                const img = document.createElement('img');
+                img.className = 'pin-favimg';
+                img.alt = '';
+                img.loading = 'lazy';
+                img.referrerPolicy = 'no-referrer';
+                img.addEventListener('error', () => img.remove());
+                img.addEventListener('load', () => { fav.textContent = ''; fav.style.background = 'transparent'; });
+                try { img.src = new URL('/favicon.ico', p.url).href; } catch (e) { /* leave initials */ }
+                fav.appendChild(img);
+            }
+            tile.appendChild(fav);
             grid.appendChild(tile);
         }
         wrap.appendChild(grid);

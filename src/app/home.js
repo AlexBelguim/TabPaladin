@@ -32,25 +32,50 @@ function submitSearch(raw) {
 
 // --- pinned links ---------------------------------------------------------
 
+// Chrome's own favicon cache, via the "favicon" permission. No network request
+// and nothing leaves the machine — unlike hotlinking each site or asking a
+// third-party icon service, either of which would tell someone else what you
+// have pinned. Firefox has no such endpoint, so it falls back to initials.
+function faviconUrl(pageUrl) {
+    try {
+        const api = typeof browser !== 'undefined' ? browser : chrome;
+        if (!api.runtime || !api.runtime.getURL) return null;
+        const base = api.runtime.getURL('/_favicon/');
+        if (!base.startsWith('chrome-extension://')) return null;
+        return `${base}?pageUrl=${encodeURIComponent(pageUrl)}&size=64`;
+    } catch (e) {
+        return null;
+    }
+}
+
 function pinTile(pin) {
     const el = document.createElement('div');
     el.className = 'pin-tile';
     el.dataset.id = pin.id;
     el.tabIndex = 0;
-    el.title = pin.url;
+    // The label lives here rather than under the tile: a grid of unlabelled
+    // icons is unusable without sight or a hover.
+    el.title = pin.title;
+    el.setAttribute('aria-label', pin.title);
 
     const fav = document.createElement('span');
     fav.className = 'pin-fav';
     fav.style.background = colorFor(pin.url);
     fav.textContent = initialsFor(pin);
 
-    const name = document.createElement('span');
-    name.className = 'pin-name';
-    name.textContent = pin.title;
-
-    const host = document.createElement('span');
-    host.className = 'pin-host';
-    host.textContent = pin.host;
+    const src = faviconUrl(pin.url);
+    if (src) {
+        const img = document.createElement('img');
+        img.className = 'pin-favimg';
+        img.alt = '';
+        img.loading = 'lazy';
+        // Initials stay underneath and show through only if the icon fails,
+        // so a site without a favicon still gets a readable tile.
+        img.addEventListener('error', () => img.remove());
+        img.addEventListener('load', () => { fav.textContent = ''; fav.style.background = 'transparent'; });
+        img.src = src;
+        fav.appendChild(img);
+    }
 
     const remove = document.createElement('button');
     remove.className = 'pin-remove';
@@ -59,7 +84,7 @@ function pinTile(pin) {
     remove.setAttribute('aria-label', `Unpin ${pin.title}`);
     remove.textContent = '×';
 
-    el.append(fav, name, host, remove);
+    el.append(fav, remove);
     return el;
 }
 
@@ -68,7 +93,9 @@ function addTile() {
     el.className = 'pin-tile pin-add';
     el.type = 'button';
     el.id = 'pinAddBtn';
-    el.innerHTML = '<span class="pin-fav">＋</span><span class="pin-name">Pin a link</span>';
+    el.title = 'Pin a link';
+    el.setAttribute('aria-label', 'Pin a link');
+    el.innerHTML = '<span class="pin-fav">＋</span>';
     return el;
 }
 

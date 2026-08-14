@@ -1,4 +1,4 @@
-/* Full-screen app page.
+﻿/* Full-screen app page.
  *
  * sidepanel.css is loaded first and keeps owning component styles (buttons,
  * cards, note preview, skeletons). This file does two things only: undo the
@@ -658,3 +658,38 @@ body.tp-app #settings-folder-list {
     body.tp-app #actions.action-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .home-recents { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ---------- pins: real favicons, no label ---------- */
+/* Icons come from Chrome's own favicon cache via the "favicon" permission, so
+   nothing is fetched from the sites themselves. The initials sit underneath
+   and show through when a site has no icon. */
+body.tp-app .pins-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+
+/* No forced square: at eight columns of a 1180px page that is a 133px tile
+   around a 38px icon, which is mostly empty. A short row reads better. */
+body.tp-app .pin-tile {
+  padding: 12px 8px;
+  gap: 0;
+  justify-content: center;
+}
+
+body.tp-app .pin-fav {
+  position: relative;
+  overflow: hidden;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+}
+
+body.tp-app .pin-favimg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  padding: 6px;
+  background: var(--surface-hover);
+}
+
+@media (max-width: 1000px) { body.tp-app .pins-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+@media (max-width: 680px)  { body.tp-app .pins-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
