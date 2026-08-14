@@ -863,3 +863,24 @@ select.note-move {
 /* Keep the last rows clear of the bar. */
 body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 #inbox-fab { bottom: calc(74px + env(safe-area-inset-bottom)); }
+
+/* ---------- bottom sheets clear the tab bar ---------- */
+/* The sheets are pinned to bottom:0 at a lower z-index than #bottom-nav, so
+   the bar covered their footer — the Drop here button sat underneath it. Lift
+   them by the bar's height instead of raising their z-index, because the bar
+   should stay reachable while a sheet is open. */
+:root { --bottom-nav-h: 58px; }
+
+.sheet {
+  bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom));
+  max-height: calc(70vh - var(--bottom-nav-h));
+  border-radius: 16px 16px 0 0;
+}
+
+/* translateY is a percentage of the sheet's own height, so 110% alone would
+   leave it peeking above the bar by exactly the offset added above. */
+.sheet.hidden {
+  transform: translateY(calc(110% + var(--bottom-nav-h) + env(safe-area-inset-bottom)));
+}
+
+#inbox-fab { bottom: calc(var(--bottom-nav-h) + 16px + env(safe-area-inset-bottom)); }
