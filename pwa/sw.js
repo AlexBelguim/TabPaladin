@@ -1,13 +1,15 @@
 // Minimal service worker — network-first for the app shell so updates roll
 // out immediately; the cache is only an offline fallback. API/LLM calls
 // always go to the network.
-// Release ritual: bump v11 here AND the ?v=11 queries in index.html together.
-const SHELL_CACHE = 'tp-shell-v12';
+// Release ritual: bump the version here AND the ?v= queries in index.html
+// together — all four numbers below included. Miss one and the phone keeps
+// serving the old bundle from cache while the desktop looks fixed.
+const SHELL_CACHE = 'tp-shell-v13';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=12',
-    '/app.js?v=12',
+    '/app.css?v=13',
+    '/app.js?v=13',
     '/manifest.webmanifest',
     '/icons/icon192.png'
 ];

@@ -50,18 +50,71 @@ function openPin(url) {
     if (target) window.open(target, '_blank', 'noopener');
 }
 
-function faviconUrl(pageUrl) {
+// Icon sources, best-privacy first. Each is tried in turn and the first that
+// loads wins; if none do, the initials underneath stay visible.
+//
+//   1. Chrome's own favicon cache — nothing leaves the machine, but it only
+//      has an icon for sites already visited in this profile, and it is absent
+//      entirely on Firefox.
+//   2. The site's own /favicon.ico — no third party, but plenty of sites serve
+//      their icon from a path declared in <link rel="icon"> instead, so this
+//      404s more often than you would expect.
+//   3. DuckDuckGo's icon service — reliable, and the one that tells someone
+//      else what you have pinned. Last on purpose, and DDG rather than Google
+//      because it is already the search engine this app sends you to.
+function faviconSources(pageUrl) {
+    const target = withScheme(pageUrl);
+    if (!target) return [];
+    const out = [];
+
     try {
         const api = typeof browser !== 'undefined' ? browser : chrome;
-        if (!api.runtime || !api.runtime.getURL) return null;
-        const base = api.runtime.getURL('/_favicon/');
-        if (!base.startsWith('chrome-extension://')) return null;
-        const target = withScheme(pageUrl);
-        if (!target) return null;
-        return `${base}?pageUrl=${encodeURIComponent(target)}&size=64`;
-    } catch (e) {
-        return null;
-    }
+        const base = api.runtime && api.runtime.getURL ? api.runtime.getURL('/_favicon/') : '';
+        if (base.startsWith('chrome-extension://')) {
+            out.push(`${base}?pageUrl=${encodeURIComponent(target)}&size=64`);
+        }
+    } catch (e) { /* not in an extension context */ }
+
+    try {
+        const host = new URL(target).hostname;
+        out.push(new URL('/favicon.ico', target).href);
+        if (host && host.includes('.')) {
+            out.push(`https://icons.duckduckgo.com/ip3/${host}.ico`);
+        }
+    } catch (e) { /* unparseable — initials only */ }
+
+    return out;
+}
+
+// Walks the sources until one loads. Nothing is shown until then, so a failing
+// source never flashes a broken image over the initials.
+function attachFavicon(favEl, pageUrl) {
+    const sources = faviconSources(pageUrl);
+    if (sources.length === 0) return;
+
+    let i = 0;
+    const img = document.createElement('img');
+    img.className = 'pin-favimg';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.style.display = 'none';
+
+    img.addEventListener('error', () => {
+        i += 1;
+        if (i < sources.length) img.src = sources[i];
+        else img.remove();
+    });
+    img.addEventListener('load', () => {
+        // A service that answers with a 1x1 placeholder is not an icon.
+        if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
+        img.style.display = '';
+        favEl.textContent = '';
+        favEl.style.background = 'transparent';
+    });
+
+    favEl.appendChild(img);
+    img.src = sources[0];
 }
 
 function pinTile(pin) {
@@ -83,19 +136,7 @@ function pinTile(pin) {
     fav.style.background = colorFor(pin.url);
     fav.textContent = initialsFor(pin);
 
-    const src = faviconUrl(pin.url);
-    if (src) {
-        const img = document.createElement('img');
-        img.className = 'pin-favimg';
-        img.alt = '';
-        img.loading = 'lazy';
-        // Initials stay underneath and show through only if the icon fails,
-        // so a site without a favicon still gets a readable tile.
-        img.addEventListener('error', () => img.remove());
-        img.addEventListener('load', () => { fav.textContent = ''; fav.style.background = 'transparent'; });
-        img.src = src;
-        fav.appendChild(img);
-    }
+    attachFavicon(fav, pin.url);
 
     const remove = document.createElement('button');
     remove.className = 'pin-remove';

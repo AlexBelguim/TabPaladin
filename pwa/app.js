@@ -522,6 +522,55 @@ function searchTargetFor(text) {
     return DDG + encodeURIComponent(t);
 }
 
+// Icon sources, best-privacy first, mirroring src/app/home.js minus the
+// extension-only cache the PWA has no access to.
+//
+//   1. The site's own /favicon.ico — no third party involved, but many sites
+//      declare their icon elsewhere via <link rel="icon">, so it often 404s.
+//   2. DuckDuckGo's icon service — reliable, and the one that tells someone
+//      else what you have pinned. Last on purpose, and DDG rather than Google
+//      because it is already the search engine this app sends you to.
+function faviconSources(pageUrl) {
+    try {
+        const host = new URL(pageUrl).hostname;
+        const out = [new URL('/favicon.ico', pageUrl).href];
+        if (host && host.includes('.')) out.push(`https://icons.duckduckgo.com/ip3/${host}.ico`);
+        return out;
+    } catch (e) {
+        return [];
+    }
+}
+
+// Walks the sources until one loads, so a failing source never flashes a
+// broken image over the initials underneath.
+function attachFavicon(favEl, pageUrl) {
+    const sources = faviconSources(pageUrl);
+    if (sources.length === 0) return;
+
+    let i = 0;
+    const img = document.createElement('img');
+    img.className = 'pin-favimg';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.style.display = 'none';
+
+    img.addEventListener('error', () => {
+        i += 1;
+        if (i < sources.length) img.src = sources[i];
+        else img.remove();
+    });
+    img.addEventListener('load', () => {
+        if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
+        img.style.display = '';
+        favEl.textContent = '';
+        favEl.style.background = 'transparent';
+    });
+
+    favEl.appendChild(img);
+    img.src = sources[0];
+}
+
 function renderHome(root) {
     const wrap = document.createElement('div');
     wrap.className = 'home-block';
@@ -582,18 +631,7 @@ function renderHome(root) {
             // and routing through an icon service would hand a third party the
             // list of everything you have pinned — the site itself already
             // knows you visit it. Initials show through if it 404s.
-            const host = hostOf(p.url);
-            if (host) {
-                const img = document.createElement('img');
-                img.className = 'pin-favimg';
-                img.alt = '';
-                img.loading = 'lazy';
-                img.referrerPolicy = 'no-referrer';
-                img.addEventListener('error', () => img.remove());
-                img.addEventListener('load', () => { fav.textContent = ''; fav.style.background = 'transparent'; });
-                try { img.src = new URL('/favicon.ico', tile.href).href; } catch (e) { /* leave initials */ }
-                fav.appendChild(img);
-            }
+            attachFavicon(fav, tile.href);
             tile.appendChild(fav);
             grid.appendChild(tile);
         }
