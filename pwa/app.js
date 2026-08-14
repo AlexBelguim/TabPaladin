@@ -375,8 +375,10 @@ function renderContent() {
     const children = node.children || [];
     // Neither the notes nor the pins folder is shown among the bookmarks —
     // notes get their own section on the root view, pins get the home tiles.
+    const atRoot = state.pathIds.length === 1;
     const folders = children.filter(c => (c.type === 'folder' || c.type === 'root')
-        && !isNotesFolder(c) && !isPinsFolder(c));
+        && !isNotesFolder(c) && !isPinsFolder(c)
+        && !(atRoot && isNoiseRoot(c)));
     const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && !isInternalNode(c));
 
     // Search and pins lead the root view — the landing state, same as the
@@ -449,6 +451,27 @@ const NOTE_DATA_PREFIX = 'data:application/json,';
 // notes root, the PWA never creates it: pin something on the computer first.
 const PINS_ROOT_TITLE = 'TabPaladin Pinned';
 const DDG = 'https://duckduckgo.com/?q=';
+
+// Top-level roots not worth browsing on a phone.
+//
+// Push used to send only the folders you had focused; it now sends the whole
+// tree, which is what makes a round trip lossless — but it also means every
+// browser root reaches the snapshot. On Opera that is Trash, Speed Dials,
+// Pinboard and friends, so the phone opened onto a wall of folders that are
+// not bookmarks. Hidden at the root only: navigate into one deliberately and
+// its contents still show.
+const NOISE_ROOTS = new Set([
+    'trash', 'prullenbak', 'papierkorb', 'corbeille',
+    'speed dials', 'speeddial', 'pinboard', 'unsynchronized pinboard',
+    'imported bookmarks', 'geïmporteerde bladwijzers'
+]);
+
+function isNoiseRoot(node) {
+    const t = (node.title || '').toLowerCase().trim();
+    if (NOISE_ROOTS.has(t)) return true;
+    // An empty root is a row that does nothing.
+    return (node.children || []).length === 0;
+}
 
 function isPinsFolder(node) {
     return node && (node.type === 'folder' || node.type === 'root') && node.title === PINS_ROOT_TITLE;
