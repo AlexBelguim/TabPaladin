@@ -884,3 +884,25 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 }
 
 #inbox-fab { bottom: calc(var(--bottom-nav-h) + 16px + env(safe-area-inset-bottom)); }
+
+/* ---------- pins: icon only ---------- */
+/* No label under each tile, so they can be smaller and denser. The name is
+   still on title/aria-label rather than dropped entirely. */
+.pins-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.pin-tile {
+  padding: 8px 4px;
+  gap: 0;
+  aspect-ratio: 1 / 1;
+  justify-content: center;
+}
+
+.pin-tile .pin-fav {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  font-size: 0.86rem;
+}

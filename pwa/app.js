@@ -544,7 +544,10 @@ function renderHome(root) {
     wrap.appendChild(search);
 
     const pinsFolder = findPinsFolder();
-    const pins = (pinsFolder?.children || []).filter(c => c.type === 'bookmark' && c.url);
+    // isInternalNode keeps the __tabpaladin_root__ identity marker out — it
+    // lives in this folder and is a bookmark, so it was showing up as a pin.
+    const pins = (pinsFolder?.children || [])
+        .filter(c => c.type === 'bookmark' && c.url && !isInternalNode(c));
     if (pins.length) {
         const head = document.createElement('div');
         head.className = 'home-head';
@@ -559,10 +562,14 @@ function renderHome(root) {
             tile.href = p.url;
             tile.target = '_blank';
             tile.rel = 'noopener';
-            tile.title = p.url;
+            // Icon only. The name lives in title/aria-label so the tile is
+            // still identifiable on hover and to a screen reader — a row of
+            // unlabelled squares would otherwise be unusable without sight.
+            const label = p.title || hostOf(p.url) || p.url;
+            tile.title = label;
+            tile.setAttribute('aria-label', label);
             tile.innerHTML =
-                `<span class="pin-fav" style="background:${colorFor(p.url)}">${escapeHtml(initialsFor(p.title, p.url))}</span>` +
-                `<span class="pin-name">${escapeHtml(p.title || hostOf(p.url))}</span>`;
+                `<span class="pin-fav" style="background:${colorFor(p.url)}">${escapeHtml(initialsFor(p.title, p.url))}</span>`;
             grid.appendChild(tile);
         }
         wrap.appendChild(grid);
