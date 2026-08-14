@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { attachImports } from './imports/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -254,23 +255,29 @@ app.get('/api/health', (req, res) => {
 });
 
 // --- Snapshots: push & pull ---
+
+// Store a snapshot and trim history. Shared by push, proposal approval and the
+// importers, so there is one place that knows a write must also enforce
+// MAX_SNAPSHOTS.
+function commitSnapshot(snapshot, deviceId = null) {
+    const ts = new Date().toISOString();
+    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
+        .run(ts, deviceId, JSON.stringify(snapshot));
+    db.prepare(`
+        DELETE FROM snapshots WHERE id NOT IN (
+            SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT ?
+        )
+    `).run(MAX_SNAPSHOTS);
+    return ts;
+}
+
 app.post('/api/push', requireAuth, (req, res) => {
     const snapshot = req.body && req.body.snapshot;
     const deviceId = (req.body && req.body.deviceId) || null;
     if (!snapshot || typeof snapshot !== 'object') {
         return res.status(400).json({ error: 'Missing snapshot' });
     }
-    const ts = new Date().toISOString();
-    const json = JSON.stringify(snapshot);
-    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)').run(ts, deviceId, json);
-
-    // Trim history beyond MAX_SNAPSHOTS.
-    db.prepare(`
-        DELETE FROM snapshots WHERE id NOT IN (
-            SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT ?
-        )
-    `).run(MAX_SNAPSHOTS);
-
+    const ts = commitSnapshot(snapshot, deviceId);
     res.json({ ok: true, timestamp: ts });
 });
 
@@ -557,13 +564,7 @@ app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
     }
 
     // Store as a new snapshot so history keeps the pre-approval state.
-    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
-        .run(now, 'llm-proposal', JSON.stringify(snapshot));
-    db.prepare(`
-        DELETE FROM snapshots WHERE id NOT IN (
-            SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT ?
-        )
-    `).run(MAX_SNAPSHOTS);
+    commitSnapshot(snapshot, 'llm-proposal');
     db.prepare('DELETE FROM note_proposals WHERE id = ?').run(prop.id);
     res.json({ ok: true });
 });
@@ -572,6 +573,11 @@ app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
     db.prepare('DELETE FROM note_proposals WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
 });
+
+// --- Importers ---
+// Registered before the static handler so /api/imports/* wins over the PWA
+// catch-all.
+attachImports(app, { db, requireAuth, latestSnapshot, commitSnapshot });
 
 // --- PWA static files ---
 if (fs.existsSync(PWA_DIR)) {

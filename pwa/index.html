@@ -9,7 +9,7 @@
   <link rel="icon" href="icons/icon192.png">
   <!-- Version query busts browser/proxy caches on each release.
        Bump the number together with SHELL_CACHE in sw.js. -->
-  <link rel="stylesheet" href="app.css?v=13">
+  <link rel="stylesheet" href="app.css?v=15">
 </head>
 <body>
   <header id="topbar">
@@ -110,10 +110,47 @@
         <p class="hint">Signed in as <strong id="auth-username-label"></strong>.</p>
         <button id="cfg-save" class="primary">Save server</button>
         <button id="auth-signout" class="ghost-block">Sign out</button>
+
+        <hr class="sep">
+
+        <strong class="block-title">Imports</strong>
+        <p class="hint">Reddit only ever shows your most recent 1000 saved posts. TabPaladin sweeps the list on a schedule and keeps everything it has ever seen, so the archive outgrows that cap.</p>
+        <div id="imports-list"></div>
+        <button id="imports-add" class="ghost-block">+ Connect Reddit</button>
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=13" type="module"></script>
+  <!-- Reddit importer setup -->
+  <div id="import-sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-header">
+      <strong>Connect Reddit</strong>
+      <button id="import-close" class="ghost">✕</button>
+    </div>
+    <div class="sheet-body">
+      <p class="hint">
+        Create an app at <strong>reddit.com/prefs/apps</strong> → <em>create another app…</em> →
+        type <strong>web app</strong>, and set the redirect URI to exactly:
+      </p>
+      <code id="import-redirect" class="redirect-uri"></code>
+      <label class="field">
+        <span>Client ID</span>
+        <input id="import-client-id" type="text" autocapitalize="none" spellcheck="false"
+               placeholder="under the app name">
+      </label>
+      <label class="field">
+        <span>Client secret</span>
+        <input id="import-client-secret" type="password" autocapitalize="none" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Sweep every (minutes)</span>
+        <input id="import-interval" type="number" min="5" step="5" value="60">
+      </label>
+      <small id="import-error" class="hint error hidden"></small>
+      <button id="import-submit" class="primary">Create &amp; authorise</button>
+    </div>
+  </div>
+
+  <script src="app.js?v=15" type="module"></script>
 </body>
 </html>

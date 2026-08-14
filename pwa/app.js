@@ -28,6 +28,7 @@ const state = {
     newNotePrefill: null,     // optional pre-filled content for a new note (e.g. from a wikilink)
     newNoteParentId: null,    // _pwaId of the notebook a new note is filed into (null = notes root)
     proposals: [],            // pending LLM note proposals awaiting approval
+    importers: [],            // configured import sources: [{id, provider, connected, items, ...}]
     importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
 };
 
@@ -522,27 +523,22 @@ function searchTargetFor(text) {
     return DDG + encodeURIComponent(t);
 }
 
-// Icon sources, best-privacy first, mirroring src/app/home.js minus the
-// extension-only cache the PWA has no access to.
-//
-//   1. The site's own /favicon.ico — no third party involved, but many sites
-//      declare their icon elsewhere via <link rel="icon">, so it often 404s.
-//   2. DuckDuckGo's icon service — reliable, and the one that tells someone
-//      else what you have pinned. Last on purpose, and DDG rather than Google
-//      because it is already the search engine this app sends you to.
+// The same source the bookmark list on this page already uses, and mirroring
+// src/app/home.js minus the extension-only cache the PWA has no access to.
 function faviconSources(pageUrl) {
     try {
         const host = new URL(pageUrl).hostname;
-        const out = [new URL('/favicon.ico', pageUrl).href];
-        if (host && host.includes('.')) out.push(`https://icons.duckduckgo.com/ip3/${host}.ico`);
-        return out;
+        if (!host || !host.includes('.')) return [];
+        return [`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`];
     } catch (e) {
         return [];
     }
 }
 
-// Walks the sources until one loads, so a failing source never flashes a
-// broken image over the initials underneath.
+// Walks the sources until one loads. Transparent rather than display:none
+// until then, so a failing source never flashes a broken icon over the
+// initials while still keeping a layout box — a hidden image marked
+// loading="lazy" is never fetched at all, which is why nothing used to appear.
 function attachFavicon(favEl, pageUrl) {
     const sources = faviconSources(pageUrl);
     if (sources.length === 0) return;
@@ -551,9 +547,8 @@ function attachFavicon(favEl, pageUrl) {
     const img = document.createElement('img');
     img.className = 'pin-favimg';
     img.alt = '';
-    img.loading = 'lazy';
     img.referrerPolicy = 'no-referrer';
-    img.style.display = 'none';
+    img.style.opacity = '0';
 
     img.addEventListener('error', () => {
         i += 1;
@@ -562,7 +557,7 @@ function attachFavicon(favEl, pageUrl) {
     });
     img.addEventListener('load', () => {
         if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
-        img.style.display = '';
+        img.style.opacity = '';
         favEl.textContent = '';
         favEl.style.background = 'transparent';
     });
@@ -627,10 +622,7 @@ function renderHome(root) {
             fav.style.background = colorFor(p.url);
             fav.textContent = initialsFor(p.title, p.url);
 
-            // Straight from the site's own /favicon.ico. No extension API here,
-            // and routing through an icon service would hand a third party the
-            // list of everything you have pinned — the site itself already
-            // knows you visit it. Initials show through if it 404s.
+            // Initials show through if the icon never arrives.
             attachFavicon(fav, tile.href);
             tile.appendChild(fav);
             grid.appendChild(tile);
@@ -1986,6 +1978,7 @@ function openSettings() {
     if (urlEl) urlEl.value = state.config.url || defaultServerUrl();
     refreshAuthUi();
     show($('settings-sheet'));
+    if (state.config.token) refreshImporters();
 }
 
 // The server serves this PWA, so when you opened it you were already talking to
@@ -2002,6 +1995,171 @@ function currentServerUrl() {
     const urlEl = $('cfg-url');
     const typed = urlEl ? urlEl.value.trim() : '';
     return (typed || state.config.url || defaultServerUrl()).replace(/\/$/, '');
+}
+
+// --- Importers ---
+//
+// The archive itself is browsed as ordinary bookmarks in the main UI, so this
+// screen only has to cover what bookmarks cannot express: connection state, when
+// the last sweep ran, and what went wrong.
+
+function importerSubtitle(src) {
+    if (!src.connected) return 'Not connected — tap Authorise.';
+    if (src.lastStatus === 'error') return src.lastError || 'Last sweep failed.';
+    if (!src.lastRun) return 'Connected. Waiting for the first sweep.';
+    const mins = Math.round((Date.now() - Date.parse(src.lastRun)) / 60000);
+    const when = mins < 1 ? 'just now'
+        : mins < 60 ? `${mins} min ago`
+        : mins < 1440 ? `${Math.round(mins / 60)} h ago`
+        : `${Math.round(mins / 1440)} d ago`;
+    // Items Reddit no longer lists are the whole point of the archive, so say so
+    // rather than hiding them in a count that looks like a discrepancy.
+    const gone = src.goneFromSource ? ` · ${src.goneFromSource} kept past Reddit's cap` : '';
+    return `Swept ${when} · every ${src.intervalMinutes} min${gone}`;
+}
+
+function renderImporters() {
+    const list = $('imports-list');
+    if (!list) return;
+    const sources = state.importers || [];
+
+    if (sources.length === 0) {
+        list.innerHTML = '<p class="hint">No importers yet.</p>';
+        return;
+    }
+
+    list.innerHTML = sources.map(src => `
+        <div class="import-row" data-id="${escapeAttr(src.id)}">
+          <div class="import-head">
+            <span class="import-name">${escapeHtml(src.label || src.provider)}</span>
+            <span class="import-count">${src.items} saved</span>
+          </div>
+          <div class="import-meta${src.lastStatus === 'error' ? ' error' : ''}">${escapeHtml(importerSubtitle(src))}</div>
+          <div class="import-actions">
+            <button data-act="${src.connected ? 'run' : 'auth'}">${src.connected ? 'Sweep now' : 'Authorise'}</button>
+            <button data-act="toggle">${src.enabled ? 'Pause' : 'Resume'}</button>
+            <button data-act="delete" class="danger">Remove</button>
+          </div>
+        </div>
+    `).join('');
+
+    list.querySelectorAll('.import-actions button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const id = btn.closest('.import-row').dataset.id;
+            handleImporterAction(id, btn.dataset.act, btn);
+        });
+    });
+}
+
+async function refreshImporters() {
+    if (!configured()) return;
+    try {
+        const data = await api('/api/imports');
+        state.importers = data.sources || [];
+        renderImporters();
+    } catch (e) {
+        const list = $('imports-list');
+        // An older server simply has no /api/imports; that is not an error worth
+        // shouting about in the settings sheet.
+        if (list) list.innerHTML = `<p class="hint">${/404/.test(String(e)) ? 'This server does not support importers yet.' : 'Could not load importers.'}</p>`;
+    }
+}
+
+function handleImporterAction(id, act, btn) {
+    // Every branch talks to the server, so one catch here beats four.
+    runImporterAction(id, act, btn).catch(e => setStatus('Importer error: ' + e.message));
+}
+
+async function runImporterAction(id, act, btn) {
+    const source = (state.importers || []).find(s => String(s.id) === String(id));
+    if (!source) return;
+
+    if (act === 'delete') {
+        // Deleting the connection must not silently bin the archive — anything
+        // Reddit has already forgotten only exists here.
+        if (!confirm(`Remove "${source.label}"?\n\nThe ${source.items} archived links stay on the server, and the bookmark folder stays where it is.`)) return;
+        await api('/api/imports/' + id, { method: 'DELETE' });
+        await refreshImporters();
+        return;
+    }
+
+    if (act === 'toggle') {
+        await api('/api/imports/' + id, {
+            method: 'PATCH',
+            body: JSON.stringify({ enabled: !source.enabled })
+        });
+        await refreshImporters();
+        return;
+    }
+
+    if (act === 'auth') {
+        const data = await api('/api/imports/' + id + '/authorize');
+        // Opened rather than navigated: losing the PWA to a redirect chain and
+        // coming back to a cold start is a bad way to connect an account.
+        window.open(data.url, '_blank', 'noopener');
+        setStatus('Approve the app on Reddit, then come back and sweep.');
+        return;
+    }
+
+    if (act === 'run') {
+        const original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Sweeping…';
+        try {
+            const result = await api('/api/imports/' + id + '/run', { method: 'POST' });
+            setStatus(result.added
+                ? `Imported ${result.added} new link${result.added === 1 ? '' : 's'}.`
+                : 'Already up to date.');
+            // Only pull when there is nothing unsaved locally — pullSnapshot
+            // replaces state wholesale and would discard pending edits.
+            if (result.projected && !state.dirty) await pullSnapshot();
+        } catch (e) {
+            setStatus('Sweep failed: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = original;
+            await refreshImporters();
+        }
+    }
+}
+
+function openImporterSetup() {
+    const redirect = $('import-redirect');
+    if (redirect) redirect.textContent = currentServerUrl() + '/api/imports/reddit/callback';
+    hide($('import-error'));
+    show($('import-sheet'));
+}
+
+async function submitImporter() {
+    const err = $('import-error');
+    const clientId = $('import-client-id').value.trim();
+    const clientSecret = $('import-client-secret').value.trim();
+    const intervalMinutes = Number($('import-interval').value) || 60;
+
+    if (!clientId || !clientSecret) {
+        err.textContent = 'Both the client ID and secret are required.';
+        show(err);
+        return;
+    }
+
+    try {
+        const created = await api('/api/imports', {
+            method: 'POST',
+            body: JSON.stringify({ provider: 'reddit', label: 'Reddit saved', clientId, clientSecret, intervalMinutes })
+        });
+        $('import-client-id').value = '';
+        $('import-client-secret').value = '';
+        hide($('import-sheet'));
+        await refreshImporters();
+        // Straight into the consent flow — a source with no credentials cannot
+        // do anything, so stopping here would just be a dead end.
+        const auth = await api('/api/imports/' + created.source.id + '/authorize');
+        window.open(auth.url, '_blank', 'noopener');
+        setStatus('Approve the app on Reddit, then come back and sweep.');
+    } catch (e) {
+        err.textContent = e.message;
+        show(err);
+    }
 }
 
 function refreshAuthUi() {
@@ -2380,6 +2538,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
+    safeAddListener('imports-add', 'click', openImporterSetup);
+    safeAddListener('import-close', 'click', () => hide($('import-sheet')));
+    safeAddListener('import-submit', 'click', submitImporter);
     safeAddListener('auth-submit', 'click', submitAuth);
     safeAddListener('auth-signout', 'click', signOut);
     // Enter in the password field signs in, which is what everyone expects.

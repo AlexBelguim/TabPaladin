@@ -763,6 +763,67 @@ select.note-move {
 #auth-signed-out .field + .field { margin-top: 8px; }
 #auth-signed-out .hint { display: block; margin: 6px 0; }
 
+/* ---------- imports ---------- */
+.sheet-body hr.sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 18px 0 14px;
+}
+
+.block-title { display: block; margin-bottom: 4px; }
+
+/* The redirect URI has to be pasted into Reddit character for character, so it
+   wraps rather than truncating and stays selectable on a phone. */
+.redirect-uri {
+  display: block;
+  margin: 8px 0 14px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  word-break: break-all;
+  user-select: all;
+}
+
+#imports-list { margin-top: 10px; }
+
+.import-row {
+  padding: 10px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+}
+
+.import-row .import-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.import-row .import-name { font-weight: 600; }
+.import-row .import-count { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+.import-row .import-meta { color: var(--muted); font-size: 0.75rem; margin-top: 2px; }
+.import-row .import-meta.error { color: var(--danger); }
+
+.import-row .import-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.import-row .import-actions button {
+  flex: 1;
+  padding: 6px 8px;
+  font-size: 0.8rem;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.import-row .import-actions button:hover { background: var(--border); color: var(--text); }
+.import-row .import-actions button.danger { color: var(--danger); }
+
 /* Wordmark doubles as the way home. */
 #brand-home {
   display: flex;

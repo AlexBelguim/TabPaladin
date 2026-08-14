@@ -19,3 +19,9 @@ services:
       # CHANGE THIS to a long random string. The extension uses the same value.
       - AUTH_TOKEN=${TABPALADIN_TOKEN:-7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b}
       - MAX_SNAPSHOTS=${MAX_SNAPSHOTS:-200}
+      # Encrypts importer OAuth refresh tokens at rest. Set it in .env before
+      # connecting an account — sync.db is the kind of file that ends up in a
+      # backup, and a Reddit refresh token in there grants access to the account.
+      # Changing it later makes existing connections unreadable and they have to
+      # be re-authorised.
+      - IMPORT_SECRET=${IMPORT_SECRET:-}

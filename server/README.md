@@ -8,6 +8,8 @@ Tiny Node + SQLite backend for the TabPaladin extension and PWA.
 cd server
 # Set a long random token:
 echo 'TABPALADIN_TOKEN=7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b' > .env
+# And a second one, if you plan to use importers (see below):
+echo 'IMPORT_SECRET=change-me-to-something-long-and-random' >> .env
 docker compose up -d --build
 ```
 
@@ -35,6 +37,15 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | POST | `/api/proposals/:id/reject` | discard a proposal |
 | GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
 | POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content, notebook? }` for approval |
+| GET | `/api/imports` | list import sources with counts and last-run state |
+| POST | `/api/imports` | create `{ provider, clientId, clientSecret, intervalMinutes? }` |
+| PATCH | `/api/imports/:id` | enable/disable, change interval or credentials |
+| DELETE | `/api/imports/:id` | remove a source; `?purge=1` also deletes its archive |
+| GET | `/api/imports/:id/items` | browse the archive (`limit`, `offset`) |
+| POST | `/api/imports/:id/run` | sweep now |
+| POST | `/api/imports/:id/reproject` | rebuild the bookmark folder from the archive |
+| GET | `/api/imports/:id/authorize` | returns the provider consent URL |
+| GET | `/api/imports/reddit/callback` | **no auth** — OAuth redirect, guarded by a one-shot `state` |
 | GET | `/` (and other paths) | serves the PWA |
 
 ## LLM share links
@@ -57,6 +68,61 @@ For LLM chats that cannot POST, the share page also teaches a universal
 review link: `https://<host>/#note=<percent-encoded markdown>[&notebook=<name>]`.
 The fragment never reaches the server — the PWA opens the note in its editor
 for review and only stores it when the user presses Save.
+
+## Importers
+
+Reddit's listing endpoints stop paginating at **1000 items**. Your saves are not
+deleted — they stay in Reddit's database — but `/user/<name>/saved` only ever returns
+the most recent 1000 and there is no page 1001. The same cap applies to upvoted,
+downvoted and hidden listings.
+
+The importer sweeps the list on a schedule and never drops what it has already seen,
+so the archive keeps growing past the cap. Items that fall off the end of Reddit's
+window are stamped as gone from the source and keep their bookmarks.
+
+### Connecting Reddit
+
+1. Go to <https://www.reddit.com/prefs/apps> → **create another app…**
+2. Pick type **web app** (not "script" — only a web app gets a refresh token).
+3. Set the redirect URI to exactly `https://<host>/api/imports/reddit/callback`.
+   The PWA shows you the right value to paste.
+4. Put a long random string in `IMPORT_SECRET` in `.env` and restart, *before*
+   connecting. It encrypts the stored refresh token; without it the token sits in
+   `sync.db` in plaintext and the server says so on startup. Changing it later
+   invalidates existing connections.
+5. In the PWA: **Settings → Imports → Connect Reddit**, paste the client ID and
+   secret, then authorise.
+
+Saved posts and saved comments both land as bookmarks under:
+
+```
+TabPaladin Imports/Reddit/Saved/<YYYY-MM>/
+```
+
+Grouped by the month the post was created, so re-projecting always produces the same
+tree. From there they are ordinary bookmarks — they sync to every device, and
+workflows, pins and the AI organiser all work on them.
+
+### How it holds together
+
+The archive lives in the `import_items` table, not in the snapshot. `/api/push`
+replaces the snapshot wholesale with whatever a browser sends, so a device that pushes
+before it pulls would otherwise drop the whole import folder — and for anything Reddit
+has already forgotten, that snapshot was the only copy. Because the bookmark tree is a
+*projection* of the table, the next sweep just rebuilds it; `POST
+/api/imports/:id/reproject` forces that repair without touching the network.
+
+A sweep that changes nothing writes no snapshot, so an idle importer does not churn
+the history or trigger pointless pulls on every device.
+
+**Imports are one-way.** Deleting an imported bookmark in TabPaladin never un-saves
+anything on Reddit.
+
+### Tests
+
+```bash
+node tools/test_imports.mjs
+```
 
 ## TLS
 

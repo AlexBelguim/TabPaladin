@@ -34,6 +34,13 @@ TabPaladin is a powerful browser extension that helps you **tame tab chaos** and
 - **Folder Suggestions** — Get intelligent folder recommendations
 - **Custom Hints** — Guide the AI with your own keywords
 
+### 📥 **Importers** (Optional, needs the sync server)
+- **Reddit saved posts** — Reddit only ever shows your most recent 1000 saves. TabPaladin sweeps the list on a schedule and keeps everything it has seen, so your archive outgrows the cap
+- **Ordinary bookmarks** — imports land in a normal folder, so workflows, pins, search and the AI organiser all work on them
+- **One-way** — deleting an import in TabPaladin never un-saves anything on Reddit
+
+See [server/README.md](server/README.md#importers) for setup.
+
 ### 🎬 **Bonus: Video Scroll Seek**
 - Scroll wheel to fast-forward/rewind fullscreen videos
 - Works on YouTube, Netflix, and more!
