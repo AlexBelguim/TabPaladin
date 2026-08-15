@@ -373,6 +373,21 @@ function renderContent() {
         renderNotesView(root, node);
         return;
     }
+    // Everything under the imports root is server-managed: the sweep rebuilds
+    // it, and moving or deleting in here is read back and acted on rather than
+    // being a local edit like anywhere else. Tint the whole view so that is
+    // obvious before someone starts rearranging.
+    const inImports = isInsideImports();
+    root.classList.toggle('in-imports', inImports);
+    if (inImports) {
+        const note = document.createElement('div');
+        note.className = 'imports-note';
+        note.innerHTML = '<strong>Synced from Reddit.</strong> The server rebuilds this folder on every sweep, '
+            + 'so nothing can be filed into it. '
+            + 'Move something out and it stays where you put it, never re-added. '
+            + 'Delete it and it is purged, and will not come back on the next sweep.';
+        root.appendChild(note);
+    }
     const children = node.children || [];
     // Neither the notes nor the pins folder is shown among the bookmarks —
     // notes get their own section on the root view, pins get the home tiles.
@@ -401,14 +416,40 @@ function renderContent() {
     }
 }
 
+// Imported bookmarks live under this root, written by the server's importers.
+const IMPORTS_ROOT_TITLE = 'TabPaladin Imports';
+
+function isImportsFolder(node) {
+    return node && node.type === 'folder' && node.title === IMPORTS_ROOT_TITLE;
+}
+
+// Is the folder currently being viewed the imports root, or inside it?
+function isInsideImports() {
+    return state.pathIds.some((_, idx) => {
+        const node = findNodeByPath(state.pathIds.slice(0, idx + 1));
+        return isImportsFolder(node);
+    });
+}
+
+// Guard for anything that would write into the folder currently open. Nothing
+// may be filed into the archive: the next sweep rebuilds that subtree from the
+// server's own records, so a bookmark added here is moved back out at best and
+// deleted at worst. Refusing up front beats explaining afterwards.
+function blockedByImports(action = 'add anything') {
+    if (!isInsideImports()) return false;
+    showToast(`Can't ${action} here — this folder is synced from Reddit and is rebuilt on every sweep.`);
+    return true;
+}
+
 function renderFolderRow(folder) {
     const row = document.createElement('div');
-    row.className = 'row folder';
+    row.className = 'row folder' + (isImportsFolder(folder) ? ' imports-root' : '');
     const subfolders = (folder.children || []).filter(c => c.type === 'folder');
     const bms = (folder.children || []).filter(c => c.type === 'bookmark' && !isInternalNode(c));
     row.innerHTML = `
-        <span class="icon">📁</span>
+        <span class="icon">${isImportsFolder(folder) ? '📥' : '📁'}</span>
         <span class="title">${escapeHtml(folder.title || '(unnamed)')}</span>
+        ${isImportsFolder(folder) ? '<span class="imports-badge">synced</span>' : ''}
         <span class="count">${subfolders.length} 📁 · ${bms.length} 📄</span>
     `;
     row.addEventListener('click', () => {
@@ -1646,6 +1687,7 @@ function openInbox() {
 async function dropHere() {
     const folder = findNodeByPath(state.pathIds);
     if (!folder) { alert('Pick a folder first.'); return; }
+    if (blockedByImports('drop links')) return;
     if (state.inbox.length === 0) { alert('Nothing in the inbox.'); return; }
 
     // Append each link as a bookmark to the current folder, locally.
@@ -1893,6 +1935,7 @@ function renderQuickFileSheet() {
                     alert('Please navigate to a folder in the background first.');
                     return;
                 }
+                if (blockedByImports('file links')) return;
                 // File locally
                 folder.children = folder.children || [];
                 folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
@@ -1953,8 +1996,31 @@ async function processShareTargetIfAny() {
     const text = params.get('text') || '';
     if (!url && /^https?:\/\//.test(text)) url = text;
     if (!url) return;
+    const shareTitle = title || text;
     try {
-        await api('/api/shared', { method: 'POST', body: JSON.stringify({ url, title: title || text }) });
+        // Posts shared from X or Instagram go straight into their own archive
+        // rather than the generic inbox — neither can be swept, so sharing is
+        // the only way those archives are ever filled. Anything else falls
+        // through to the inbox exactly as before.
+        let captured = null;
+        try {
+            captured = await api('/api/imports/capture', {
+                method: 'POST',
+                body: JSON.stringify({ url, title: shareTitle })
+            });
+        } catch (e) {
+            // An older server has no capture route; the inbox still works.
+            console.warn('Capture unavailable, falling back to inbox', e);
+        }
+
+        if (captured && captured.captured) {
+            const name = captured.provider === 'x' ? 'X' : 'Instagram';
+            showToast(captured.duplicate
+                ? `Already in your ${name} archive.`
+                : `Saved to ${name} — ${captured.items} archived.`);
+        } else {
+            await api('/api/shared', { method: 'POST', body: JSON.stringify({ url, title: shareTitle }) });
+        }
     } catch (e) {
         console.warn('Share-target push failed', e);
     } finally {
@@ -2000,6 +2066,12 @@ function currentServerUrl() {
 // the last sweep ran, and what went wrong.
 
 function importerSubtitle(src) {
+    if (src.manual) {
+        // Nothing polls this one, so last-run time would be meaningless. Say
+        // how it gets filled instead.
+        const gone = src.filed ? ` · ${src.filed} filed away` : '';
+        return `Filled by sharing posts to TabPaladin${gone}`;
+    }
     if (!src.connected) return 'Not connected — tap Authorise.';
     if (src.lastStatus === 'error') return src.lastError || 'Last sweep failed.';
     if (!src.lastRun) return 'Connected. Waiting for the first sweep.';
@@ -2032,8 +2104,8 @@ function renderImporters() {
           </div>
           <div class="import-meta${src.lastStatus === 'error' ? ' error' : ''}">${escapeHtml(importerSubtitle(src))}</div>
           <div class="import-actions">
-            <button data-act="${src.connected ? 'run' : 'auth'}">${src.connected ? 'Sweep now' : 'Authorise'}</button>
-            <button data-act="toggle">${src.enabled ? 'Pause' : 'Resume'}</button>
+            ${src.manual ? '' : `<button data-act="${src.connected ? 'run' : 'auth'}">${src.connected ? 'Sweep now' : 'Authorise'}</button>`}
+            ${src.manual ? '' : `<button data-act="toggle">${src.enabled ? 'Pause' : 'Resume'}</button>`}
             <button data-act="delete" class="danger">Remove</button>
           </div>
         </div>
@@ -2431,6 +2503,8 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('newFolderBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
+
+        if (blockedByImports('create a folder')) return;
 
         if (!configured()) {
             showToast('Please open settings (⚙) first.');

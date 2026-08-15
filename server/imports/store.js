@@ -104,7 +104,34 @@ export function initSchema(db) {
             source_id INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        -- Items the user deleted out of the import folder. The archive row and
+        -- everything in it is gone; only the source's own id for it is kept.
+        --
+        -- Without this, deleting achieves nothing: the post is still saved on
+        -- Reddit, so the next sweep re-imports it and it reappears within the
+        -- hour. A tombstone is what makes a delete stick, and it holds no
+        -- content — no title, no url, nothing to leak in a backup.
+        CREATE TABLE IF NOT EXISTS import_dismissed (
+            source_id INTEGER NOT NULL,
+            external_id TEXT NOT NULL,
+            dismissed_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, external_id)
+        );
     `);
+
+    // Migration for databases created before the import folder respected the
+    // user. filed_at marks an item the user moved out to file somewhere of
+    // their own: still archived and still counted, but never projected back in,
+    // because re-adding it is what would duplicate it.
+    try { db.prepare('ALTER TABLE import_items ADD COLUMN filed_at TEXT').run(); } catch (e) { /* column already exists */ }
+
+    // When this item was last drawn into a committed snapshot. Reconciling
+    // needs it: an item missing from the folder only means the user removed it
+    // if the item was ever *put* there. Judging on import time instead purges
+    // anything swept but not yet projected — a real window, since a restart or
+    // a push between the sweep and the projection lands squarely in it.
+    try { db.prepare('ALTER TABLE import_items ADD COLUMN projected_at TEXT').run(); } catch (e) { /* column already exists */ }
 }
 
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
@@ -195,6 +222,13 @@ export function makeStore(db) {
         // listing. Returns true when the row is new.
         upsertItem(sourceId, item) {
             const now = new Date().toISOString();
+
+            // Deleted by the user. It is very likely still saved at the source,
+            // so without this check every sweep would resurrect it.
+            const dismissed = db.prepare('SELECT 1 FROM import_dismissed WHERE source_id = ? AND external_id = ?')
+                .get(sourceId, item.externalId);
+            if (dismissed) return false;
+
             const existing = db.prepare('SELECT id FROM import_items WHERE source_id = ? AND external_id = ?')
                 .get(sourceId, item.externalId);
             if (existing) {
@@ -237,6 +271,68 @@ export function makeStore(db) {
                 .all(sourceId);
         },
 
+        // What the projection is allowed to draw: everything except items the
+        // user has already filed elsewhere.
+        activeItemsFor(sourceId) {
+            return db.prepare('SELECT * FROM import_items WHERE source_id = ? AND filed_at IS NULL ORDER BY created_utc DESC, id DESC')
+                .all(sourceId);
+        },
+
+        // The user moved these out of the import folder. Keep the archive row —
+        // the item still counts and still came from Reddit — but stop drawing
+        // it, or the next rebuild puts a duplicate back where they took it from.
+        markFiled(ids) {
+            if (!ids.length) return 0;
+            const now = new Date().toISOString();
+            const stmt = db.prepare('UPDATE import_items SET filed_at = ? WHERE id = ?');
+            const run = db.transaction((list) => { for (const id of list) stmt.run(now, id); });
+            run(ids);
+            return ids.length;
+        },
+
+        // The user deleted these. The row goes entirely — unrecoverable by
+        // design, since anything past Reddit's 1000-item window cannot be
+        // fetched again — and a contentless tombstone stays behind so a later
+        // sweep does not simply import it all over again.
+        purgeItems(rows) {
+            if (!rows.length) return 0;
+            const now = new Date().toISOString();
+            const del = db.prepare('DELETE FROM import_items WHERE id = ?');
+            const tomb = db.prepare('INSERT OR IGNORE INTO import_dismissed (source_id, external_id, dismissed_at) VALUES (?, ?, ?)');
+            const run = db.transaction((list) => {
+                for (const r of list) { tomb.run(r.source_id, r.external_id, now); del.run(r.id); }
+            });
+            run(rows);
+            return rows.length;
+        },
+
+        // Undo a delete for items still present at the source: drops the
+        // tombstone so the next sweep is free to bring them back.
+        undismiss(sourceId, externalIds = null) {
+            if (externalIds === null) {
+                return db.prepare('DELETE FROM import_dismissed WHERE source_id = ?').run(sourceId).changes;
+            }
+            const stmt = db.prepare('DELETE FROM import_dismissed WHERE source_id = ? AND external_id = ?');
+            const run = db.transaction((list) => { for (const e of list) stmt.run(sourceId, e); });
+            run(externalIds);
+            return externalIds.length;
+        },
+
+        // Records that these items are now present in a committed snapshot, so
+        // a later absence can be read as the user having removed them.
+        markProjected(ids) {
+            if (!ids.length) return 0;
+            const now = new Date().toISOString();
+            const stmt = db.prepare('UPDATE import_items SET projected_at = ? WHERE id = ?');
+            const run = db.transaction((list) => { for (const id of list) stmt.run(now, id); });
+            run(ids);
+            return ids.length;
+        },
+
+        countDismissed(sourceId) {
+            return db.prepare('SELECT COUNT(*) AS n FROM import_dismissed WHERE source_id = ?').get(sourceId).n;
+        },
+
         pageItems(sourceId, { limit = 100, offset = 0 } = {}) {
             return db.prepare(`
                 SELECT * FROM import_items WHERE source_id = ?
@@ -247,10 +343,11 @@ export function makeStore(db) {
         countItems(sourceId) {
             const row = db.prepare(`
                 SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN removed_at_source IS NOT NULL THEN 1 ELSE 0 END) AS gone
+                       SUM(CASE WHEN removed_at_source IS NOT NULL THEN 1 ELSE 0 END) AS gone,
+                       SUM(CASE WHEN filed_at IS NOT NULL THEN 1 ELSE 0 END) AS filed
                 FROM import_items WHERE source_id = ?
             `).get(sourceId);
-            return { total: row.total || 0, goneFromSource: row.gone || 0 };
+            return { total: row.total || 0, goneFromSource: row.gone || 0, filed: row.filed || 0 };
         },
 
         // --- OAuth handshake state ---

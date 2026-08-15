@@ -1,7 +1,11 @@
 // Runs a source: refresh token -> sweep the listing -> archive -> project.
 
 import * as reddit from './reddit.js';
-import { buildProviderFolder, applyProviderFolder } from './project.js';
+import { isManualProvider } from './manual.js';
+import {
+    buildProviderFolder, applyProviderFolder, providerFolderTitle,
+    reconcile, ejectForeign
+} from './project.js';
 
 const TICK_MS = 60 * 1000;
 
@@ -60,26 +64,68 @@ export async function sweepSource(store, source) {
     return { fetched: items.length, added, missing, pages };
 }
 
-// Rebuild this source's subtree from the archive and commit only if it changed.
-// Committing unconditionally would burn a slot in the snapshot history every
-// tick and push a pointless pull at every device.
+// Read what the user did to the folder, record it, then rebuild from what is
+// left and commit only if the tree actually changed. Committing unconditionally
+// would burn a slot in the snapshot history every tick and push a pointless
+// pull at every device.
 export function projectSource(store, source, { latestSnapshot, commitSnapshot }) {
-    const snapshot = latestSnapshot();
-    if (!snapshot) return { projected: false, reason: 'no snapshot on server yet' };
+    const latest = latestSnapshot();
+    if (!latest || !latest.snapshot) return { projected: false, reason: 'no snapshot on server yet' };
+    const { snapshot, timestamp } = latest;
 
-    const items = store.itemsFor(source.id);
     const listTitle = source.config.listTitle || 'Saved';
+    const providerTitle = providerFolderTitle(source.provider);
+
+    // Reconcile first, against every archived row — including ones already
+    // filed, so a filed item the user later moved *back* into the folder is not
+    // judged again on stale information.
+    const { filed, purged } = reconcile({
+        snapshot,
+        snapshotTimestamp: timestamp,
+        providerTitle,
+        items: store.itemsFor(source.id).filter(i => !i.filed_at)
+    });
+
+    if (filed.length) store.markFiled(filed.map(i => i.id));
+    if (purged.length) store.purgeItems(purged);
+
+    const items = store.activeItemsFor(source.id);
+    const known = new Set(items.map(i => i.url));
+
+    // Nothing may live inside the archive. Anything that found its way in is
+    // moved out to the folder holding the imports root before the rebuild, which
+    // would otherwise delete it.
+    const ejected = ejectForeign(snapshot, providerTitle, known);
+
     const folder = buildProviderFolder({ provider: source.provider, listTitle, items });
 
-    if (!applyProviderFolder(snapshot, folder)) return { projected: false, reason: 'no change' };
+    // An ejection counts as a change on its own: it moved a bookmark somewhere
+    // else in the tree without necessarily altering the provider folder, and
+    // dropping the commit would silently undo it.
+    const rebuilt = applyProviderFolder(snapshot, folder);
+    if (!rebuilt && !ejected.length) {
+        // Unchanged means the folder already holds exactly these items, so they
+        // are just as much "in a committed snapshot" as if we had written one.
+        store.markProjected(items.filter(i => !i.projected_at).map(i => i.id));
+        return { projected: false, reason: 'no change', filed: filed.length, purged: purged.length, ejected: 0 };
+    }
 
     commitSnapshot(snapshot, 'importer');
-    return { projected: true, items: items.length };
+    // Only now are these items actually in a snapshot, which is what later
+    // makes their absence readable as the user having removed them.
+    store.markProjected(items.map(i => i.id));
+    return {
+        projected: true, items: items.length,
+        filed: filed.length, purged: purged.length, ejected: ejected.length
+    };
 }
 
 export async function runSource(store, source, ctx) {
     try {
-        const swept = await sweepSource(store, source);
+        // Manual sources have nothing to fetch — they are filled by sharing a
+        // link to the app. Projecting is still worth doing, so a capture that
+        // could not be drawn at the time (no snapshot yet, say) lands later.
+        const swept = isManualProvider(source.provider) ? { manual: true } : await sweepSource(store, source);
         const projected = projectSource(store, source, ctx);
         store.markRun(source.id, { status: 'ok' });
         return { ok: true, ...swept, ...projected };
@@ -107,7 +153,9 @@ export function startScheduler(store, ctx) {
         try {
             for (const source of store.listSources()) {
                 if (!isDue(source)) continue;
-                if (!store.hasCredentials(source.id)) continue;
+                // Credentials gate the fetch-based sources only; a manual one
+                // has none and never will.
+                if (!isManualProvider(source.provider) && !store.hasCredentials(source.id)) continue;
                 const result = await runSource(store, source, ctx);
                 if (!result.ok) {
                     console.warn(`[TabPaladin Imports] ${source.provider}#${source.id} failed: ${result.error}`);

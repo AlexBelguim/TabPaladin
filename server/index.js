@@ -372,6 +372,15 @@ function latestSnapshot() {
     return row ? JSON.parse(row.json) : null;
 }
 
+// Same, plus when it was taken. The importers need the timestamp to tell "the
+// user deleted this" from "this was imported after that snapshot was pushed" —
+// without it, a device pushing a stale copy of the import folder would purge
+// everything swept since it last pulled.
+function latestSnapshotWithMeta() {
+    const row = db.prepare('SELECT json, timestamp FROM snapshots ORDER BY timestamp DESC LIMIT 1').get();
+    return row ? { snapshot: JSON.parse(row.json), timestamp: row.timestamp } : null;
+}
+
 // All notes under a folder, recursively, tagged with their notebook (subfolder title).
 function collectNotes(folder, notebook, out = []) {
     for (const c of folder.children || []) {
@@ -577,7 +586,7 @@ app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
 // --- Importers ---
 // Registered before the static handler so /api/imports/* wins over the PWA
 // catch-all.
-attachImports(app, { db, requireAuth, latestSnapshot, commitSnapshot });
+attachImports(app, { db, requireAuth, latestSnapshot: latestSnapshotWithMeta, commitSnapshot });
 
 // --- PWA static files ---
 if (fs.existsSync(PWA_DIR)) {

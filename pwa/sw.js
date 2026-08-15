@@ -4,12 +4,12 @@
 // Release ritual: bump the version here AND the ?v= queries in index.html
 // together — all four numbers below included. Miss one and the phone keeps
 // serving the old bundle from cache while the desktop looks fixed.
-const SHELL_CACHE = 'tp-shell-v21';
+const SHELL_CACHE = 'tp-shell-v24';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=21',
-    '/app.js?v=21',
+    '/app.css?v=24',
+    '/app.js?v=24',
     '/manifest.webmanifest',
     '/icons/icon192.png'
 ];

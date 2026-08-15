@@ -1267,6 +1267,10 @@ function buildOrganizeHeader(title, parentFolderId) {
     return wrap;
 }
 
+// Root of the server-managed import archive. Its whole subtree is read-only to
+// the user apart from taking things out of it.
+const IMPORTS_ROOT_TITLE = 'TabPaladin Imports';
+
 function renderFolderCard(sub, depth = 0) {
     const card = document.createElement('div');
     card.className = 'source-folder-card';
@@ -1280,7 +1284,18 @@ function renderFolderCard(sub, depth = 0) {
 
     // Header
     const header = document.createElement('div');
-    header.className = 'source-folder-header';
+    // The imports subtree is server-managed: the sweep rebuilds it, and moving
+    // or deleting inside it is read back and acted on rather than being a local
+    // edit like anywhere else. Mark it so that is visible before someone starts
+    // rearranging, and so the drop target below can refuse.
+    //
+    // inImports is inherited from the parent card, so the whole subtree is
+    // locked rather than just the root — dropping into Reddit/Saved/2026-08 is
+    // exactly as pointless as dropping into the root.
+    const isImportsRoot = sub.title === IMPORTS_ROOT_TITLE;
+    const isImports = isImportsRoot || sub.inImports === true;
+    header.className = 'source-folder-header' + (isImports ? ' is-imports' : '');
+    card.dataset.imports = isImports ? '1' : '';
 
     const statsParts = [];
     if (sub.folderCount > 0) statsParts.push(`${sub.folderCount} 📁`);
@@ -1303,15 +1318,16 @@ function renderFolderCard(sub, depth = 0) {
     header.innerHTML = `
         <span class="folder-drag-handle" title="Drag to move folder" draggable="true">⋮⋮</span>
         <span class="folder-caret">▶</span>
-        <span class="folder-icon">${sub.icon || '📁'}</span>
+        <span class="folder-icon">${isImports ? '📥' : (sub.icon || '📁')}</span>
         <span class="folder-title">${escapeHtml(sub.title)}</span>
+        ${isImports ? '<span class="imports-badge">synced</span>' : ''}
         <span class="folder-stats">${stats}</span>
         ${openBtnHtml}
-        <button class="sm-btn split-btn" title="Sort loose files in this folder" style="padding:2px 8px;">✨ Split</button>
-        <button class="sm-btn new-subfolder-btn" title="Create a folder inside ${escapeHtml(sub.title)}" style="padding:2px 8px;">＋📁</button>
+        ${isImports ? '' : `<button class="sm-btn split-btn" title="Sort loose files in this folder" style="padding:2px 8px;">✨ Split</button>`}
+        ${isImports ? '' : `<button class="sm-btn new-subfolder-btn" title="Create a folder inside ${escapeHtml(sub.title)}" style="padding:2px 8px;">＋📁</button>`}
         ${deleteBtnHtml}
         ${drillBtnHtml}
-        <input type="checkbox" class="source-select-check" title="Select for batch action (Analyze & Sort / Restructure)">
+        ${isImports ? '' : '<input type="checkbox" class="source-select-check" title="Select for batch action (Analyze & Sort / Restructure)">'}
     `;
     card.appendChild(header);
 
@@ -1326,7 +1342,7 @@ function renderFolderCard(sub, depth = 0) {
     header.addEventListener('click', async (e) => {
         if (e.target.closest('button') || e.target.closest('input')) return;
         if (body.style.display === 'none') {
-            await renderFolderBody(sub.id, body, depth);
+            await renderFolderBody(sub.id, body, depth, isImports);
             body.style.display = 'block';
             caret.textContent = '▼';
         } else {
@@ -1346,7 +1362,9 @@ function renderFolderCard(sub, depth = 0) {
     }
 
     // Split = AI/heuristic on this folder's loose files only.
-    header.querySelector('.split-btn').addEventListener('click', async (e) => {
+    // Optional chaining throughout: these controls are omitted inside the
+    // import archive, where they would only queue up work the next sweep undoes.
+    header.querySelector('.split-btn')?.addEventListener('click', async (e) => {
         e.stopPropagation();
         await runSplitOnFolder(sub.id, sub.title);
     });
@@ -1362,7 +1380,7 @@ function renderFolderCard(sub, depth = 0) {
     }
 
     // New subfolder button — creates a folder inside this one.
-    header.querySelector('.new-subfolder-btn').addEventListener('click', async (e) => {
+    header.querySelector('.new-subfolder-btn')?.addEventListener('click', async (e) => {
         e.stopPropagation();
         const name = prompt(`Name for new folder inside "${sub.title}":`);
         if (!name) return;
@@ -1371,11 +1389,11 @@ function renderFolderCard(sub, depth = 0) {
             // Expand the card so the user sees the new folder.
             const caret = header.querySelector('.folder-caret');
             if (body.style.display === 'none') {
-                await renderFolderBody(sub.id, body, depth);
+                await renderFolderBody(sub.id, body, depth, isImports);
                 body.style.display = 'block';
                 if (caret) caret.textContent = '▼';
             } else {
-                await renderFolderBody(sub.id, body, depth);
+                await renderFolderBody(sub.id, body, depth, isImports);
             }
             // Update header stats.
             await refreshFolderBodyIfOpen(sub.id);
@@ -1409,7 +1427,7 @@ function renderFolderCard(sub, depth = 0) {
 
     // Checkbox: select for batch Analyze/Restructure.
     const checkbox = header.querySelector('.source-select-check');
-    checkbox.addEventListener('change', () => {
+    checkbox?.addEventListener('change', () => {
         if (checkbox.checked) {
             card.classList.add('selected');
             card.dataset.value = sub.id;
@@ -1454,6 +1472,12 @@ function renderFolderCard(sub, depth = 0) {
 
     // Drop target — accept dragged bookmark, bulk bookmarks, folder, tab, bulk tabs, or AI group.
     card.addEventListener('dragover', (e) => {
+        // Nothing may be filed *into* the archive. The next sweep rebuilds this
+        // subtree from the server's own records, so anything dropped here is
+        // either thrown away or quietly relocated — better to refuse the drop
+        // than to accept it and lose it. Not calling preventDefault is what
+        // makes the browser show "no drop" and reject it.
+        if (isImports) { e.dataTransfer.dropEffect = 'none'; return; }
         const types = e.dataTransfer.types;
         if (!types.includes('text/tp-bookmark-id') &&
             !types.includes('text/tp-bookmark-ids') &&
@@ -1470,7 +1494,7 @@ function renderFolderCard(sub, depth = 0) {
             springTimer = setTimeout(async () => {
                 springTimer = null;
                 if (body.style.display !== 'none') return; // user expanded it manually meanwhile
-                await renderFolderBody(sub.id, body, depth);
+                await renderFolderBody(sub.id, body, depth, isImports);
                 body.style.display = 'block';
                 const caretEl = header.querySelector('.folder-caret');
                 if (caretEl) caretEl.textContent = '▼';
@@ -1488,6 +1512,11 @@ function renderFolderCard(sub, depth = 0) {
         e.stopPropagation();
         card.classList.remove('drop-hover');
         cancelSpring();
+
+        // Belt and braces: dragover already refuses, but a drop can still be
+        // synthesised, and silently accepting one would lose the bookmark at
+        // the next sweep.
+        if (isImports) return;
 
         const bookmarkId = e.dataTransfer.getData('text/tp-bookmark-id');
         const bookmarkIdsJson = e.dataTransfer.getData('text/tp-bookmark-ids');
@@ -1781,7 +1810,9 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
     });
 }
 
-async function renderFolderBody(folderId, body, depth = 0) {
+// inImports rides down the recursion so the whole archive subtree is locked,
+// not just its root.
+async function renderFolderBody(folderId, body, depth = 0, inImports = false) {
     // Recursive: show subfolders (as nested cards) + loose bookmarks (grouped by domain).
     const tree = await chrome.bookmarks.getSubTree(folderId);
     if (!tree || !tree[0]) return;
@@ -1810,7 +1841,8 @@ async function renderFolderBody(folderId, body, depth = 0) {
             folderCount: sfChildren.filter(c => !c.url).length,
             fileCount: sfChildren.filter(isVisibleBookmark).length,
             icon: parentIsWorkflowsRoot ? '🛡️' : '📁',
-            isWorkflow: parentIsWorkflowsRoot
+            isWorkflow: parentIsWorkflowsRoot,
+            inImports: inImports || sf.title === IMPORTS_ROOT_TITLE
         }, depth + 1);
         body.appendChild(card);
     }
@@ -1859,7 +1891,7 @@ async function refreshFolderBodyIfOpen(folderId) {
         } catch (e) { /* folder gone — fine */ }
 
         if (body && body.style.display !== 'none') {
-            await renderFolderBody(folderId, body, depth);
+            await renderFolderBody(folderId, body, depth, inImports);
         }
     }
 }
@@ -2954,6 +2986,42 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </div>
             </div>
 
+            <!-- 5. Imports -->
+            <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Imports</h3>
+            <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                    Reddit only ever lists your most recent 1000 saved posts. The server sweeps the list on a schedule and keeps everything it has seen, so the archive outgrows that cap.
+                </div>
+
+                <div id="imports-list" style="font-size:0.8rem; color:var(--text-muted);">Loading…</div>
+
+                <button id="imports-add-btn" class="sm-btn" style="width:100%; margin-top:10px;">+ Connect Reddit</button>
+
+                <div id="imports-form" style="display:none; margin-top:12px; border-top:1px solid var(--border-color); padding-top:12px;">
+                    <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:6px;">
+                        Create a <strong>web app</strong> at <code style="color:#93c5fd;">reddit.com/prefs/apps</code> with this exact redirect URI:
+                    </div>
+                    <code id="imports-redirect" style="display:block; padding:6px 8px; background:#111827; border-radius:4px; font-size:0.7rem; color:#93c5fd; word-break:break-all; margin-bottom:10px; user-select:all;"></code>
+
+                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Client ID</div>
+                    <input type="text" id="imports-client-id" autocapitalize="none" spellcheck="false" placeholder="the short string under the app name" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+
+                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Client secret</div>
+                    <input type="password" id="imports-client-secret" autocapitalize="none" spellcheck="false" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+
+                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Sweep every (minutes)</div>
+                    <input type="number" id="imports-interval" min="5" step="5" value="60" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+
+                    <div id="imports-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
+                    <button id="imports-submit-btn" class="primary-btn" style="width:100%;">Create &amp; authorise</button>
+                </div>
+
+                <div id="imports-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
+                <div style="font-size:0.7rem; color:#666; margin-top:6px;">
+                    Imported links arrive as bookmarks in <strong>TabPaladin Imports</strong>. Sweeping happens on the server whether or not this panel is open — press <strong>Pull</strong> above to bring new ones into this browser.
+                </div>
+            </div>
+
             <!-- Save Actions -->
             <div style="margin-top:20px; display:flex; gap:10px; justify-content:flex-end;">
                  <button id="closeSettingsBtnInternal" class="sm-btn" style="padding:8px 16px;">Cancel</button>
@@ -3598,6 +3666,195 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             alert('Pull failed: ' + e.message);
         }
     });
+
+    // --- Imports ---
+    //
+    // A second front-end for the server's /api/imports endpoints, sharing the
+    // Backend Sync URL and session token above. Nothing importer-specific runs
+    // in the browser: the sweep is scheduled server-side and happens whether or
+    // not this panel is open, so this only configures sources and kicks off a
+    // run by hand.
+    const importsStatus = () => document.getElementById('imports-status');
+    const writeImportsStatus = (msg) => { const el = importsStatus(); if (el) el.textContent = msg || ''; };
+
+    const importsApi = async (path, opts = {}) => {
+        const cfg = getBackendConfig();
+        if (!cfg.token) throw new Error('Sign in to the sync server first.');
+        const res = await fetch(cfg.url.replace(/\/$/, '') + path, {
+            ...opts,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + cfg.token,
+                ...(opts.headers || {})
+            }
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            // A server that predates the importers has no such route at all,
+            // which is worth saying plainly rather than as a bare 404.
+            if (res.status === 404 && !/Source not found/.test(body)) {
+                throw new Error('This server has no importer support yet — rebuild it (docker compose up -d --build).');
+            }
+            throw new Error(`${res.status}: ${body.slice(0, 200)}`);
+        }
+        return res.json();
+    };
+
+    const importSubtitle = (src) => {
+        if (src.manual) {
+            // Nothing polls this one, so a last-run time would be meaningless.
+            const gone = src.filed ? ` · ${src.filed} filed away` : '';
+            return `Filled by sharing posts to TabPaladin on your phone${gone}`;
+        }
+        if (!src.connected) return 'Not connected — press Authorise.';
+        if (src.lastStatus === 'error') return src.lastError || 'Last sweep failed.';
+        if (!src.lastRun) return 'Connected. Waiting for the first sweep.';
+        const mins = Math.round((Date.now() - Date.parse(src.lastRun)) / 60000);
+        const when = mins < 1 ? 'just now'
+            : mins < 60 ? `${mins} min ago`
+            : mins < 1440 ? `${Math.round(mins / 60)} h ago`
+            : `${Math.round(mins / 1440)} d ago`;
+        // Items Reddit no longer lists are the point of the archive, so name
+        // them rather than leaving a count that looks like a discrepancy.
+        const gone = src.goneFromSource ? ` · ${src.goneFromSource} kept past Reddit's cap` : '';
+        return `Swept ${when} · every ${src.intervalMinutes} min${gone}`;
+    };
+
+    const renderImports = (sources) => {
+        const list = document.getElementById('imports-list');
+        if (!list) return;
+        if (!sources.length) {
+            list.innerHTML = '<div style="color:#666;">No importers yet.</div>';
+            return;
+        }
+        list.innerHTML = sources.map(src => `
+            <div data-import-id="${src.id}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; gap:8px;">
+                    <strong style="color:#ddd;">${escapeHtml(src.label || src.provider)}</strong>
+                    <span style="font-size:0.72rem; color:var(--text-muted); white-space:nowrap;">${src.items} saved</span>
+                </div>
+                <div style="font-size:0.72rem; margin-top:3px; color:${src.lastStatus === 'error' ? 'var(--danger-color)' : 'var(--text-muted)'};">${escapeHtml(importSubtitle(src))}</div>
+                <div style="display:flex; gap:6px; margin-top:8px;">
+                    ${src.manual ? '' : `<button class="sm-btn" data-import-act="${src.connected ? 'run' : 'auth'}" style="flex:1;">${src.connected ? 'Sweep now' : 'Authorise'}</button>`}
+                    ${src.manual ? '' : `<button class="sm-btn" data-import-act="toggle" style="flex:1;">${src.enabled ? 'Pause' : 'Resume'}</button>`}
+                    <button class="sm-btn" data-import-act="delete" style="flex:1; color:var(--danger-color);">Remove</button>
+                </div>
+            </div>
+        `).join('');
+
+        list.querySelectorAll('[data-import-act]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.closest('[data-import-id]').dataset.importId;
+                handleImportAction(id, btn.dataset.importAct, btn)
+                    .catch(e => writeImportsStatus('Importer error: ' + e.message));
+            });
+        });
+    };
+
+    const refreshImports = async () => {
+        const list = document.getElementById('imports-list');
+        if (!list) return;
+        const cfg = getBackendConfig();
+        if (!cfg.token) { list.innerHTML = '<div style="color:#666;">Sign in above to manage importers.</div>'; return; }
+        try {
+            const data = await importsApi('/api/imports');
+            renderImports(data.sources || []);
+        } catch (e) {
+            list.innerHTML = `<div style="color:#666;">${escapeHtml(e.message)}</div>`;
+        }
+    };
+
+    const openAuthTab = (url) => {
+        const ext = typeof browser !== 'undefined' ? browser : chrome;
+        ext.tabs.create({ url });
+    };
+
+    async function handleImportAction(id, act, btn) {
+        const cfg = getBackendConfig();
+
+        if (act === 'delete') {
+            // The archive is the only copy of anything Reddit has already
+            // dropped, so removing a connection must not quietly bin it.
+            if (!confirm('Remove this importer?\n\nThe archived links stay on the server and the bookmark folder stays where it is.')) return;
+            await importsApi('/api/imports/' + id, { method: 'DELETE' });
+            writeImportsStatus('Importer removed.');
+            await refreshImports();
+            return;
+        }
+
+        if (act === 'toggle') {
+            const list = await importsApi('/api/imports');
+            const src = (list.sources || []).find(s => String(s.id) === String(id));
+            await importsApi('/api/imports/' + id, {
+                method: 'PATCH',
+                body: JSON.stringify({ enabled: !(src && src.enabled) })
+            });
+            await refreshImports();
+            return;
+        }
+
+        if (act === 'auth') {
+            const data = await importsApi('/api/imports/' + id + '/authorize');
+            openAuthTab(data.url);
+            writeImportsStatus('Approve the app on Reddit, then come back and sweep.');
+            return;
+        }
+
+        if (act === 'run') {
+            const original = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Sweeping…';
+            try {
+                const result = await importsApi('/api/imports/' + id + '/run', { method: 'POST' });
+                writeImportsStatus(result.added
+                    ? `Imported ${result.added} new link${result.added === 1 ? '' : 's'}. Press Pull to bring them into this browser.`
+                    : 'Already up to date.');
+            } catch (e) {
+                writeImportsStatus('Sweep failed: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = original;
+                await refreshImports();
+            }
+        }
+    }
+
+    document.getElementById('imports-add-btn')?.addEventListener('click', () => {
+        const form = document.getElementById('imports-form');
+        const redirect = document.getElementById('imports-redirect');
+        if (redirect) redirect.textContent = getBackendConfig().url.replace(/\/$/, '') + '/api/imports/reddit/callback';
+        form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    });
+
+    document.getElementById('imports-submit-btn')?.addEventListener('click', async () => {
+        const err = document.getElementById('imports-error');
+        const clientId = document.getElementById('imports-client-id').value.trim();
+        const clientSecret = document.getElementById('imports-client-secret').value.trim();
+        const intervalMinutes = Number(document.getElementById('imports-interval').value) || 60;
+        err.textContent = '';
+
+        if (!clientId || !clientSecret) { err.textContent = 'Both the client ID and secret are required.'; return; }
+
+        try {
+            const created = await importsApi('/api/imports', {
+                method: 'POST',
+                body: JSON.stringify({ provider: 'reddit', label: 'Reddit saved', clientId, clientSecret, intervalMinutes })
+            });
+            document.getElementById('imports-client-id').value = '';
+            document.getElementById('imports-client-secret').value = '';
+            document.getElementById('imports-form').style.display = 'none';
+            await refreshImports();
+            // Straight into consent — a source with no credentials can do
+            // nothing, so stopping here would just be a dead end.
+            const auth = await importsApi('/api/imports/' + created.source.id + '/authorize');
+            openAuthTab(auth.url);
+            writeImportsStatus('Approve the app on Reddit, then come back and sweep.');
+        } catch (e) {
+            err.textContent = e.message;
+        }
+    });
+
+    refreshImports();
 
     document.getElementById('closeSettingsBtnInternal').addEventListener('click', closeSettings);
 

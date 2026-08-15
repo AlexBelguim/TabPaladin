@@ -651,6 +651,32 @@ ol {
   background-color: rgba(255, 255, 255, 0.03);
 }
 
+/* --- Imported bookmarks ---
+   The imports folder is not like the rest of the tree: the server owns it, and
+   moving or deleting inside it is read back and acted on rather than being a
+   local edit. A left rule and a warm tint rather than a heavy fill, so it reads
+   as "different" without shouting. */
+.source-folder-header.is-imports {
+  background-color: rgba(249, 115, 22, 0.09);
+  border-left: 3px solid rgba(249, 115, 22, 0.65);
+  padding-left: 9px; /* keep the text aligned with the untinted rows */
+}
+
+.source-folder-header.is-imports:hover {
+  background-color: rgba(249, 115, 22, 0.16);
+}
+
+.imports-badge {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #fb923c;
+  border: 1px solid rgba(249, 115, 22, 0.45);
+  flex-shrink: 0;
+}
+
 .folder-drag-handle {
   display: inline-block;
   cursor: grab;

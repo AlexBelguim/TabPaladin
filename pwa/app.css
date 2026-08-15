@@ -177,6 +177,52 @@ input:focus { outline: none; border-color: var(--primary); }
 }
 .row.bookmark img { width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0; }
 
+/* --- Imported bookmarks ---
+   The imports folder is not like the rest of the tree: the server owns it, and
+   moving or deleting inside it is read back and acted on rather than being a
+   local edit. Give it a different ground so nobody discovers that by accident.
+   A left rule rather than a heavy fill, so a folder of 3000 rows does not turn
+   into a wall of colour. */
+:root { --imports-accent: #f97316; }
+
+.row.folder.imports-root {
+  background: color-mix(in srgb, var(--imports-accent) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--imports-accent) 40%, var(--border));
+}
+
+.imports-badge {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--imports-accent);
+  border: 1px solid color-mix(in srgb, var(--imports-accent) 45%, transparent);
+  flex-shrink: 0;
+}
+
+#content.in-imports .row {
+  border-left: 3px solid color-mix(in srgb, var(--imports-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--imports-accent) 6%, var(--surface));
+}
+
+#content.in-imports .row.folder:hover {
+  background: color-mix(in srgb, var(--imports-accent) 14%, var(--surface));
+}
+
+/* Named so it reads as guidance rather than an error. */
+.imports-note {
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border-radius: var(--radius);
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--imports-accent) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--imports-accent) 30%, var(--border));
+}
+.imports-note strong { color: var(--imports-accent); }
+
 /* --- Inbox FAB --- */
 #inbox-fab {
   position: fixed;

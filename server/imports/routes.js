@@ -2,7 +2,10 @@
 
 import * as reddit from './reddit.js';
 import { runSource, sweepSource, projectSource } from './runner.js';
+import { classify, isManualProvider } from './manual.js';
 
+// Only Reddit can be created by hand; the manual archives create themselves the
+// first time something is shared into them.
 const PROVIDERS = new Set(['reddit']);
 
 function callbackUri(req) {
@@ -21,11 +24,16 @@ export function publicSource(store, source) {
         lastRun: source.lastRun,
         lastStatus: source.lastStatus,
         lastError: source.lastError,
-        connected: store.hasCredentials(source.id),
+        // Manual sources are never "connected" in the OAuth sense and have
+        // nothing to sweep; clients use this to drop those controls.
+        manual: isManualProvider(source.provider),
+        connected: isManualProvider(source.provider) || store.hasCredentials(source.id),
         listTitle: source.config.listTitle || 'Saved',
         hasClientId: Boolean(source.config.clientId),
         items: counts.total,
-        goneFromSource: counts.goneFromSource
+        goneFromSource: counts.goneFromSource,
+        filed: counts.filed,
+        dismissed: store.countDismissed(source.id)
     };
 }
 
@@ -136,6 +144,78 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
         const source = store.getSource(req.params.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         res.json({ ok: true, ...projectSource(store, source, ctx) });
+    });
+
+    // Forget which items the user deleted, so a later sweep may bring back any
+    // that are still saved at the source. The only way back from a delete —
+    // the archived copy itself is gone for good.
+    app.post('/api/imports/:id/undismiss', requireAuth, (req, res) => {
+        const source = store.getSource(req.params.id);
+        if (!source) return res.status(404).json({ error: 'Source not found' });
+        const cleared = store.undismiss(source.id);
+        res.json({ ok: true, cleared, note: 'Only items still present at the source will return.' });
+    });
+
+    // Capture a shared link into the archive it belongs to.
+    //
+    // This is what the Android share sheet hits. X and Instagram cannot be
+    // swept — no free API on one, no personal saved list on the other — so
+    // sharing a post to the app is the only way either archive ever gets filled.
+    // The source is created on first use so there is nothing to set up.
+    //
+    // A link that belongs to neither returns captured:false rather than an
+    // error, so the client can fall back to the ordinary shared-links inbox.
+    app.post('/api/imports/capture', requireAuth, (req, res) => {
+        const { url, title } = req.body || {};
+        if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing url' });
+
+        const hit = classify(url);
+        if (!hit) return res.json({ ok: true, captured: false, reason: 'not a manual import source' });
+
+        let source = store.listSources().find(s => s.provider === hit.provider);
+        if (!source) {
+            source = store.createSource({
+                provider: hit.provider,
+                label: hit.label,
+                config: { listTitle: 'Saved' },
+                // Nothing to poll; the interval only paces the projection pass
+                // that redraws the folder.
+                intervalMinutes: 60
+            });
+        }
+
+        // Already archived. Not an error — sharing the same post twice is a
+        // normal thing to do — and deliberately not re-upserted, so its capture
+        // date and therefore its month folder stay put.
+        const existing = store.itemsFor(source.id).find(i => i.external_id === hit.externalId);
+        if (existing) {
+            return res.json({ ok: true, captured: true, duplicate: true, provider: hit.provider, items: store.countItems(source.id).total });
+        }
+
+        // Deleted before, deliberately. Honour that rather than silently
+        // resurrecting it; re-sharing is a clear enough signal to undo it.
+        store.undismiss(source.id, [hit.externalId]);
+
+        // No date is available from a share, so capture time it is. It is
+        // written once and never updated, which is what keeps the monthly
+        // grouping stable across re-projections.
+        const now = new Date().toISOString();
+        store.upsertItem(source.id, {
+            externalId: hit.externalId,
+            url: hit.url,
+            title: title || hit.url,
+            container: hit.container,
+            createdUtc: now,
+            extra: { capturedVia: 'share' }
+        });
+
+        const projected = projectSource(store, store.getSource(source.id), ctx);
+        res.json({
+            ok: true, captured: true, duplicate: false,
+            provider: hit.provider, sourceId: source.id,
+            items: store.countItems(source.id).total,
+            projected: Boolean(projected.projected)
+        });
     });
 
     // --- Reddit OAuth ---

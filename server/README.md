@@ -44,6 +44,8 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | GET | `/api/imports/:id/items` | browse the archive (`limit`, `offset`) |
 | POST | `/api/imports/:id/run` | sweep now |
 | POST | `/api/imports/:id/reproject` | rebuild the bookmark folder from the archive |
+| POST | `/api/imports/:id/undismiss` | forget deleted-item tombstones so a sweep may restore them |
+| POST | `/api/imports/capture` | file a shared `{ url, title }` into its archive (X / Instagram) |
 | GET | `/api/imports/:id/authorize` | returns the provider consent URL |
 | GET | `/api/imports/reddit/callback` | **no auth** — OAuth redirect, guarded by a one-shot `state` |
 | GET | `/` (and other paths) | serves the PWA |
@@ -117,6 +119,78 @@ the history or trigger pointless pulls on every device.
 
 **Imports are one-way.** Deleting an imported bookmark in TabPaladin never un-saves
 anything on Reddit.
+
+### X and Instagram — captured, not swept
+
+Neither can be fetched. X has had no free API tier since February 2026, and
+Instagram has no route to a personal saved or liked list at all: Basic Display
+shut down in December 2024, and the Graph API exposes saves only as an aggregate
+insight on Business accounts.
+
+What does work is the Android share sheet. The PWA already declares
+`share_target`, so **like a post → Share → TabPaladin** and it lands in its own
+archive next to Reddit:
+
+```
+TabPaladin Imports/X/Saved/<YYYY-MM>/          "@nasa — Look at this nebula"
+TabPaladin Imports/Instagram/Saved/<YYYY-MM>/
+```
+
+`POST /api/imports/capture { url, title }` does the routing. It classifies by
+host, creates the source on first use (nothing to set up), and returns
+`captured:false` for anything else so the client falls back to the ordinary
+shared-links inbox. Share-sheet tracking parameters (`?t=`, `?s=`, `?igsh=`) are
+stripped before storing, or the same post shared twice would archive twice.
+
+These sources have no credentials and no sweep, so the clients drop the
+Authorise, Sweep and Pause controls for them. Everything else is identical —
+same folder layout, same protections, same move/delete behaviour.
+
+Two things this is not: it captures only what you deliberately share from now
+on, with no backfill of anything you liked previously; and a share carries just
+a URL and sometimes a title, so there is no author or date beyond capture time.
+Grouping uses capture time for that reason.
+
+A true one-tap floating overlay is not possible here — drawing over other apps
+needs `SYSTEM_ALERT_WINDOW`, a native Android permission with no web equivalent.
+That would be a separate native app firing the same share intent.
+
+### The import folder is managed, not yours to rearrange
+
+The projection is a full rebuild, so a naive sweep would undo whatever you did:
+move an import out to file it and a second copy comes back, delete one and it
+returns within the hour. Instead, each projection first reads the folder and acts
+on what it finds:
+
+| you did | result |
+|---|---|
+| left it alone | stays where it is |
+| **moved it out** of the import folder | marked filed — still archived and counted, never projected back, so no duplicate |
+| **deleted it** | purged from the archive, plus a contentless tombstone so a later sweep does not re-import it |
+| put your *own* bookmark in the folder | ejected — moved back out beside the imports root, never deleted |
+
+Taking things **out** is the only edit the folder supports. Both clients refuse
+drops into the subtree and hide the controls that would write into it (new
+subfolder, split, batch select), but the browser's own bookmark manager has no
+such manners — hence the ejection, which is what keeps a stray bookmark from
+being deleted by the next rebuild.
+
+Deleting is unrecoverable — the archived copy is gone, and anything past Reddit's
+1000-item window cannot be fetched again. `POST /api/imports/:id/undismiss`
+clears the tombstones so a later sweep may restore items *still saved on Reddit*;
+it cannot bring back the rest.
+
+Two guards keep that from eating the archive, and both matter:
+
+- **No import folder in the snapshot** means the tree predates it — a device that
+  pushed before it pulled. Everything would look deleted, so nothing is
+  reconciled and the rebuild heals the folder instead.
+- **An item imported after the snapshot was taken** cannot have been deleted in
+  it; it did not exist yet. Without this, a stale device pushing an old copy of
+  the folder would purge every item swept since it last pulled.
+
+Both clients tint the folder and show a short explainer inside it, so this is
+visible before you start dragging things around.
 
 ### Tests
 
