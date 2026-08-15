@@ -54,6 +54,32 @@ function setStatus(text) {
 }
 
 // Premium glassmorphic toast notification
+// Mirror the server URL and session token into Cache Storage so the service
+// worker can reach the server on its own. That is what lets a shared link be
+// captured without launching the app: workers cannot read localStorage, where
+// the config actually lives. Called on every change, including sign-out, which
+// clears it — a stale token in here would keep working after you signed out.
+const SW_CONFIG_CACHE = 'tp-config';
+const SW_CONFIG_KEY = '/__tp_config';
+
+async function mirrorConfigToSW() {
+    if (!('caches' in window)) return;
+    try {
+        const cache = await caches.open(SW_CONFIG_CACHE);
+        if (!state.config.url || !state.config.token) {
+            await cache.delete(SW_CONFIG_KEY);
+            return;
+        }
+        await cache.put(SW_CONFIG_KEY, new Response(
+            JSON.stringify({ url: state.config.url, token: state.config.token }),
+            { headers: { 'Content-Type': 'application/json' } }
+        ));
+    } catch (e) {
+        // Not fatal: the worker falls back to opening the app for a share.
+        console.warn('Could not mirror config to the service worker', e);
+    }
+}
+
 function showToast(message) {
     const existing = document.getElementById('tp-toast');
     if (existing) existing.remove();
@@ -128,6 +154,12 @@ async function api(path, opts = {}) {
 
 // --- Initial load ---
 async function bootstrap() {
+    // Existing installs already hold a token in localStorage and will never
+    // sign in again, so mirror on every start rather than only on change —
+    // otherwise the worker has no config and every share falls back to opening
+    // the app.
+    mirrorConfigToSW();
+
     await processShareTargetIfAny();
 
     if (!configured()) {
@@ -2304,6 +2336,7 @@ async function submitAuth() {
         localStorage.setItem(LS.url, base);
         localStorage.setItem(LS.token, data.token);
         localStorage.setItem(LS.username, data.username || username);
+        mirrorConfigToSW();
         if ($('cfg-password')) $('cfg-password').value = '';
         refreshAuthUi();
         hide($('settings-sheet'));
@@ -2326,6 +2359,7 @@ async function signOut() {
     state.config.token = '';
     localStorage.removeItem(LS.token);
     localStorage.removeItem(LS.username);
+    mirrorConfigToSW();
     state.snapshot = null;
     refreshAuthUi();
     setStatus('Signed out.');
@@ -2335,6 +2369,7 @@ function saveSettings() {
     const base = currentServerUrl();
     state.config.url = base;
     localStorage.setItem(LS.url, base);
+    mirrorConfigToSW();
     hide($('settings-sheet'));
     bootstrap();
 }

@@ -196,7 +196,22 @@ visible before you start dragging things around.
 
 ```bash
 node tools/test_imports.mjs
+node tools/test_share_sw.mjs
 ```
+
+### Sharing from a phone
+
+The PWA declares a share target, so a post shared from X or Instagram on Android
+lands in its own archive beside Reddit. The share posts to `/share`, which the
+**service worker answers itself** and replies `204` — that is what stops the app
+launching every time you share something. The worker cannot read `localStorage`,
+so the app mirrors the server URL and session token into a `tp-config` Cache
+Storage entry, cleared on sign-out.
+
+Anything that stops the worker finishing — not signed in, server unreachable,
+session expired — redirects into the app, which handles the same share the long
+way. `POST /share` on the server does the same when no worker is registered yet.
+Losing the link is the one outcome worth avoiding.
 
 ## TLS
 

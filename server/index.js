@@ -588,6 +588,20 @@ app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
 // catch-all.
 attachImports(app, { db, requireAuth, latestSnapshot: latestSnapshotWithMeta, commitSnapshot });
 
+// --- Share target fallback ---
+//
+// The manifest posts shares to /share so the service worker can answer them
+// without launching the app. This route only runs when that worker is not
+// there to intercept — during its first install, or if it failed to register —
+// and hands the share to the app the long way instead of 404ing and losing the
+// link. Unauthenticated because a share target navigation carries no token; it
+// only bounces the parameters back to the client.
+app.post('/share', express.urlencoded({ extended: false }), (req, res) => {
+    const { url = '', title = '', text = '' } = req.body || {};
+    const params = new URLSearchParams({ share: '1', url, title, text });
+    res.redirect(303, '/?' + params);
+});
+
 // --- PWA static files ---
 if (fs.existsSync(PWA_DIR)) {
     // no-cache: browsers/proxies may store but must revalidate (ETag → cheap
