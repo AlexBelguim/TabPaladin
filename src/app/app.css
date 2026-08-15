@@ -254,6 +254,7 @@ body.tp-app .tp-gear {
 }
 
 .pin-fav {
+    position: relative;
     width: 30px;
     height: 30px;
     border-radius: 8px;
@@ -264,6 +265,19 @@ body.tp-app .tp-gear {
     color: #fff;
     flex-shrink: 0;
 }
+
+/* The initials are their own layer, carrying the tile colour, so a loaded icon
+   can hide them with a class instead of the DOM surgery that used to delete
+   the icon along with them. */
+.pin-initials {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    border-radius: inherit;
+}
+
+.pin-fav.has-icon .pin-initials { display: none; }
 
 .pin-name {
     max-width: 100%;
@@ -660,36 +674,87 @@ body.tp-app #settings-folder-list {
 }
 
 /* ---------- pins: real favicons, no label ---------- */
-/* Icons come from Chrome's own favicon cache via the "favicon" permission, so
-   nothing is fetched from the sites themselves. The initials sit underneath
-   and show through when a site has no icon. */
-body.tp-app .pins-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+/* Icons come from Google's icon service, the same source sidepanel.js uses for
+   bookmark rows. The coloured initials sit behind and show through only when
+   the icon never arrives. */
+/* Fixed-width cells rather than a column count, so a tile is exactly its icon
+   and nothing else. A fractional count would stretch each cell and leave the
+   icon floating in the middle of dead space — which is what made the tile
+   chrome look like a frame drawn around the favicon. auto-fill also replaces
+   the per-breakpoint column counts this used to need. */
+body.tp-app .pins-grid {
+  grid-template-columns: repeat(auto-fill, 80px);
+  gap: 18px;
+  justify-content: start;
+}
 
-/* No forced square: at eight columns of a 1180px page that is a 133px tile
-   around a 38px icon, which is mostly empty. A short row reads better. */
+/* A pin is the favicon. No plate, no border, no padding — the icon is the
+   whole control, and the only chrome is the remove button on hover. */
 body.tp-app .pin-tile {
-  padding: 12px 8px;
+  width: 80px;
+  padding: 0;
   gap: 0;
+  background: none;
+  border: none;
+  border-radius: 18px;
   justify-content: center;
 }
+
+/* Chrome is gone, so hover needs to say "this is clickable" some other way. */
+body.tp-app .pin-fav { transition: transform 0.12s ease; }
+body.tp-app .pin-tile:hover .pin-fav { transform: scale(1.07); }
 
 body.tp-app .pin-fav {
   position: relative;
   overflow: hidden;
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+  width: 80px;
+  height: 80px;
+  border-radius: 18px;
 }
 
+/* No plate behind the icon and no padding around it: the framed look was the
+   image's own background showing in the gap, which read as a border drawn
+   around every pin. The icon now sits straight on the tile at full size. */
 body.tp-app .pin-favimg {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  padding: 6px;
-  background: var(--surface-hover);
+  background: none;
 }
 
-@media (max-width: 1000px) { body.tp-app .pins-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
-@media (max-width: 680px)  { body.tp-app .pins-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+/* The add button is the one tile that keeps a border, because it has no
+   artwork of its own — the dashed square is the only thing making it read as a
+   target.
+
+   It is drawn 10% smaller than the pins on purpose. Optical sizing: a hollow
+   outline and a solid mass of identical dimensions do not read as the same
+   size, because the outline only marks the boundary while the interior stays
+   background, so the eye reads the shape as larger and lighter than the filled
+   squares beside it. Matching the numbers here would make it the odd one out;
+   matching what it looks like means taking a few pixels off. Same reason a
+   circle or triangle has to be drawn oversized to sit level with a square in a
+   row of icons — this is that rule pointing the other way. Keep the radius
+   proportional (0.22 of the side) so the corners stay consistent too. */
+body.tp-app .pin-add .pin-fav {
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+}
+
+/* The unpin cross. Sits on the icon's corner rather than a tile's, since there
+   is no longer a tile around it, and carries its own background so it stays
+   legible over whatever the favicon happens to be. */
+body.tp-app .pin-remove {
+  top: -7px;
+  right: -7px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  font-size: 0.8rem;
+}

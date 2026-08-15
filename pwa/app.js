@@ -523,47 +523,35 @@ function searchTargetFor(text) {
     return DDG + encodeURIComponent(t);
 }
 
-// The same source the bookmark list on this page already uses, and mirroring
-// src/app/home.js minus the extension-only cache the PWA has no access to.
-function faviconSources(pageUrl) {
-    try {
-        const host = new URL(pageUrl).hostname;
-        if (!host || !host.includes('.')) return [];
-        return [`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`];
-    } catch (e) {
-        return [];
-    }
-}
-
-// Walks the sources until one loads. Transparent rather than display:none
-// until then, so a failing source never flashes a broken icon over the
-// initials while still keeping a layout box — a hidden image marked
-// loading="lazy" is never fetched at all, which is why nothing used to appear.
+// One source, fetched the way the bookmark rows on this page already fetch
+// theirs: a plain <img src> pointed at Google's service. Mirrors
+// src/app/home.js exactly — no source chain, nothing deferring the load.
+//
+// The coloured initials sit in their own element behind the icon, and a loaded
+// icon hides them by putting .has-icon on the container — CSS does the hiding,
+// nothing is removed from the DOM. That separation is deliberate: the initials
+// used to be text directly on the container, so hiding them meant
+// favEl.textContent = '', which removes *every* child including the <img>. The
+// icon deleted itself the instant it loaded and the tile went blank.
 function attachFavicon(favEl, pageUrl) {
-    const sources = faviconSources(pageUrl);
-    if (sources.length === 0) return;
+    let host = '';
+    try {
+        host = new URL(pageUrl).hostname;
+    } catch (e) {
+        return; // unparseable — initials only
+    }
+    if (!host.includes('.')) return;
 
-    let i = 0;
     const img = document.createElement('img');
     img.className = 'pin-favimg';
     img.alt = '';
     img.referrerPolicy = 'no-referrer';
-    img.style.opacity = '0';
-
-    img.addEventListener('error', () => {
-        i += 1;
-        if (i < sources.length) img.src = sources[i];
-        else img.remove();
-    });
-    img.addEventListener('load', () => {
-        if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
-        img.style.opacity = '';
-        favEl.textContent = '';
-        favEl.style.background = 'transparent';
-    });
+    // Initials are a better fallback than a broken-image glyph on top of them.
+    img.addEventListener('error', () => img.remove());
+    img.addEventListener('load', () => favEl.classList.add('has-icon'));
+    img.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`;
 
     favEl.appendChild(img);
-    img.src = sources[0];
 }
 
 function renderHome(root) {
@@ -619,8 +607,16 @@ function renderHome(root) {
 
             const fav = document.createElement('span');
             fav.className = 'pin-fav';
-            fav.style.background = colorFor(p.url);
-            fav.textContent = initialsFor(p.title, p.url);
+
+            // Own element, not text on the container, so hiding it can never
+            // take the icon with it. The tile colour rides on the initials
+            // rather than the container for the same reason: it has to
+            // disappear together with them.
+            const initials = document.createElement('span');
+            initials.className = 'pin-initials';
+            initials.style.background = colorFor(p.url);
+            initials.textContent = initialsFor(p.title, p.url);
+            fav.appendChild(initials);
 
             // Initials show through if the icon never arrives.
             attachFavicon(fav, tile.href);

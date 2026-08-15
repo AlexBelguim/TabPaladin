@@ -8,8 +8,7 @@
     "tabs",
     "bookmarks",
     "storage",
-    "downloads",
-    "favicon"
+    "downloads"
   ],
   "background": {
     "service_worker": "src/background/background.js"

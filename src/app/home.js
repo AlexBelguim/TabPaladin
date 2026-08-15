@@ -50,72 +50,35 @@ function openPin(url) {
     if (target) window.open(target, '_blank', 'noopener');
 }
 
-// Icon sources, tried in turn; the first that loads wins, and if none do the
-// initials underneath stay visible.
+// One source, fetched the way sidepanel.js has always fetched icons for
+// bookmark rows: a plain <img src> pointed at Google's service. No source
+// chain, nothing deferring the load, nothing hiding the element.
 //
-//   1. Chrome's own favicon cache — nothing leaves the machine, but it only
-//      has an icon for sites already visited in this profile, and it is absent
-//      entirely on Firefox.
-//   2. Google's icon service — the same source the bookmark lists in the side
-//      panel have always used. An earlier version of this avoided it on
-//      privacy grounds and reached for the site's own /favicon.ico instead,
-//      but the side panel was already sending Google every bookmarked host, so
-//      the stance cost reliability here and bought nothing anywhere.
-function faviconSources(pageUrl) {
-    const target = withScheme(pageUrl);
-    if (!target) return [];
-    const out = [];
-
-    try {
-        const api = typeof browser !== 'undefined' ? browser : chrome;
-        const base = api.runtime && api.runtime.getURL ? api.runtime.getURL('/_favicon/') : '';
-        if (base.startsWith('chrome-extension://')) {
-            out.push(`${base}?pageUrl=${encodeURIComponent(target)}&size=64`);
-        }
-    } catch (e) { /* not in an extension context */ }
-
-    try {
-        const host = new URL(target).hostname;
-        if (host && host.includes('.')) {
-            out.push(`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`);
-        }
-    } catch (e) { /* unparseable — initials only */ }
-
-    return out;
-}
-
-// Walks the sources until one loads. The image is transparent rather than
-// display:none until then, so a failing source never flashes a broken icon
-// over the initials — and, unlike display:none, it keeps a layout box. That
-// distinction is the whole bug this once had: the image was also loading="lazy",
-// and a lazy image with no box is never fetched, so neither load nor error ever
-// fired and the chain below never started. No lazy here for the same reason.
+// The coloured initials sit in their own element behind the icon, and a loaded
+// icon hides them by putting .has-icon on the container — CSS does the hiding,
+// nothing is removed from the DOM. That separation is deliberate: the initials
+// used to be text directly on the container, so hiding them meant
+// favEl.textContent = '', which removes *every* child including the <img>. The
+// icon deleted itself the instant it loaded and the tile went blank.
 function attachFavicon(favEl, pageUrl) {
-    const sources = faviconSources(pageUrl);
-    if (sources.length === 0) return;
+    let host = '';
+    try {
+        host = new URL(withScheme(pageUrl)).hostname;
+    } catch (e) {
+        return; // unparseable — initials only
+    }
+    if (!host.includes('.')) return;
 
-    let i = 0;
     const img = document.createElement('img');
     img.className = 'pin-favimg';
     img.alt = '';
     img.referrerPolicy = 'no-referrer';
-    img.style.opacity = '0';
-
-    img.addEventListener('error', () => {
-        i += 1;
-        if (i < sources.length) img.src = sources[i];
-        else img.remove();
-    });
-    img.addEventListener('load', () => {
-        // A service that answers with a 1x1 placeholder is not an icon.
-        if (img.naturalWidth <= 1) { img.dispatchEvent(new Event('error')); return; }
-        img.style.opacity = '';
-        favEl.textContent = '';
-        favEl.style.background = 'transparent';
-    });
+    // Initials are a better fallback than a broken-image glyph on top of them.
+    img.addEventListener('error', () => img.remove());
+    img.addEventListener('load', () => favEl.classList.add('has-icon'));
+    img.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`;
 
     favEl.appendChild(img);
-    img.src = sources[0];
 }
 
 function pinTile(pin) {
@@ -134,8 +97,15 @@ function pinTile(pin) {
 
     const fav = document.createElement('span');
     fav.className = 'pin-fav';
-    fav.style.background = colorFor(pin.url);
-    fav.textContent = initialsFor(pin);
+
+    // Own element, not text on the container, so hiding it can never take the
+    // icon with it. The tile colour rides on the initials rather than the
+    // container for the same reason: it has to disappear together with them.
+    const initials = document.createElement('span');
+    initials.className = 'pin-initials';
+    initials.style.background = colorFor(pin.url);
+    initials.textContent = initialsFor(pin);
+    fav.appendChild(initials);
 
     attachFavicon(fav, pin.url);
 

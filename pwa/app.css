@@ -727,6 +727,7 @@ select.note-move {
 .pin-tile:active { border-color: var(--primary); }
 
 .pin-fav {
+  position: relative;
   width: 26px;
   height: 26px;
   border-radius: 7px;
@@ -737,6 +738,19 @@ select.note-move {
   color: #fff;
   flex-shrink: 0;
 }
+
+/* The initials are their own layer, carrying the tile colour, so a loaded icon
+   can hide them with a class instead of the DOM surgery that used to delete
+   the icon along with them. */
+.pin-initials {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: inherit;
+}
+
+.pin-fav.has-icon .pin-initials { display: none; }
 
 .pin-name {
   max-width: 100%;
@@ -947,34 +961,50 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 #inbox-fab { bottom: calc(var(--bottom-nav-h) + 16px + env(safe-area-inset-bottom)); }
 
 /* ---------- pins: icon only ---------- */
-/* No label under each tile, so they can be smaller and denser. The name is
-   still on title/aria-label rather than dropped entirely. */
+/* No label under each tile, and no tile either — a pin is the favicon and
+   nothing else. Fixed-width cells rather than a column count, so a cell is
+   exactly its icon; a fractional count would stretch the cell and strand the
+   icon in the middle of it. The name is still on title/aria-label rather than
+   dropped entirely. */
 .pins-grid {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 9px;
+  grid-template-columns: repeat(auto-fill, 52px);
+  gap: 13px;
+  /* start, not space-between: auto-fill keeps empty trailing tracks, and
+     space-between would push a short row apart to fill them. */
+  justify-content: start;
 }
 
 .pin-tile {
-  padding: 8px 4px;
+  width: 52px;
+  height: 52px;
+  padding: 0;
   gap: 0;
-  aspect-ratio: 1 / 1;
+  background: none;
+  border: none;
   justify-content: center;
 }
 
 .pin-tile .pin-fav {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  font-size: 0.86rem;
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
+  font-size: 0.95rem;
 }
 
-.pin-fav { position: relative; overflow: hidden; }
+/* Chrome is gone, so a press needs to register some other way. */
+.pin-tile .pin-fav { transition: transform 0.12s ease; }
+.pin-tile:active .pin-fav { transform: scale(0.93); }
+
+.pin-fav { overflow: hidden; }
+
+/* No plate behind the icon and no padding around it: the framed look was the
+   image's own background showing in the gap, which read as a border drawn
+   around every pin. The icon now sits straight on the tile at full size. */
 .pin-favimg {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  padding: 5px;
-  background: var(--surface-2);
+  background: none;
 }
