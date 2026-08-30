@@ -277,6 +277,18 @@ check('the top-level fallback card has a name', allBm[0].title === 'All bookmark
 check('the top-level fallback exposes every root',
     allBm[0].children.length === (await Tree.getChildren('0')).length);
 
+console.log('\n6d. Top level exposes roles, so "show everything" can skip app roots');
+const top = await Tree.getChildren('0');
+check('top level is reachable via id 0', top.length > 0);
+check('app-managed roots are identifiable by role',
+    top.some(n => n.role === 'notes'), top.map(n => `${n.title}:${n.role||'-'}`).join(', '));
+const browsable = top.filter(n => n.kind === 'folder'
+    && n.role !== 'pins' && n.role !== 'notes' && n.role !== 'workflows');
+check('ordinary folders survive the filter used by the empty-focus default',
+    browsable.some(n => n.title === 'Stuff'), browsable.map(n => n.title).join(', '));
+check('the imports subtree is still offered for browsing',
+    browsable.some(n => n.readOnly));
+
 console.log('\n7. Import from the browser (one-time)');
 const imported = await TreeStore.importFromBrowser();
 check('items imported', imported.imported > 0, String(imported.imported));

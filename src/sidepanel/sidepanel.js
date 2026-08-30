@@ -210,6 +210,18 @@ function setupEventListeners() {
     document.getElementById('workflows-list').addEventListener('click', handleWorkflowClick);
 }
 
+// The tree's top-level folders, minus the app-managed roots that already have
+// their own places in the UI (pins tiles, notes view, the workflows card).
+async function topLevelFolders() {
+    try {
+        const top = await Tree.getChildren('0');
+        return top.filter(n => n.kind === 'folder' && n.role !== 'pins' && n.role !== 'notes' && n.role !== 'workflows');
+    } catch (e) {
+        console.warn('[TabPaladin] Could not read the top level:', e.message);
+        return [];
+    }
+}
+
 // Keep only focused-folder ids that exist in the current tree. Returns how
 // many were dropped, so a one-off migration cleanup can say so.
 async function pruneStaleFocusedFolders() {
@@ -444,6 +456,13 @@ async function renderMainView({ regroup = true } = {}) {
     const wfRoot = await findWorkflowRootSilent();
     const realRoots = [];
     if (wfRoot) realRoots.push({ id: wfRoot.id, isWorkflow: true });
+    // Same default as the Sources grid: nothing focused means show everything,
+    // rather than only the workflows folder.
+    if (focused.length === 0) {
+        for (const top of await topLevelFolders()) {
+            if (!realRoots.find(r => r.id === top.id)) realRoots.push({ id: top.id, isWorkflow: false });
+        }
+    }
     for (const id of focused) {
         if (!realRoots.find(r => r.id === id)) realRoots.push({ id, isWorkflow: false });
     }
@@ -1126,7 +1145,19 @@ async function renderSourceGrid(folderId) {
         for (const id of focused) {
             if (!roots.find(r => r.id === id)) roots.push({ id, isWorkflow: false });
         }
-        if (roots.length === 0) roots.push({ id: '2', isWorkflow: false }); // Fallback: Other Bookmarks
+        // With no folders focused, show the whole tree's top level.
+        //
+        // The old fallback only fired when `roots` was completely empty, which
+        // the workflows root alone was enough to prevent — so a user with no
+        // focused folders saw a lone Workflows card and none of their
+        // bookmarks. It used to be masked by focusedFolderIds defaulting to
+        // real browser roots; the migrated tree has no such thing, so the
+        // top level of the tree is the honest default.
+        if (focused.length === 0) {
+            for (const top of await topLevelFolders()) {
+                if (!roots.find(r => r.id === top.id)) roots.push({ id: top.id, isWorkflow: false });
+            }
+        }
 
         sourceList.appendChild(buildOrganizeHeader('Sources', null));
 
