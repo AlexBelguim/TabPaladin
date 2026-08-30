@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TabPaladin — PC fullscreen mockups</title>
+<style>
+/* ============================================================
+   TabPaladin PC (fullscreen) mockups
+   Tokens: copied verbatim from src/sidepanel/sidepanel.css :root
+   Icons: inline SVG sprite (stroke, currentColor) — no emoji,
+   no external assets, MV3-CSP-safe.
+   ============================================================ */
+:root {
+  --bg-color: #0f172a;
+  --surface-color: #1e293b;
+  --surface-hover: #334155;
+  --text-color: #f1f5f9;
+  --text-muted: #94a3b8;
+  --border-color: #334155;
+  --primary-color: #3b82f6;
+  --primary-hover: #2563eb;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --danger-color: #ef4444;
+  --accent-color: #8b5cf6;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-glow: 0 0 15px rgba(59, 130, 246, 0.3);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #090e1a; /* mockup backdrop only — not a product token */
+  color: var(--text-color);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* --- Icon system --- */
+.ic {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+  vertical-align: -3px;
+}
+.ic.sm { width: 14px; height: 14px; stroke-width: 2.2; }
+.tp-logo-badge { width: 22px; height: 22px; flex: none; }
+
+/* --- Mockup chrome (NOT part of the design) --- */
+.mock-label {
+  max-width: 1280px;
+  margin: 40px auto 8px;
+  padding: 0 8px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.mock-label b { color: var(--text-color); text-transform: none; letter-spacing: 0; }
+.mock-frame {
+  max-width: 1280px;
+  margin: 0 auto 24px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.mock-screen {
+  background: var(--bg-color);
+  height: 760px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ============================================================
+   PRODUCT CSS below this line — the actual proposal
+   ============================================================ */
+
+/* --- Fullscreen top bar (replaces the sidepanel <header>) --- */
+.tp-topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--bg-color);
+  flex: none;
+}
+.tp-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.1rem;
+  font-weight: 700;
+  background: linear-gradient(to right, #60a5fa, #a78bfa);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+.tp-nav {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+  margin-left: 12px;
+}
+.tp-nav a {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+.tp-nav a:hover { background: rgba(255,255,255,0.05); color: var(--text-color); }
+.tp-nav a.active {
+  color: var(--text-color);
+  background: rgba(59, 130, 246, 0.15);
+}
+
+/* Reused button patterns, unchanged from sidepanel.css */
+.primary-btn {
+  padding: 10px 16px;
+  background-color: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.primary-btn:hover { background-color: var(--primary-hover); }
+.sm-btn {
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sm-btn:hover { background: rgba(255, 255, 255, 0.05); color: var(--text-color); }
+.sm-btn.outlined { border-color: var(--border-color); color: var(--text-color); }
+.sm-btn.danger { color: var(--danger-color); }
+
+/* Sync buttons: the inline styles from sidepanel.html become classes */
+.sync-pull {
+  border: 1px solid rgba(245,158,11,0.3);
+  background: rgba(245,158,11,0.05);
+  color: var(--warning-color);
+}
+.sync-push {
+  border: 1px solid rgba(59,130,246,0.3);
+  background: rgba(59,130,246,0.05);
+  color: var(--primary-color);
+}
+
+/* --- Page body --- */
+.wrap {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+.wrap-inner { max-width: 1080px; margin: 0 auto; }
+
+h2.section-title {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  margin: 0 0 12px;
+  color: var(--text-muted);
+}
+
+/* --- Homescreen --- */
+.hero { text-align: center; padding: 40px 0 28px; }
+.hero h1 {
+  margin: 0 0 20px;
+  font-size: 2.2rem;
+  font-weight: 700;
+  background: linear-gradient(to right, #60a5fa, #a78bfa);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+}
+
+/* DuckDuckGo search — a plain GET form, no JS needed */
+.ddg-search {
+  display: flex;
+  gap: 8px;
+  max-width: 620px;
+  margin: 0 auto;
+}
+.ddg-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 14px 18px;
+  font-size: 1.05rem;
+  background-color: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  color: var(--text-color);
+  transition: all 0.2s ease;
+}
+.ddg-search input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+.ddg-search button { border-radius: var(--radius-lg); padding: 14px 22px; }
+
+/* Quick-action tiles: the sidepanel action-grid buttons become tiles
+   with an icon chip instead of five different background colors */
+.quick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  max-width: 860px;
+  margin: 32px auto 0;
+}
+.action-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-color);
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+.action-tile:hover {
+  border-color: var(--primary-color);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+.action-tile .tile-icon {
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+}
+/* Accent colors survive, but as icon chips — one component, five tints */
+.tint-blue   { background: rgba(59,130,246,0.15); color: #60a5fa; }
+.tint-green  { background: rgba(16,185,129,0.15); color: #34d399; }
+.tint-indigo { background: rgba(99,102,241,0.15); color: #818cf8; }
+.tint-amber  { background: rgba(245,158,11,0.15); color: #fbbf24; }
+.tint-sky    { background: rgba(14,165,233,0.15); color: #38bdf8; }
+.action-tile small { color: var(--text-muted); font-weight: 400; font-size: 0.78rem; }
+
+/* --- Dashboard cards on the homescreen --- */
+.dashboard {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  max-width: 1080px;
+  margin: 36px auto 0;
+  text-align: left;
+}
+.card {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.card-head h3 { margin: 0; font-size: 0.85rem; font-weight: 600; }
+.card-head .sm-btn { font-size: 0.78rem; padding: 4px 8px; }
+.card-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+
+/* Unified row — adopted from pwa/app.css .row so both clients share a shape */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.row:hover { background: rgba(255,255,255,0.06); }
+.row .icon { flex-shrink: 0; display: flex; color: var(--text-muted); }
+.row .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row .count { color: var(--text-muted); font-size: 0.82rem; white-space: nowrap; }
+
+/* Tab-group color dots replace colored emoji */
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.dot.blue { background: #60a5fa; }
+.dot.green { background: #34d399; }
+.dot.violet { background: #a78bfa; }
+
+/* Empty state — same dashed style as sidepanel.css .empty-state */
+.empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 20px;
+  border: 2px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  margin: 8px;
+}
+
+/* --- Notes screen: two-pane --- */
+.notes-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.notes-list-pane {
+  background: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px;
+}
+.notes-list-pane input[type="search"] {
+  width: 100%;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  background-color: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-color);
+  font-size: 0.9rem;
+}
+/* Existing note list item styles, unchanged */
+.note-list-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  margin-bottom: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+.note-list-item:hover { background: rgba(255, 255, 255, 0.04); }
+.note-list-item.active { border-color: var(--primary-color); background: rgba(59,130,246,0.08); }
+.note-item-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.note-item-snippet {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.note-item-notebook {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: #0ea5e9;
+  background: rgba(14, 165, 233, 0.12);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+/* Reading pane: adopts the PWA "black reading page" look */
+.note-reader {
+  background: #000;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  min-height: 560px;
+  max-height: 640px;
+  overflow-y: auto;
+  padding: 20px 28px;
+}
+.note-reader .note-page-title {
+  margin: 0 0 4px;
+  font-size: 1.6rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.note-reader .note-page-meta { color: var(--text-muted); font-size: 0.78rem; margin-bottom: 16px; }
+
+/* .note-preview-body typography mirrors pwa/app.css exactly */
+.note-preview-body { font-size: 1rem; line-height: 1.8; overflow-wrap: anywhere; }
+.note-preview-body h2 { font-size: 1.3rem; font-weight: 700; margin: 0.9em 0 0.3em; }
+.note-preview-body p { margin: 0.35em 0; }
+.note-preview-body ul { margin: 0.3em 0; padding-left: 1.4em; }
+.note-preview-body li { margin: 0.15em 0; }
+
+/* Task list — same contract as shipping code (.note-task / .note-task-box / data-line) */
+.note-preview-body li.note-task {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0.25em 0 0.25em -1.4em;
+}
+.note-preview-body li.note-task .note-task-box {
+  width: 18px; height: 18px;
+  margin: 3px 0 0;
+  flex: none;
+  accent-color: var(--primary-color);
+  cursor: pointer;
+}
+.note-preview-body li.note-task.done > span { text-decoration: line-through; opacity: 0.6; }
+
+.note-wikilink {
+  color: var(--primary-color);
+  background: rgba(59, 130, 246, 0.12);
+  padding: 0 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.note-urllink { color: var(--primary-color); word-break: break-all; }
+.note-backlinks {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+  font-size: 0.8rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+/* --- Workflows screen --- */
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.page-head h2 { margin: 0; font-size: 1.2rem; }
+.workflow-item {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  margin-bottom: 10px;
+  transition: background 0.2s ease;
+}
+.workflow-item:hover { background-color: var(--surface-hover); }
+.workflow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wf-caret { width: 14px; color: var(--text-muted); font-size: 0.7rem; }
+.workflow-head .wf-name { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-head .wf-meta { color: var(--text-muted); font-size: 0.8rem; white-space: nowrap; }
+.workflow-actions { display: flex; gap: 6px; }
+.workflow-actions .sm-btn { border: 1px solid var(--border-color); color: var(--text-color); }
+.workflow-actions .sm-btn.danger { color: var(--danger-color); }
+.workflow-body {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  background: rgba(0,0,0,0.15);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+.wf-domain-group { margin-bottom: 4px; }
+.wf-domain-header {
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  font-weight: 600;
+  font-size: 0.85rem;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wf-tab-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 24px;
+  font-size: 0.85rem;
+  border-radius: 4px;
+}
+.wf-tab-row:hover { background: rgba(255, 255, 255, 0.04); }
+.wf-tab-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Loading skeleton — pure CSS, no assets */
+@keyframes shimmer { 0% { opacity: 0.4; } 50% { opacity: 0.9; } 100% { opacity: 0.4; } }
+.skeleton {
+  border-radius: var(--radius-md);
+  background: var(--surface-color);
+  animation: shimmer 1.6s infinite ease-in-out;
+}
+.skeleton.row-skel { height: 62px; margin-bottom: 10px; }
+
+/* --- Organizer source screen --- */
+.source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+.source-btn {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-color);
+  cursor: pointer;
+  min-height: 64px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 8px 12px;
+  transition: all 0.2s ease;
+  text-align: left;
+}
+.source-btn:hover { border-color: var(--primary-color); transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.source-btn.selected {
+  background-color: rgba(59, 130, 246, 0.15);
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 1px var(--primary-color);
+}
+.source-btn .src-name { font-weight: 600; font-size: 0.9rem; display: flex; align-items: center; gap: 6px; }
+.source-btn .src-count { color: var(--text-muted); font-size: 0.78rem; }
+
+.mock-footer {
+  max-width: 1280px;
+  margin: 0 auto 60px;
+  padding: 0 8px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+</style>
+</head>
+<body>
+
+<!-- Icon sprite: hand-authored stroke icons, currentColor. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></symbol>
+    <symbol id="i-tabs" viewBox="0 0 24 24"><rect x="3" y="8" width="13" height="12" rx="2"/><path d="M7 8V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/></symbol>
+    <symbol id="i-tree" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><path d="M6.5 10v3a2 2 0 0 0 2 2H14"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3"/><polyline points="21 3 21 9 15 9"/></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="14 3 14 9 20 9"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="9" cy="6" r="2.2"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2.2"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="7" cy="18" r="2.2"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="14"/><polyline points="6 10 12 16 18 10"/><line x1="4" y1="20" x2="20" y2="20"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><line x1="12" y1="16" x2="12" y2="5"/><polyline points="6 9 12 3 18 9"/><line x1="4" y1="20" x2="20" y2="20"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4z"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 22 8 12 14 2 8"/><polyline points="2 13 12 19 22 13"/></symbol>
+  </defs>
+</svg>
+
+<!-- ================= HOME (populated) ================= -->
+<div class="mock-label">PC · fullscreen · <b>Home — populated</b> · DDG search + quick actions + dashboard</div>
+<div class="mock-frame">
+  <div class="mock-screen">
+    <div class="tp-topbar">
+      <span class="tp-logo"><svg class="tp-logo-badge" viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="5" fill="#2faeee" stroke="#1e3c72" stroke-width="2"/><path d="M14 24 L20 30 L34 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>TabPaladin</span>
+      <nav class="tp-nav">
+        <a href="#" class="active">Home</a>
+        <a href="#">Workflows</a>
+        <a href="#">Notes</a>
+        <a href="#">Organize</a>
+        <a href="#">Settings</a>
+      </nav>
+      <button class="sm-btn sync-pull"><svg class="ic sm"><use href="#i-download"/></svg>Pull</button>
+      <button class="sm-btn sync-push"><svg class="ic sm"><use href="#i-upload"/></svg>Push</button>
+      <button class="sm-btn" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+    </div>
+    <div class="wrap">
+      <div class="wrap-inner">
+        <div class="hero">
+          <h1>TabPaladin</h1>
+          <form class="ddg-search" action="https://duckduckgo.com/" method="get">
+            <input type="search" name="q" placeholder="Search DuckDuckGo…" autofocus>
+            <button type="submit" class="primary-btn"><svg class="ic"><use href="#i-search"/></svg>Search</button>
+          </form>
+          <div class="quick-grid">
+            <button class="action-tile">
+              <span class="tile-icon tint-blue"><svg class="ic"><use href="#i-tabs"/></svg></span>
+              Group Open Tabs
+              <small>14 ungrouped tabs</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-green"><svg class="ic"><use href="#i-tree"/></svg></span>
+              Organize Bookmarks
+              <small>3 folders to review</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-indigo"><svg class="ic"><use href="#i-refresh"/></svg></span>
+              Workflows
+              <small>4 saved</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-sky"><svg class="ic"><use href="#i-note"/></svg></span>
+              Notes
+              <small>12 notes · 2 notebooks</small>
+            </button>
+          </div>
+        </div>
+
+        <div class="dashboard">
+          <div class="card">
+            <div class="card-head"><h3>Open tab groups</h3><button class="sm-btn">Group tabs</button></div>
+            <div class="card-body">
+              <div class="row"><span class="icon"><span class="dot blue"></span></span><span class="title">Research — Web Audio API</span><span class="count">8 tabs</span></div>
+              <div class="row"><span class="icon"><span class="dot green"></span></span><span class="title">Shopping</span><span class="count">5 tabs</span></div>
+              <div class="row"><span class="icon"><span class="dot violet"></span></span><span class="title">News &amp; reading</span><span class="count">11 tabs</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Recent notes</h3><button class="sm-btn">All notes</button></div>
+            <div class="card-body">
+              <div class="note-list-item">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span class="note-item-title" style="flex:1;">Meeting notes — Q3 planning kickoff with the extended team</span>
+                  <span class="note-item-notebook">Work</span>
+                </div>
+                <div class="note-item-snippet">- [ ] Book the offsite venue - [x] Send agenda…</div>
+              </div>
+              <div class="note-list-item">
+                <div class="note-item-title">Web Audio latency findings</div>
+                <div class="note-item-snippet">baseLatency on Chrome Android is still…</div>
+              </div>
+              <div class="note-list-item">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span class="note-item-title" style="flex:1;">Reading list digest</span>
+                  <span class="note-item-notebook">Inbox</span>
+                </div>
+                <div class="note-item-snippet">[[Web Audio latency findings]] and 4 more links…</div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Workflows</h3><button class="sm-btn">Manage</button></div>
+            <div class="card-body">
+              <div class="row"><span class="icon"><svg class="ic sm"><use href="#i-refresh"/></svg></span><span class="title">Morning standup</span><span class="count">6 tabs</span></div>
+              <div class="row"><span class="icon"><svg class="ic sm"><use href="#i-refresh"/></svg></span><span class="title">Side project — TabPaladin dev environment with a very long name</span><span class="count">9 tabs</span></div>
+              <div class="row"><span class="icon"><svg class="ic sm"><use href="#i-refresh"/></svg></span><span class="title">Weekly review</span><span class="count">4 tabs</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= HOME (empty / first run) ================= -->
+<div class="mock-label">PC · fullscreen · <b>Home — empty / first run</b> · nothing grouped, no workflows, no notes</div>
+<div class="mock-frame">
+  <div class="mock-screen">
+    <div class="tp-topbar">
+      <span class="tp-logo"><svg class="tp-logo-badge" viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="5" fill="#2faeee" stroke="#1e3c72" stroke-width="2"/><path d="M14 24 L20 30 L34 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>TabPaladin</span>
+      <nav class="tp-nav">
+        <a href="#" class="active">Home</a>
+        <a href="#">Workflows</a>
+        <a href="#">Notes</a>
+        <a href="#">Organize</a>
+        <a href="#">Settings</a>
+      </nav>
+      <button class="sm-btn sync-pull"><svg class="ic sm"><use href="#i-download"/></svg>Pull</button>
+      <button class="sm-btn sync-push"><svg class="ic sm"><use href="#i-upload"/></svg>Push</button>
+      <button class="sm-btn" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+    </div>
+    <div class="wrap">
+      <div class="wrap-inner">
+        <div class="hero">
+          <h1>TabPaladin</h1>
+          <form class="ddg-search" action="https://duckduckgo.com/" method="get">
+            <input type="search" name="q" placeholder="Search DuckDuckGo…">
+            <button type="submit" class="primary-btn"><svg class="ic"><use href="#i-search"/></svg>Search</button>
+          </form>
+          <div class="quick-grid">
+            <button class="action-tile">
+              <span class="tile-icon tint-blue"><svg class="ic"><use href="#i-tabs"/></svg></span>
+              Group Open Tabs
+              <small>Nothing grouped yet</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-green"><svg class="ic"><use href="#i-tree"/></svg></span>
+              Organize Bookmarks
+              <small>Pick folders to clean</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-indigo"><svg class="ic"><use href="#i-refresh"/></svg></span>
+              Workflows
+              <small>Save your first workflow</small>
+            </button>
+            <button class="action-tile">
+              <span class="tile-icon tint-sky"><svg class="ic"><use href="#i-note"/></svg></span>
+              Notes
+              <small>Write your first note</small>
+            </button>
+          </div>
+        </div>
+        <div class="dashboard">
+          <div class="card">
+            <div class="card-head"><h3>Open tab groups</h3></div>
+            <p class="empty-state">No tabs grouped yet.<br>Hit “Group Open Tabs” to sort this window.</p>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Recent notes</h3></div>
+            <p class="empty-state">No notes yet. They live in your bookmarks,<br>so they sync everywhere.</p>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Workflows</h3></div>
+            <p class="empty-state">No saved workflows.<br>Open a set of tabs, then save it for later.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= NOTES (two-pane) ================= -->
+<div class="mock-label">PC · fullscreen · <b>Notes — two-pane reader</b> · long title, task list, wikilinks, backlinks, scrolling body</div>
+<div class="mock-frame">
+  <div class="mock-screen">
+    <div class="tp-topbar">
+      <span class="tp-logo"><svg class="tp-logo-badge" viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="5" fill="#2faeee" stroke="#1e3c72" stroke-width="2"/><path d="M14 24 L20 30 L34 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>TabPaladin</span>
+      <nav class="tp-nav">
+        <a href="#">Home</a>
+        <a href="#">Workflows</a>
+        <a href="#" class="active">Notes</a>
+        <a href="#">Organize</a>
+        <a href="#">Settings</a>
+      </nav>
+      <button class="sm-btn sync-pull"><svg class="ic sm"><use href="#i-download"/></svg>Pull</button>
+      <button class="sm-btn sync-push"><svg class="ic sm"><use href="#i-upload"/></svg>Push</button>
+      <button class="sm-btn" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+    </div>
+    <div class="wrap">
+      <div class="wrap-inner">
+        <div class="notes-layout">
+          <div class="notes-list-pane">
+            <div style="display:flex; gap:6px; margin-bottom:10px;">
+              <input type="search" placeholder="Search notes…" style="margin-bottom:0;">
+              <button class="sm-btn outlined" style="flex:none;"><svg class="ic sm"><use href="#i-plus"/></svg>New</button>
+            </div>
+            <div class="note-list-item active">
+              <div class="note-item-title">Meeting notes — Q3 planning kickoff with the extended leadership team and guests</div>
+              <div class="note-item-snippet">- [ ] Book the offsite venue - [x] Send agenda…</div>
+            </div>
+            <div class="note-list-item">
+              <div class="note-item-title">Web Audio latency findings</div>
+              <div class="note-item-snippet">baseLatency on Chrome Android is still…</div>
+            </div>
+            <div class="note-list-item">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span class="note-item-title" style="flex:1;">Reading list digest</span>
+                <span class="note-item-notebook">Inbox</span>
+              </div>
+              <div class="note-item-snippet">[[Web Audio latency findings]] and 4 more…</div>
+            </div>
+            <div class="note-list-item">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span class="note-item-title" style="flex:1;">Gift ideas</span>
+                <span class="note-item-notebook">Personal</span>
+              </div>
+              <div class="note-item-snippet">Mechanical keyboard, that one book…</div>
+            </div>
+          </div>
+          <div class="note-reader">
+            <h1 class="note-page-title">Meeting notes — Q3 planning kickoff with the extended leadership team and guests</h1>
+            <div class="note-page-meta">Notebook: Work · Updated 2 hours ago</div>
+            <div class="note-preview-body">
+              <h2>Action items</h2>
+              <ul class="note-tasks">
+                <li class="note-task"><input type="checkbox" class="note-task-box" data-line="3"><span>Book the offsite venue — see [[Venue shortlist 2026]]</span></li>
+                <li class="note-task done"><input type="checkbox" class="note-task-box" data-line="4" checked><span>Send agenda to the extended team</span></li>
+                <li class="note-task"><input type="checkbox" class="note-task-box" data-line="5"><span>Confirm budget with finance before Friday, the approval chain is long and this keeps slipping</span></li>
+                <li class="note-task done" style="margin-left:24px;"><input type="checkbox" class="note-task-box" data-line="6" checked><span>Nested: draft the one-pager</span></li>
+              </ul>
+              <h2>Notes</h2>
+              <p>Kickoff went well. Main risk is the migration timeline — compare with [[Migration plan draft]] and the infra doc at <a class="note-urllink" href="#">https://example.com/infra/migration-timeline-v2</a>.</p>
+              <p>Long paragraph to demonstrate scrolling and wrapping behavior in the reading pane. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.</p>
+              <p>More content follows so the pane has to scroll: decisions, parking-lot items, and follow-ups all land here. The reader caps its height and scrolls internally while the notes list on the left stays put.</p>
+              <p>Parking lot: pricing experiment, changelog cadence, support macros, the permanent redirect question that nobody wants to own but everybody keeps asking about in every single review meeting.</p>
+            </div>
+            <div class="note-backlinks">
+              Linked from:
+              <span class="note-wikilink" data-target="Migration plan draft">[[Migration plan draft]]</span>
+              <span class="note-wikilink" data-target="Weekly review">[[Weekly review]]</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= WORKFLOWS (expanded + loading) ================= -->
+<div class="mock-label">PC · fullscreen · <b>Workflows</b> · one expanded, one collapsed, long name; plus loading skeleton</div>
+<div class="mock-frame">
+  <div class="mock-screen">
+    <div class="tp-topbar">
+      <span class="tp-logo"><svg class="tp-logo-badge" viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="5" fill="#2faeee" stroke="#1e3c72" stroke-width="2"/><path d="M14 24 L20 30 L34 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>TabPaladin</span>
+      <nav class="tp-nav">
+        <a href="#">Home</a>
+        <a href="#" class="active">Workflows</a>
+        <a href="#">Notes</a>
+        <a href="#">Organize</a>
+        <a href="#">Settings</a>
+      </nav>
+      <button class="sm-btn sync-pull"><svg class="ic sm"><use href="#i-download"/></svg>Pull</button>
+      <button class="sm-btn sync-push"><svg class="ic sm"><use href="#i-upload"/></svg>Push</button>
+      <button class="sm-btn" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+    </div>
+    <div class="wrap">
+      <div class="wrap-inner">
+        <div class="page-head">
+          <h2>Saved Workflows</h2>
+          <div style="display:flex; gap:6px;">
+            <button class="sm-btn outlined"><svg class="ic sm"><use href="#i-download"/></svg>Import</button>
+            <button class="sm-btn outlined"><svg class="ic sm"><use href="#i-upload"/></svg>Export All</button>
+            <button class="primary-btn" style="background-color: var(--warning-color);"><svg class="ic sm"><use href="#i-plus"/></svg>Save current window</button>
+          </div>
+        </div>
+
+        <div class="workflow-item">
+          <div class="workflow-head">
+            <span class="wf-caret">▼</span>
+            <span class="wf-name">Side project — TabPaladin dev environment with a very long workflow name that overflows</span>
+            <span class="wf-meta">9 tabs · updated 3 days ago</span>
+            <span class="workflow-actions">
+              <button class="sm-btn"><svg class="ic sm"><use href="#i-play"/></svg>Open all</button>
+              <button class="sm-btn"><svg class="ic sm"><use href="#i-refresh"/></svg>Update</button>
+              <button class="sm-btn danger"><svg class="ic sm"><use href="#i-trash"/></svg>Delete</button>
+            </span>
+          </div>
+          <div class="workflow-body">
+            <div class="wf-domain-group">
+              <div class="wf-domain-header"><span style="flex:1;">github.com</span><span style="color:var(--text-muted); font-weight:400;">3</span></div>
+              <div class="wf-tab-row"><span>TabPaladin — repository</span></div>
+              <div class="wf-tab-row"><span>Pull requests · TabPaladin</span></div>
+              <div class="wf-tab-row"><span>Issue #41: notes sync conflict on…</span></div>
+            </div>
+            <div class="wf-domain-group">
+              <div class="wf-domain-header"><span style="flex:1;">developer.mozilla.org</span><span style="color:var(--text-muted); font-weight:400;">2</span></div>
+              <div class="wf-tab-row"><span>Web extensions — Manifest V3</span></div>
+              <div class="wf-tab-row"><span>bookmarks.create() reference</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="workflow-item">
+          <div class="workflow-head">
+            <span class="wf-caret">▶</span>
+            <span class="wf-name">Morning standup</span>
+            <span class="wf-meta">6 tabs · updated yesterday</span>
+            <span class="workflow-actions">
+              <button class="sm-btn"><svg class="ic sm"><use href="#i-play"/></svg>Open all</button>
+              <button class="sm-btn"><svg class="ic sm"><use href="#i-refresh"/></svg>Update</button>
+              <button class="sm-btn danger"><svg class="ic sm"><use href="#i-trash"/></svg>Delete</button>
+            </span>
+          </div>
+        </div>
+
+        <h2 class="section-title" style="margin-top: 24px;">Loading state (while bookmark tree is read)</h2>
+        <div class="skeleton row-skel"></div>
+        <div class="skeleton row-skel" style="width: 85%;"></div>
+        <div class="skeleton row-skel" style="width: 70%;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= ORGANIZER (source selection) ================= -->
+<div class="mock-label">PC · fullscreen · <b>Organize — pick folders</b> · selected state, AI hints</div>
+<div class="mock-frame">
+  <div class="mock-screen">
+    <div class="tp-topbar">
+      <span class="tp-logo"><svg class="tp-logo-badge" viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="5" fill="#2faeee" stroke="#1e3c72" stroke-width="2"/><path d="M14 24 L20 30 L34 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>TabPaladin</span>
+      <nav class="tp-nav">
+        <a href="#">Home</a>
+        <a href="#">Workflows</a>
+        <a href="#">Notes</a>
+        <a href="#" class="active">Organize</a>
+        <a href="#">Settings</a>
+      </nav>
+      <button class="sm-btn sync-pull"><svg class="ic sm"><use href="#i-download"/></svg>Pull</button>
+      <button class="sm-btn sync-push"><svg class="ic sm"><use href="#i-upload"/></svg>Push</button>
+      <button class="sm-btn" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+    </div>
+    <div class="wrap">
+      <div class="wrap-inner">
+        <div class="page-head"><h2>Select Folders to Clean</h2></div>
+        <div class="source-grid">
+          <button class="source-btn selected"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>Loose files</span><span class="src-count">42 bookmarks</span></button>
+          <button class="source-btn"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>Dev</span><span class="src-count">128 bookmarks</span></button>
+          <button class="source-btn"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>Recipes</span><span class="src-count">17 bookmarks</span></button>
+          <button class="source-btn selected"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>Music gear and pedalboard wishlist overflow folder</span><span class="src-count">23 bookmarks</span></button>
+          <button class="source-btn"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>Travel</span><span class="src-count">9 bookmarks</span></button>
+          <button class="source-btn"><span class="src-name"><svg class="ic sm"><use href="#i-folder"/></svg>News</span><span class="src-count">61 bookmarks</span></button>
+        </div>
+        <div style="margin: 16px 0 10px;">
+          <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">AI Hints (Optional)</label>
+          <input type="text" placeholder="e.g. pop, kpop, fitness, react…" style="width:100%; max-width:480px; padding:10px 12px; background:rgba(0,0,0,0.2); border:1px solid var(--border-color); color:var(--text-color); border-radius:var(--radius-md); font-size:0.9rem;">
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="primary-btn"><svg class="ic sm"><use href="#i-sparkle"/></svg>Analyze &amp; Sort</button>
+          <button class="primary-btn" style="background-color: var(--accent-color);"><svg class="ic sm"><use href="#i-layers"/></svg>Restructure</button>
+          <button class="sm-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mock-footer">
+  Notes on this proposal: icons are a hand-authored inline SVG sprite (stroke, <code>currentColor</code>) plus the real
+  <code>assets/icon48.svg</code> logo inlined — no emoji, no icon font, no external files, MV3-CSP-safe and offline-safe.
+  The DDG bar is a plain <code>&lt;form action="https://duckduckgo.com/" method="get"&gt;</code>.
+  Pull/Push inline styles from sidepanel.html become <code>.sync-pull</code>/<code>.sync-push</code> classes.
+  The five rainbow action buttons become one <code>.action-tile</code> component with tint variants.
+  Rows adopt the PWA's <code>.row</code> shape so both clients share a visual language.
+  Notes keep the exact DOM contract (.note-task-box data-line, .note-wikilink, .note-urllink).
+  "Update" on workflows is from todo.md and would be new logic — flagged, not assumed.
+</div>
+
+</body>
+</html>

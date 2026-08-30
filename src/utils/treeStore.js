@@ -27,8 +27,9 @@ const api = typeof browser !== 'undefined' ? browser : chrome;
 const STORE_KEY = 'tpTree';
 const DATA_PREFIX = 'data:application/json,';
 
-export const ROLES = ['pins', 'notes', 'workflows'];
+export const ROLES = ['bookmarks', 'pins', 'notes', 'workflows'];
 const ROLE_DEFAULT_TITLE = {
+    bookmarks: 'Bookmarks',
     pins: 'TabPaladin Pinned',
     notes: 'TabPaladin Notes',
     workflows: 'TabPaladin Workflows'
@@ -373,6 +374,35 @@ function convertBrowserNode(node) {
     return folder;
 }
 
+// Best-effort browser name for the import folder. userAgentData is the
+// non-deprecated source and names Brave/Edge/Opera correctly where the UA
+// string lies about being Chrome; the UA is the fallback, ordered so the
+// impostors are tested before Chrome itself.
+function browserName() {
+    try {
+        const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+        const known = brands
+            .map(b => b.brand)
+            .find(b => /Brave|Opera|Microsoft Edge|Firefox|Vivaldi|Chrome/i.test(b) && !/Not.?A.?Brand/i.test(b));
+        if (known) {
+            if (/Microsoft Edge/i.test(known)) return 'Edge';
+            if (/Chrome/i.test(known) && brands.length > 2) {
+                const better = brands.map(b => b.brand).find(b => /Brave|Opera|Vivaldi|Edge/i.test(b));
+                if (better) return better.replace(/Microsoft /, '');
+            }
+            return known;
+        }
+    } catch (e) { /* not available — fall through to the UA string */ }
+
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    if (/Firefox\//i.test(ua)) return 'Firefox';
+    if (/OPR\/|Opera/i.test(ua)) return 'Opera';
+    if (/Edg\//i.test(ua)) return 'Edge';
+    if (/Vivaldi/i.test(ua)) return 'Vivaldi';
+    if (/Chrome\//i.test(ua)) return 'Chrome';
+    return 'Browser';
+}
+
 // --- Public API -------------------------------------------------------------
 
 export const TreeStore = {
@@ -605,16 +635,19 @@ export const TreeStore = {
         }
     },
 
-    // One-time import of this browser's own bookmarks into the working copy,
-    // as a new top-level folder. Replaces the old push-from-browser-tree; the
-    // browser's bookmarks are read once and never written.
+    // Import this browser's own bookmarks into the working copy, as a named
+    // folder inside Bookmarks — "Chrome bookmarks", "Firefox bookmarks" — so
+    // it is obvious later where a collection came from, and so importing from
+    // a second browser does not merge into the first. The browser's own
+    // bookmarks are read once and never written.
     async importFromBrowser() {
         await ensureLoaded();
         const tree = await api.bookmarks.getTree();
         const root = tree[0];
+        const host = await TreeStore.ensureRoleRoot('bookmarks');
         const folder = makeNode({
             kind: 'folder',
-            title: `Imported ${new Date().toISOString().slice(0, 10)}`
+            title: `${browserName()} bookmarks`
         });
         let count = 0;
         for (const browserRoot of root.children || []) {
@@ -624,7 +657,15 @@ export const TreeStore = {
             count++;
         }
         if (!folder.children.length) return { imported: 0 };
-        insertNode(folder, null);
+        // A second import from the same browser gets its own dated folder
+        // rather than silently merging into, or replacing, the first.
+        const taken = new Set((host.children || []).map(c => c.title));
+        if (taken.has(folder.title)) {
+            folder.title = `${folder.title} (${new Date().toISOString().slice(0, 10)})`;
+            let n = 2;
+            while (taken.has(folder.title)) folder.title = `${browserName()} bookmarks (${n++})`;
+        }
+        insertNode(folder, host.id);
         const walkCount = (n) => 1 + (n.children || []).reduce((s, c) => s + walkCount(c), 0);
         return { imported: walkCount(folder) - 1, folderId: folder.id };
     },

@@ -47,6 +47,19 @@ no browser roots. Nodes are:
 Roles replaced the old magic folder titles ("TabPaladin Notes" etc.) as the way
 clients find their app-managed roots.
 
+One folder carries `role: "bookmarks"` and is the tree's main bookmarks folder,
+titled **Bookmarks**. On first boot after the upgrade the busiest ordinary
+top-level folder is designated as it (usually the browser's "Other Bookmarks"),
+renamed, and any other ordinary top-level folder is moved inside — a browser's
+split between "Bookmarks Bar" and "Other Bookmarks" is a browser's problem, not
+a database's. Browser noise roots (Trash, Speed Dials, Pinboard) are left where
+they are and hidden by the clients. This runs once and never fights a later
+rename or reorganisation.
+
+Importing a browser's bookmarks creates a named folder inside it — "Chrome
+bookmarks", "Firefox bookmarks" — so a second import cannot merge into the
+first.
+
 `PUT /api/tree` replaces the whole tree: `{ roots, baseVersion, deviceId }`.
 If `baseVersion` is not the server's current version — another device pushed in
 between — the push is refused with **409** and the client must pull first (or
@@ -55,7 +68,7 @@ send `force: true`). Every accepted write bumps the version and lands a
 
 The response of `GET /api/tree` also carries a **virtual imports subtree**
 (`id: "imports:root"`, flagged `virtual`/`readOnly`) composed at read time from
-the import archive. It is never stored, is stripped from any pushed tree, and
+the import archive and nested inside the Bookmarks folder. It is never stored, is stripped from any pushed tree, and
 can only be changed through the explicit import verbs below.
 
 ## Endpoints

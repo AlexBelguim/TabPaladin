@@ -490,7 +490,9 @@ async function renderMainView({ regroup = true } = {}) {
     // rather than only the workflows folder.
     if (focused.length === 0) {
         for (const top of await topLevelFolders()) {
-            if (!realRoots.find(r => r.id === top.id)) realRoots.push({ id: top.id, isWorkflow: false });
+            if (!realRoots.find(r => r.id === top.id)) {
+                realRoots.push({ id: top.id, isWorkflow: false, isBookmarks: top.role === 'bookmarks' });
+            }
         }
     }
     for (const id of focused) {
@@ -517,14 +519,11 @@ async function renderMainView({ regroup = true } = {}) {
     grid.className = 'roots-grid';
     container.appendChild(grid);
 
-    // Open Tabs is the tall one and gets the full width to itself; the folder
-    // roots sit side by side beneath it. Columns only work now that browser
-    // noise is filtered out — with eight of them they were unreadable.
+    // One column: Open Tabs, Workflows, Bookmarks. The archive is no longer a
+    // sibling here — it lives inside Bookmarks, where a collection of
+    // bookmarks belongs.
     grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
-
-    const rootsRow = document.createElement('div');
-    rootsRow.className = 'roots-row';
-    grid.appendChild(rootsRow);
+    const rootsRow = grid;
 
     for (const r of realRoots) {
         try {
@@ -535,7 +534,7 @@ async function renderMainView({ regroup = true } = {}) {
                 title: c.title,
                 folderCount: c.subfolders.length,
                 fileCount: c.looseCount,
-                icon: r.isWorkflow ? '🛡️' : '📁'
+                icon: r.isWorkflow ? '🛡️' : (r.isBookmarks ? '🔖' : '📁')
             }, 0);
             rootsRow.appendChild(card);
         } catch (e) {
@@ -1197,14 +1196,16 @@ async function renderSourceGrid(folderId) {
         // top level of the tree is the honest default.
         if (focused.length === 0) {
             for (const top of await topLevelFolders()) {
-                if (!roots.find(r => r.id === top.id)) roots.push({ id: top.id, isWorkflow: false });
+                if (!roots.find(r => r.id === top.id)) {
+                    roots.push({ id: top.id, isWorkflow: false, isBookmarks: top.role === 'bookmarks' });
+                }
             }
         }
 
         sourceList.appendChild(buildOrganizeHeader('Sources', null));
 
         const grid = document.createElement('div');
-        grid.className = 'roots-row'; // side by side — see renderMainView
+        grid.className = 'roots-grid'; // one section per row — see renderMainView
         sourceList.appendChild(grid);
 
         for (const r of roots) {
@@ -1216,7 +1217,7 @@ async function renderSourceGrid(folderId) {
                     title: c.title,
                     folderCount: c.subfolders.length,
                     fileCount: c.looseCount,
-                    icon: r.isWorkflow ? '🛡️' : '📁'
+                    icon: r.isWorkflow ? '🛡️' : (r.isBookmarks ? '🔖' : '📁')
                 }, 0);
                 grid.appendChild(card);
             } catch (e) {

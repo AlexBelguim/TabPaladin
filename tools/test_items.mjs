@@ -180,6 +180,52 @@ console.log('\n1. Migration from a browser-tree snapshot');
     db.close();
 }
 
+console.log('\n4b. The Bookmarks root');
+{
+    const db = freshDb();
+    const enc2 = (o) => 'data:application/json,' + encodeURIComponent(JSON.stringify(o));
+    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
+        .run('2026-08-01T00:00:00Z', 'ext', JSON.stringify({
+            type: 'root', children: [
+                { type: 'folder', title: 'Bookmarks Bar', children: [{ type: 'bookmark', title: 'HN', url: 'https://hn' }] },
+                { type: 'folder', title: 'Other Bookmarks', children: [
+                    { type: 'folder', title: 'Dev', children: [{ type: 'bookmark', title: 'MDN', url: 'https://mdn' }] },
+                    { type: 'folder', title: 'TabPaladin Notes', children: [{ type: 'bookmark', title: 'N', url: enc2({ v: 1, content: 'x' }) }] }
+                ] },
+                { type: 'folder', title: 'Trash', children: [{ type: 'bookmark', title: 'junk', url: 'https://junk' }] }
+            ]
+        }));
+    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    items.migrateFromLatestSnapshotIfNeeded();
+    const r = items.ensureBookmarksRoot();
+
+    check('the busiest ordinary root becomes Bookmarks', r.renamedFrom === 'Other Bookmarks', r.renamedFrom);
+    const roots = items.readTree().roots;
+    const bm = roots.find(n => n.role === 'bookmarks');
+    check('it is titled Bookmarks', bm && bm.title === 'Bookmarks', bm && bm.title);
+    check('other ordinary roots move inside it',
+        (bm.children || []).some(c => c.title === 'Bookmarks Bar'));
+    check('noise roots are left alone, not adopted',
+        roots.some(n => n.title === 'Trash') && !(bm.children || []).some(c => c.title === 'Trash'));
+    check('nothing is lost in the move',
+        JSON.stringify(bm).includes('MDN') && JSON.stringify(bm).includes('HN'));
+    check('bookmarksRootId points at it', items.bookmarksRootId() === bm.id);
+
+    // Idempotent: a second call must not rename or move anything again.
+    const before = JSON.stringify(items.readTree().roots);
+    const again = items.ensureBookmarksRoot();
+    check('a second call is a no-op', again.created === false && again.renamedFrom === undefined);
+    check('the tree is untouched', JSON.stringify(items.readTree().roots) === before);
+
+    // A user rename must stick.
+    const rows = db.prepare("SELECT id FROM items WHERE role = 'bookmarks'").all();
+    db.prepare("UPDATE items SET title = 'My stuff' WHERE id = ?").run(rows[0].id);
+    items.ensureBookmarksRoot();
+    check('a renamed root is not renamed back',
+        items.readTree().roots.find(n => n.role === 'bookmarks').title === 'My stuff');
+    db.close();
+}
+
 console.log('\n5. Empty server: no snapshot, nothing to migrate');
 {
     const db = freshDb();

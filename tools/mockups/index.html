@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TabPaladin mockups</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #090e1a;
+    color: #f1f5f9;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .box { max-width: 560px; padding: 32px; }
+  h1 {
+    font-size: 1.6rem;
+    background: linear-gradient(to right, #60a5fa, #a78bfa);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  a.card {
+    display: block;
+    padding: 16px 18px;
+    margin: 12px 0;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    color: #f1f5f9;
+    text-decoration: none;
+  }
+  a.card:hover { border-color: #3b82f6; }
+  a.card small { display: block; color: #94a3b8; margin-top: 4px; }
+  p.note { color: #94a3b8; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>TabPaladin — design mockups</h1>
+    <p class="note">
+      Non-shipping. Nothing here is wired into manifest.json, the extension, or the PWA.
+      Both files reuse the existing design tokens and class names from
+      <code>src/sidepanel/sidepanel.css</code> and <code>pwa/app.css</code>.
+    </p>
+    <a class="card" href="pc.html">
+      🖥️ PC — fullscreen extension pages
+      <small>Home with DuckDuckGo search, quick-action tiles, dashboard; two-pane notes reader;
+      workflows (expanded + loading skeletons); organizer source picker; empty/first-run states.</small>
+    </a>
+    <a class="card" href="pwa.html">
+      📱 PWA — phone (390px)
+      <small>Home without search bar (quick actions, recent notes, folders), notes list with notebooks,
+      black note reading page with task checkboxes, inbox sheet, loading/empty states.</small>
+    </a>
+    <p class="note">
+      Direction: drop the side-panel layout on PC in favor of full screens with a top nav bar;
+      the PWA keeps its app-shell topbar. Shared components (.row, .action-tile, .card, skeletons)
+      give both clients one visual language inside the existing palette.
+    </p>
+  </div>
+</body>
+</html>

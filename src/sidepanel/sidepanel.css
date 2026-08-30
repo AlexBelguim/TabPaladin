@@ -425,33 +425,6 @@ ol {
   gap: 8px;
 }
 
-/* The folder roots, side by side. min-width:0 is what stops a long bookmark
-   title from forcing a column wider than its share and pushing the row off
-   screen; the columns wrap instead of overflowing once they hit their basis. */
-.roots-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 12px;
-  width: 100%;
-}
-
-.roots-row > .source-folder-card {
-  flex: 1 1 280px;
-  min-width: 0;
-  max-height: 80vh;
-  overflow-y: auto;
-  align-self: stretch;
-}
-
-/* Keep the folder name visible while scrolling a long column. */
-.roots-row > .source-folder-card > .source-folder-header {
-  position: sticky;
-  top: 0;
-  background-color: var(--surface-color);
-  z-index: 2;
-}
-
 .open-tabs-card {
   border-left: 3px solid var(--primary-color);
 }

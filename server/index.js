@@ -85,6 +85,16 @@ if (migration.migrated) {
     console.log(`[TabPaladin] Migrated latest snapshot into the items table (${migration.nodes} nodes).`);
 }
 
+// One bookmarks folder, called Bookmarks, holding everything else. Idempotent:
+// a tree that already has one is left exactly as the user arranged it.
+const bookmarksRoot = items.ensureBookmarksRoot();
+if (bookmarksRoot.created) {
+    console.log('[TabPaladin] Created the Bookmarks root.');
+} else if (bookmarksRoot.renamedFrom) {
+    console.log(`[TabPaladin] Designated "${bookmarksRoot.renamedFrom}" as the Bookmarks root`
+        + (bookmarksRoot.moved ? ` and moved ${bookmarksRoot.moved} top-level folder(s) into it.` : '.'));
+}
+
 const app = express();
 app.set('trust proxy', true); // so req.protocol reflects X-Forwarded-Proto behind a reverse proxy
 app.use(cors({ origin: true, credentials: false }));
@@ -282,12 +292,30 @@ const { store: importsStore } = attachImports(app, { db, requireAuth });
 app.get('/api/tree', requireAuth, (req, res) => {
     const { version, roots } = items.readTree();
     const importsTree = buildImportsTree(importsStore);
-    res.json({
-        ok: true,
-        version,
-        roots: importsTree ? [...roots, importsTree] : roots
-    });
+    if (importsTree) {
+        // The archive belongs inside Bookmarks, not beside it — it is a
+        // collection of bookmarks like any other, and a top-level sibling made
+        // it look like a separate account. Falls back to the top level only if
+        // there is somehow no bookmarks root to hold it.
+        const rootId = items.bookmarksRootId();
+        const host = rootId ? findNode(roots, rootId) : null;
+        if (host) {
+            host.children = [...(host.children || []), importsTree];
+        } else {
+            roots.push(importsTree);
+        }
+    }
+    res.json({ ok: true, version, roots });
 });
+
+function findNode(nodes, id) {
+    for (const n of nodes) {
+        if (n.id === id) return n;
+        const hit = n.children ? findNode(n.children, id) : null;
+        if (hit) return hit;
+    }
+    return null;
+}
 
 // Cheap freshness probe so clients can show "the server has newer" without
 // downloading the whole tree.

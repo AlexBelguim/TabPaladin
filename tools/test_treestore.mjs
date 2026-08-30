@@ -293,7 +293,16 @@ console.log('\n7. Import from the browser (one-time)');
 const imported = await TreeStore.importFromBrowser();
 check('items imported', imported.imported > 0, String(imported.imported));
 const importedFolder = await TreeStore.getNode(imported.folderId);
-check('lands in a dated top-level folder', /^Imported \d{4}-\d{2}-\d{2}$/.test(importedFolder.title));
+check('the folder is named after the browser it came from',
+    /bookmarks$/i.test(importedFolder.title), importedFolder.title);
+const bmRoot = await TreeStore.findRoleRoot('bookmarks');
+check('it lands inside the Bookmarks root, not at the top level',
+    bmRoot && (bmRoot.children || []).some(c => c.id === imported.folderId));
+const second = await TreeStore.importFromBrowser();
+check('importing twice does not collide or merge',
+    second.folderId !== imported.folderId
+    && (await TreeStore.getNode(second.folderId)).title !== importedFolder.title,
+    (await TreeStore.getNode(second.folderId)).title);
 const flat = JSON.stringify(importedFolder);
 check('legacy data: note converted to a note node', flat.includes('"kind":"note"') && flat.includes('legacy'));
 check('sentinels dropped', !flat.includes('__tabpaladin_root__'));

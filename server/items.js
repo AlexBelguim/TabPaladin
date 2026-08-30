@@ -22,7 +22,7 @@
 import crypto from 'node:crypto';
 
 export const KINDS = new Set(['folder', 'bookmark', 'note']);
-export const ROLES = new Set(['pins', 'notes', 'workflows']);
+export const ROLES = new Set(['bookmarks', 'pins', 'notes', 'workflows']);
 export const TREE_FORMAT = 2;
 
 export function newId() {
@@ -209,6 +209,78 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     function findRoleRow(role) {
         return db.prepare("SELECT * FROM items WHERE kind = 'folder' AND role = ? ORDER BY created_at LIMIT 1").get(role)
             || null;
+    }
+
+    // --- The main bookmarks root -------------------------------------------
+    //
+    // With the tree in a database there is no reason to keep a browser's idea
+    // of "Other Bookmarks" as a top-level sibling of everything else: there is
+    // one bookmarks folder, it is called Bookmarks, and imports live inside it
+    // like any other collection.
+    //
+    // Runs once. A tree that already has a bookmarks-role folder is left alone,
+    // so this cannot fight the user renaming or reorganising it later.
+    const NOISE_TITLES = new Set([
+        'trash', 'prullenbak', 'papierkorb', 'corbeille',
+        'speed dials', 'speeddial', 'pinboard', 'unsynchronized pinboard',
+        'imported bookmarks', 'geïmporteerde bladwijzers'
+    ]);
+
+    function descendantCount(id) {
+        const kids = db.prepare('SELECT id FROM items WHERE parent_id = ?').all(id);
+        return kids.reduce((n, k) => n + 1 + descendantCount(k.id), 0);
+    }
+
+    const ensureBookmarksRoot = db.transaction(() => {
+        const existing = findRoleRow('bookmarks');
+        if (existing) return { id: existing.id, created: false };
+
+        const tops = db.prepare("SELECT * FROM items WHERE parent_id IS NULL AND kind = 'folder'").all();
+        const candidates = tops.filter(t => !t.role && !NOISE_TITLES.has((t.title || '').toLowerCase().trim()));
+
+        const now = new Date().toISOString();
+        // The biggest ordinary root is the one holding the user's bookmarks;
+        // "Other Bookmarks" wins ties because that is what it was called.
+        let chosen = null;
+        let best = -1;
+        for (const c of candidates) {
+            const n = descendantCount(c.id) + (/other|unfiled|bookmark/i.test(c.title || '') ? 1e6 : 0);
+            if (n > best) { best = n; chosen = c; }
+        }
+
+        if (!chosen) {
+            const id = newId();
+            const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id IS NULL').get().p;
+            db.prepare(`
+                INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at)
+                VALUES (?, NULL, ?, 'folder', 'bookmarks', 'Bookmarks', ?, ?)
+            `).run(id, max + 1, now, now);
+            setMeta('treeVersion', version() + 1);
+            return { id, created: true };
+        }
+
+        db.prepare("UPDATE items SET role = 'bookmarks', title = 'Bookmarks', updated_at = ? WHERE id = ?")
+            .run(now, chosen.id);
+
+        // Any other ordinary top-level folder becomes a child of it, so the top
+        // level is the app's own sections rather than a browser's leftovers.
+        // Noise roots are left where they are: they are hidden, not owned.
+        let moved = 0;
+        const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id = ?').get(chosen.id).p;
+        let pos = maxPos + 1;
+        for (const c of candidates) {
+            if (c.id === chosen.id) continue;
+            db.prepare('UPDATE items SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?')
+                .run(chosen.id, pos++, now, c.id);
+            moved++;
+        }
+        setMeta('treeVersion', version() + 1);
+        return { id: chosen.id, created: false, renamedFrom: chosen.title, moved };
+    });
+
+    function bookmarksRootId() {
+        const row = findRoleRow('bookmarks');
+        return row ? row.id : null;
     }
 
     // --- Notes (used by /llm share pages and proposal approval) -------------
@@ -430,6 +502,8 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
 
     return {
         version,
+        ensureBookmarksRoot,
+        bookmarksRootId,
         readTree,
         writeTree,
         normalizeRoots,
