@@ -418,36 +418,14 @@ ol {
   gap: 8px;
 }
 
-/* Root grid: stacked by default, side-by-side columns when there are 2+ roots */
+/* Root list: one root per row. Columns were tried and became unreadable
+   once "nothing focused" started meaning every top-level folder. */
 .roots-grid {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.roots-grid.multi {
-  flex-direction: row;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 12px;
-}
-
-.roots-grid.multi > .source-folder-card {
-  flex: 1 1 280px;
-  min-width: 0;
-  max-height: 80vh;
-  overflow-y: auto;
-  align-self: stretch;
-}
-
-.roots-grid.multi > .source-folder-card > .source-folder-header {
-  position: sticky;
-  top: 0;
-  background-color: var(--surface-color);
-  z-index: 2;
-}
-
-/* Open Tabs root (main view) */
 .open-tabs-card {
   border-left: 3px solid var(--primary-color);
 }

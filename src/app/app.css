@@ -39,14 +39,6 @@ body.tp-app #groups-container {
     }
 }
 
-/* With real width available, let the columns grow rather than sitting at their
-   280px basis with dead space between them. */
-body.tp-app .roots-grid.multi > .source-folder-card {
-    flex: 1 1 340px;
-    max-height: none;
-}
-
-/* ---------- top bar ---------- */
 .tp-topbar {
     display: flex;
     align-items: center;

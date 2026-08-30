@@ -478,8 +478,13 @@ async function renderMainView({ regroup = true } = {}) {
     headerBar.querySelector('#mainRegroupBtn').addEventListener('click', () => renderMainView({ regroup: true }));
 
     const grid = document.createElement('div');
-    const totalRoots = 1 + realRoots.length;
-    grid.className = totalRoots > 1 ? 'roots-grid multi' : 'roots-grid';
+    // Always a stacked list, one root per row.
+    //
+    // The side-by-side variant was tuned for the two or three focused folders
+    // this view used to show. Now that "nothing focused" means every top-level
+    // folder, it produced a row of tall narrow columns with the titles
+    // truncated to "T..", which is unreadable and wastes the whole viewport.
+    grid.className = 'roots-grid';
     container.appendChild(grid);
 
     grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
@@ -1162,7 +1167,7 @@ async function renderSourceGrid(folderId) {
         sourceList.appendChild(buildOrganizeHeader('Sources', null));
 
         const grid = document.createElement('div');
-        grid.className = roots.length > 1 ? 'roots-grid multi' : 'roots-grid';
+        grid.className = 'roots-grid'; // one root per row — see renderMainView
         sourceList.appendChild(grid);
 
         for (const r of roots) {
