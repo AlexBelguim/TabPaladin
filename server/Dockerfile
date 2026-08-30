@@ -9,8 +9,12 @@ WORKDIR /app
 COPY server/package.json server/package-lock.json* ./
 RUN npm install --omit=dev
 
-# Copy server source
-COPY server/index.js ./
+# Copy server source. A glob rather than a list of filenames: index.js used to
+# be named explicitly, so adding items.js shipped a container whose entrypoint
+# imported a file that was not in the image, and it crash-looped on boot.
+# server/*.js matches top-level modules only, so node_modules is not pulled in
+# (its native better-sqlite3 build is for the host OS and would not run here).
+COPY server/*.js ./
 COPY server/imports ./imports
 
 # PWA is copied from the build context (the repo root, see docker-compose context).

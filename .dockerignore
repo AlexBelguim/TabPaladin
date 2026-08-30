@@ -1,0 +1,18 @@
+# The build context is the repo root (see server/docker-compose.yml), so
+# everything here is sent to the Docker daemon on every build unless excluded.
+.git
+.github
+
+# Host-built native modules: better-sqlite3 here is compiled for the host OS
+# and must never reach the image, which builds its own inside Alpine.
+**/node_modules
+
+# Runtime state and secrets — the database lives in a mounted volume.
+server/data
+server/.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Not part of the server image.
+tools/mockups
