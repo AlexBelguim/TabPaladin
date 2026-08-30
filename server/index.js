@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { attachImports } from './imports/index.js';
+import { buildImportsTree } from './imports/project.js';
+import { makeItemsStore } from './items.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,6 +22,8 @@ const db = new Database(path.join(DATA_DIR, 'sync.db'));
 db.pragma('journal_mode = WAL');
 
 db.exec(`
+    -- History of the tree. Rows written before the items table existed hold
+    -- whole browser-tree blobs; rows written since hold {format: 2, roots}.
     CREATE TABLE IF NOT EXISTS snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -72,6 +76,14 @@ db.exec(`
 // Migrations for existing databases.
 try { db.prepare('ALTER TABLE note_proposals ADD COLUMN notebook TEXT').run(); } catch (e) { /* column already exists */ }
 try { db.prepare("ALTER TABLE note_proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'").run(); } catch (e) { /* column already exists */ }
+
+// The canonical tree. On the first boot after the upgrade this converts the
+// newest browser-tree snapshot into rows, so nothing is lost switching over.
+const items = makeItemsStore(db, { maxSnapshots: MAX_SNAPSHOTS });
+const migration = items.migrateFromLatestSnapshotIfNeeded();
+if (migration.migrated) {
+    console.log(`[TabPaladin] Migrated latest snapshot into the items table (${migration.nodes} nodes).`);
+}
 
 const app = express();
 app.set('trust proxy', true); // so req.protocol reflects X-Forwarded-Proto behind a reverse proxy
@@ -251,46 +263,67 @@ app.post('/api/auth/password', requireAuth, (req, res) => {
 
 // --- Health (no auth) ---
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, version: 1, configured: Boolean(AUTH_TOKEN) || userCount() > 0 });
+    res.json({ ok: true, version: 2, configured: Boolean(AUTH_TOKEN) || userCount() > 0 });
 });
 
-// --- Snapshots: push & pull ---
+// --- Importers ---
+// Attached before the tree routes so /api/tree can append the virtual imports
+// subtree, and before the static handler so /api/imports/* wins over the PWA
+// catch-all.
+const { store: importsStore } = attachImports(app, { db, requireAuth });
 
-// Store a snapshot and trim history. Shared by push, proposal approval and the
-// importers, so there is one place that knows a write must also enforce
-// MAX_SNAPSHOTS.
-function commitSnapshot(snapshot, deviceId = null) {
-    const ts = new Date().toISOString();
-    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
-        .run(ts, deviceId, JSON.stringify(snapshot));
-    db.prepare(`
-        DELETE FROM snapshots WHERE id NOT IN (
-            SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT ?
-        )
-    `).run(MAX_SNAPSHOTS);
-    return ts;
-}
-
-app.post('/api/push', requireAuth, (req, res) => {
-    const snapshot = req.body && req.body.snapshot;
-    const deviceId = (req.body && req.body.deviceId) || null;
-    if (!snapshot || typeof snapshot !== 'object') {
-        return res.status(400).json({ error: 'Missing snapshot' });
-    }
-    const ts = commitSnapshot(snapshot, deviceId);
-    res.json({ ok: true, timestamp: ts });
-});
-
-app.get('/api/pull', requireAuth, (req, res) => {
-    const row = db.prepare('SELECT timestamp, device_id, json FROM snapshots ORDER BY timestamp DESC LIMIT 1').get();
-    if (!row) return res.json({ ok: true, snapshot: null, timestamp: null });
+// --- The tree ---
+//
+// GET returns the user's tree plus a virtual, read-only imports subtree that is
+// composed from the archive at read time and never stored. PUT replaces the
+// user's tree wholesale — git-style: the client edits a local working copy and
+// pushes it, and a push whose baseVersion is stale is refused so it cannot
+// silently overwrite what another device pushed in between.
+app.get('/api/tree', requireAuth, (req, res) => {
+    const { version, roots } = items.readTree();
+    const importsTree = buildImportsTree(importsStore);
     res.json({
         ok: true,
-        timestamp: row.timestamp,
-        deviceId: row.device_id,
-        snapshot: JSON.parse(row.json)
+        version,
+        roots: importsTree ? [...roots, importsTree] : roots
     });
 });
+
+// Cheap freshness probe so clients can show "the server has newer" without
+// downloading the whole tree.
+app.get('/api/tree/version', requireAuth, (req, res) => {
+    res.json({ ok: true, version: items.version() });
+});
+
+app.put('/api/tree', requireAuth, (req, res) => {
+    const { roots, baseVersion, deviceId, force } = req.body || {};
+    if (!Array.isArray(roots)) {
+        return res.status(400).json({ error: 'Missing roots (array of top-level nodes).' });
+    }
+    const current = items.version();
+    if (!force) {
+        if (baseVersion === undefined || baseVersion === null) {
+            return res.status(400).json({ error: 'Missing baseVersion — pull first, or pass force:true to overwrite.' });
+        }
+        if (Number(baseVersion) !== current) {
+            return res.status(409).json({
+                error: 'The tree changed on the server since your last pull. Pull, then push again.',
+                version: current
+            });
+        }
+    }
+    const version = items.writeTree(roots, { deviceId: deviceId || null });
+    res.json({ ok: true, version });
+});
+
+// The old whole-browser-tree sync. Gone for good reason: it required mapping
+// browser-specific root folders across vendors, and a mismatch deleted or
+// duplicated data. A 410 with directions beats a 404 for any straggler client.
+const goneHandler = (req, res) => res.status(410).json({
+    error: 'Snapshot push/pull was replaced by /api/tree. Update the TabPaladin extension/PWA.'
+});
+app.post('/api/push', requireAuth, goneHandler);
+app.get('/api/pull', requireAuth, goneHandler);
 
 app.get('/api/history', requireAuth, (req, res) => {
     const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots ORDER BY timestamp DESC LIMIT 100').all();
@@ -327,85 +360,7 @@ app.delete('/api/shared', requireAuth, (req, res) => {
     res.json({ ok: true });
 });
 
-// --- Notes helpers (same data model as pwa/app.js and the extension) ---
-// Notes are bookmarks in the "TabPaladin Notes" folder whose url is a
-// data:application/json payload: {v:1, content, createdAt, updatedAt}.
-const NOTES_ROOT_TITLE = 'TabPaladin Notes';
-const NOTE_DATA_PREFIX = 'data:application/json,';
 const SHARE_TTL_MS = Math.max(1, Number(process.env.SHARE_TTL_MINUTES || 60)) * 60 * 1000;
-
-function findNotesFolder(snapshot) {
-    if (!snapshot) return null;
-    for (const rootChild of snapshot.children || []) {
-        if (isNotesFolderNode(rootChild)) return rootChild;
-        for (const c of rootChild.children || []) {
-            if (isNotesFolderNode(c)) return c;
-        }
-    }
-    return null;
-}
-
-function isNotesFolderNode(node) {
-    return node && (node.type === 'folder' || node.type === 'root') && node.title === NOTES_ROOT_TITLE;
-}
-
-function isNoteBookmark(b) {
-    return b && b.type === 'bookmark' && typeof b.url === 'string'
-        && b.url.startsWith(NOTE_DATA_PREFIX) && b.title !== '__tabpaladin_meta__';
-}
-
-function decodeNote(b) {
-    try {
-        const p = JSON.parse(decodeURIComponent(b.url.slice(NOTE_DATA_PREFIX.length)));
-        return { content: p.content || '', createdAt: p.createdAt || null, updatedAt: p.updatedAt || null };
-    } catch (e) {
-        return { content: '', createdAt: null, updatedAt: null };
-    }
-}
-
-function encodeNoteUrl({ content, createdAt, updatedAt }) {
-    return NOTE_DATA_PREFIX + encodeURIComponent(JSON.stringify({ v: 1, content, createdAt, updatedAt }));
-}
-
-function latestSnapshot() {
-    const row = db.prepare('SELECT json FROM snapshots ORDER BY timestamp DESC LIMIT 1').get();
-    return row ? JSON.parse(row.json) : null;
-}
-
-// Same, plus when it was taken. The importers need the timestamp to tell "the
-// user deleted this" from "this was imported after that snapshot was pushed" —
-// without it, a device pushing a stale copy of the import folder would purge
-// everything swept since it last pulled.
-function latestSnapshotWithMeta() {
-    const row = db.prepare('SELECT json, timestamp FROM snapshots ORDER BY timestamp DESC LIMIT 1').get();
-    return row ? { snapshot: JSON.parse(row.json), timestamp: row.timestamp } : null;
-}
-
-// All notes under a folder, recursively, tagged with their notebook (subfolder title).
-function collectNotes(folder, notebook, out = []) {
-    for (const c of folder.children || []) {
-        if (isNoteBookmark(c)) out.push({ notebook, bookmark: c });
-        else if (c && (c.type === 'folder' || c.type === 'root')) collectNotes(c, c.title || notebook, out);
-    }
-    return out;
-}
-
-// Sort note children in every folder under (and including) the notes root to
-// match the given list of titles; unlisted notes keep their relative order last.
-function applyNoteOrder(notesRoot, order) {
-    const idx = new Map(order.map((t, i) => [t, i]));
-    const rank = (n) => (idx.has(n.title) ? idx.get(n.title) : Infinity);
-    const sortFolder = (folder) => {
-        const kids = folder.children || [];
-        const sortedNotes = kids.filter(isNoteBookmark).sort((a, b) => rank(a) - rank(b));
-        let ni = 0;
-        folder.children = kids.map(c => isNoteBookmark(c) ? sortedNotes[ni++] : c);
-        for (const c of folder.children) {
-            if (c && (c.type === 'folder' || c.type === 'root')) sortFolder(c);
-        }
-    };
-    sortFolder(notesRoot);
-}
 
 function getValidShareToken(req, res) {
     const row = db.prepare('SELECT token, expires_at FROM share_tokens WHERE token = ?').get(req.params.token);
@@ -432,9 +387,19 @@ app.post('/api/share', requireAuth, (req, res) => {
 
 app.get('/llm/:token', (req, res) => {
     if (!getValidShareToken(req, res)) return;
-    const snapshot = latestSnapshot();
-    const folder = findNotesFolder(snapshot);
-    const entries = folder ? collectNotes(folder, null) : [];
+    // Straight out of the items table — notes used to be decoded out of a
+    // pushed browser-tree blob here.
+    const notes = items.listNotes();
+    // Group notebooks together, loose notes first, keeping each group's order.
+    const groupOrder = [];
+    const groups = new Map();
+    for (const n of notes) {
+        const key = n.notebook || '';
+        if (!groups.has(key)) { groups.set(key, []); groupOrder.push(key); }
+        groups.get(key).push(n);
+    }
+    groupOrder.sort((a, b) => (a === '') === (b === '') ? 0 : (a === '' ? -1 : 1));
+
     const origin = `${req.protocol}://${req.get('host')}`;
     const proposeUrl = `${origin}/llm/${req.params.token}/propose`;
 
@@ -464,16 +429,13 @@ app.get('/llm/:token', (req, res) => {
     md += `  - Optionally append &notebook=<name> (also percent-encoded) to file the note in a notebook.\n`;
     md += `  - Example: ${origin}/#note=%23%20Shopping%0A%0A-%20milk&notebook=Recipes\n`;
     md += `  - The link opens a review screen in the user's app; nothing is saved until they press Save. Present it as a clickable markdown link like [Review and save this note](URL).\n\n`;
-    md += `---\n\n## Existing notes (${entries.length})\n\n`;
-    if (entries.length === 0) md += `(no notes yet)\n\n`;
-    let lastNotebook;
-    for (const e of entries) {
-        if (e.notebook !== lastNotebook) {
-            md += `### 📓 Notebook: ${e.notebook || '(none)'}\n\n`;
-            lastNotebook = e.notebook;
+    md += `---\n\n## Existing notes (${notes.length})\n\n`;
+    if (notes.length === 0) md += `(no notes yet)\n\n`;
+    for (const key of groupOrder) {
+        md += `### 📓 Notebook: ${key || '(none)'}\n\n`;
+        for (const n of groups.get(key)) {
+            md += `#### ${n.title || 'Untitled'}\n\n${n.content || '(empty)'}\n\n---\n\n`;
         }
-        const meta = decodeNote(e.bookmark);
-        md += `#### ${e.bookmark.title || 'Untitled'}\n\n${meta.content || '(empty)'}\n\n---\n\n`;
     }
     res.type('text/plain; charset=utf-8').send(md);
 });
@@ -528,65 +490,16 @@ app.get('/api/proposals', requireAuth, (req, res) => {
 app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
     const prop = db.prepare('SELECT id, title, content, notebook, kind FROM note_proposals WHERE id = ?').get(req.params.id);
     if (!prop) return res.status(404).json({ error: 'Proposal not found' });
-    const snapshot = latestSnapshot();
-    if (!snapshot) return res.status(409).json({ error: 'No snapshot on server yet.' });
-
-    let folder = findNotesFolder(snapshot);
-    if (!folder) {
-        // Put it under the "Other Bookmarks" equivalent, falling back to the last root.
-        const roots = snapshot.children || [];
-        const parent = roots.find(r => /other|unfiled/i.test(r.title || '')) || roots[roots.length - 1];
-        if (!parent) return res.status(409).json({ error: 'Snapshot has no root folder.' });
-        folder = { type: 'folder', title: NOTES_ROOT_TITLE, children: [] };
-        parent.children = parent.children || [];
-        parent.children.push(folder);
-    }
-
-    const now = new Date().toISOString();
-
-    if (prop.kind === 'reorder') {
-        let order = null;
-        try { order = JSON.parse(prop.content); } catch (e) { /* corrupt */ }
-        if (!Array.isArray(order)) return res.status(400).json({ error: 'Corrupt reorder proposal.' });
-        applyNoteOrder(folder, order);
-    } else {
-        // File into the requested notebook (subfolder), creating it if missing.
-        let target = folder;
-        if (prop.notebook) {
-            target = (folder.children || []).find(c => (c.type === 'folder' || c.type === 'root') && c.title === prop.notebook);
-            if (!target) {
-                target = { type: 'folder', title: prop.notebook, children: [] };
-                folder.children = folder.children || [];
-                folder.children.push(target);
-            }
-        }
-
-        const existing = (target.children || []).find(c => isNoteBookmark(c) && c.title === prop.title)
-            || collectNotes(folder, null).find(e => e.bookmark.title === prop.title)?.bookmark;
-        if (existing) {
-            const meta = decodeNote(existing);
-            existing.url = encodeNoteUrl({ content: prop.content, createdAt: meta.createdAt || now, updatedAt: now });
-        } else {
-            target.children = target.children || [];
-            target.children.push({ type: 'bookmark', title: prop.title, url: encodeNoteUrl({ content: prop.content, createdAt: now, updatedAt: now }) });
-        }
-    }
-
-    // Store as a new snapshot so history keeps the pre-approval state.
-    commitSnapshot(snapshot, 'llm-proposal');
+    const result = items.applyNoteProposal(prop);
+    if (!result.ok) return res.status(400).json({ error: result.error });
     db.prepare('DELETE FROM note_proposals WHERE id = ?').run(prop.id);
-    res.json({ ok: true });
+    res.json({ ok: true, version: items.version() });
 });
 
 app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
     db.prepare('DELETE FROM note_proposals WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
 });
-
-// --- Importers ---
-// Registered before the static handler so /api/imports/* wins over the PWA
-// catch-all.
-attachImports(app, { db, requireAuth, latestSnapshot: latestSnapshotWithMeta, commitSnapshot });
 
 // --- Share target fallback ---
 //

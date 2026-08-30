@@ -1,11 +1,9 @@
 // Importer persistence — sources, their credentials, and the archive itself.
 //
-// The archive lives here rather than in the snapshot because /api/push replaces
-// the snapshot wholesale with whatever tree a browser sends. A device that
-// pushes before it pulls would drop the whole import folder from the newest
-// snapshot, and for anything Reddit has already forgotten past its 1000-item
-// listing cap that snapshot is the only copy. Keeping items in their own table
-// makes the bookmark tree a projection that can always be rebuilt.
+// The archive is append-only and lives only here. For anything Reddit has
+// already forgotten past its 1000-item listing cap, this table is the only
+// copy. Clients see it as a virtual subtree composed at read time and can only
+// change it through explicit verbs, never by pushing a tree.
 
 import crypto from 'node:crypto';
 
@@ -120,18 +118,10 @@ export function initSchema(db) {
         );
     `);
 
-    // Migration for databases created before the import folder respected the
-    // user. filed_at marks an item the user moved out to file somewhere of
-    // their own: still archived and still counted, but never projected back in,
-    // because re-adding it is what would duplicate it.
+    // filed_at marks an item the user copied into their own tree: still
+    // archived and still counted, but no longer drawn into the virtual imports
+    // subtree, because showing it there too would duplicate it.
     try { db.prepare('ALTER TABLE import_items ADD COLUMN filed_at TEXT').run(); } catch (e) { /* column already exists */ }
-
-    // When this item was last drawn into a committed snapshot. Reconciling
-    // needs it: an item missing from the folder only means the user removed it
-    // if the item was ever *put* there. Judging on import time instead purges
-    // anything swept but not yet projected — a real window, since a restart or
-    // a push between the sweep and the projection lands squarely in it.
-    try { db.prepare('ALTER TABLE import_items ADD COLUMN projected_at TEXT').run(); } catch (e) { /* column already exists */ }
 }
 
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
@@ -271,16 +261,16 @@ export function makeStore(db) {
                 .all(sourceId);
         },
 
-        // What the projection is allowed to draw: everything except items the
-        // user has already filed elsewhere.
+        // What the virtual subtree draws: everything except items the user has
+        // already filed into their own tree.
         activeItemsFor(sourceId) {
             return db.prepare('SELECT * FROM import_items WHERE source_id = ? AND filed_at IS NULL ORDER BY created_utc DESC, id DESC')
                 .all(sourceId);
         },
 
-        // The user moved these out of the import folder. Keep the archive row —
+        // The user copied these into their own tree. Keep the archive row —
         // the item still counts and still came from Reddit — but stop drawing
-        // it, or the next rebuild puts a duplicate back where they took it from.
+        // it into the virtual subtree, or it would show up twice.
         markFiled(ids) {
             if (!ids.length) return 0;
             const now = new Date().toISOString();
@@ -316,17 +306,6 @@ export function makeStore(db) {
             const run = db.transaction((list) => { for (const e of list) stmt.run(sourceId, e); });
             run(externalIds);
             return externalIds.length;
-        },
-
-        // Records that these items are now present in a committed snapshot, so
-        // a later absence can be read as the user having removed them.
-        markProjected(ids) {
-            if (!ids.length) return 0;
-            const now = new Date().toISOString();
-            const stmt = db.prepare('UPDATE import_items SET projected_at = ? WHERE id = ?');
-            const run = db.transaction((list) => { for (const id of list) stmt.run(now, id); });
-            run(ids);
-            return ids.length;
         },
 
         countDismissed(sourceId) {

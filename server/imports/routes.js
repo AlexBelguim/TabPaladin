@@ -1,7 +1,7 @@
 // HTTP surface for importers.
 
 import * as reddit from './reddit.js';
-import { runSource, sweepSource, projectSource } from './runner.js';
+import { runSource } from './runner.js';
 import { classify, isManualProvider } from './manual.js';
 
 // Only Reddit can be created by hand; the manual archives create themselves the
@@ -50,9 +50,15 @@ function resultPage(title, body) {
 <div class="card">${body}</div>`;
 }
 
-export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSnapshot }) {
-    const ctx = { latestSnapshot, commitSnapshot };
+// Shared by the delete and file verbs: resolve a request body's externalIds
+// against one source's archive rows.
+function rowsForExternalIds(store, sourceId, externalIds) {
+    if (!Array.isArray(externalIds) || externalIds.length === 0) return null;
+    const wanted = new Set(externalIds.map(String));
+    return store.itemsFor(sourceId).filter(r => wanted.has(String(r.external_id)));
+}
 
+export function attachRoutes(app, { store, requireAuth }) {
     app.get('/api/imports', requireAuth, (req, res) => {
         res.json({ ok: true, sources: store.listSources().map(s => publicSource(store, s)) });
     });
@@ -121,7 +127,8 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
                 container: r.container,
                 createdUtc: r.created_utc,
                 importedAt: r.imported_at,
-                goneFromSource: Boolean(r.removed_at_source)
+                goneFromSource: Boolean(r.removed_at_source),
+                filed: Boolean(r.filed_at)
             }))
         });
     });
@@ -132,18 +139,41 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
         if (!store.hasCredentials(source.id)) {
             return res.status(409).json({ error: 'Connect the account first.' });
         }
-        const result = await runSource(store, source, ctx);
+        const result = await runSource(store, source);
         if (!result.ok) return res.status(502).json(result);
         res.json(result);
     });
 
-    // Rebuild the bookmark folder from the archive without touching the network.
-    // The repair hatch for a snapshot that lost the folder to an out-of-order
-    // push.
-    app.post('/api/imports/:id/reproject', requireAuth, (req, res) => {
+    // Delete items from the archive. This used to be inferred from what a
+    // pushed bookmark tree no longer contained; now it is a verb, which is the
+    // only kind of delete that cannot be triggered by a stale device.
+    //
+    // Unrecoverable by design — anything past Reddit's 1000-item window cannot
+    // be fetched again. The tombstone left behind is what stops the next sweep
+    // from simply re-importing a post that is still saved at the source.
+    app.post('/api/imports/:id/items/delete', requireAuth, (req, res) => {
         const source = store.getSource(req.params.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
-        res.json({ ok: true, ...projectSource(store, source, ctx) });
+        const rows = rowsForExternalIds(store, source.id, (req.body || {}).externalIds);
+        if (!rows) return res.status(400).json({ error: 'externalIds must be a non-empty array.' });
+        const purged = store.purgeItems(rows);
+        res.json({ ok: true, purged });
+    });
+
+    // The user copied these into their own tree. The archive row stays — the
+    // item still counts and still came from the source — but it stops being
+    // drawn into the virtual folder, so it does not show up twice.
+    app.post('/api/imports/:id/items/file', requireAuth, (req, res) => {
+        const source = store.getSource(req.params.id);
+        if (!source) return res.status(404).json({ error: 'Source not found' });
+        const rows = rowsForExternalIds(store, source.id, (req.body || {}).externalIds);
+        if (!rows) return res.status(400).json({ error: 'externalIds must be a non-empty array.' });
+        const filed = store.markFiled(rows.map(r => r.id));
+        res.json({
+            ok: true,
+            filed,
+            items: rows.map(r => ({ externalId: r.external_id, url: r.url, title: r.title }))
+        });
     });
 
     // Forget which items the user deleted, so a later sweep may bring back any
@@ -178,8 +208,6 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
                 provider: hit.provider,
                 label: hit.label,
                 config: { listTitle: 'Saved' },
-                // Nothing to poll; the interval only paces the projection pass
-                // that redraws the folder.
                 intervalMinutes: 60
             });
         }
@@ -198,7 +226,7 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
 
         // No date is available from a share, so capture time it is. It is
         // written once and never updated, which is what keeps the monthly
-        // grouping stable across re-projections.
+        // grouping stable.
         const now = new Date().toISOString();
         store.upsertItem(source.id, {
             externalId: hit.externalId,
@@ -209,12 +237,10 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
             extra: { capturedVia: 'share' }
         });
 
-        const projected = projectSource(store, store.getSource(source.id), ctx);
         res.json({
             ok: true, captured: true, duplicate: false,
             provider: hit.provider, sourceId: source.id,
-            items: store.countItems(source.id).total,
-            projected: Boolean(projected.projected)
+            items: store.countItems(source.id).total
         });
     });
 
@@ -286,4 +312,4 @@ export function attachRoutes(app, { store, requireAuth, latestSnapshot, commitSn
     });
 }
 
-export { sweepSource, projectSource, runSource };
+export { runSource };
