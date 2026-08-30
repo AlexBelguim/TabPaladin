@@ -1,7 +1,11 @@
-// Minimal vanilla PWA for TabPaladin. Browses the latest synced snapshot.
+// Minimal vanilla PWA for TabPaladin. Browses the server's canonical tree
+// (GET /api/tree) as an in-memory working copy, edits it locally, and pushes it
+// back (PUT /api/tree) git-style — a push against a tree another device changed
+// since the last pull is refused until you pull or force.
 // "Drop here" filing: navigate to a folder, tap the button — every link in the
-// Recent-links modal is appended to the current folder of an in-memory edited
-// snapshot, then pushed back to the server.
+// Recent-links modal is appended to the current folder, then pushed.
+
+import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
 
 const LS = {
     url: 'tp_pwa_url',
@@ -18,8 +22,8 @@ const state = {
             || ((location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : ''),
         token: localStorage.getItem(LS.token) || ''
     },
-    snapshot: null,           // bookmark tree root: { type:'root', children: [...] }
-    snapshotTimestamp: null,
+    snapshot: null,           // wrapper { type:'root', children: [...] } around the server's top-level folders
+    treeVersion: 0,           // server tree version this working copy is based on
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
     dirty: false,             // unsaved local edits to the snapshot
@@ -166,7 +170,7 @@ async function bootstrap() {
         setStatus('Open Settings (⚙) to configure your sync server.');
         return;
     }
-    await pullSnapshot();
+    try { await pullSnapshot(); } catch (e) { /* status already set */ }
     await refreshInbox();
     await refreshProposals();
     await checkUnfiledLinks();
@@ -270,22 +274,76 @@ async function processImportHashIfAny() {
     showToast('Review the note, then press Save.');
 }
 
+// --- Wire format <-> local shape ---
+//
+// The server's tree (GET/PUT /api/tree) speaks {id, kind:'folder'|'bookmark'|'note',
+// title, url?, payload?, role?, virtual?} with no browser roots — just top-level
+// folders. This app's rendering and editing code predates that and works on
+// {type, title, url, children} nodes where a note is a bookmark whose url is a
+// data:application/json payload. Rather than rewrite every view, the two shapes
+// convert at the sync boundary: notes gain their data: url on the way in and
+// give it back up on the way out, and server ids ride along as _pwaId so they
+// survive a round trip unchanged.
+function fromWire(node) {
+    const out = { title: node.title || '', _pwaId: node.id };
+    if (node.role) out._role = node.role;
+    if (node.virtual || node.readOnly) out._virtual = true;
+    // Payloads this app doesn't render (a workflow folder's createdAt, fields a
+    // newer client added) must survive the round trip, or a push from the
+    // phone would erase them server-wide for every device.
+    if (node.payload) out._payload = node.payload;
+    if (node.kind === 'bookmark') {
+        out.type = 'bookmark';
+        out.url = node.url;
+    } else if (node.kind === 'note') {
+        out.type = 'bookmark';
+        out.url = encodeNoteUrl({
+            content: (node.payload && node.payload.content) || '',
+            createdAt: (node.payload && node.payload.createdAt) || null,
+            updatedAt: (node.payload && node.payload.updatedAt) || null
+        });
+    } else {
+        out.type = 'folder';
+        out.children = (node.children || []).map(fromWire);
+    }
+    return out;
+}
+
+function toWire(node) {
+    if (node._virtual) return null; // the imports subtree is never pushed back
+    const id = node._pwaId || newLocalId();
+    if (node.type === 'bookmark' && node.url && node.url.startsWith(NOTE_DATA_PREFIX)) {
+        const meta = decodeNote(node);
+        // Merge over the carried payload so fields this app doesn't know about
+        // survive; the data: url only ever encodes these three.
+        return { id, kind: 'note', title: node.title || '', payload: { ...(node._payload || {}), ...meta } };
+    }
+    if (node.type === 'bookmark') {
+        const out = { id, kind: 'bookmark', title: node.title || '', url: node.url };
+        if (node._payload) out.payload = node._payload;
+        return out;
+    }
+    const out = { id, kind: 'folder', title: node.title || '' };
+    if (node._role) out.role = node._role;
+    if (node._payload) out.payload = node._payload;
+    out.children = (node.children || []).map(toWire).filter(Boolean);
+    return out;
+}
+
 async function pullSnapshot() {
     try {
         setStatus('Pulling…');
-        const data = await api('/api/pull');
-        if (!data.snapshot) {
-            setStatus('No snapshot on server yet. Use Push from the extension to upload your bookmarks.');
-            state.snapshot = null;
-            return;
-        }
-        state.snapshot = data.snapshot;
-        state.snapshotTimestamp = data.timestamp;
+        const data = await api('/api/tree');
+        // A wrapper node so the rest of the app keeps its "root with children"
+        // navigation model; only its children are real.
+        state.snapshot = { type: 'root', title: '', children: (data.roots || []).map(fromWire) };
+        state.treeVersion = Number(data.version) || 0;
         state.pathIds = [getRootId(state.snapshot)];
         state.dirty = false;
         renderView();
     } catch (e) {
         setStatus('Pull failed: ' + e.message);
+        throw e;
     }
 }
 
@@ -315,9 +373,17 @@ async function refreshProposals() {
 
 function getRootId(snap) { return assignIds(snap); }
 
-let _idCounter = 0;
+// Random rather than a counter: these ids are pushed to the server as the
+// node's permanent identity, and a counter would hand two different nodes the
+// same id across sessions.
+function newLocalId() {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
 function assignIds(node) {
-    if (!node._pwaId) node._pwaId = 'n' + (++_idCounter);
+    if (!node._pwaId) node._pwaId = newLocalId();
     if (node.children) node.children.forEach(assignIds);
     return node._pwaId;
 }
@@ -414,18 +480,17 @@ function renderContent() {
     if (inImports) {
         const note = document.createElement('div');
         note.className = 'imports-note';
-        note.innerHTML = '<strong>Synced from Reddit.</strong> The server rebuilds this folder on every sweep, '
-            + 'so nothing can be filed into it. '
-            + 'Move something out and it stays where you put it, never re-added. '
-            + 'Delete it and it is purged, and will not come back on the next sweep.';
+        note.innerHTML = '<strong>Import archive.</strong> This folder is drawn straight from the '
+            + 'server\'s archive on every pull, so nothing can be filed into it and it is read-only here. '
+            + 'Use the desktop app to file or delete archived items.';
         root.appendChild(note);
     }
     const children = node.children || [];
-    // Neither the notes nor the pins folder is shown among the bookmarks —
-    // notes get their own section on the root view, pins get the home tiles.
+    // App-managed folders are not shown among the bookmarks — notes get their
+    // own section, pins get the home tiles, workflows get their own section.
     const atRoot = state.pathIds.length === 1;
     const folders = children.filter(c => (c.type === 'folder' || c.type === 'root')
-        && !isNotesFolder(c) && !isPinsFolder(c)
+        && !isNotesFolder(c) && !isPinsFolder(c) && !isWorkflowsFolder(c)
         && !(atRoot && isNoiseRoot(c)));
     const bookmarks = children.filter(c => c.type === 'bookmark' && c.url && !isInternalNode(c));
 
@@ -445,6 +510,7 @@ function renderContent() {
 
     if (state.pathIds.length === 1) {
         renderNotesSection(root);
+        renderWorkflowsSection(root);
     }
 }
 
@@ -452,7 +518,9 @@ function renderContent() {
 const IMPORTS_ROOT_TITLE = 'TabPaladin Imports';
 
 function isImportsFolder(node) {
-    return node && node.type === 'folder' && node.title === IMPORTS_ROOT_TITLE;
+    // The virtual flag is authoritative (it is what the push-side strip keys
+    // on); the title check remains as a fallback for the root row.
+    return node && node.type === 'folder' && (node._virtual || node.title === IMPORTS_ROOT_TITLE);
 }
 
 // Is the folder currently being viewed the imports root, or inside it?
@@ -469,7 +537,7 @@ function isInsideImports() {
 // deleted at worst. Refusing up front beats explaining afterwards.
 function blockedByImports(action = 'add anything') {
     if (!isInsideImports()) return false;
-    showToast(`Can't ${action} here — this folder is synced from Reddit and is rebuilt on every sweep.`);
+    showToast(`Can't ${action} here — this folder is the import archive and is read-only.`);
     return true;
 }
 
@@ -548,7 +616,8 @@ function isNoiseRoot(node) {
 }
 
 function isPinsFolder(node) {
-    return node && (node.type === 'folder' || node.type === 'root') && node.title === PINS_ROOT_TITLE;
+    return node && (node.type === 'folder' || node.type === 'root')
+        && (node._role === 'pins' || node.title === PINS_ROOT_TITLE);
 }
 
 function findPinsFolder() {
@@ -785,7 +854,107 @@ function collectRecentNotes(node, out = []) {
 }
 
 function isNotesFolder(node) {
-    return node && (node.type === 'folder' || node.type === 'root') && node.title === NOTES_ROOT_TITLE;
+    return node && (node.type === 'folder' || node.type === 'root')
+        && (node._role === 'notes' || node.title === NOTES_ROOT_TITLE);
+}
+
+// --- Workflows: saved tab sessions, now first-class in the web app ---
+//
+// A workflow is a folder under the workflows root whose bookmark children are
+// the saved tabs. The web app can't capture open tabs (that needs the
+// extension's tabs API), but it can list, open and delete what's saved — which
+// is the part that matters on a machine without the extension.
+const WORKFLOWS_ROOT_TITLE = 'TabPaladin Workflows';
+
+function isWorkflowsFolder(node) {
+    return node && (node.type === 'folder' || node.type === 'root')
+        && (node._role === 'workflows' || node.title === WORKFLOWS_ROOT_TITLE);
+}
+
+function findWorkflowsRoot() {
+    if (!state.snapshot) return null;
+    const walk = (node) => {
+        for (const c of node.children || []) {
+            if (c.type !== 'folder' && c.type !== 'root') continue;
+            if (isWorkflowsFolder(c)) return c;
+            const hit = walk(c);
+            if (hit) return hit;
+        }
+        return null;
+    };
+    return walk(state.snapshot);
+}
+
+function workflowTabs(folder) {
+    return (folder.children || []).filter(c =>
+        c.type === 'bookmark' && c.url && !c.url.startsWith(NOTE_DATA_PREFIX) && !isInternalNode(c));
+}
+
+// One user gesture is usually allowed one popup; the rest need the user to
+// allow pop-ups for this site once. Count what got through and say so.
+function openWorkflowTabs(folder) {
+    const tabs = workflowTabs(folder);
+    if (!tabs.length) { showToast('This workflow has no tabs.'); return; }
+    let opened = 0;
+    for (const t of tabs) {
+        const w = window.open(t.url, '_blank', 'noopener');
+        if (w) opened++;
+    }
+    if (opened < tabs.length) {
+        showToast(`Opened ${opened} of ${tabs.length} — allow pop-ups for this site to open all at once.`);
+    }
+}
+
+function renderWorkflowsSection(root) {
+    const wfRoot = findWorkflowsRoot();
+    if (!wfRoot) return;
+    const workflows = (wfRoot.children || []).filter(c => c.type === 'folder');
+    if (!workflows.length) return;
+
+    const section = document.createElement('div');
+    section.className = 'notes-section workflows-section';
+
+    const header = document.createElement('div');
+    header.className = 'notes-section-header';
+    const title = document.createElement('h2');
+    title.textContent = '🛡️ Workflows';
+    header.appendChild(title);
+    section.appendChild(header);
+
+    for (const wf of workflows) {
+        const tabs = workflowTabs(wf);
+        const row = document.createElement('div');
+        row.className = 'row workflow-row';
+        row.innerHTML = `
+            <span class="icon">🛡️</span>
+            <span class="title">${escapeHtml(wf.title || '(unnamed)')}</span>
+            <span class="count">${tabs.length} tab${tabs.length === 1 ? '' : 's'}</span>
+            <button class="wf-open primary" title="Open all tabs">▶ Open</button>
+            <button class="wf-del" title="Delete workflow">🗑</button>
+        `;
+        row.querySelector('.wf-open').addEventListener('click', (e) => {
+            e.stopPropagation();
+            openWorkflowTabs(wf);
+        });
+        row.querySelector('.wf-del').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Delete workflow "${wf.title}" (${tabs.length} tabs)?`)) return;
+            wfRoot.children = (wfRoot.children || []).filter(c => c !== wf);
+            state.dirty = true;
+            renderView();
+            try {
+                setStatus('Saving…');
+                await pushSnapshot();
+                showToast('Workflow deleted.');
+                setStatus('');
+            } catch (err) {
+                setStatus('');
+                showToast('Delete failed: ' + err.message + ' — use ⬆️ to retry.');
+            }
+        });
+        section.appendChild(row);
+    }
+    root.appendChild(section);
 }
 
 // TabPaladin's own sentinels: the per-workflow meta record and the root
@@ -815,20 +984,21 @@ function encodeNoteUrl({ content, createdAt, updatedAt }) {
     return NOTE_DATA_PREFIX + encodeURIComponent(JSON.stringify({ v: 1, content, createdAt, updatedAt }));
 }
 
-// Locate the notes folder (root → browser root → TabPaladin Notes) with its path.
+// Locate the notes folder anywhere in the tree, with its path. A full search,
+// not a fixed-depth one: missing a root the user moved deeper is what would
+// make ensureNotesFolder create a duplicate.
 function findNotesFolderWithPath() {
     if (!state.snapshot) return null;
-    for (const rootChild of state.snapshot.children || []) {
-        if (isNotesFolder(rootChild)) {
-            return { node: rootChild, path: [state.snapshot._pwaId, rootChild._pwaId] };
+    const walk = (node, path) => {
+        for (const c of node.children || []) {
+            if (c.type !== 'folder' && c.type !== 'root') continue;
+            if (isNotesFolder(c)) return { node: c, path: [...path, c._pwaId] };
+            const hit = walk(c, [...path, c._pwaId]);
+            if (hit) return hit;
         }
-        for (const c of rootChild.children || []) {
-            if (isNotesFolder(c)) {
-                return { node: c, path: [state.snapshot._pwaId, rootChild._pwaId, c._pwaId] };
-            }
-        }
-    }
-    return null;
+        return null;
+    };
+    return walk(state.snapshot, [state.snapshot._pwaId]);
 }
 
 // Replace [[oldTitle]] with [[newTitle]] inside a content string.
@@ -884,17 +1054,19 @@ async function ensureNotesFolder() {
     const existing = findNotesFolderWithPath();
     if (existing) return existing;
 
-    // The PWA never creates the notes root.
-    //
-    // It used to, guessing at the extension's location by native id and then
-    // by title. When the guess missed — localized root names, a browser whose
-    // "Other Bookmarks" carries a different native id, a snapshot pushed from
-    // a second browser — the two ended up with a notes root each, neither
-    // seeing the other's notes, and pulls stacked more. One creator removes
-    // the whole class of problem: the extension owns root creation, the PWA
-    // only ever reads and writes inside a root that already exists.
-    showToast('No notes folder yet — open TabPaladin on your computer and create a note there first, then pull.');
-    return null;
+    // Safe to create now: the notes root is identified by its role, so there
+    // is no title-guessing and no duplicate-roots hazard. Created locally only
+    // — deliberately NOT auto-pushed. Merely opening Notes must never push a
+    // whole tree; if this phone's copy were stale, that push would raise the
+    // conflict/force dialog as a side effect of viewing notes. The root rides
+    // along with the next real save or explicit push.
+    const nb = { type: 'folder', title: NOTES_ROOT_TITLE, _role: 'notes', children: [] };
+    assignIds(nb);
+    state.snapshot.children = state.snapshot.children || [];
+    state.snapshot.children.push(nb);
+    state.dirty = true;
+    updatePushBtnState();
+    return findNotesFolderWithPath();
 }
 
 function buildNoteRow(note, onOpen) {
@@ -1746,20 +1918,32 @@ async function dropHere() {
     }
 }
 
-async function pushSnapshot() {
-    // Strip our PWA-only _pwaId fields before sending.
-    const clean = cleanSnapshot(state.snapshot);
-    await api('/api/push', { method: 'POST', body: JSON.stringify({ snapshot: clean, deviceId: 'pwa' }) });
-    state.dirty = false;
-}
-
-function cleanSnapshot(node) {
-    const out = { type: node.type, title: node.title };
-    if (node.url) out.url = node.url;
-    if (node.dateAdded) out.dateAdded = node.dateAdded;
-    if (node.nativeId) out.nativeId = node.nativeId;
-    if (node.children) out.children = node.children.map(cleanSnapshot);
-    return out;
+async function pushSnapshot({ force = false } = {}) {
+    const roots = (state.snapshot.children || []).map(toWire).filter(Boolean);
+    // Pushing an empty tree erases everything server-side for every device —
+    // never do that without a very explicit yes.
+    if (roots.length === 0 && (state.treeVersion || 0) > 0) {
+        if (!confirm('This would push an EMPTY tree and erase all bookmarks on the server. Really continue?')) {
+            throw new Error('Push cancelled — tree is empty.');
+        }
+    }
+    try {
+        const data = await api('/api/tree', {
+            method: 'PUT',
+            body: JSON.stringify({ roots, baseVersion: state.treeVersion || 0, deviceId: 'pwa', force })
+        });
+        state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
+        state.dirty = false;
+    } catch (e) {
+        // A stale baseVersion means another device pushed since our last pull.
+        // Never overwrite that silently — ask.
+        if (/^409[\s:]/.test(e.message) || /changed on the server/i.test(e.message)) {
+            if (confirm('Another device pushed changes since this phone last pulled.\n\nOK = overwrite the server with THIS phone\'s version\nCancel = keep both as they are (pull later to see theirs — your edit is then lost)')) {
+                return pushSnapshot({ force: true });
+            }
+        }
+        throw e;
+    }
 }
 
 // --- Quick-File Modal (proactive clipboard & inbox filing) ---
@@ -2212,7 +2396,7 @@ async function runImporterAction(id, act, btn) {
                 : 'Already up to date.');
             // Only pull when there is nothing unsaved locally — pullSnapshot
             // replaces state wholesale and would discard pending edits.
-            if (result.projected && !state.dirty) await pullSnapshot();
+            if (result.added && !state.dirty) await pullSnapshot();
         } catch (e) {
             setStatus('Sweep failed: ' + e.message);
         } finally {
@@ -2465,26 +2649,13 @@ window.addEventListener('DOMContentLoaded', () => {
             showToast('Please open settings (⚙) first.');
             return;
         }
+        if (state.dirty && !confirm('You have local edits that were never pushed. Pulling replaces this phone\'s copy with the server\'s tree and discards them.\n\nPull anyway?')) {
+            return;
+        }
         try {
-            setStatus('Pulling…');
-            const data = await api('/api/pull');
-            if (!data.snapshot) {
-                setStatus('No snapshot on server yet.');
-                showToast('No snapshot on server yet.');
-                return;
-            }
-            state.snapshot = data.snapshot;
-            state.snapshotTimestamp = data.timestamp;
-            state.pathIds = [getRootId(state.snapshot)];
-            state.dirty = false;
-            
-            showToast('Snapshot pulled successfully! Refreshing...');
-            setStatus('Pulled successfully! Refreshing...');
-            setTimeout(() => {
-                location.reload();
-            }, 1000);
+            await pullSnapshot();
+            showToast('Pulled the latest tree.');
         } catch (err) {
-            setStatus('Pull failed: ' + err.message);
             showToast('Pull failed: ' + err.message);
         }
     });
@@ -2503,11 +2674,9 @@ window.addEventListener('DOMContentLoaded', () => {
         try {
             setStatus('Pushing…');
             await pushSnapshot();
-            showToast('Snapshot pushed successfully! Refreshing...');
-            setStatus('Pushed successfully! Refreshing...');
-            setTimeout(() => {
-                location.reload();
-            }, 1000);
+            setStatus('');
+            showToast('Pushed.');
+            renderView();
         } catch (err) {
             setStatus('Push failed: ' + err.message);
             showToast('Push failed: ' + err.message);
@@ -2554,11 +2723,6 @@ window.addEventListener('DOMContentLoaded', () => {
                 showToast('Failed to pull snapshot: ' + err.message);
                 return;
             }
-        }
-
-        if (state.pathIds.length <= 1) {
-            showToast('Please open Bookmarks Bar or Other Bookmarks before creating a folder.');
-            return;
         }
 
         const name = prompt('Enter new folder name:');
@@ -2643,6 +2807,46 @@ window.addEventListener('DOMContentLoaded', () => {
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
+
+    // Import a browser's exported bookmarks file — the no-extension way in.
+    safeAddListener('bm-import-btn', 'click', () => $('bm-import-file').click());
+    safeAddListener('bm-import-file', 'change', async (e) => {
+        const file = e.target.files[0];
+        e.target.value = '';
+        if (!file) return;
+        if (!state.snapshot) {
+            try { await pullSnapshot(); } catch (err) { showToast('Pull the tree first: ' + err.message); return; }
+        }
+        let folder;
+        try {
+            folder = importedFolderFrom(await file.text(), new Date().toISOString().slice(0, 10));
+        } catch (err) {
+            showToast('Could not read that file: ' + err.message);
+            return;
+        }
+        if (!folder) {
+            showToast('No bookmarks found in that file — is it a browser bookmarks export?');
+            return;
+        }
+        const n = countNodes(folder) - 1;
+        if (!confirm(`Import ${n} item(s) into a new "${folder.title}" folder and push?`)) return;
+        assignIds(folder);
+        state.snapshot.children = state.snapshot.children || [];
+        state.snapshot.children.push(folder);
+        state.dirty = true;
+        try {
+            setStatus('Saving…');
+            await pushSnapshot();
+            setStatus('');
+            showToast(`Imported ${n} item(s).`);
+            hide($('settings-sheet'));
+            renderView();
+        } catch (err) {
+            setStatus('');
+            showToast('Push failed: ' + err.message + ' — the import is kept locally, use ⬆️ to retry.');
+            renderView();
+        }
+    });
     safeAddListener('imports-add', 'click', openImporterSetup);
     safeAddListener('import-close', 'click', () => hide($('import-sheet')));
     safeAddListener('import-submit', 'click', submitImporter);

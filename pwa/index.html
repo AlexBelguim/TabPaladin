@@ -9,7 +9,7 @@
   <link rel="icon" href="icons/icon192.png">
   <!-- Version query busts browser/proxy caches on each release.
        Bump the number together with SHELL_CACHE in sw.js. -->
-  <link rel="stylesheet" href="app.css?v=25">
+  <link rel="stylesheet" href="app.css?v=27">
 </head>
 <body>
   <header id="topbar">
@@ -113,6 +113,15 @@
 
         <hr class="sep">
 
+        <strong class="block-title">Bookmarks</strong>
+        <p class="hint">Bring in a browser's existing bookmarks: in the browser, open the bookmark
+          manager and <em>Export bookmarks</em> (works in Chrome, Firefox, Opera, Edge), then upload
+          the HTML file here. Everything lands in a dated "Imported" folder.</p>
+        <button id="bm-import-btn" class="ghost-block">📚 Import bookmarks (HTML file)</button>
+        <input id="bm-import-file" type="file" accept=".html,.htm,text/html" class="hidden">
+
+        <hr class="sep">
+
         <strong class="block-title">Imports</strong>
         <p class="hint">Reddit only ever shows your most recent 1000 saved posts. TabPaladin sweeps the list on a schedule and keeps everything it has ever seen, so the archive outgrows that cap.</p>
         <div id="imports-list"></div>
@@ -151,6 +160,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=25" type="module"></script>
+  <script src="app.js?v=27" type="module"></script>
 </body>
 </html>

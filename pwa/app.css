@@ -1054,3 +1054,58 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
   object-fit: contain;
   background: none;
 }
+
+/* ---------- workflows section ---------- */
+.workflow-row { align-items: center; }
+.workflow-row .title { flex: 1; }
+.workflow-row .wf-open { padding: 6px 12px; font-size: 0.8rem; flex-shrink: 0; }
+.workflow-row .wf-del {
+  background: transparent;
+  color: var(--danger);
+  padding: 6px 8px;
+  flex-shrink: 0;
+}
+.workflow-row .wf-del:hover { background: rgba(239, 68, 68, 0.12); }
+
+/* ---------- desktop layout ---------- */
+/* The web app is the desktop client too, not just the phone's. Same DOM, one
+   media query: the bottom tab bar disappears (its four destinations already
+   live in the topbar and menu), content settles into a centered column, and
+   the bottom sheets become centered dialogs instead of drawers. */
+@media (min-width: 900px) {
+  #bottom-nav { display: none; }
+  body { padding-bottom: 48px; }
+
+  /* Full-width bars, centered contents — no wrapper element needed. */
+  #topbar,
+  #breadcrumb,
+  #content {
+    padding-left: max(16px, calc((100vw - 880px) / 2));
+    padding-right: max(16px, calc((100vw - 880px) / 2));
+  }
+  #content { padding-bottom: 48px; }
+
+  /* Sheets become centered modal dialogs. */
+  .sheet {
+    left: 50%;
+    right: auto;
+    bottom: 48px;
+    width: min(560px, 92vw);
+    transform: translateX(-50%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    max-height: min(75vh, 720px);
+  }
+  .sheet.hidden {
+    transform: translate(-50%, calc(120% + 60px));
+  }
+
+  #inbox-fab { bottom: 24px; right: 24px; }
+
+  /* Mouse-first affordances. */
+  .row.bookmark:hover,
+  .row.note:hover,
+  .workflow-row:hover { background: var(--surface-2); }
+  .home-actions { grid-template-columns: repeat(4, 1fr); }
+  .pins-grid { gap: 16px; }
+}
