@@ -156,11 +156,13 @@ window are stamped as gone from the source and stay in the archive.
 Saved posts and saved comments both appear in every client under:
 
 ```
-TabPaladin Imports/Reddit/Saved/<YYYY-MM>/
+Bookmarks/TabPaladin Imports/Reddit/
 ```
 
-Grouped by the month the post was created, so the tree looks the same on every
-read.
+Flat, newest first. The month grouping this used to have earned its keep while
+the folder was written into the bookmark tree and had to rebuild identically;
+the subtree is composed fresh on every read now, so the extra levels only cost
+clicks.
 
 ### How it holds together
 

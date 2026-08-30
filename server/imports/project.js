@@ -41,45 +41,26 @@ export function titleFor(item, provider) {
     return full.length > 180 ? full.slice(0, 177) + '…' : full;
 }
 
-// Group by the month the item was created rather than when it was imported.
-// Import time would scatter a first-run backfill of 1000 posts into one giant
-// folder; creation time is stable, so the tree looks the same on every read.
-export function monthKey(item) {
-    const ts = item.created_utc;
-    if (!ts) return 'undated';
-    const d = new Date(ts);
-    if (Number.isNaN(d.getTime())) return 'undated';
-    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-}
-
-// One provider's subtree: <Provider>/<List>/<YYYY-MM>/bookmarks. Item ids are
-// `imp:<sourceId>:<externalId>` so a client can hand them straight back to the
-// delete/file verbs.
+// One provider's subtree: a single <Provider> folder of bookmarks. Item ids
+// are `imp:<sourceId>:<externalId>` so a client can hand them straight back to
+// the delete/file verbs.
 export function buildProviderFolder({ source, items }) {
     const provider = source.provider;
-    const listTitle = source.config.listTitle || 'Saved';
 
-    const byMonth = new Map();
-    for (const item of items) {
-        const key = monthKey(item);
-        if (!byMonth.has(key)) byMonth.set(key, []);
-        byMonth.get(key).push(item);
-    }
-
-    // Newest month first; "undated" sorts last rather than colliding with real
-    // keys under a plain string sort.
-    const months = [...byMonth.keys()].sort((a, b) => {
-        if (a === 'undated') return 1;
-        if (b === 'undated') return -1;
-        return b.localeCompare(a);
-    });
-
-    const monthFolders = months.map(month => ({
-        id: `imp:src:${source.id}:${month}`,
+    // Flat: the items sit directly in the provider folder.
+    //
+    // They used to be nested <Provider>/<List>/<YYYY-MM>/, which put four
+    // levels between you and fifteen links. The month grouping earned its keep
+    // when the folder was written into the bookmark tree and had to be stable
+    // across rebuilds; the subtree is composed fresh on every read now, so the
+    // grouping only costs clicks. Newest first, which is the order the months
+    // were approximating anyway.
+    return {
+        id: `imp:src:${source.id}`,
         kind: 'folder',
-        title: month,
+        title: providerFolderTitle(provider),
         virtual: true,
-        children: byMonth.get(month)
+        children: items
             .slice()
             .sort((a, b) => String(b.created_utc || '').localeCompare(String(a.created_utc || '')))
             .map(item => ({
@@ -89,20 +70,6 @@ export function buildProviderFolder({ source, items }) {
                 url: item.url,
                 virtual: true
             }))
-    }));
-
-    return {
-        id: `imp:src:${source.id}`,
-        kind: 'folder',
-        title: providerFolderTitle(provider),
-        virtual: true,
-        children: [{
-            id: `imp:src:${source.id}:list`,
-            kind: 'folder',
-            title: listTitle,
-            virtual: true,
-            children: monthFolders
-        }]
     };
 }
 

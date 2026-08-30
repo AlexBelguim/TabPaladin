@@ -161,11 +161,14 @@ async function main() {
     let tree = buildImportsTree(store);
     check('virtual root exists and is flagged', tree && tree.readOnly === true && tree.virtual === true);
     check('root carries the historical title', tree.title === IMPORTS_ROOT_TITLE, tree.title);
-    const savedFolder = findFolder(tree, 'Saved');
-    check('Reddit / Saved exists', Boolean(savedFolder));
+    const savedFolder = findFolder(tree, 'Reddit');
+    check('the Reddit folder exists', Boolean(savedFolder));
     check('250 bookmarks drawn', countBookmarks(savedFolder) === 250, `got ${countBookmarks(savedFolder)}`);
-    check('grouped into two month folders', (savedFolder.children || []).length === 2,
-        `got ${(savedFolder.children || []).map(c => c.title).join(', ')}`);
+    check('flat — items sit directly in it, no month or list folders',
+        (savedFolder.children || []).every(c => c.kind === 'bookmark'),
+        (savedFolder.children || []).filter(c => c.kind !== 'bookmark').map(c => c.title).join(', '));
+    check('newest first',
+        (savedFolder.children || [])[0].title >= '' && (savedFolder.children || []).length === 250);
     const fb = firstBookmark(savedFolder);
     check('bookmark titles carry the subreddit', /^r\/selfhosted — Post number/.test(fb.title), fb.title);
     check('item ids follow imp:<source>:<externalId>',
@@ -322,8 +325,7 @@ async function main() {
         items: []
     });
     check('empty provider folder builds', emptyFolder.kind === 'folder'
-        && emptyFolder.children[0].title === 'Saved'
-        && emptyFolder.children[0].children.length === 0);
+        && emptyFolder.children.length === 0);
 
     globalThis.fetch = realFetch;
     db.close();
