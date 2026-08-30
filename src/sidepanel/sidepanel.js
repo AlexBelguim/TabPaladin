@@ -510,18 +510,12 @@ async function renderMainView({ regroup = true } = {}) {
     headerBar.querySelector('#mainRegroupBtn').addEventListener('click', () => renderMainView({ regroup: true }));
 
     const grid = document.createElement('div');
-    // Always a stacked list, one root per row.
-    //
-    // The side-by-side variant was tuned for the two or three focused folders
-    // this view used to show. Now that "nothing focused" means every top-level
-    // folder, it produced a row of tall narrow columns with the titles
-    // truncated to "T..", which is unreadable and wastes the whole viewport.
-    grid.className = 'roots-grid';
+    grid.className = 'roots-row';
     container.appendChild(grid);
 
-    // One column: Open Tabs, Workflows, Bookmarks. The archive is no longer a
-    // sibling here — it lives inside Bookmarks, where a collection of
-    // bookmarks belongs.
+    // Columns, side by side: Open Tabs, Workflows, Bookmarks. Each is a
+    // section you scan independently, so they sit next to each other rather
+    // than stacking and pushing the later ones below the fold.
     grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
     const rootsRow = grid;
 
@@ -1205,7 +1199,7 @@ async function renderSourceGrid(folderId) {
         sourceList.appendChild(buildOrganizeHeader('Sources', null));
 
         const grid = document.createElement('div');
-        grid.className = 'roots-grid'; // one section per row — see renderMainView
+        grid.className = 'roots-row'; // side by side — see renderMainView
         sourceList.appendChild(grid);
 
         for (const r of roots) {

@@ -418,11 +418,38 @@ ol {
   gap: 8px;
 }
 
-/* Outer stack: Open Tabs, then the row of folder roots. */
 .roots-grid {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* The sections, side by side. min-width:0 is load-bearing: without it a long
+   bookmark title sets the flex basis and pushes the row off screen, which is
+   what cut the cards off at the right edge. Columns wrap onto a second line on
+   a narrow window rather than overflowing. */
+.roots-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+}
+
+.roots-row > .source-folder-card {
+  flex: 1 1 320px;
+  min-width: 0;
+  max-height: 80vh;
+  overflow-y: auto;
+  align-self: stretch;
+}
+
+/* Keep the section name visible while scrolling a long column. */
+.roots-row > .source-folder-card > .source-folder-header {
+  position: sticky;
+  top: 0;
+  background-color: var(--surface-color);
+  z-index: 2;
 }
 
 .open-tabs-card {
