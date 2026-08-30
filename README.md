@@ -34,11 +34,15 @@ TabPaladin is a powerful browser extension that helps you **tame tab chaos** and
 - **Folder Suggestions** — Get intelligent folder recommendations
 - **Custom Hints** — Guide the AI with your own keywords
 
+### 🗄️ **Server-owned bookmarks** (needs the sync server)
+- **One tree, any browser** — your bookmarks live in the sync server's database, not in any browser's own bookmark store, so Chrome, Firefox, Opera and the phone all see the identical tree
+- **Git-style sync** — edit locally (works offline), then **Push**; **Pull** fetches the server's tree. A push is refused if another device pushed since your last pull, so nothing is silently overwritten
+- **Import from any browser** — one click copies a browser's existing bookmarks into the tree; the browser's own bookmarks are never touched again
+
 ### 📥 **Importers** (Optional, needs the sync server)
 - **Reddit saved posts** — Reddit only ever shows your most recent 1000 saves. TabPaladin sweeps the list on a schedule and keeps everything it has seen, so your archive outgrows the cap
 - **X & Instagram** — neither can be fetched (no free API on one, no personal saved list on the other), so share a post to TabPaladin from your phone and it lands in the same archive
-- **Ordinary bookmarks** — imports land in a normal folder, so workflows, pins, search and the AI organiser all work on them
-- **Managed folder** — nothing can be filed *into* it; move an import out and it stays filed, delete it and it stays deleted
+- **A read-only folder in your tree** — the archive appears as a normal-looking folder on every device; deleting an item tombstones it on the server, and dragging one out files a copy into your own tree
 - **One-way** — deleting an import in TabPaladin never un-saves anything on Reddit
 
 See [server/README.md](server/README.md#importers) for setup.
@@ -51,27 +55,33 @@ See [server/README.md](server/README.md#importers) for setup.
 
 ## 📦 Installation
 
-### Chrome
-1. Download or clone this repository
-2. Go to `chrome://extensions`
-3. Enable **Developer mode** (toggle in top right)
-4. Click **Load unpacked**
-5. Select the repository folder
+Two clients, one tree. The **extension** is the full desktop client — it's the
+only one that can capture open tabs into workflows and auto-sync them on tab
+close. The **web app** (served by the sync server) is the client for phones
+and for any machine without the extension.
 
-### Firefox
-1. Go to `about:debugging#/runtime/this-firefox`
-2. Click **Load Temporary Add-on**
-3. Select any file in the `firefox/` folder
+### Extension (desktop)
+
+- **Chrome**: `chrome://extensions` → Developer mode → **Load unpacked** → the repository folder
+- **Firefox**: `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → any file in `firefox/`
+
+### Web app (phone + anywhere else)
+
+Run the sync server (see [server/README.md](server/README.md)), open
+`https://<your-server>` and sign in. On a phone, install it as a PWA for
+share-sheet capture. To bring in a browser's existing bookmarks without the
+extension, export them from that browser's bookmark manager and upload the
+HTML file in **Settings → Import bookmarks** — works with any browser.
 
 ---
 
 ## 🎮 How to Use
 
-1. **Click the TabPaladin icon** in your toolbar to open the sidebar
-2. **Create Workflow** — Save all your current tabs
-3. **View Workflows** — See saved workflows, restore or delete them
+1. **Click the TabPaladin icon** in your toolbar to open the app
+2. **Create Workflow** — Save all your current tabs (extension)
+3. **View Workflows** — Restore, open, or delete saved sessions (both clients)
 4. **Organize Bookmarks** — Use AI to clean up your bookmark mess
-5. **Settings** — Configure AI features and preferences
+5. **Push / Pull** — git-style sync; edit offline, push when ready
 
 ---
 
@@ -79,14 +89,12 @@ See [server/README.md](server/README.md#importers) for setup.
 
 ```
 TabPaladin/
+├── server/                 # Node + SQLite sync server — owns the bookmark tree
+├── pwa/                    # The web app (desktop + phone), served by the server
+├── tools/                  # Headless tests and recovery scripts
 ├── manifest.json           # Chrome extension manifest (v3)
-├── firefox/
-│   └── manifest.json       # Firefox add-on manifest (v2, points to ../src/)
-├── src/                    # Shared source code (Chrome + Firefox)
-│   ├── background/         # Background script (polyfilled)
-│   ├── sidepanel/          # Main UI (HTML, CSS, JS)
-│   ├── content/            # Content scripts (video scroll)
-│   └── utils/              # Shared utilities
+├── firefox/                # Firefox add-on manifest (v2, points to ../src/)
+├── src/                    # Extension source (tab capture, workflows, organizer UI)
 └── assets/                 # Shared icons and images
 ```
 

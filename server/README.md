@@ -2,6 +2,19 @@
 
 Tiny Node + SQLite backend for the TabPaladin extension and PWA.
 
+**The server owns the bookmarks.** The canonical tree lives in the `items`
+table of `sync.db`; the extension and the PWA each hold a local working copy
+and sync it git-style — edit locally, **push** to upload, **pull** to replace
+the working copy with the server's tree. The browser's own bookmark store is
+never touched (a one-time *Import this browser's bookmarks* action copies it
+in). This replaced the old whole-browser-tree snapshot sync, which had to map
+browser-specific root folders ("Other Bookmarks" vs "Unfiled Bookmarks" vs
+Opera's "Unsorted Bookmarks") across vendors and broke whenever they disagreed.
+
+On the first boot after upgrading, the server converts the newest legacy
+snapshot into the items table automatically — notes, pins, workflows and all.
+Nothing is lost; old history rows stay readable.
+
 ## Run on TrueNAS (or any Docker host)
 
 ```bash
@@ -16,6 +29,35 @@ docker compose up -d --build
 The server listens on `http://<host>:18921`. Configure the same `TABPALADIN_TOKEN`
 in the extension settings (Backend section) and you're synced.
 
+## The tree
+
+`GET /api/tree` returns `{ version, roots }` — an array of top-level folders,
+no browser roots. Nodes are:
+
+```jsonc
+{ "id": "ab12cd34ef56aa00",       // permanent; survives every push/pull
+  "kind": "folder",                // folder | bookmark | note
+  "title": "Recipes",
+  "role": "notes",                 // folders only, optional: pins | notes | workflows
+  "url": "https://…",             // bookmarks only
+  "payload": { "content": "…" },  // notes: {content, createdAt, updatedAt}
+  "children": [] }                 // folders only
+```
+
+Roles replaced the old magic folder titles ("TabPaladin Notes" etc.) as the way
+clients find their app-managed roots.
+
+`PUT /api/tree` replaces the whole tree: `{ roots, baseVersion, deviceId }`.
+If `baseVersion` is not the server's current version — another device pushed in
+between — the push is refused with **409** and the client must pull first (or
+send `force: true`). Every accepted write bumps the version and lands a
+`{format: 2, roots}` row in the history table.
+
+The response of `GET /api/tree` also carries a **virtual imports subtree**
+(`id: "imports:root"`, flagged `virtual`/`readOnly`) composed at read time from
+the import archive. It is never stored, is stripped from any pushed tree, and
+can only be changed through the explicit import verbs below.
+
 ## Endpoints
 
 All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
@@ -23,17 +65,19 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | server status |
-| POST | `/api/push` | upload `{ snapshot, deviceId? }` |
-| GET | `/api/pull` | get latest snapshot |
-| GET | `/api/history` | list of past snapshot timestamps |
-| GET | `/api/history/:id` | fetch a specific past snapshot |
+| GET | `/api/tree` | the tree (+ virtual imports subtree) |
+| PUT | `/api/tree` | replace the tree `{ roots, baseVersion, deviceId?, force? }`; 409 on a stale baseVersion |
+| GET | `/api/tree/version` | cheap freshness probe |
+| GET | `/api/history` | list of past tree versions |
+| GET | `/api/history/:id` | fetch a specific past version |
+| POST | `/api/push`, GET `/api/pull` | **410 Gone** — the legacy snapshot sync, kept only to tell old clients to update |
 | GET | `/api/shared` | pending links inbox |
 | POST | `/api/shared` | add `{ url, title? }` |
 | DELETE | `/api/shared/:id` | remove one inbox entry |
 | DELETE | `/api/shared` | clear inbox |
 | POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`) |
 | GET | `/api/proposals` | list pending LLM note proposals |
-| POST | `/api/proposals/:id/approve` | apply a proposal to the latest snapshot (new snapshot row) |
+| POST | `/api/proposals/:id/approve` | apply a proposal to the tree (bumps the version) |
 | POST | `/api/proposals/:id/reject` | discard a proposal |
 | GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
 | POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content, notebook? }` for approval |
@@ -43,7 +87,8 @@ All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/he
 | DELETE | `/api/imports/:id` | remove a source; `?purge=1` also deletes its archive |
 | GET | `/api/imports/:id/items` | browse the archive (`limit`, `offset`) |
 | POST | `/api/imports/:id/run` | sweep now |
-| POST | `/api/imports/:id/reproject` | rebuild the bookmark folder from the archive |
+| POST | `/api/imports/:id/items/delete` | purge `{ externalIds }` from the archive (tombstoned) |
+| POST | `/api/imports/:id/items/file` | mark `{ externalIds }` as filed into the user's own tree |
 | POST | `/api/imports/:id/undismiss` | forget deleted-item tombstones so a sweep may restore them |
 | POST | `/api/imports/capture` | file a shared `{ url, title }` into its archive (X / Instagram) |
 | GET | `/api/imports/:id/authorize` | returns the provider consent URL |
@@ -56,13 +101,13 @@ The PWA's "🔗 Share with LLM" button calls `POST /api/share` and copies a link
 like `https://<host>/llm/<token>`. Paste it into any LLM chat with web access:
 the LLM can read all notes plus instructions (note styling, `[[wikilinks]]`, and
 that it must **never edit directly** — it can only `POST .../propose`). The
-proposal lands in the PWA's *Pending approval* block; approving applies it to
-the snapshot (creating or replacing the note with that title).
+proposal lands in the PWA's *Pending approval* block; approving writes the note
+straight into the items table (creating or replacing the note with that title).
 
 Links expire after 1 hour by default; override with `SHARE_TTL_MINUTES`.
-Unauthenticated routes expose only the notes folder, never the full snapshot.
+Unauthenticated routes expose only the notes, never the full tree.
 
-Notes are grouped into **notebooks** (subfolders of `TabPaladin Notes`);
+Notes are grouped into **notebooks** (subfolders of the notes root);
 proposals can include an optional `"notebook"` field and the share page lists
 notes grouped by notebook.
 
@@ -80,7 +125,7 @@ downvoted and hidden listings.
 
 The importer sweeps the list on a schedule and never drops what it has already seen,
 so the archive keeps growing past the cap. Items that fall off the end of Reddit's
-window are stamped as gone from the source and keep their bookmarks.
+window are stamped as gone from the source and stay in the archive.
 
 ### Connecting Reddit
 
@@ -95,29 +140,38 @@ window are stamped as gone from the source and keep their bookmarks.
 5. In the PWA: **Settings → Imports → Connect Reddit**, paste the client ID and
    secret, then authorise.
 
-Saved posts and saved comments both land as bookmarks under:
+Saved posts and saved comments both appear in every client under:
 
 ```
 TabPaladin Imports/Reddit/Saved/<YYYY-MM>/
 ```
 
-Grouped by the month the post was created, so re-projecting always produces the same
-tree. From there they are ordinary bookmarks — they sync to every device, and
-workflows, pins and the AI organiser all work on them.
+Grouped by the month the post was created, so the tree looks the same on every
+read.
 
 ### How it holds together
 
-The archive lives in the `import_items` table, not in the snapshot. `/api/push`
-replaces the snapshot wholesale with whatever a browser sends, so a device that pushes
-before it pulls would otherwise drop the whole import folder — and for anything Reddit
-has already forgotten, that snapshot was the only copy. Because the bookmark tree is a
-*projection* of the table, the next sweep just rebuilds it; `POST
-/api/imports/:id/reproject` forces that repair without touching the network.
+The archive's only home is the `import_items` table. What clients see as the
+`TabPaladin Imports` folder is a **virtual subtree composed at read time** and
+appended to every `GET /api/tree` response — it is never stored, a pushed tree
+never contains it, and no stale device can damage it. This replaced the old
+projection machinery, which wrote the folder into the snapshot and then had to
+reconcile, eject and guard its way around every device's pushes.
 
-A sweep that changes nothing writes no snapshot, so an idle importer does not churn
-the history or trigger pointless pulls on every device.
+The subtree is read-only in both clients. Two gestures on it are real
+features, and both are explicit server verbs rather than inferred from a push:
 
-**Imports are one-way.** Deleting an imported bookmark in TabPaladin never un-saves
+| you did | what happens |
+|---|---|
+| **deleted an item** (desktop app) | `POST /api/imports/:id/items/delete` — purged from the archive, plus a contentless tombstone so a later sweep does not re-import it |
+| **dragged an item out** into your own folder (desktop app) | `POST /api/imports/:id/items/file` — a copy lands in your tree, the archive keeps the row but stops drawing it, so it never shows twice |
+
+Deleting is unrecoverable — the archived copy is gone, and anything past Reddit's
+1000-item window cannot be fetched again. `POST /api/imports/:id/undismiss`
+clears the tombstones so a later sweep may restore items *still saved on Reddit*;
+it cannot bring back the rest.
+
+**Imports are one-way.** Deleting an imported item in TabPaladin never un-saves
 anything on Reddit.
 
 ### X and Instagram — captured, not swept
@@ -136,7 +190,7 @@ TabPaladin Imports/X/Saved/<YYYY-MM>/          "@nasa — Look at this nebula"
 TabPaladin Imports/Instagram/Saved/<YYYY-MM>/
 ```
 
-`POST /api/imports/capture { url, title }` does the routing. It classifies by
+`POST /api/imports/capture` does the routing. It classifies by
 host, creates the source on first use (nothing to set up), and returns
 `captured:false` for anything else so the client falls back to the ordinary
 shared-links inbox. Share-sheet tracking parameters (`?t=`, `?s=`, `?igsh=`) are
@@ -144,7 +198,7 @@ stripped before storing, or the same post shared twice would archive twice.
 
 These sources have no credentials and no sweep, so the clients drop the
 Authorise, Sweep and Pause controls for them. Everything else is identical —
-same folder layout, same protections, same move/delete behaviour.
+same folder layout, same delete/file semantics.
 
 Two things this is not: it captures only what you deliberately share from now
 on, with no backfill of anything you liked previously; and a share carries just
@@ -155,48 +209,14 @@ A true one-tap floating overlay is not possible here — drawing over other apps
 needs `SYSTEM_ALERT_WINDOW`, a native Android permission with no web equivalent.
 That would be a separate native app firing the same share intent.
 
-### The import folder is managed, not yours to rearrange
-
-The projection is a full rebuild, so a naive sweep would undo whatever you did:
-move an import out to file it and a second copy comes back, delete one and it
-returns within the hour. Instead, each projection first reads the folder and acts
-on what it finds:
-
-| you did | result |
-|---|---|
-| left it alone | stays where it is |
-| **moved it out** of the import folder | marked filed — still archived and counted, never projected back, so no duplicate |
-| **deleted it** | purged from the archive, plus a contentless tombstone so a later sweep does not re-import it |
-| put your *own* bookmark in the folder | ejected — moved back out beside the imports root, never deleted |
-
-Taking things **out** is the only edit the folder supports. Both clients refuse
-drops into the subtree and hide the controls that would write into it (new
-subfolder, split, batch select), but the browser's own bookmark manager has no
-such manners — hence the ejection, which is what keeps a stray bookmark from
-being deleted by the next rebuild.
-
-Deleting is unrecoverable — the archived copy is gone, and anything past Reddit's
-1000-item window cannot be fetched again. `POST /api/imports/:id/undismiss`
-clears the tombstones so a later sweep may restore items *still saved on Reddit*;
-it cannot bring back the rest.
-
-Two guards keep that from eating the archive, and both matter:
-
-- **No import folder in the snapshot** means the tree predates it — a device that
-  pushed before it pulled. Everything would look deleted, so nothing is
-  reconciled and the rebuild heals the folder instead.
-- **An item imported after the snapshot was taken** cannot have been deleted in
-  it; it did not exist yet. Without this, a stale device pushing an old copy of
-  the folder would purge every item swept since it last pulled.
-
-Both clients tint the folder and show a short explainer inside it, so this is
-visible before you start dragging things around.
-
 ### Tests
 
 ```bash
-node tools/test_imports.mjs
-node tools/test_share_sw.mjs
+node tools/test_items.mjs      # canonical tree store: migration, versioning, notes
+node tools/test_treestore.mjs  # extension working copy: managers, facade, sync, import verbs
+node tools/test_imports.mjs    # importers: archive, virtual subtree, tombstones
+node tools/test_share_sw.mjs   # PWA service worker share handling
+node tools/test_auth.mjs --url http://127.0.0.1:18921 --legacy <token>   # against a live server
 ```
 
 ### Sharing from a phone

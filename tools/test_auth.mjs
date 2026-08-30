@@ -44,7 +44,7 @@ check('status is public and reports no account yet',
     `hasAccount=${status0.json?.hasAccount}`);
 
 // 2. Protected route rejects an unauthenticated caller.
-const noAuth = await call('/api/pull');
+const noAuth = await call('/api/tree');
 check('pull without credentials is rejected', noAuth.status === 401, `HTTP ${noAuth.status}`);
 
 // 3. Setup creates the account and returns a session.
@@ -62,7 +62,7 @@ const reSetup = await call('/api/auth/setup', { method: 'POST', body: { username
 check('setup refuses an unauthenticated second account', reSetup.status === 403, `HTTP ${reSetup.status}`);
 
 // 6. The issued session works.
-const withSession = await call('/api/pull', { token: setup.json?.token });
+const withSession = await call('/api/tree', { token: setup.json?.token });
 check('session token grants access', withSession.status === 200, `HTTP ${withSession.status}`);
 
 // 7. Login with the right password.
@@ -79,20 +79,20 @@ check('unknown user rejected identically',
     `${unknown.status} "${unknown.json?.error}"`);
 
 // 9. A made-up token is rejected.
-const bogus = await call('/api/pull', { token: 'f'.repeat(64) });
+const bogus = await call('/api/tree', { token: 'f'.repeat(64) });
 check('invented token rejected', bogus.status === 401, `HTTP ${bogus.status}`);
 
 // 10. Logout revokes only that session.
 const other = await call('/api/login', { method: 'POST', body: { username: USER, password: PASS } });
 await call('/api/logout', { method: 'POST', token: login.json?.token });
-const afterLogout = await call('/api/pull', { token: login.json?.token });
-const otherStillOk = await call('/api/pull', { token: other.json?.token });
+const afterLogout = await call('/api/tree', { token: login.json?.token });
+const otherStillOk = await call('/api/tree', { token: other.json?.token });
 check('logout revokes that session', afterLogout.status === 401, `HTTP ${afterLogout.status}`);
 check('logout leaves other sessions alone', otherStillOk.status === 200, `HTTP ${otherStillOk.status}`);
 
 // 11. Legacy token keeps working during migration.
 if (LEGACY) {
-    const legacy = await call('/api/pull', { token: LEGACY });
+    const legacy = await call('/api/tree', { token: LEGACY });
     check('legacy shared token still works', legacy.status === 200, `HTTP ${legacy.status}`);
 }
 
@@ -102,7 +102,7 @@ const change = await call('/api/auth/password', {
     body: { currentPassword: PASS, newPassword: NEWPASS }
 });
 check('password change succeeds with the right current password', change.status === 200, `HTTP ${change.status}`);
-const oldSession = await call('/api/pull', { token: other.json?.token });
+const oldSession = await call('/api/tree', { token: other.json?.token });
 check('password change revokes existing sessions', oldSession.status === 401, `HTTP ${oldSession.status}`);
 const newLogin = await call('/api/login', { method: 'POST', body: { username: USER, password: NEWPASS } });
 check('new password works', newLogin.status === 200, `HTTP ${newLogin.status}`);
