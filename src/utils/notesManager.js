@@ -1,75 +1,20 @@
-// Notes feature — Obsidian-lite notes stored as bookmarks under a
-// "TabPaladin Notes" root folder, resolved through the same shared resolver
-// as the workflows root. Each note is one bookmark whose url is a
-// data:application/json payload, so it syncs via the browser account and
-// can't be accidentally opened as a page.
-import { StorageManager } from './storageManager.js';
+// Notes feature — Obsidian-lite notes stored as first-class note items under
+// the tree's notes root (the folder carrying role 'notes'). A note is a node
+// of kind 'note': the title is the note title, and the payload holds
+// {content, createdAt, updatedAt}. Notes used to be bookmarks with a
+// data:application/json url; the payload replaced that encoding when the tree
+// moved server-side.
+import { TreeStore } from './treeStore.js';
 
-const api = typeof browser !== 'undefined' ? browser : chrome;
-
-const NOTES_ROOT_TITLE = 'TabPaladin Notes';
-const NOTES_ROOT_SETTINGS_KEY = 'notesRootBookmarkId';
-const DATA_PREFIX = 'data:application/json,';
-
-async function findNotesRoot() {
-    return StorageManager.resolveRootFolder({
-        title: NOTES_ROOT_TITLE,
-        settingsKey: NOTES_ROOT_SETTINGS_KEY,
-        create: false
-    });
-}
-
-async function findOrCreateNotesRoot() {
-    return StorageManager.resolveRootFolder({
-        title: NOTES_ROOT_TITLE,
-        settingsKey: NOTES_ROOT_SETTINGS_KEY,
-        create: true
-    });
-}
-
-// Every folder literally titled "TabPaladin Notes". Normally one; a second
-// appears when the extension and the PWA each created their own before the
-// two ever synced. Reading from all of them means notes written on the phone
-// are never invisible here just because the roots disagree — writes still go
-// to the canonical root that resolveRootFolder picks.
-async function findAllNotesRoots() {
-    let folders = [];
-    try {
-        const matches = await api.bookmarks.search({ title: NOTES_ROOT_TITLE });
-        folders = matches.filter(m => !m.url && m.title === NOTES_ROOT_TITLE);
-    } catch (e) {
-        folders = [];
-    }
-    const canonical = await findNotesRoot();
-    const seen = new Set();
-    const out = [];
-    for (const f of [canonical, ...folders]) {
-        if (f && !seen.has(f.id)) { seen.add(f.id); out.push(f); }
-    }
-    return out;
-}
-
-function buildNoteUrl(payload) {
-    return DATA_PREFIX + encodeURIComponent(JSON.stringify(payload));
-}
-
-function parseNoteNode(node) {
-    if (!node || !node.url || !node.url.startsWith(DATA_PREFIX)) return null;
-    // The root-identity marker is also a data: bookmark and lives in this
-    // folder. It is bookkeeping, not a note.
-    if (node.title === '__tabpaladin_root__') return null;
-    let payload = {};
-    try {
-        payload = JSON.parse(decodeURIComponent(node.url.slice(DATA_PREFIX.length)));
-    } catch (e) {
-        return null;
-    }
+function toNote(node) {
+    if (!node || node.kind !== 'note') return null;
+    const p = node.payload || {};
     return {
         id: node.id,
         title: node.title,
-        content: payload.content || '',
-        createdAt: payload.createdAt || new Date(node.dateAdded || Date.now()).toISOString(),
-        updatedAt: payload.updatedAt || payload.createdAt || null
+        content: p.content || '',
+        createdAt: p.createdAt || null,
+        updatedAt: p.updatedAt || p.createdAt || null
     };
 }
 
@@ -121,78 +66,65 @@ function rewriteWikiLink(content, oldTitle, newTitle) {
     return content.replace(new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`, 'g'), `[[${newTitle}]]`);
 }
 
+// Walk one folder for notes; subfolders are notebooks, so recurse and tag each
+// note with the folder title it sits in.
+function collect(folder, notebook, out) {
+    for (const c of folder.children || []) {
+        const note = toNote(c);
+        if (note) {
+            note.notebook = notebook;
+            out.push(note);
+        } else if (c.kind === 'folder') {
+            collect(c, c.title || notebook, out);
+        }
+    }
+}
+
 export const NotesManager = {
-    NOTES_ROOT_TITLE,
+    NOTES_ROOT_TITLE: 'TabPaladin Notes',
     parseLinks,
     parseTaskLine,
     toggleTaskAtLine,
 
-    findNotesRoot,
-
-    findAllNotesRoots,
+    findNotesRoot: () => TreeStore.findRoleRoot('notes'),
 
     listNotes: async () => {
-        const roots = await findAllNotesRoots();
-        if (roots.length === 0) return [];
+        const root = await TreeStore.findRoleRoot('notes');
+        if (!root) return [];
         const notes = [];
-        const seen = new Set();
-        // Direct children are loose notes; subfolders are notebooks
-        // (created by the PWA), so recurse one level and tag each note
-        // with its notebook title.
-        const walk = async (parentId, notebook) => {
-            const children = await api.bookmarks.getChildren(parentId);
-            for (const c of children) {
-                const note = parseNoteNode(c);
-                if (note) {
-                    if (seen.has(note.id)) continue;
-                    seen.add(note.id);
-                    note.notebook = notebook;
-                    notes.push(note);
-                } else if (!c.url) {
-                    await walk(c.id, c.title || notebook);
-                }
-            }
-        };
-        for (const root of roots) {
-            try {
-                await walk(root.id, null);
-            } catch (e) {
-                // A duplicate root that vanished mid-read shouldn't lose the rest.
-                console.warn('[TabPaladin Notes] could not read notes root', root.id, e);
-            }
-        }
+        collect(root, null, notes);
         // Most recently updated first.
         notes.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
         return notes;
     },
 
     createNote: async (title, content = '') => {
-        const root = await findOrCreateNotesRoot();
+        const root = await TreeStore.ensureRoleRoot('notes');
         const now = new Date().toISOString();
-        const node = await api.bookmarks.create({
+        const node = await TreeStore.createNode({
             parentId: root.id,
+            kind: 'note',
             title,
-            url: buildNoteUrl({ v: 1, content, createdAt: now, updatedAt: now })
+            payload: { content, createdAt: now, updatedAt: now }
         });
-        return parseNoteNode(node);
+        return toNote(node);
     },
 
     updateNote: async (id, { title, content }) => {
-        const current = (await api.bookmarks.get(id))[0];
+        const current = await TreeStore.getNode(id);
         if (!current) throw new Error('Note not found');
-        const note = parseNoteNode(current);
+        const note = toNote(current);
         const oldTitle = current.title;
         const newTitle = title !== undefined ? title : oldTitle;
         const newContent = content !== undefined ? content : (note ? note.content : '');
 
-        await api.bookmarks.update(id, {
+        const updated = await TreeStore.updateNode(id, {
             title: newTitle,
-            url: buildNoteUrl({
-                v: 1,
+            payload: {
                 content: newContent,
                 createdAt: note ? note.createdAt : new Date().toISOString(),
                 updatedAt: new Date().toISOString()
-            })
+            }
         });
 
         // Rename: rewrite [[Old Title]] links in every other note so they don't break.
@@ -202,23 +134,22 @@ export const NotesManager = {
                 if (other.id === id) continue;
                 const rewritten = rewriteWikiLink(other.content, oldTitle, newTitle);
                 if (rewritten !== other.content) {
-                    await api.bookmarks.update(other.id, {
-                        url: buildNoteUrl({
-                            v: 1,
+                    await TreeStore.updateNode(other.id, {
+                        payload: {
                             content: rewritten,
                             createdAt: other.createdAt,
                             updatedAt: new Date().toISOString()
-                        })
+                        }
                     });
                 }
             }
         }
 
-        return (await api.bookmarks.get(id))[0];
+        return updated;
     },
 
     deleteNote: async (id) => {
-        await api.bookmarks.remove(id);
+        await TreeStore.removeNode(id);
     },
 
     // Notes whose content links to [[title]] (excluding the note itself).

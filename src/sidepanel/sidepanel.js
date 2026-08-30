@@ -10,21 +10,68 @@ import { TabGrouper, CONTEXT_KEYWORDS } from '../utils/tabGrouper.js';
 import { StorageManager } from '../utils/storageManager.js';
 import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
 import { AIService } from '../utils/aiService.js';
-import { BackendSync } from '../utils/backendSync.js';
+import { TreeStore } from '../utils/treeStore.js';
 import { NotesManager } from '../utils/notesManager.js';
 import { resolveServerUrl } from '../utils/config.js';
+
+// Every read and write goes against the local working copy of the synced tree
+// (chrome.bookmarks-compatible facade). The browser's own bookmarks are only
+// touched by the one-time "Import from this browser" action.
+const Tree = TreeStore.bookmarks;
 
 // --- State ---
 let currentTabs = [];
 let savedWorkflows = [];
+// Set when the startup pull fails, so the empty state can explain itself
+// rather than looking like data loss.
+let startupSyncError = null;
+
+// A dismissible banner at the top of the app explaining why there is no data.
+function showStartupSyncBanner() {
+    if (!startupSyncError) return;
+    if (document.getElementById('tp-sync-banner')) return;
+    const bar = document.createElement('div');
+    bar.id = 'tp-sync-banner';
+    bar.style.cssText = 'margin:8px; padding:10px 12px; border-radius:8px; background:rgba(245,158,11,0.12);'
+        + 'border:1px solid var(--warning-color, #f59e0b); color:#fcd34d; font-size:0.82rem; line-height:1.45;';
+    bar.innerHTML = `<strong>Couldn't load your bookmarks from the server.</strong><br>`
+        + `${escapeHtml(startupSyncError)}<br>`
+        + `<span style="color:#9ca3af;">Your data is on the server — nothing here has been deleted. `
+        + `Fix the server, then press ⬇ Pull.</span>`;
+    const host = document.querySelector('.container') || document.body;
+    host.insertBefore(bar, host.firstChild);
+}
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
-    // One-time migration of legacy storage.local workflows into bookmark-backed storage.
+    await TreeStore.load();
+
+    // First run after the update (or a fresh install): the working copy is
+    // empty. If we're already signed in, pull the server's tree silently so
+    // the app doesn't open onto nothing.
+    try {
+        const st = TreeStore.status();
+        if (st.isEmpty && !st.dirty) {
+            const cfg = await getSyncConfig();
+            if (cfg.token) {
+                await TreeStore.sync.pull(cfg);
+                await persistSyncStamp('pull');
+                console.log('[TabPaladin] Working copy was empty — pulled the server tree.');
+            }
+        }
+    } catch (e) {
+        // Never fail silently here: an empty working copy plus a failed pull
+        // looks exactly like "all my bookmarks are gone", when in fact the
+        // data is on the server and only the fetch failed.
+        console.warn('[TabPaladin] Initial pull failed:', e.message);
+        startupSyncError = e.message;
+    }
+
+    // One-time migration of legacy storage.local workflows into the tree.
     try {
         const result = await StorageManager.migrateLegacyIfNeeded();
         if (result.migrated > 0) {
-            console.log(`TabPaladin: Migrated ${result.migrated} legacy workflow(s) to bookmarks.`);
+            console.log(`TabPaladin: Migrated ${result.migrated} legacy workflow(s).`);
         }
     } catch (e) {
         console.warn("Migration check failed (non-fatal):", e);
@@ -33,13 +80,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadWorkflows();
     await loadCurrentTabs();
 
-    console.log("🛠️ StorageManager Loaded:", StorageManager);
-    console.log("Existing Workflows:", savedWorkflows);
-
     setupEventListeners();
 
-    // Live refresh: when bookmarks change (e.g. auto-sync removed a tab), refresh the workflow list.
-    const api = typeof browser !== 'undefined' ? browser : chrome;
+    // Live refresh: when the tree changes (an edit here, the background script
+    // auto-removing a closed workflow tab, or a pull), refresh what's visible.
     const scheduleRefresh = (() => {
         let pending = null;
         return () => {
@@ -54,15 +98,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             }, 250);
         };
     })();
-
-    if (api.bookmarks) {
-        if (api.bookmarks.onRemoved) api.bookmarks.onRemoved.addListener(scheduleRefresh);
-        if (api.bookmarks.onCreated) api.bookmarks.onCreated.addListener(scheduleRefresh);
-        if (api.bookmarks.onChanged) api.bookmarks.onChanged.addListener(scheduleRefresh);
-        if (api.bookmarks.onMoved) api.bookmarks.onMoved.addListener(scheduleRefresh);
-    }
+    TreeStore.onChanged(scheduleRefresh);
 
     setupDragAutoScroll();
+    showStartupSyncBanner();
 });
 
 // Auto-scroll the sidepanel when the cursor approaches the top/bottom edge during a drag.
@@ -203,7 +242,7 @@ function serializeBookmarkNode(node) {
 }
 
 async function exportBookmarkFolder(folderId) {
-    const subTree = await chrome.bookmarks.getSubTree(folderId);
+    const subTree = await Tree.getSubTree(folderId);
     if (!subTree || !subTree[0]) throw new Error('Folder not found');
     const payload = {
         version: 1,
@@ -225,11 +264,11 @@ async function recreateBookmarkChildren(parentId, children) {
         if (!node || typeof node !== 'object') continue;
         if (node.type === 'bookmark' && node.url) {
             try {
-                await chrome.bookmarks.create({ parentId, title: node.title || node.url, url: node.url });
+                await Tree.create({ parentId, title: node.title || node.url, url: node.url });
             } catch (e) { console.warn('Failed to create bookmark', node, e); }
         } else if (node.type === 'folder') {
             try {
-                const folder = await chrome.bookmarks.create({ parentId, title: node.title || 'Folder' });
+                const folder = await Tree.create({ parentId, title: node.title || 'Folder' });
                 await recreateBookmarkChildren(folder.id, node.children || []);
             } catch (e) { console.warn('Failed to create folder', node, e); }
         }
@@ -242,7 +281,7 @@ async function importBookmarkFolder(jsonText, parentId = '2') {
         throw new Error('Not a valid TabPaladin folder export (missing type:folder or title).');
     }
 
-    const siblings = await chrome.bookmarks.getChildren(parentId);
+    const siblings = await Tree.getChildren(parentId);
     const existing = siblings.find(s => !s.url && s.title === data.title);
 
     let finalTitle = data.title;
@@ -250,7 +289,7 @@ async function importBookmarkFolder(jsonText, parentId = '2') {
         const choice = await askFolderConflict(data.title);
         if (choice === 'cancel') return null;
         if (choice === 'overwrite') {
-            try { await chrome.bookmarks.removeTree(existing.id); }
+            try { await Tree.removeTree(existing.id); }
             catch (e) { throw new Error('Could not delete existing folder: ' + e.message); }
         } else if (choice === 'rename') {
             const newName = prompt(`New name for the imported folder:`, `${data.title} (imported)`);
@@ -259,7 +298,7 @@ async function importBookmarkFolder(jsonText, parentId = '2') {
         }
     }
 
-    const folder = await chrome.bookmarks.create({ parentId, title: finalTitle });
+    const folder = await Tree.create({ parentId, title: finalTitle });
     await recreateBookmarkChildren(folder.id, data.children || []);
     return folder.id;
 }
@@ -290,7 +329,7 @@ async function getFolderPath(folderId) {
     let id = folderId;
     let safety = 32;
     while (id && safety-- > 0) {
-        const nodes = await chrome.bookmarks.get(id).catch(() => []);
+        const nodes = await Tree.get(id).catch(() => []);
         const node = nodes && nodes[0];
         if (!node) break;
         const label = node.title ||
@@ -302,137 +341,9 @@ async function getFolderPath(folderId) {
     return parts.join(' > ');
 }
 
-async function buildFolderPathsMap() {
-    const pathMap = new Map();
-    const tree = await chrome.bookmarks.getTree();
-    
-    function walk(node, parentPath = '') {
-        if (node.url) return; // ignore bookmarks
-        
-        let currentPath = '';
-        if (node.id === '0') {
-            currentPath = '';
-        } else {
-            const label = node.title ||
-                (node.id === '1' ? 'Bookmarks Bar' : node.id === '2' ? 'Other Bookmarks' : node.id === '3' ? 'Mobile' : '');
-            currentPath = parentPath ? `${parentPath} > ${label}` : label;
-            if (currentPath) {
-                pathMap.set(currentPath, node.id);
-            }
-        }
-        
-        if (node.children) {
-            for (const child of node.children) {
-                walk(child, currentPath);
-            }
-        }
-    }
-    
-    if (tree && tree[0]) {
-        walk(tree[0], '');
-    }
-    return pathMap;
-}
-
-async function applyPullAndRemapSettings(snapshot, cfg, timestamp) {
-    const settings = await StorageManager.getSettings();
-    const oldFocusedIds = settings.focusedFolderIds || [];
-    const oldWfRootId = settings.workflowRootBookmarkId;
-    const oldNotesRootId = settings.notesRootBookmarkId;
-
-    // Dynamically discover browser root folder IDs (works for Chrome, Opera, Brave, Edge, Firefox).
-    const tree = await chrome.bookmarks.getTree();
-    const browserRootIds = new Set((tree[0].children || []).map(c => String(c.id)));
-
-    // 1. Map old IDs to their absolute path names (browser roots keep their ID directly)
-    const pathMap = {};
-    for (const id of oldFocusedIds) {
-        if (browserRootIds.has(id)) {
-            pathMap[id] = id;
-            continue;
-        }
-        const path = await getFolderPath(id);
-        if (path) {
-            pathMap[id] = path;
-        }
-    }
-
-    let wfRootPath = null;
-    if (oldWfRootId && !browserRootIds.has(oldWfRootId)) {
-        wfRootPath = await getFolderPath(oldWfRootId);
-    }
-
-    let notesRootPath = null;
-    if (oldNotesRootId && !browserRootIds.has(oldNotesRootId)) {
-        notesRootPath = await getFolderPath(oldNotesRootId);
-    }
-
-    // 2. Perform the destructive pull
-    await BackendSync.applyPull(snapshot);
-
-    // Every bookmark was just deleted and recreated, so any cached root id
-    // refers to a node that no longer exists.
-    StorageManager.resetRootCache();
-
-    // Heal duplicate app roots straight away.
-    //
-    // A pull recreates exactly what the snapshot holds, so if the snapshot
-    // itself carries two "TabPaladin Workflows" folders, consolidating by hand
-    // fixes only the local copy and the duplicate is back on the next sync.
-    // That is why the warning kept reappearing after every pull. Merging here
-    // ends the loop regardless of how the second folder got there, and the next
-    // push writes the healed tree back so the snapshot stops carrying it.
-    for (const rootTitle of ['TabPaladin Workflows', 'TabPaladin Notes', 'TabPaladin Pinned']) {
-        try {
-            const merged = await StorageManager.consolidateDuplicateRoots(rootTitle);
-            if (merged > 0) console.log(`[TabPaladin Pull] Merged ${merged} duplicate "${rootTitle}" folder(s).`);
-        } catch (e) {
-            console.warn('[TabPaladin Pull] Could not consolidate', rootTitle, e);
-        }
-    }
-
-    // 3. Traversal/Search the newly recreated tree to map paths back to new IDs
-    const newPathToIdMap = await buildFolderPathsMap();
-
-    // 4. Resolve the new IDs from the paths
-    const newFocusedIds = [];
-    for (const id of oldFocusedIds) {
-        if (browserRootIds.has(id)) {
-            newFocusedIds.push(id);
-            continue;
-        }
-        const path = pathMap[id];
-        if (path && newPathToIdMap.has(path)) {
-            newFocusedIds.push(newPathToIdMap.get(path));
-        } else {
-            console.warn(`[TabPaladin] Could not remap focused folder path: "${path}"`);
-        }
-    }
-
-    let newWfRootId = oldWfRootId;
-    if (wfRootPath && newPathToIdMap.has(wfRootPath)) {
-        newWfRootId = newPathToIdMap.get(wfRootPath);
-    }
-
-    let newNotesRootId = oldNotesRootId;
-    if (notesRootPath && newPathToIdMap.has(notesRootPath)) {
-        newNotesRootId = newPathToIdMap.get(notesRootPath);
-    }
-
-    // 5. Update settings
-    const updated = {
-        ...settings,
-        focusedFolderIds: newFocusedIds,
-        workflowRootBookmarkId: newWfRootId,
-        notesRootBookmarkId: newNotesRootId,
-        backend: {
-            ...cfg,
-            lastSyncAt: timestamp,
-            lastSyncKind: 'pull'
-        }
-    };
-    await StorageManager.saveSettings(updated);
-}
+// Node ids survive push/pull now, so there is nothing to remap after a sync —
+// the old path-capture/remap machinery that lived here is gone with the
+// destructive pull it compensated for.
 
 // Module-level state for the main view (AI groups are mutable in-memory; tabs are sourced live).
 let mainViewState = {
@@ -442,7 +353,7 @@ let mainViewState = {
 
 async function getAllBookmarkUrls() {
     const urls = new Set();
-    const tree = await chrome.bookmarks.getTree();
+    const tree = await Tree.getTree();
     function walk(node) {
         if (node.url) urls.add(node.url);
         (node.children || []).forEach(walk);
@@ -852,7 +763,7 @@ async function renderWorkflows() {
         return;
     }
 
-    const children = await chrome.bookmarks.getChildren(wfRoot.id);
+    const children = await Tree.getChildren(wfRoot.id);
     const wfFolders = children.filter(c => !c.url);
     if (wfFolders.length === 0) {
         list.innerHTML = '<li class="empty-state">No saved workflows.</li>';
@@ -864,7 +775,7 @@ async function renderWorkflows() {
     list.style.listStyle = 'none';
     list.style.padding = '0';
     for (const wf of wfFolders) {
-        const wfChildren = await chrome.bookmarks.getChildren(wf.id);
+        const wfChildren = await Tree.getChildren(wf.id);
         const card = renderFolderCard({
             id: wf.id,
             title: wf.title,
@@ -1064,17 +975,10 @@ let currentNavStack = []; // Stack of {id, title} for breadcrumbs.
 // Virtual root sentinel: shown when multiple focused folders are selected in settings.
 const VIRTUAL_ROOT_ID = '__virtual_root__';
 
-// Cache the duplicate count so the settings UI can surface it without re-querying.
-let _wfDuplicateCount = 0;
-
 async function findWorkflowRootSilent() {
     try {
-        // Delegate to StorageManager so save and render always resolve the same
-        // workflows root (previously two different resolvers could pick
-        // different folders when duplicates existed).
-        const root = await StorageManager.findWorkflowRoot();
-        _wfDuplicateCount = StorageManager.getWorkflowRootDuplicateCount();
-        return root;
+        // Role lookup on the tree — duplicates can't exist any more.
+        return await StorageManager.findWorkflowRoot();
     } catch (e) {
         return null;
     }
@@ -1090,6 +994,46 @@ function isInternalBookmark(node) {
 }
 function isVisibleBookmark(node) {
     return node && node.url && !isInternalBookmark(node);
+}
+
+// Deleting or moving a row that lives inside the imports archive goes through
+// the server's explicit verbs instead of a tree edit: delete tombstones it so a
+// sweep cannot bring it back, and moving it out files a copy into your own tree
+// while the archive stops drawing it.
+// Split a batch of node ids into archived import items and ordinary nodes.
+// Refuses up front when the batch contains the archive's own folders (month /
+// provider ids like `imp:src:…`): those have no delete/file verb, and letting
+// the batch start would tombstone some items and then die mid-loop on the
+// folder, leaving a half-applied operation.
+function partitionImportIds(ids) {
+    const strIds = ids.map(String);
+    if (strIds.some(id => id.startsWith('imp:src:') || id === 'imports:root')) {
+        throw new Error('Import folders are managed by the server — act on the items inside them instead.');
+    }
+    return {
+        importIds: strIds.filter(id => TreeStore.imports.parse(id)),
+        plainIds: strIds.filter(id => !TreeStore.imports.parse(id))
+    };
+}
+
+async function removeBookmarksSmart(ids) {
+    const { importIds, plainIds } = partitionImportIds(ids);
+    if (importIds.length) {
+        await TreeStore.imports.deleteItems(await getSyncConfig(), importIds);
+    }
+    for (const id of plainIds) {
+        await Tree.remove(id);
+    }
+}
+
+async function moveBookmarksSmart(ids, targetFolderId) {
+    const { importIds, plainIds } = partitionImportIds(ids);
+    if (importIds.length) {
+        await TreeStore.imports.fileItems(await getSyncConfig(), importIds, targetFolderId);
+    }
+    for (const id of plainIds) {
+        await Tree.move(id, { parentId: targetFolderId });
+    }
 }
 
 // Open an array of bookmark-shaped {url, title} items as tabs in a new window.
@@ -1109,7 +1053,7 @@ async function openBookmarkInCurrentWindow(url) {
 }
 
 async function openWorkflowAsTabs(folderId, folderTitle) {
-    const children = await chrome.bookmarks.getChildren(folderId);
+    const children = await Tree.getChildren(folderId);
     const bookmarks = children.filter(isVisibleBookmark);
     if (bookmarks.length === 0) {
         alert(`"${folderTitle}" has no bookmarks to open.`);
@@ -1189,7 +1133,7 @@ async function renderSourceGrid(folderId) {
     // can open the parent breadcrumb level via Back, or expand the folder card from above.
     // For now: if the breadcrumb folder has loose bookmarks, render them as a section at the top.
     if (content.looseCount > 0) {
-        const looseChildren = (await chrome.bookmarks.getChildren(content.id)).filter(isVisibleBookmark);
+        const looseChildren = (await Tree.getChildren(content.id)).filter(isVisibleBookmark);
         if (looseChildren.length > 0) {
             sourceList.appendChild(renderTopLevelLooseSection(content.id, looseChildren));
         }
@@ -1247,7 +1191,7 @@ function buildOrganizeHeader(title, parentFolderId) {
             const name = prompt(`Name for new folder inside "${title}":`);
             if (!name) return;
             try {
-                const created = await chrome.bookmarks.create({ parentId: parentFolderId, title: name });
+                const created = await Tree.create({ parentId: parentFolderId, title: name });
                 console.log('[TabPaladin] Created folder', created);
                 // Refresh the top-level view if we're at this folder's breadcrumb.
                 const top = currentNavStack[currentNavStack.length - 1];
@@ -1292,7 +1236,7 @@ function renderFolderCard(sub, depth = 0) {
     // inImports is inherited from the parent card, so the whole subtree is
     // locked rather than just the root — dropping into Reddit/Saved/2026-08 is
     // exactly as pointless as dropping into the root.
-    const isImportsRoot = sub.title === IMPORTS_ROOT_TITLE;
+    const isImportsRoot = sub.title === IMPORTS_ROOT_TITLE || sub.readOnly === true;
     const isImports = isImportsRoot || sub.inImports === true;
     header.className = 'source-folder-header' + (isImports ? ' is-imports' : '');
     card.dataset.imports = isImports ? '1' : '';
@@ -1385,7 +1329,7 @@ function renderFolderCard(sub, depth = 0) {
         const name = prompt(`Name for new folder inside "${sub.title}":`);
         if (!name) return;
         try {
-            await chrome.bookmarks.create({ parentId: sub.id, title: name.trim() });
+            await Tree.create({ parentId: sub.id, title: name.trim() });
             // Expand the card so the user sees the new folder.
             const caret = header.querySelector('.folder-caret');
             if (body.style.display === 'none') {
@@ -1413,7 +1357,7 @@ function renderFolderCard(sub, depth = 0) {
                 : `Delete empty folder "${sub.title}"?`;
             if (!confirm(msg)) return;
             try {
-                await chrome.bookmarks.removeTree(sub.id);
+                await Tree.removeTree(sub.id);
                 // Remove the card from the DOM with a quick fade-out.
                 card.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
                 card.style.opacity = '0';
@@ -1444,7 +1388,7 @@ function renderFolderCard(sub, depth = 0) {
         if (e.target.closest('button') || e.target.closest('input')) return;
         e.preventDefault();
         try {
-            const kids = await chrome.bookmarks.getChildren(sub.id);
+            const kids = await Tree.getChildren(sub.id);
             const bookmarks = kids.filter(isVisibleBookmark);
             if (bookmarks.length === 0) return;
             await openBookmarksAsNewWindow(bookmarks);
@@ -1537,11 +1481,11 @@ function renderFolderCard(sub, depth = 0) {
                 const g = JSON.parse(groupPayload);
                 if (!g.items || g.items.length === 0) return;
                 // Create subfolder under target with the group name (reuse existing if name matches).
-                const siblings = await chrome.bookmarks.getChildren(sub.id);
+                const siblings = await Tree.getChildren(sub.id);
                 const existing = siblings.find(s => !s.url && s.title.toLowerCase() === g.name.toLowerCase());
-                const folderId = existing ? existing.id : (await chrome.bookmarks.create({ parentId: sub.id, title: g.name })).id;
+                const folderId = existing ? existing.id : (await Tree.create({ parentId: sub.id, title: g.name })).id;
                 for (const it of g.items) {
-                    await chrome.bookmarks.create({ parentId: folderId, title: it.title || it.url, url: it.url });
+                    await Tree.create({ parentId: folderId, title: it.title || it.url, url: it.url });
                     if (closeTabs && it.tabId != null) closedTabIds.push(it.tabId);
                 }
                 // Remove group from main-view state.
@@ -1560,16 +1504,16 @@ function renderFolderCard(sub, depth = 0) {
                     if (shouldNestByDomain) {
                         let domain = 'Tabs';
                         try { domain = new URL(items[0].url).hostname.replace(/^www\./, ''); } catch (err) {}
-                        const siblings = await chrome.bookmarks.getChildren(sub.id);
+                        const siblings = await Tree.getChildren(sub.id);
                         const takenNames = new Set(siblings.filter(s => !s.url).map(s => s.title));
                         let name = domain, suffix = 2;
                         while (takenNames.has(name)) name = `${domain} (${suffix++})`;
-                        const subfolder = await chrome.bookmarks.create({ parentId: sub.id, title: name });
+                        const subfolder = await Tree.create({ parentId: sub.id, title: name });
                         targetFolderId = subfolder.id;
                     }
 
                     for (const it of items) {
-                        await chrome.bookmarks.create({ parentId: targetFolderId, title: it.title || it.url, url: it.url });
+                        await Tree.create({ parentId: targetFolderId, title: it.title || it.url, url: it.url });
                         if (closeTabs && it.tabId != null) closedTabIds.push(it.tabId);
                     }
 
@@ -1584,7 +1528,7 @@ function renderFolderCard(sub, depth = 0) {
             } else if (tabPayload) {
                 // Single tab → one bookmark in this folder.
                 const t = JSON.parse(tabPayload);
-                await chrome.bookmarks.create({ parentId: sub.id, title: t.title || t.url, url: t.url });
+                await Tree.create({ parentId: sub.id, title: t.title || t.url, url: t.url });
                 if (closeTabs && t.tabId != null) closedTabIds.push(t.tabId);
                 // Remove tab from its source AI group, if any.
                 if (t.sourceGroupId) {
@@ -1594,19 +1538,16 @@ function renderFolderCard(sub, depth = 0) {
             } else if (bookmarkIdsJson) {
                 let ids = [];
                 try { ids = JSON.parse(bookmarkIdsJson); } catch (err) { console.warn('Bad bookmark-ids payload'); }
-                for (const id of ids) {
-                    try { await chrome.bookmarks.move(String(id), { parentId: sub.id }); }
-                    catch (err) { console.warn('Failed to move bookmark', id, err); }
-                }
+                await moveBookmarksSmart(ids.map(String), sub.id);
             } else if (bookmarkId) {
-                await chrome.bookmarks.move(bookmarkId, { parentId: sub.id });
+                await moveBookmarksSmart([bookmarkId], sub.id);
             } else if (draggedFolderId) {
                 if (draggedFolderId === sub.id) { console.log('[TabPaladin] Skipped self-drop'); return; }
                 if (await isAncestorOf(draggedFolderId, sub.id)) {
                     alert("Can't move a folder into one of its own descendants.");
                     return;
                 }
-                await chrome.bookmarks.move(draggedFolderId, { parentId: sub.id });
+                await Tree.move(draggedFolderId, { parentId: sub.id });
             } else {
                 console.log('[TabPaladin] Drop ignored — no payload');
                 return;
@@ -1705,9 +1646,7 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
             e.stopPropagation();
             if (!confirm(`Delete all ${count} bookmarks under "${d}"?`)) return;
             try {
-                for (const id of ids) {
-                    await chrome.bookmarks.remove(id);
-                }
+                await removeBookmarksSmart(ids);
                 group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
                 group.style.opacity = '0';
                 group.style.transform = 'translateX(20px)';
@@ -1767,7 +1706,7 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
                 e.stopPropagation();
                 if (!confirm(`Delete bookmark "${b.title || b.url}"?`)) return;
                 try {
-                    await chrome.bookmarks.remove(b.id);
+                    await removeBookmarksSmart([b.id]);
                     row.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
                     row.style.opacity = '0';
                     row.style.transform = 'translateX(20px)';
@@ -1814,7 +1753,7 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
 // not just its root.
 async function renderFolderBody(folderId, body, depth = 0, inImports = false) {
     // Recursive: show subfolders (as nested cards) + loose bookmarks (grouped by domain).
-    const tree = await chrome.bookmarks.getSubTree(folderId);
+    const tree = await Tree.getSubTree(folderId);
     if (!tree || !tree[0]) return;
     const children = tree[0].children || [];
     const subfolders = children.filter(c => !c.url);
@@ -1833,7 +1772,7 @@ async function renderFolderBody(folderId, body, depth = 0, inImports = false) {
 
     // Subfolders first — each as a nested expandable card.
     for (const sf of subfolders) {
-        const sfChildren = await chrome.bookmarks.getChildren(sf.id);
+        const sfChildren = await Tree.getChildren(sf.id);
         const card = renderFolderCard({
             id: sf.id,
             title: sf.title,
@@ -1856,7 +1795,7 @@ async function isAncestorOf(ancestorId, descendantId) {
     let current = descendantId;
     let safety = 64;
     while (current && safety-- > 0) {
-        const arr = await chrome.bookmarks.get(current).catch(() => []);
+        const arr = await Tree.get(current).catch(() => []);
         const node = arr && arr[0];
         if (!node) return false;
         const parent = node.parentId;
@@ -1878,7 +1817,7 @@ async function refreshFolderBodyIfOpen(folderId) {
 
         // Update header stats regardless of body open/closed
         try {
-            const children = await chrome.bookmarks.getChildren(folderId);
+            const children = await Tree.getChildren(folderId);
             const folderCount = children.filter(c => !c.url).length;
             const fileCount = children.filter(isVisibleBookmark).length;
             const statsEl = card.querySelector('.folder-stats');
@@ -1891,7 +1830,7 @@ async function refreshFolderBodyIfOpen(folderId) {
         } catch (e) { /* folder gone — fine */ }
 
         if (body && body.style.display !== 'none') {
-            await renderFolderBody(folderId, body, depth, inImports);
+            await renderFolderBody(folderId, body, depth, card.dataset.imports === '1');
         }
     }
 }
@@ -2542,12 +2481,12 @@ async function applyTabModeGroups(approvedGroups) {
 
         if (group.newSubfolder && group.newSubfolder.trim() !== '') {
             try {
-                const siblings = await chrome.bookmarks.getChildren(folderId);
+                const siblings = await Tree.getChildren(folderId);
                 const existing = siblings.find(s => !s.url && s.title.toLowerCase() === group.newSubfolder.toLowerCase());
                 if (existing) {
                     folderId = existing.id;
                 } else {
-                    const created = await chrome.bookmarks.create({
+                    const created = await Tree.create({
                         parentId: folderId,
                         title: group.newSubfolder
                     });
@@ -2557,7 +2496,7 @@ async function applyTabModeGroups(approvedGroups) {
         }
 
         for (const item of group.items) {
-            await chrome.bookmarks.create({
+            await Tree.create({
                 parentId: folderId,
                 title: item.title,
                 url: item.url
@@ -2982,8 +2921,14 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                     ${settings.backend && settings.backend.lastSyncAt ? 'Last sync: ' + new Date(settings.backend.lastSyncAt).toLocaleString() : ''}
                 </div>
                 <div style="font-size:0.7rem; color:#666; margin-top:6px;">
-                    Push uploads your full bookmark tree as a timestamped snapshot. Pull <strong>replaces</strong> your local bookmarks (Bookmarks Bar / Other Bookmarks / Mobile) with the latest snapshot from the server.
+                    Your bookmarks live on the server and in this local working copy — the browser's own
+                    bookmarks are not touched. Push uploads your local edits; Pull replaces the working copy
+                    with the server's tree. A push is refused if another device pushed since your last pull.
                 </div>
+                <button id="browser-import-btn" class="sm-btn" style="width:100%; margin-top:10px;"
+                        title="Copy this browser's own bookmarks into the tree as a new top-level folder (one-time)">
+                    📚 Import this browser's bookmarks
+                </button>
             </div>
 
             <!-- 5. Imports -->
@@ -3089,33 +3034,10 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             card.dataset.id = folder.id;
 
             const icon = folder.isWorkflow ? '🛡️' : '📁';
-            let subtitleHtml = '';
-            if (folder.isWorkflow) {
-                const parentOptionsHtml = (folders || []).map(f =>
-                    `<option value="${f.id}" ${f.id === wfRoot.parentId ? 'selected' : ''}>${escapeHtml(f.title)}</option>`
-                ).join('');
-                const dupeWarningHtml = _wfDuplicateCount > 0
-                    ? `<div style="margin-top:4px; font-size:0.72rem; color:var(--warning-color); display:flex; align-items:center; gap:6px;">
-                           <span>⚠️ ${_wfDuplicateCount} duplicate Workflows folder(s) detected.</span>
-                           <button class="sm-btn wf-consolidate-btn" style="padding:2px 6px;">Consolidate</button>
-                       </div>`
-                    : '';
-                subtitleHtml = `
-                    <div style="display:flex; align-items:center; gap:6px; margin-top:4px; font-size:0.72rem; color:var(--text-muted);">
-                        <span>Located in:</span>
-                        <select class="wf-location-select" title="Move the workflows folder to a different root"
-                                style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); color:var(--text-color); padding:2px 4px; border-radius:4px; font-size:0.72rem;">
-                            ${parentOptionsHtml}
-                        </select>
-                    </div>
-                    ${dupeWarningHtml}
-                `;
-            }
             card.innerHTML = `
                 <div class="icon" style="margin:0; width:auto;">${icon}</div>
                 <div style="flex:1; width:auto; overflow:hidden; min-width:0;">
                     <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(folder.title)}</div>
-                    ${subtitleHtml}
                 </div>
                 <button class="sm-btn folder-export-btn" title="Export this folder + contents as JSON" data-id="${folder.id}" style="padding:4px 8px; flex-shrink:0;">📤</button>
                 <div class="checkbox-indicator" style="font-size:1.2rem; width:auto; flex-shrink:0; color:${isChecked ? '#10b981' : 'transparent'};">✓</div>
@@ -3123,7 +3045,6 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
             card.addEventListener('click', (e) => {
                 if (e.target.closest('.folder-export-btn')) return;
-                if (e.target.closest('.wf-location-select')) return;
                 card.classList.toggle('selected');
                 const indicator = card.querySelector('.checkbox-indicator');
                 indicator.style.color = card.classList.contains('selected') ? '#10b981' : 'transparent';
@@ -3136,58 +3057,6 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 try { await exportBookmarkFolder(folder.id); }
                 catch (err) { alert('Export failed: ' + err.message); }
             });
-
-            // Workflows folder: Consolidate button — move children from duplicate
-            // TabPaladin Workflows folders into the chosen one, then delete duplicates.
-            const consolidateBtn = card.querySelector('.wf-consolidate-btn');
-            if (consolidateBtn && folder.isWorkflow) {
-                consolidateBtn.addEventListener('click', async (e) => {
-                    e.stopPropagation();
-                    if (!confirm(`Found ${_wfDuplicateCount} duplicate Workflows folder(s).\n\nMove their contents into "${folder.title}" and delete the duplicates?\n\nThis is irreversible.`)) return;
-                    try {
-                        const matches = await chrome.bookmarks.search({ title: 'TabPaladin Workflows' });
-                        const dupes = matches.filter(m => !m.url && m.title === 'TabPaladin Workflows' && m.id !== folder.id);
-                        for (const dupe of dupes) {
-                            const kids = await chrome.bookmarks.getChildren(dupe.id);
-                            for (const k of kids) {
-                                try { await chrome.bookmarks.move(k.id, { parentId: folder.id }); }
-                                catch (err) { console.warn('Failed to move during consolidate', k.id, err); }
-                            }
-                            try { await chrome.bookmarks.removeTree(dupe.id); }
-                            catch (err) { console.warn('Failed to remove duplicate', dupe.id, err); }
-                        }
-                        alert(`Consolidated ${dupes.length} duplicate folder(s).`);
-                        // Re-render settings so the warning clears and counts update.
-                        document.getElementById('settingsToggleBtn').click();
-                        document.getElementById('settingsToggleBtn').click();
-                    } catch (err) {
-                        alert('Consolidate failed: ' + err.message);
-                    }
-                });
-            }
-
-            // Workflows folder: dropdown to move it between top-level roots.
-            const locSel = card.querySelector('.wf-location-select');
-            if (locSel && folder.isWorkflow) {
-                let currentParentId = wfRoot.parentId;
-                locSel.addEventListener('click', (e) => e.stopPropagation());
-                locSel.addEventListener('change', async (e) => {
-                    e.stopPropagation();
-                    const newParentId = e.target.value;
-                    if (newParentId === currentParentId) return;
-                    try {
-                        await chrome.bookmarks.move(wfRoot.id, { parentId: newParentId });
-                        currentParentId = newParentId;
-                        // Persist the ID so future lookups stick to this specific folder.
-                        const s = await StorageManager.getSettings();
-                        await StorageManager.saveSettings({ ...s, workflowRootBookmarkId: wfRoot.id });
-                        console.log('[TabPaladin] Moved workflows folder to', newParentId);
-                    } catch (err) {
-                        alert('Move failed: ' + err.message);
-                        e.target.value = currentParentId;
-                    }
-                });
-            }
 
             grid.appendChild(card);
         });
@@ -3234,7 +3103,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
         for (const id of customIds) {
             try {
-                const nodes = await chrome.bookmarks.get(id);
+                const nodes = await Tree.get(id);
                 const node = nodes && nodes[0];
                 if (!node) continue;
                 const path = await getFolderPath(id);
@@ -3612,7 +3481,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         if (!cfg.url) { alert('Enter a server URL first.'); return; }
         writeBackendStatus('Testing…');
         try {
-            const h = await BackendSync.health(cfg);
+            const h = await TreeStore.sync.health(cfg);
             writeBackendStatus(h && h.ok ? `Server OK (auth ${h.configured ? 'ready' : 'MISSING'})` : 'Unexpected response');
         } catch (e) {
             writeBackendStatus('Test failed: ' + e.message);
@@ -3620,50 +3489,29 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     });
 
     document.getElementById('backend-push-btn').addEventListener('click', async () => {
-        const cfg = getBackendConfig();
-        if (!cfg.token) { alert('Not signed in. Open Settings and sign in to the sync server.'); return; }
-        if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
-        writeBackendStatus('Pushing…');
-        try {
-            const settings = await StorageManager.getSettings();
-            const focusedFolderIds = settings.focusedFolderIds || [];
-            const wfRoot = await findWorkflowRootSilent();
-            const workflowRootId = wfRoot ? wfRoot.id : null;
-            const notesRoot = await NotesManager.findNotesRoot();
-            const notesRootId = notesRoot ? notesRoot.id : null;
-            const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId, notesRootId);
-            await persistBackendConfig({ lastSyncAt: ts, lastSyncKind: 'push' });
-            writeBackendStatus('Pushed at ' + new Date(ts).toLocaleString());
-        } catch (e) {
-            writeBackendStatus('Push failed: ' + e.message);
-        }
+        writeBackendStatus(await doPush() || '');
     });
 
     document.getElementById('backend-pull-btn').addEventListener('click', async () => {
-        const cfg = getBackendConfig();
-        if (!cfg.token) { alert('Not signed in. Open Settings and sign in to the sync server.'); return; }
-        writeBackendStatus('Checking latest…');
+        writeBackendStatus(await doPull() || '');
+    });
+
+    document.getElementById('browser-import-btn').addEventListener('click', async () => {
+        if (!confirm(
+            'Copy this browser\'s own bookmarks into TabPaladin?\n\n' +
+            'They land in a new "Imported <date>" top-level folder in your working copy — ' +
+            'the browser\'s bookmarks themselves are not changed. Push afterwards to sync them.'
+        )) return;
         try {
-            const data = await BackendSync.pullLatestInfo(cfg);
-            if (!data || !data.snapshot) {
-                writeBackendStatus('No snapshot on server yet.');
+            const result = await TreeStore.importFromBrowser();
+            if (!result.imported) {
+                writeBackendStatus('Nothing to import — this browser has no bookmarks.');
                 return;
             }
-            const when = new Date(data.timestamp).toLocaleString();
-            const yes = confirm(
-                `Replace your local bookmarks with the snapshot from ${when}?\n\n` +
-                `This wipes the current contents of Bookmarks Bar / Other Bookmarks / Mobile and recreates them from the server snapshot.\n\n` +
-                `Tip: Push first if you have local changes you want to keep.`
-            );
-            if (!yes) { writeBackendStatus('Pull cancelled.'); return; }
-            writeBackendStatus('Pulling…');
-            await applyPullAndRemapSettings(data.snapshot, cfg, data.timestamp);
-            writeBackendStatus('Pulled snapshot from ' + when);
-            alert('Pull successful! Local bookmarks updated.');
-            location.reload();
+            writeBackendStatus(`Imported ${result.imported} item(s). Push to sync them to the server.`);
+            alert(`Imported ${result.imported} item(s) from this browser.`);
         } catch (e) {
-            writeBackendStatus('Pull failed: ' + e.message);
-            alert('Pull failed: ' + e.message);
+            writeBackendStatus('Import failed: ' + e.message);
         }
     });
 
@@ -3912,81 +3760,102 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
 });
 
-// --- Main header Push/Pull (registered at module load so they work without opening Settings first) ---
-function _mainStatusEl() { return document.getElementById('backend-status'); }
+// --- Push/Pull (shared by the main header buttons and the Settings panel) ---
+//
+// Git-style: the working copy is edited locally, push uploads it, pull replaces
+// it. A push against a server that moved on since the last pull is refused with
+// a conflict, so nothing another device pushed can be silently overwritten.
 function _updateMainStatus(msg) {
-    const el = _mainStatusEl();
+    const el = document.getElementById('backend-status');
     if (el) el.textContent = msg;
 }
 
-document.getElementById('mainPushBtn').addEventListener('click', async () => {
-    try {
-        const settings = await StorageManager.getSettings();
-        const cfg = settings.backend || {};
-        if (!cfg.token) {
-            alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
-            return;
-        }
-        if (!confirm('Upload your selected target folders and workflows folder to the server?')) return;
+async function getSyncConfig() {
+    const settings = await StorageManager.getSettings();
+    const cfg = settings.backend || {};
+    return { url: resolveServerUrl(cfg.url), token: cfg.token || '' };
+}
 
-        _updateMainStatus('Pushing…');
-        const focusedFolderIds = settings.focusedFolderIds || [];
-        const wfRoot = await findWorkflowRootSilent();
-        const workflowRootId = wfRoot ? wfRoot.id : null;
-        const notesRoot = await NotesManager.findNotesRoot();
-        const notesRootId = notesRoot ? notesRoot.id : null;
-        const ts = await BackendSync.push(cfg, focusedFolderIds, workflowRootId, notesRootId);
+async function persistSyncStamp(kind) {
+    const settings = await StorageManager.getSettings();
+    await StorageManager.saveSettings({
+        ...settings,
+        backend: { ...(settings.backend || {}), lastSyncAt: new Date().toISOString(), lastSyncKind: kind }
+    });
+}
 
-        const updated = { ...settings, backend: { ...cfg, lastSyncAt: ts, lastSyncKind: 'push' } };
-        await StorageManager.saveSettings(updated);
-
-        _updateMainStatus('Pushed at ' + new Date(ts).toLocaleString());
-        alert('Push successful!');
-        location.reload();
-    } catch (e) {
-        _updateMainStatus('Push failed: ' + e.message);
-        alert('Push failed: ' + e.message);
+// Returns a status string for the caller to display.
+async function doPush() {
+    const cfg = await getSyncConfig();
+    if (!cfg.token) {
+        alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
+        return 'Not signed in.';
     }
+    // A fresh install has an empty working copy; pushing it (especially with
+    // force after the inevitable conflict) would erase the whole tree on the
+    // server for every device. Pull is almost always what was meant.
+    if (TreeStore.status().isEmpty) {
+        if (!confirm('Your local working copy is EMPTY. Pushing it would erase the entire tree on the server.\n\nIf this is a fresh install, press Cancel and Pull instead.\n\nReally push an empty tree?')) {
+            return 'Push cancelled — working copy is empty.';
+        }
+    }
+    try {
+        const { version } = await TreeStore.sync.push(cfg);
+        await persistSyncStamp('push');
+        return `Pushed (v${version}).`;
+    } catch (e) {
+        if (e.status === 409) {
+            const takeTheirs = confirm(
+                'The server has changes you have not pulled (another device pushed).\n\n' +
+                'OK = Pull the server\'s tree now (your unpushed local edits are discarded)\n' +
+                'Cancel = Do nothing, so you can look first.\n\n' +
+                'To overwrite the server instead, push again after this dialog and confirm the force prompt.'
+            );
+            if (takeTheirs) return doPull({ skipConfirm: true });
+            if (confirm('Force-push YOUR tree and overwrite the server\'s newer version? This discards what the other device pushed.')) {
+                const { version } = await TreeStore.sync.push(cfg, { force: true });
+                await persistSyncStamp('push');
+                return `Force-pushed (v${version}).`;
+            }
+            return 'Push cancelled — pull first.';
+        }
+        alert('Push failed: ' + e.message);
+        return 'Push failed: ' + e.message;
+    }
+}
+
+async function doPull({ skipConfirm = false } = {}) {
+    const cfg = await getSyncConfig();
+    if (!cfg.token) {
+        alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
+        return 'Not signed in.';
+    }
+    const status = TreeStore.status();
+    if (!skipConfirm && status.dirty) {
+        if (!confirm('You have local edits that were never pushed. Pulling replaces your working copy with the server\'s tree and discards them.\n\nPull anyway?')) {
+            return 'Pull cancelled.';
+        }
+    }
+    try {
+        const { version } = await TreeStore.sync.pull(cfg);
+        await persistSyncStamp('pull');
+        return `Pulled (v${version}).`;
+    } catch (e) {
+        alert('Pull failed: ' + e.message);
+        return 'Pull failed: ' + e.message;
+    }
+}
+
+document.getElementById('mainPushBtn').addEventListener('click', async () => {
+    _updateMainStatus('Pushing…');
+    _updateMainStatus(await doPush());
 });
 
 document.getElementById('mainPullBtn').addEventListener('click', async () => {
-    try {
-        const settings = await StorageManager.getSettings();
-        const cfg = settings.backend || {};
-        if (!cfg.token) {
-            alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
-            return;
-        }
-
-        _updateMainStatus('Checking latest…');
-        const data = await BackendSync.pullLatestInfo(cfg);
-        if (!data || !data.snapshot) {
-            _updateMainStatus('No snapshot on server yet.');
-            alert('No snapshot on server yet.');
-            return;
-        }
-
-        const when = new Date(data.timestamp).toLocaleString();
-        const yes = confirm(
-            `Replace your local bookmarks with the snapshot from ${when}?\n\n` +
-            `This wipes the current contents of Bookmarks Bar / Other Bookmarks / Mobile and recreates them from the server snapshot.\n\n` +
-            `Tip: Push first if you have local changes you want to keep.`
-        );
-        if (!yes) {
-            _updateMainStatus('Pull cancelled.');
-            return;
-        }
-
-        _updateMainStatus('Pulling…');
-        await applyPullAndRemapSettings(data.snapshot, cfg, data.timestamp);
-
-        _updateMainStatus('Pulled snapshot from ' + when);
-        alert('Pull successful! Local bookmarks updated.');
-        location.reload();
-    } catch (e) {
-        _updateMainStatus('Pull failed: ' + e.message);
-        alert('Pull failed: ' + e.message);
-    }
+    _updateMainStatus('Pulling…');
+    _updateMainStatus(await doPull());
+    await loadWorkflows();
+    if (isMainViewVisible()) await renderMainView({ regroup: false });
 });
 
 function closeSettings() {

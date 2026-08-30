@@ -1,425 +1,79 @@
-// Firefox/Chrome compatibility - use browser API directly
+// Workflows + settings.
+//
+// Workflows live in the synced tree under the folder carrying role
+// 'workflows': each workflow is a folder whose payload holds {createdAt} and
+// whose bookmark children are the saved tabs. Roles replaced the old
+// magic-title lookup, so the entire root-identity apparatus this file used to
+// carry — marker bookmarks, duplicate scans, merge-on-resolve — is gone: a
+// role is unique in the tree by construction, and ids are stable across sync.
+//
+// Settings stay in extension storage; they are device-local, not tree data.
+import { TreeStore } from './treeStore.js';
+
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
-const WORKFLOW_ROOT_TITLE = 'TabPaladin Workflows';
-// Sentinel bookmark title used to store workflow metadata (createdAt, etc).
-// Lives at the top of each workflow folder, has a non-http url so users can't accidentally open it.
-const META_TITLE = '__tabpaladin_meta__';
-
-// Resolved root folders, keyed by the settings key that persists their id
-// (e.g. 'workflowRootBookmarkId', 'notesRootBookmarkId').
-const rootFolderCaches = new Map();
-// Number of *extra* "TabPaladin Workflows" folders found during the last full
-// resolution (0 = no duplicates). Surfaced in the settings UI.
-let workflowRootDuplicateCount = 0;
-
-async function persistRootId(settingsKey, id, settings) {
-    try {
-        await StorageManager.saveSettings({ ...settings, [settingsKey]: id });
-    } catch (e) { /* non-fatal */ }
-}
-
-// --- Root identity ------------------------------------------------------
-//
-// A title is not an identity. It is not unique and it is not stable, and
-// resolving "the" workflows root by searching the tree for a folder called
-// "TabPaladin Workflows" is what produced duplicates that came back after
-// every pull: with two candidates the code picked whichever had more children,
-// which flips as they diverge.
-//
-// So each app root carries a marker bookmark holding a generated id and a
-// creation time — the same trick already used per-workflow with
-// __tabpaladin_meta__, one level up. The title is only a hint for finding
-// candidates; the marker decides which is real, and the oldest wins, which is
-// stable no matter what either folder contains.
-const ROOT_MARKER_TITLE = '__tabpaladin_root__';
-const ROOT_MARKER_PREFIX = 'data:application/json,';
-
-function buildMarkerUrl(payload) {
-    return ROOT_MARKER_PREFIX + encodeURIComponent(JSON.stringify(payload));
-}
-
-// Reads the marker, and collapses extras down to one.
-//
-// A parse failure used to mean "no marker", so the caller wrote another one —
-// and a marker that has been through a push/pull round trip is re-encoded, so
-// it stopped parsing and a fresh marker piled up on every resolve. The node's
-// existence is now what counts; the payload is best-effort. Anything past the
-// first is removed so they cannot accumulate again.
-async function readRootMarker(folderId) {
-    let markers;
-    try {
-        const children = await api.bookmarks.getChildren(folderId);
-        markers = children.filter(c => c.title === ROOT_MARKER_TITLE && c.url);
-    } catch (e) {
-        return null;
-    }
-    if (markers.length === 0) return null;
-
-    for (const extra of markers.slice(1)) {
-        try { await api.bookmarks.remove(extra.id); } catch (e) { /* ignore */ }
-    }
-
-    const node = markers[0];
-    let parsed = {};
-    try {
-        parsed = JSON.parse(decodeURIComponent(node.url.slice(ROOT_MARKER_PREFIX.length)));
-    } catch (e) {
-        try { parsed = JSON.parse(node.url.slice(ROOT_MARKER_PREFIX.length)); } catch (e2) { parsed = {}; }
-    }
-    return {
-        nodeId: node.id,
-        rootId: parsed.rootId || null,
-        // Undated markers still count as markers; they just lose ties.
-        createdAt: parsed.createdAt || null
-    };
-}
-
-async function writeRootMarker(folderId, settingsKey, createdAt) {
-    try {
-        const payload = {
-            v: 1,
-            kind: settingsKey,
-            rootId: (globalThis.crypto && globalThis.crypto.randomUUID)
-                ? globalThis.crypto.randomUUID()
-                : 'r' + Date.now() + Math.random().toString(16).slice(2),
-            createdAt: createdAt || new Date().toISOString()
-        };
-        await api.bookmarks.create({
-            parentId: folderId,
-            title: ROOT_MARKER_TITLE,
-            url: buildMarkerUrl(payload)
-        });
-        return payload;
-    } catch (e) {
-        return null;
-    }
-}
-
-// Do two folders hold the same thing? Compared by the set of child titles,
-// which is enough to recognise the copy-of-a-copy case without walking the
-// whole subtree.
-async function sameContents(aId, bId) {
-    try {
-        const [a, b] = await Promise.all([api.bookmarks.getChildren(aId), api.bookmarks.getChildren(bId)]);
-        if (a.length !== b.length) return false;
-        const key = (n) => (n.url ? 'b|' + n.title + '|' + n.url : 'f|' + n.title);
-        const setA = new Set(a.map(key));
-        return b.every(n => setA.has(key(n)));
-    } catch (e) {
-        return false;
-    }
-}
-
-// Move everything out of `from` into `keep`, then delete `from` — but only if
-// it actually emptied. Never destroy content we failed to move.
-//
-// Duplicates that arise from syncing are copies of each other, not disjoint
-// halves. Moving blindly therefore concatenated them: four workflows became
-// eight, then sixteen, growing on every cycle. So a child whose twin already
-// exists in the keeper is dropped rather than moved — but only when the two
-// genuinely match, so two workflows that merely share a name are both kept.
-async function absorbFolder(from, keepId) {
-    let moved = 0;
-    let skipped = 0;
-    const kids = await api.bookmarks.getChildren(from.id);
-    const existing = await api.bookmarks.getChildren(keepId);
-
-    for (const k of kids) {
-        // The loser's marker is dropped, not carried across.
-        if (k.title === ROOT_MARKER_TITLE && k.url) {
-            try { await api.bookmarks.remove(k.id); } catch (e) { /* ignore */ }
-            continue;
-        }
-
-        const twin = existing.find(e => e.title === k.title && Boolean(e.url) === Boolean(k.url)
-            && (k.url ? e.url === k.url : true));
-        if (twin && (k.url || await sameContents(k.id, twin.id))) {
-            try {
-                if (k.url) await api.bookmarks.remove(k.id);
-                else await api.bookmarks.removeTree(k.id);
-                skipped++;
-            } catch (e) { console.warn('[TabPaladin] could not drop duplicate', k.id, e); }
-            continue;
-        }
-
-        try {
-            await api.bookmarks.move(k.id, { parentId: keepId });
-            existing.push(k);
-            moved++;
-        } catch (e) { console.warn('[TabPaladin] could not move during merge', k.id, e); }
-    }
-    if (skipped) console.log(`[TabPaladin] Dropped ${skipped} duplicate item(s) already present in the keeper.`);
-    const left = await api.bookmarks.getChildren(from.id);
-    if (left.length === 0) {
-        try { await api.bookmarks.removeTree(from.id); return moved; }
-        catch (e) { console.warn('[TabPaladin] could not remove merged folder', from.id, e); }
-    } else {
-        console.warn(`[TabPaladin] leaving duplicate "${from.title}" (${from.id}); ${left.length} child(ren) would not move.`);
-    }
-    return moved;
-}
-
-// Remove twins that are already side by side inside one root.
-//
-// Repairs trees that an earlier build doubled: the merge used to concatenate
-// copies, so a root can hold two of every workflow. Only exact twins go —
-// identical title and, for folders, an identical set of children — so two
-// workflows that merely share a name both survive.
-async function dedupeWithin(folderId) {
-    let removed = 0;
-    let children;
-    try { children = await api.bookmarks.getChildren(folderId); } catch (e) { return 0; }
-
-    const kept = [];
-    for (const c of children) {
-        if (c.title === ROOT_MARKER_TITLE && c.url) continue; // readRootMarker owns these
-        const twin = kept.find(k => k.title === c.title && Boolean(k.url) === Boolean(c.url)
-            && (c.url ? k.url === c.url : true));
-        if (twin && (c.url || await sameContents(c.id, twin.id))) {
-            try {
-                if (c.url) await api.bookmarks.remove(c.id);
-                else await api.bookmarks.removeTree(c.id);
-                removed++;
-            } catch (e) { console.warn('[TabPaladin] could not remove twin', c.id, e); }
-            continue;
-        }
-        kept.push(c);
-    }
-    if (removed) console.log(`[TabPaladin] Removed ${removed} duplicated item(s) inside the root.`);
-    return removed;
-}
-
-async function countDuplicateFolders(title) {
-    try {
-        const matches = await api.bookmarks.search({ title });
-        return Math.max(0, matches.filter(m => !m.url && m.title === title).length - 1);
-    } catch (e) {
-        return 0;
-    }
-}
-
-/**
- * Single source of truth for an app-managed root folder (workflows, notes).
- * Every caller (save, list, render, settings) must resolve through this so
- * they never disagree about which folder is "the" root.
- *
- * Resolution order:
- *   1. Verified in-memory cache.
- *   2. The persisted settings[settingsKey], if it still exists.
- *   3. Exact-title bookmark search; with duplicates, the folder holding the
- *      most children wins. The choice is persisted.
- *   4. With create=true, a new folder under Other Bookmarks (id '2').
- *
- * Returns null when nothing exists and create=false.
- */
-async function resolveRootFolder({ title, settingsKey, create = false }) {
-    // No early return on a cache or a persisted id.
-    //
-    // Both used to short-circuit straight to a folder, which meant the
-    // duplicate scan below only ran when the stored id was already broken —
-    // so on the common path the app happily kept using one of two roots and
-    // the Consolidate warning came back forever. The scan is a local indexed
-    // lookup; paying it every resolve is what makes a second root impossible
-    // to observe. The cache and the persisted id now only express a
-    // *preference* between candidates.
-    const settings = await StorageManager.getSettings();
-    const cached = rootFolderCaches.get(settingsKey);
-    const preferredId = (cached && cached.id) || (settings && settings[settingsKey]) || null;
-
-    if (preferredId && !cached) {
-        try {
-            const node = (await api.bookmarks.get(preferredId))[0];
-            // The id alone isn't enough: bookmark ids are only meaningful within
-            // the tree that produced them, so a persisted id can end up on some
-            // unrelated folder (a destructive pull recreates every node, users
-            // reorganize, profiles get restored). Binding to it silently would
-            // hide every note and file new ones into a stranger's folder, so the
-            // title has to match too.
-            if (node && node.title !== title) {
-                console.warn(`[TabPaladin] Persisted ${settingsKey}=${preferredId} now points at ` +
-                    `"${node.title}", not "${title}" — re-resolving by title.`);
-            }
-        } catch (e) {
-            // Persisted folder gone — the title search below covers it.
-        }
-    }
-
-    // bookmarks.search is token-based and can return near-matches like
-    // "TabPaladin Workflows backup" — require an exact title match.
-    const matches = await api.bookmarks.search({ title });
-    const folders = matches.filter(m => !m.url && m.title === title);
-
-    let chosen = folders[0] || null;
-
-    if (folders.length > 1) {
-        // Heal here, on every resolve — not only after a pull.
-        //
-        // Duplicates can appear at any time: a push from another device, the
-        // browser's own sync landing a second copy, a manual move. Healing only
-        // in the pull path left every other moment exposed, which is why the
-        // warning kept coming back. Merging at the single point that every
-        // caller already funnels through means the rest of the app can never
-        // observe two roots.
-        const marked = [];
-        for (const f of folders) {
-            const marker = await readRootMarker(f.id);
-            const kids = await api.bookmarks.getChildren(f.id);
-            marked.push({ folder: f, marker, count: kids.length });
-        }
-
-        // Oldest marker wins — stable regardless of what either folder holds.
-        // With no markers at all, prefer the one we already had recorded, and
-        // only then fall back to the fullest.
-        const remembered = marked.find(m => preferredId && String(m.folder.id) === String(preferredId));
-        const withMarkers = marked.filter(m => m.marker && m.marker.createdAt);
-        const winner = withMarkers.length
-            ? withMarkers.reduce((a, b) => (a.marker.createdAt <= b.marker.createdAt ? a : b))
-            : (remembered || marked.reduce((a, b) => (a.count >= b.count ? a : b)));
-
-        chosen = winner.folder;
-        for (const other of marked) {
-            if (other.folder.id === chosen.id) continue;
-            const moved = await absorbFolder(other.folder, chosen.id);
-            console.log(`[TabPaladin] Merged duplicate "${title}" ${other.folder.id} into ${chosen.id} (${moved} item(s)).`);
-        }
-    }
-
-    // Create under Other Bookmarks. '2' is the standard id on both Chrome and Firefox.
-    if (!chosen && create) {
-        chosen = await api.bookmarks.create({
-            parentId: '2',
-            title
-        });
-    }
-
-    if (chosen) {
-        // Clear out twins sitting side by side, including any left behind by
-        // the build that concatenated instead of deduplicating.
-        await dedupeWithin(chosen.id);
-        // Stamp anything that isn't marked yet, so the next resolve has a
-        // stable identity to compare rather than counting children again.
-        // readRootMarker also collapses extra markers down to one.
-        if (!(await readRootMarker(chosen.id))) {
-            await writeRootMarker(chosen.id, settingsKey);
-        }
-        rootFolderCaches.set(settingsKey, chosen);
-        await persistRootId(settingsKey, chosen.id, settings);
-    }
-
-    // Recount after healing, so settings shows the truth rather than the
-    // situation before the merge.
-    if (title === WORKFLOW_ROOT_TITLE) {
-        workflowRootDuplicateCount = await countDuplicateFolders(title);
-    }
-    return chosen;
-}
-
-async function resolveWorkflowRoot({ create = false } = {}) {
-    return resolveRootFolder({
-        title: WORKFLOW_ROOT_TITLE,
-        settingsKey: 'workflowRootBookmarkId',
-        create
-    });
-}
-
-async function findOrCreateRoot() {
-    return resolveWorkflowRoot({ create: true });
-}
-
-function isMetaNode(node) {
-    return node && node.title === META_TITLE;
-}
-
-function parseMeta(node) {
-    if (!node || !node.url) return {};
-    try {
-        // url is data:application/json,<encoded JSON>
-        const prefix = 'data:application/json,';
-        if (!node.url.startsWith(prefix)) return {};
-        return JSON.parse(decodeURIComponent(node.url.slice(prefix.length)));
-    } catch (e) {
-        return {};
-    }
-}
-
-function buildMetaUrl(meta) {
-    return 'data:application/json,' + encodeURIComponent(JSON.stringify(meta));
-}
-
-async function hydrateWorkflow(folderNode) {
-    const children = await api.bookmarks.getChildren(folderNode.id);
-    let meta = {};
+function hydrateWorkflow(folderNode) {
     const tabs = [];
-    for (const c of children) {
-        if (isMetaNode(c)) {
-            meta = parseMeta(c);
-            continue;
-        }
-        if (c.url) {
+    for (const c of folderNode.children || []) {
+        if (c.kind === 'bookmark' && c.url) {
             tabs.push({
-                id: c.id, // bookmark id, used for partial restore + sync
+                id: c.id, // tree node id, used for partial restore + sync
                 url: c.url,
                 title: c.title,
                 favIconUrl: null
             });
         }
     }
+    const payload = folderNode.payload || {};
     return {
         id: folderNode.id,
         name: folderNode.title,
-        createdAt: meta.createdAt || new Date(folderNode.dateAdded || Date.now()).toISOString(),
+        createdAt: payload.createdAt || new Date().toISOString(),
         tabs
     };
 }
 
 export const StorageManager = {
     /**
-     * Save a new workflow as a bookmark folder under "TabPaladin Workflows".
+     * Save a new workflow as a folder under the workflows root.
      */
     saveWorkflow: async (name, tabs) => {
-        const root = await findOrCreateRoot();
-        const folder = await api.bookmarks.create({
+        const root = await TreeStore.ensureRoleRoot('workflows');
+        const folder = await TreeStore.createNode({
             parentId: root.id,
-            title: name
-        });
-
-        // Write meta sentinel first so it stays at the top.
-        await api.bookmarks.create({
-            parentId: folder.id,
-            title: META_TITLE,
-            url: buildMetaUrl({ createdAt: new Date().toISOString() })
+            kind: 'folder',
+            title: name,
+            payload: { createdAt: new Date().toISOString() }
         });
 
         for (const t of tabs) {
             if (!t.url) continue;
-            await api.bookmarks.create({
+            await TreeStore.createNode({
                 parentId: folder.id,
+                kind: 'bookmark',
                 title: t.title || t.url,
                 url: t.url
             });
         }
 
-        return await hydrateWorkflow(folder);
+        const fresh = await TreeStore.getNode(folder.id);
+        return hydrateWorkflow(fresh);
     },
 
     getWorkflows: async () => {
-        const root = await findOrCreateRoot();
-        const children = await api.bookmarks.getChildren(root.id);
-        const folders = children.filter(c => !c.url);
-        const workflows = [];
-        for (const f of folders) {
-            workflows.push(await hydrateWorkflow(f));
-        }
-        return workflows;
+        const root = await TreeStore.findRoleRoot('workflows');
+        if (!root) return [];
+        return (root.children || [])
+            .filter(c => c.kind === 'folder')
+            .map(hydrateWorkflow);
     },
 
     /**
-     * Delete a workflow by its bookmark folder id.
+     * Delete a workflow by its folder id.
      */
     deleteWorkflow: async (id) => {
         try {
-            await api.bookmarks.removeTree(id);
+            await TreeStore.removeNode(id);
         } catch (e) {
             console.warn("deleteWorkflow: folder already gone?", e);
         }
@@ -430,7 +84,7 @@ export const StorageManager = {
      */
     removeTabFromWorkflow: async (bookmarkId) => {
         try {
-            await api.bookmarks.remove(bookmarkId);
+            await TreeStore.removeNode(bookmarkId);
         } catch (e) {
             // Already gone — that's fine
         }
@@ -503,7 +157,7 @@ export const StorageManager = {
     },
 
     /**
-     * Import workflows from JSON. Each entry becomes a new bookmark folder under the root.
+     * Import workflows from JSON. Each entry becomes a new folder under the root.
      */
     importWorkflows: async (jsonString) => {
         try {
@@ -524,7 +178,7 @@ export const StorageManager = {
     },
 
     /**
-     * One-time migration: move legacy storage.local "workflows" into the bookmark tree.
+     * One-time migration: move legacy storage.local "workflows" into the tree.
      */
     migrateLegacyIfNeeded: async () => {
         const data = await api.storage.local.get(['workflows', 'tpMigrationDone']);
@@ -564,75 +218,7 @@ export const StorageManager = {
     /**
      * Expose helpers for callers that need them.
      */
-    getWorkflowRoot: findOrCreateRoot,
+    getWorkflowRoot: () => TreeStore.ensureRoleRoot('workflows'),
     // Resolve the workflows root without creating it (null when absent).
-    findWorkflowRoot: () => resolveWorkflowRoot({ create: false }),
-    getWorkflowRootDuplicateCount: () => workflowRootDuplicateCount,
-    // Generic root-folder resolver, also used by the notes feature.
-    resolveRootFolder,
-    // Drop the in-memory root cache. Call after anything that rebuilds the
-    // bookmark tree wholesale (a destructive pull), since every cached id is
-    // then meaningless.
-    resetRootCache: () => rootFolderCaches.clear(),
-
-    /**
-     * Merge every duplicate folder of `title` into one, moving their children
-     * across and deleting the emptied husks. Returns the number merged.
-     *
-     * This is what the Consolidate button in settings does, as a function, so a
-     * pull can do it automatically. Duplicates keep coming back because a pull
-     * faithfully recreates whatever the snapshot holds — if the snapshot itself
-     * carries two workflow roots, consolidating locally fixes nothing the next
-     * time you sync. Healing after every pull makes the recurrence a non-event
-     * whatever put the second folder there.
-     *
-     * The survivor is the folder with the most children, matching how
-     * resolveRootFolder picks, so the two never disagree about which is "the"
-     * root.
-     */
-    consolidateDuplicateRoots: async (title) => {
-        let folders;
-        try {
-            const matches = await api.bookmarks.search({ title });
-            folders = matches.filter(m => !m.url && m.title === title);
-        } catch (e) {
-            return 0;
-        }
-        if (folders.length < 2) return 0;
-
-        const counts = new Map();
-        for (const f of folders) {
-            try { counts.set(f.id, (await api.bookmarks.getChildren(f.id)).length); }
-            catch (e) { counts.set(f.id, -1); }
-        }
-        const keep = folders.reduce((best, f) => (counts.get(f.id) > counts.get(best.id) ? f : best), folders[0]);
-
-        let merged = 0;
-        for (const dupe of folders) {
-            if (dupe.id === keep.id) continue;
-            try {
-                const kids = await api.bookmarks.getChildren(dupe.id);
-                for (const k of kids) {
-                    try { await api.bookmarks.move(k.id, { parentId: keep.id }); }
-                    catch (e) { console.warn('[TabPaladin] consolidate: could not move', k.id, e); }
-                }
-                // Only remove once empty — never delete content we failed to move.
-                const left = await api.bookmarks.getChildren(dupe.id);
-                if (left.length === 0) {
-                    await api.bookmarks.removeTree(dupe.id);
-                    merged++;
-                } else {
-                    console.warn(`[TabPaladin] consolidate: leaving "${title}" ${dupe.id}, ${left.length} child(ren) would not move.`);
-                }
-            } catch (e) {
-                console.warn('[TabPaladin] consolidate failed for', dupe.id, e);
-            }
-        }
-        if (merged > 0) {
-            rootFolderCaches.clear();
-            workflowRootDuplicateCount = 0;
-        }
-        return merged;
-    },
-    META_TITLE
+    findWorkflowRoot: () => TreeStore.findRoleRoot('workflows')
 };

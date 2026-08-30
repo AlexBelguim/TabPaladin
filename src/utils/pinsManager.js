@@ -1,32 +1,10 @@
 // Pinned links — the tiles on the home screen.
 //
-// Stored as plain bookmarks under a "TabPaladin Pinned" root, resolved through
-// the same shared resolver as workflows and notes. Plain bookmarks, not the
-// data: payloads notes use, because a pin *is* a URL — this way it still works
-// if you open it straight from the browser's bookmark manager, and it rides the
-// existing sync to the phone with no new plumbing.
-import { StorageManager } from './storageManager.js';
-
-const api = typeof browser !== 'undefined' ? browser : chrome;
-
-const PINS_ROOT_TITLE = 'TabPaladin Pinned';
-const PINS_ROOT_SETTINGS_KEY = 'pinsRootBookmarkId';
-
-async function findPinsRoot() {
-    return StorageManager.resolveRootFolder({
-        title: PINS_ROOT_TITLE,
-        settingsKey: PINS_ROOT_SETTINGS_KEY,
-        create: false
-    });
-}
-
-async function findOrCreatePinsRoot() {
-    return StorageManager.resolveRootFolder({
-        title: PINS_ROOT_TITLE,
-        settingsKey: PINS_ROOT_SETTINGS_KEY,
-        create: true
-    });
-}
+// Stored as bookmark items under the tree's pins root (the folder carrying
+// role 'pins'), which lives in the synced tree like everything else. Roles
+// replaced the old magic-title folders, so there is nothing to resolve and no
+// duplicate roots to heal.
+import { TreeStore } from './treeStore.js';
 
 // Host without the www, used as the tile's second line and to derive initials.
 export function hostOf(url) {
@@ -60,9 +38,7 @@ export function colorFor(url) {
 }
 
 function toPin(node) {
-    if (!node || !node.url) return null;
-    // Root-identity bookkeeping, not something the user pinned.
-    if (node.title === '__tabpaladin_root__') return null;
+    if (!node || node.kind !== 'bookmark' || !node.url) return null;
     return {
         id: node.id,
         title: node.title || hostOf(node.url) || node.url,
@@ -72,20 +48,12 @@ function toPin(node) {
 }
 
 export const PinsManager = {
-    PINS_ROOT_TITLE,
-
     // Never creates the root: an empty home screen shows the "Pin a link" tile,
     // and the folder appears the first time something is actually pinned.
     list: async () => {
-        const root = await findPinsRoot();
+        const root = await TreeStore.findRoleRoot('pins');
         if (!root) return [];
-        try {
-            const children = await api.bookmarks.getChildren(root.id);
-            return children.map(toPin).filter(Boolean);
-        } catch (e) {
-            console.warn('[TabPaladin] Failed to read pins', e);
-            return [];
-        }
+        return (root.children || []).map(toPin).filter(Boolean);
     },
 
     add: async (url, title) => {
@@ -100,14 +68,14 @@ export const PinsManager = {
             throw new Error(`"${clean}" is not a URL.`);
         }
 
-        const root = await findOrCreatePinsRoot();
-        const existing = await api.bookmarks.getChildren(root.id);
-        if (existing.some(c => c.url === withScheme)) {
+        const root = await TreeStore.ensureRoleRoot('pins');
+        if ((root.children || []).some(c => c.url === withScheme)) {
             throw new Error('That link is already pinned.');
         }
 
-        const node = await api.bookmarks.create({
+        const node = await TreeStore.createNode({
             parentId: root.id,
+            kind: 'bookmark',
             title: (title || '').trim() || hostOf(withScheme) || withScheme,
             url: withScheme
         });
@@ -115,19 +83,19 @@ export const PinsManager = {
     },
 
     remove: async (id) => {
-        await api.bookmarks.remove(id);
+        await TreeStore.removeNode(id);
     },
 
     rename: async (id, title) => {
-        const node = await api.bookmarks.update(id, { title: String(title || '').trim() });
+        const node = await TreeStore.updateNode(id, { title: String(title || '').trim() });
         return toPin(node);
     },
 
     // index is the destination position within the pins root.
     move: async (id, index) => {
-        const root = await findPinsRoot();
+        const root = await TreeStore.findRoleRoot('pins');
         if (!root) return null;
-        const node = await api.bookmarks.move(id, { parentId: root.id, index });
+        const node = await TreeStore.moveNode(id, { parentId: root.id, index });
         return toPin(node);
     }
 };

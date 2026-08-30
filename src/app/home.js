@@ -7,6 +7,7 @@
 import { PinsManager, initialsFor, colorFor } from '../utils/pinsManager.js';
 import { StorageManager } from '../utils/storageManager.js';
 import { NotesManager } from '../utils/notesManager.js';
+import { TreeStore } from '../utils/treeStore.js';
 
 const DDG = 'https://duckduckgo.com/?q=';
 
@@ -295,4 +296,17 @@ export async function initHome() {
 window.addEventListener('tabpaladin:home-refresh', () => {
     renderPins();
     renderRecents();
+});
+
+// And re-render when the tree itself changes — a pull finishing after the home
+// screen already painted (the startup auto-pull), an edit in another view, or
+// another TabPaladin page writing the working copy.
+let homeTreeRefresh = null;
+TreeStore.onChanged(() => {
+    if (homeTreeRefresh) return;
+    homeTreeRefresh = setTimeout(() => {
+        homeTreeRefresh = null;
+        renderPins();
+        renderRecents();
+    }, 250);
 });

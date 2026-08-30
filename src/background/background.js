@@ -92,6 +92,23 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 });
 
+// --- Workflow auto-sync without touching the tree ---
+//
+// This script must not edit the stored tree itself: an open TabPaladin page
+// holds the working copy in memory and persists it on a debounce, so a
+// read-modify-write from here would race it — last writer wins and one side's
+// edit silently vanishes. Instead the background only appends the node id to a
+// pending-removals queue; treeStore (which owns the tree) applies the queue on
+// its next load or storage event, against its own current copy.
+const PENDING_REMOVALS_KEY = 'tpPendingRemovals';
+
+async function queueTreeRemoval(id) {
+    const data = await api.storage.local.get(PENDING_REMOVALS_KEY);
+    const list = (data && data[PENDING_REMOVALS_KEY]) || [];
+    if (!list.includes(id)) list.push(id);
+    await api.storage.local.set({ [PENDING_REMOVALS_KEY]: list });
+}
+
 // Auto-sync: when a tracked tab closes, remove its bookmark from the workflow
 api.tabs.onRemoved.addListener(async (tabId) => {
     try {
@@ -100,7 +117,7 @@ api.tabs.onRemoved.addListener(async (tabId) => {
         if (!entry) return;
 
         try {
-            await api.bookmarks.remove(entry.bookmarkId);
+            await queueTreeRemoval(entry.bookmarkId);
         } catch (e) {
             // Bookmark already gone — fine
         }

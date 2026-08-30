@@ -1,6 +1,11 @@
 import { TabGrouper } from './tabGrouper.js';
 import { AIService } from './aiService.js';
 import { StorageManager } from './storageManager.js';
+import { TreeStore } from './treeStore.js';
+
+// All reads and writes go against the local working copy of the synced tree,
+// through its chrome.bookmarks-compatible facade.
+const Tree = TreeStore.bookmarks;
 
 
 export const BookmarkOrganizer = {
@@ -12,7 +17,7 @@ export const BookmarkOrganizer = {
      */
     getStructure: async () => {
         try {
-            const tree = await chrome.bookmarks.getTree();
+            const tree = await Tree.getTree();
             if (!tree || tree.length === 0) return [];
             const root = tree[0];
             return root.children || [];
@@ -35,7 +40,7 @@ export const BookmarkOrganizer = {
             // Handle Root Scope (Array of IDs scenario or Single ID)
             // If folderId is 'root', we might need top level?
             // Assuming single ID for drill down.
-            const subTree = await chrome.bookmarks.getSubTree(folderId);
+            const subTree = await Tree.getSubTree(folderId);
             if (!subTree || subTree.length === 0) return null;
 
             const root = subTree[0];
@@ -115,7 +120,7 @@ export const BookmarkOrganizer = {
 
         for (const id of scopeIds) {
             try {
-                const subTree = await chrome.bookmarks.getSubTree(id);
+                const subTree = await Tree.getSubTree(id);
                 if (subTree && subTree.length > 0) {
                     // subTree[0] is the folder itself.
                     // We need its path context? 
@@ -138,7 +143,7 @@ export const BookmarkOrganizer = {
      * @returns {Promise<Array>} Array of { id, title, path, pathId }
      */
     getFolderMap: async (allowedRootIds = null) => {
-        const tree = await chrome.bookmarks.getTree();
+        const tree = await Tree.getTree();
         let folders = [];
 
         function traverse(node, currentPath, currentPathId) {
@@ -193,7 +198,7 @@ export const BookmarkOrganizer = {
         let bookmarks = [];
 
         async function traverse(id) {
-            const nodes = await chrome.bookmarks.getSubTree(id);
+            const nodes = await Tree.getSubTree(id);
 
             function visit(node) {
                 if (node.url) {
@@ -206,7 +211,7 @@ export const BookmarkOrganizer = {
         }
 
         async function getLoose(id) {
-            const nodes = await chrome.bookmarks.getSubTree(id);
+            const nodes = await Tree.getSubTree(id);
             if (nodes && nodes[0] && nodes[0].children) {
                 nodes[0].children.forEach(node => {
                     if (node.url) bookmarks.push(node);
@@ -245,7 +250,7 @@ export const BookmarkOrganizer = {
 
         // Helper: Find existing subfolder by name or synonyms
         async function findSubfolder(parentId, name, useSynonyms = false) {
-            const children = await chrome.bookmarks.getChildren(parentId);
+            const children = await Tree.getChildren(parentId);
             const folders = children.filter(c => !c.url);
 
             // 1. Exact Match
@@ -267,7 +272,7 @@ export const BookmarkOrganizer = {
 
             // Get Items to Organize (Only loose files in this folder)
             // We use getSubTree to be sure we are looking at the right place
-            const tree = await chrome.bookmarks.getSubTree(sourceId);
+            const tree = await Tree.getSubTree(sourceId);
             if (!tree || !tree.length) continue;
 
             const root = tree[0];
@@ -373,7 +378,7 @@ export const BookmarkOrganizer = {
                     // CRITICAL FIX: Double Check if the proposed "newSubfolder" already exists in "targetId".
                     // (Same validity check as before, still vital)
                     if (newSubfolder) {
-                        const targetChildren = await chrome.bookmarks.getChildren(targetId);
+                        const targetChildren = await Tree.getChildren(targetId);
                         const existingSub = targetChildren.find(c => !c.url && c.title.toLowerCase() === newSubfolder.toLowerCase());
                         if (existingSub) {
                             targetId = existingSub.id;
@@ -381,7 +386,7 @@ export const BookmarkOrganizer = {
                             newSubfolder = '';
 
                             if (niceDomain && niceDomain.toLowerCase() !== context.toLowerCase()) {
-                                const deepChildren = await chrome.bookmarks.getChildren(existingSub.id);
+                                const deepChildren = await Tree.getChildren(existingSub.id);
                                 const deepMatch = deepChildren.find(c => !c.url && c.title.toLowerCase() === niceDomain.toLowerCase());
                                 if (deepMatch) {
                                     targetId = deepMatch.id;
@@ -448,7 +453,7 @@ export const BookmarkOrganizer = {
             if (rawId.startsWith('loose-')) {
                 const realId = rawId.replace('loose-', '');
                 try {
-                    const children = await chrome.bookmarks.getChildren(realId);
+                    const children = await Tree.getChildren(realId);
                     // Shallow fetch: only direct children that are items
                     children.forEach(child => {
                         if (child.url) {
@@ -466,7 +471,7 @@ export const BookmarkOrganizer = {
             } else {
                 // Recursive Fetch (Folder Mode)
                 try {
-                    const subTree = await chrome.bookmarks.getSubTree(rawId);
+                    const subTree = await Tree.getSubTree(rawId);
                     if (subTree && subTree.length > 0) {
                         extractItems(subTree[0]);
                     }
@@ -575,13 +580,13 @@ export const BookmarkOrganizer = {
             if (group.newSubfolder && group.newSubfolder.trim() !== '') {
                 // Check if it actually exists inside user specified parent
                 // (Optimization: could minimize API calls, but creates ensure safety)
-                const children = await chrome.bookmarks.getChildren(folderId);
+                const children = await Tree.getChildren(folderId);
                 const existing = children.find(c => c.title.toLowerCase() === group.newSubfolder.toLowerCase() && !c.url);
 
                 if (existing) {
                     folderId = existing.id;
                 } else {
-                    const created = await chrome.bookmarks.create({
+                    const created = await Tree.create({
                         parentId: folderId,
                         title: group.newSubfolder
                     });
@@ -592,7 +597,7 @@ export const BookmarkOrganizer = {
             // Move items
             for (const item of group.items) {
                 try {
-                    await chrome.bookmarks.move(item.id, { parentId: folderId });
+                    await Tree.move(item.id, { parentId: folderId });
                 } catch (e) { console.warn("Failed to move bookmark", item.id, e); }
             }
         }

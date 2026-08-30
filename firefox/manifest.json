@@ -13,6 +13,7 @@
         "tabs",
         "bookmarks",
         "storage",
+        "unlimitedStorage",
         "downloads",
         "<all_urls>"
     ],
