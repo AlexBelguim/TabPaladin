@@ -3766,8 +3766,34 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 // it. A push against a server that moved on since the last pull is refused with
 // a conflict, so nothing another device pushed can be silently overwritten.
 function _updateMainStatus(msg) {
+    // #backend-status only exists while the Settings panel is rendered, so it
+    // cannot be the only place a sync reports to: clicking Push or Pull from
+    // the header wrote into nothing and the buttons looked dead even when the
+    // sync had worked. The toast always exists.
     const el = document.getElementById('backend-status');
     if (el) el.textContent = msg;
+    tpToast(msg);
+}
+
+// Small transient banner, bottom-centre. Deliberately not alert(): a sync runs
+// on every push and a modal per sync is its own kind of broken.
+function tpToast(msg, ms = 3200) {
+    if (!msg) return;
+    let el = document.getElementById('tp-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'tp-toast';
+        el.style.cssText = 'position:fixed; left:50%; bottom:24px; transform:translateX(-50%);'
+            + 'background:rgba(17,24,39,0.97); color:#e5e7eb; border:1px solid var(--border-color,#374151);'
+            + 'padding:10px 16px; border-radius:10px; font-size:0.85rem; z-index:3000;'
+            + 'box-shadow:0 10px 30px rgba(0,0,0,0.5); max-width:80vw; text-align:center;'
+            + 'transition:opacity .18s ease;';
+        document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(tpToast._t);
+    tpToast._t = setTimeout(() => { el.style.opacity = '0'; }, ms);
 }
 
 async function getSyncConfig() {
@@ -3839,7 +3865,16 @@ async function doPull({ skipConfirm = false } = {}) {
     try {
         const { version } = await TreeStore.sync.pull(cfg);
         await persistSyncStamp('pull');
-        return `Pulled (v${version}).`;
+        // Count what arrived: a successful pull that returns an empty tree is a
+        // completely different problem from a pull that failed, and they are
+        // indistinguishable if the message only says "pulled".
+        const tree = await Tree.getTree();
+        let items = 0;
+        const walk = (n) => { items++; (n.children || []).forEach(walk); };
+        (tree[0].children || []).forEach(walk);
+        return items === 0
+            ? `Pulled (v${version}) — but the server's tree is EMPTY.`
+            : `Pulled ${items} item(s) (v${version}).`;
     } catch (e) {
         alert('Pull failed: ' + e.message);
         return 'Pull failed: ' + e.message;
