@@ -517,7 +517,14 @@ async function renderMainView({ regroup = true } = {}) {
     grid.className = 'roots-grid';
     container.appendChild(grid);
 
+    // Open Tabs is the tall one and gets the full width to itself; the folder
+    // roots sit side by side beneath it. Columns only work now that browser
+    // noise is filtered out — with eight of them they were unreadable.
     grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
+
+    const rootsRow = document.createElement('div');
+    rootsRow.className = 'roots-row';
+    grid.appendChild(rootsRow);
 
     for (const r of realRoots) {
         try {
@@ -530,7 +537,7 @@ async function renderMainView({ regroup = true } = {}) {
                 fileCount: c.looseCount,
                 icon: r.isWorkflow ? '🛡️' : '📁'
             }, 0);
-            grid.appendChild(card);
+            rootsRow.appendChild(card);
         } catch (e) {
             console.warn("Could not load root", r.id, e);
         }
@@ -1197,7 +1204,7 @@ async function renderSourceGrid(folderId) {
         sourceList.appendChild(buildOrganizeHeader('Sources', null));
 
         const grid = document.createElement('div');
-        grid.className = 'roots-grid'; // one root per row — see renderMainView
+        grid.className = 'roots-row'; // side by side — see renderMainView
         sourceList.appendChild(grid);
 
         for (const r of roots) {
