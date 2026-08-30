@@ -648,7 +648,7 @@ export const TreeStore = {
             if (isTopLevelParent(id)) {
                 return [{
                     id: String(id ?? '0'),
-                    title: '',
+                    title: 'All bookmarks',
                     kind: 'folder',
                     children: state.roots.map((r, i) => view(r, null, i, true))
                 }];

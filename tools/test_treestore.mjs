@@ -270,6 +270,13 @@ check('queued removal applied to the live tree', (await TreeStore.getNode(doomed
 check('queue cleared after applying', !(await chrome.storage.local.get('tpPendingRemovals')).tpPendingRemovals);
 check('unknown ids in the queue are ignored without error', true);
 
+console.log('\n6c. Legacy/stale ids resolve or report absent, never silently empty');
+check('unknown id is absent, not an exception', (await TreeStore.getNode('347')) === null);
+const allBm = await Tree.getSubTree('2');
+check('the top-level fallback card has a name', allBm[0].title === 'All bookmarks');
+check('the top-level fallback exposes every root',
+    allBm[0].children.length === (await Tree.getChildren('0')).length);
+
 console.log('\n7. Import from the browser (one-time)');
 const imported = await TreeStore.importFromBrowser();
 check('items imported', imported.imported > 0, String(imported.imported));

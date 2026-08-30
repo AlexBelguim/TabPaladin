@@ -67,6 +67,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         startupSyncError = e.message;
     }
 
+    // Drop focused-folder ids that no longer resolve.
+    //
+    // These were browser bookmark ids ('1', '2', '347'...) chosen against the
+    // old chrome.bookmarks tree. The migrated tree has its own ids, so every
+    // one of them now points at nothing — and because the list is non-empty,
+    // the views that filter by it render nothing while skipping the "show
+    // everything" fallback that only triggers on an empty list. The result is
+    // a fully populated working copy that displays as empty.
+    try {
+        const dropped = await pruneStaleFocusedFolders();
+        if (dropped) console.log(`[TabPaladin] Dropped ${dropped} focused folder id(s) that predate the migration.`);
+    } catch (e) {
+        console.warn('[TabPaladin] Could not prune focused folders:', e.message);
+    }
+
     // One-time migration of legacy storage.local workflows into the tree.
     try {
         const result = await StorageManager.migrateLegacyIfNeeded();
@@ -193,6 +208,21 @@ function setupEventListeners() {
 
     // Dynamic listeners for workflow items
     document.getElementById('workflows-list').addEventListener('click', handleWorkflowClick);
+}
+
+// Keep only focused-folder ids that exist in the current tree. Returns how
+// many were dropped, so a one-off migration cleanup can say so.
+async function pruneStaleFocusedFolders() {
+    const settings = await StorageManager.getSettings();
+    const ids = settings.focusedFolderIds || [];
+    if (!ids.length) return 0;
+    const kept = [];
+    for (const id of ids) {
+        if (await TreeStore.getNode(id)) kept.push(id);
+    }
+    if (kept.length === ids.length) return 0;
+    await StorageManager.saveSettings({ ...settings, focusedFolderIds: kept });
+    return ids.length - kept.length;
 }
 
 // --- Tabs Logic ---
