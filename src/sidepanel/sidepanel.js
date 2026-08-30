@@ -210,12 +210,42 @@ function setupEventListeners() {
     document.getElementById('workflows-list').addEventListener('click', handleWorkflowClick);
 }
 
-// The tree's top-level folders, minus the app-managed roots that already have
-// their own places in the UI (pins tiles, notes view, the workflows card).
+// Browser roots that are not bookmark folders in any useful sense. They came
+// across in the migration because the old snapshot was a whole browser tree,
+// and Opera in particular contributes four of them. Same list as the PWA's
+// NOISE_ROOTS in pwa/app.js — that client is deployed separately and cannot
+// import from here, so the two must be kept in step by hand.
+const NOISE_ROOT_TITLES = new Set([
+    'trash', 'prullenbak', 'papierkorb', 'corbeille',
+    'speed dials', 'speeddial', 'pinboard', 'unsynchronized pinboard',
+    'unsynchronized pinboard ', 'imported bookmarks', 'geïmporteerde bladwijzers'
+]);
+
+function isNoiseRoot(node) {
+    const t = (node.title || '').toLowerCase().trim();
+    return NOISE_ROOT_TITLES.has(t);
+}
+
+// The tree's top-level folders worth listing: not an app-managed root (those
+// have their own homes — pins tiles, notes view, the workflows card), not
+// browser noise, and not empty. An empty root is a row that does nothing.
 async function topLevelFolders() {
     try {
         const top = await Tree.getChildren('0');
-        return top.filter(n => n.kind === 'folder' && n.role !== 'pins' && n.role !== 'notes' && n.role !== 'workflows');
+        const out = [];
+        for (const n of top) {
+            if (n.kind !== 'folder') continue;
+            if (n.role === 'pins' || n.role === 'notes' || n.role === 'workflows') continue;
+            if (isNoiseRoot(n)) continue;
+            // The imports archive is always worth showing; anything else has to
+            // actually contain something.
+            if (!n.readOnly) {
+                const kids = await Tree.getChildren(n.id);
+                if (kids.length === 0) continue;
+            }
+            out.push(n);
+        }
+        return out;
     } catch (e) {
         console.warn('[TabPaladin] Could not read the top level:', e.message);
         return [];
