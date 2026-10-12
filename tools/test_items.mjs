@@ -260,5 +260,39 @@ console.log('\n6. Normalization guards');
     db.close();
 }
 
+console.log('\n7. Duplicate role folders are merged, nothing dropped');
+{
+    const db = freshDb();
+    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    items.writeTree([
+        { id: 'w1', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [
+            { id: 'wf1', kind: 'folder', title: 'Old', children: [] }
+        ]},
+        { id: 'w2', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [
+            { id: 'wf2', kind: 'folder', title: 'Yesterday', children: [
+                { id: 't1', kind: 'bookmark', title: 't', url: 'https://t.example' }
+            ]}
+        ]}
+    ]);
+    const roots = items.readTree().roots;
+    const wfRoots = allNodes(roots).filter(n => n.role === 'workflows');
+    check('one workflows root remains', wfRoots.length === 1);
+    check('both workflows live under it',
+        wfRoots[0].children.map(c => c.title).join() === 'Old,Yesterday');
+    check('the merged workflow kept its tabs', JSON.stringify(roots).includes('t.example'));
+
+    // A database that already holds duplicates (written before the merge
+    // existed) is healed at boot.
+    db.prepare("INSERT INTO items (id, parent_id, position, kind, role, title) VALUES ('w3', NULL, 9, 'folder', 'workflows', 'Dup')").run();
+    db.prepare("INSERT INTO items (id, parent_id, position, kind, title, url) VALUES ('t3', 'w3', 0, 'bookmark', 'x', 'https://x3.example')").run();
+    const healed = items.healDuplicateRoles();
+    const after = allNodes(items.readTree().roots);
+    check('boot heal merges stored duplicates',
+        healed.healed && after.filter(n => n.role === 'workflows').length === 1);
+    check('boot heal keeps the duplicate\'s children', after.some(n => n.url === 'https://x3.example'));
+    check('a clean tree is left alone', items.healDuplicateRoles().healed === false);
+    db.close();
+}
+
 console.log(failures === 0 ? '\nAll items tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);

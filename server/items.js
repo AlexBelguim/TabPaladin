@@ -139,7 +139,47 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
             }
             return out;
         };
-        return (Array.isArray(roots) ? roots : []).map(clean).filter(Boolean);
+        const out = (Array.isArray(roots) ? roots : []).map(clean).filter(Boolean);
+        mergeDuplicateRoles(out);
+        return out;
+    }
+
+    // A role is meant to be unique, but nothing on a client enforces it: a
+    // working copy that never pulled creates its own workflows root, and a
+    // force push then lands a second one beside the server's. Clients use the
+    // first one they find, so whatever was saved into the other was invisible.
+    // Fold every later copy's children into the first; nothing is dropped
+    // except the empty husk.
+    function mergeDuplicateRoles(roots) {
+        const first = new Map();
+        const walk = (siblings) => {
+            for (let i = 0; i < siblings.length; i++) {
+                const n = siblings[i];
+                if (n.kind !== 'folder') continue;
+                if (n.role) {
+                    const keep = first.get(n.role);
+                    if (keep && keep !== n) {
+                        keep.children.push(...n.children);
+                        siblings.splice(i--, 1);
+                        continue;
+                    }
+                    first.set(n.role, n);
+                }
+                walk(n.children);
+            }
+        };
+        walk(roots);
+        return roots;
+    }
+
+    // Heal a stored tree that already has duplicate role folders. Runs at boot.
+    function healDuplicateRoles() {
+        const dupes = db.prepare(
+            "SELECT role, COUNT(*) AS n FROM items WHERE kind = 'folder' AND role IS NOT NULL GROUP BY role HAVING n > 1"
+        ).all();
+        if (!dupes.length) return { healed: false };
+        writeTree(readTree().roots, { deviceId: 'heal-duplicate-roles' });
+        return { healed: true, roles: dupes.map(d => d.role) };
     }
 
     // --- Tree <-> rows ------------------------------------------------------
@@ -207,7 +247,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     // --- Role lookups -------------------------------------------------------
 
     function findRoleRow(role) {
-        return db.prepare("SELECT * FROM items WHERE kind = 'folder' AND role = ? ORDER BY created_at LIMIT 1").get(role)
+        return db.prepare("SELECT * FROM items WHERE kind = 'folder' AND role = ? ORDER BY parent_id IS NOT NULL, position LIMIT 1").get(role)
             || null;
     }
 
@@ -511,6 +551,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         listNotes,
         applyNoteProposal,
         migrateFromLatestSnapshotIfNeeded,
+        healDuplicateRoles,
         recordHistory
     };
 }

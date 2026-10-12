@@ -85,6 +85,11 @@ if (migration.migrated) {
     console.log(`[TabPaladin] Migrated latest snapshot into the items table (${migration.nodes} nodes).`);
 }
 
+const healed = items.healDuplicateRoles();
+if (healed.healed) {
+    console.log(`[TabPaladin] Merged duplicate role folders: ${healed.roles.join(', ')}.`);
+}
+
 // One bookmarks folder, called Bookmarks, holding everything else. Idempotent:
 // a tree that already has one is left exactly as the user arranged it.
 const bookmarksRoot = items.ensureBookmarksRoot();
