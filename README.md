@@ -8,7 +8,7 @@
 
 [![Chrome](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)](https://github.com/AlexBelguim/TabPaladin)
 [![Firefox](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox&logoColor=white)](https://github.com/AlexBelguim/TabPaladin)
-[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -111,7 +111,13 @@ Contributions are welcome! Feel free to:
 
 ## 📜 License
 
-**Proprietary** — All rights reserved. Contact for licensing inquiries.
+Copyright (C) 2026 AlexBelguim
+
+TabPaladin is free software: you can redistribute it and/or modify it under the terms of the
+[GNU Affero General Public License v3.0](LICENSE). If you run a modified version as a service
+for other people, you must make your modified source available to them.
+
+See [PRIVACY.md](PRIVACY.md) for what data TabPaladin handles and where it goes.
 
 ---
 

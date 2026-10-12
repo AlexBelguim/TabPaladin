@@ -1,0 +1,78 @@
+# TabPaladin Privacy Policy
+
+_Last updated: 13 October 2026_
+
+TabPaladin is a browser extension and a companion web app for saving tab sessions
+("workflows"), organising bookmarks, and keeping notes. It is self-hosted software:
+**the developer does not run a server, does not collect analytics, and never receives
+your data.** Everything below describes where your data goes on your own devices and
+on services you choose to connect.
+
+## What the extension accesses
+
+| Permission | Why |
+|---|---|
+| **Tabs** | To list your open tabs, save them as a workflow, reopen a workflow, and remove a tab from a workflow when you close it. |
+| **Bookmarks** | Only when you press **Import this browser's bookmarks**, to copy them once into TabPaladin. Your browser's own bookmarks are read, never changed. |
+| **Storage / unlimited storage** | To keep your bookmark tree, workflows, notes and settings on your device. |
+| **Downloads** | Only when you export workflows or folders to a file. |
+| **Scripting + access to all sites** _(optional, off by default)_ | Only if you turn on **Scroll to seek in fullscreen videos**. It lets the mouse wheel skip through a fullscreen video. It reads nothing from the page and sends nothing anywhere. Turning it off removes the permission. |
+
+## Where your data is stored
+
+- **On your device.** Your bookmark tree, workflows, notes and settings are kept in the
+  extension's local storage. If you set up AI organisation, your Gemini API key is also
+  stored there. In the web app, your server address and sign-in session are kept in that
+  browser's storage.
+- **On your own sync server, if you set one up.** TabPaladin can sync with a server that
+  *you* host (for example in Docker on a home NAS). When you sign in and push, your
+  bookmark tree, workflows and notes are sent to that server and stored in its database,
+  along with a history of earlier versions. Your username and a hashed password are
+  stored there too. Nobody else operates or can see this server unless you give them
+  access.
+
+## Third-party services
+
+TabPaladin only contacts these when you use the matching feature:
+
+- **Google Gemini (AI organisation).** Off by default. If you turn it on and enter your own
+  API key, the **titles** of the bookmarks being organised and your folder names are sent
+  to Google's Gemini API, along with any hints you type. Your API key is included in each
+  request. This is subject to
+  [Google's terms and privacy policy](https://policies.google.com/privacy).
+- **Google favicon service.** To show site icons, the extension and web app request each
+  bookmark's icon from `www.google.com/s2/favicons`, which tells Google the domain of each
+  bookmark being displayed (not the full address).
+- **DuckDuckGo.** Text you type into the home-screen search box is sent to DuckDuckGo
+  only when you submit a search.
+- **Reddit (imports).** Only if you connect a Reddit account in the Imports section. Your
+  own sync server, not the extension, then uses your own Reddit API app credentials to
+  download your saved posts and keeps a copy on your server. Saved posts you later delete
+  on Reddit may stay in that archive until you delete them in TabPaladin.
+
+## What TabPaladin does not do
+
+- No analytics, telemetry, tracking or advertising.
+- No sale or sharing of data with anyone.
+- No data is sent to the developer.
+- Your browsing history is never read.
+
+## Sharing notes with an AI assistant
+
+The sync server can create a temporary link that lets an AI assistant read your notes and
+suggest changes. The link expires after one hour, and suggested changes are only applied
+once you approve them. Anyone who has the link can read your notes until it expires, so
+share it only with the assistant you intend.
+
+## Deleting your data
+
+- **Extension:** removing the extension deletes everything it stored on your device.
+- **Sync server:** your data lives in the server's database file, which you control and
+  can delete at any time.
+- **Gemini / Reddit:** disconnect them in TabPaladin's settings and revoke the API key or
+  app in your Google or Reddit account.
+
+## Changes and contact
+
+Changes to this policy are published in this file in the project's repository, with the
+date at the top updated. Questions can be raised as an issue on the project's GitHub page.

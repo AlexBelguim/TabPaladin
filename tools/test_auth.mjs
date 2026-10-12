@@ -33,7 +33,7 @@ async function call(path, { method = 'GET', token, body } = {}) {
     return { status: res.status, json };
 }
 
-const USER = 'alex';
+const USER = 'tester';
 const PASS = 'correct horse battery';
 const NEWPASS = 'staple correct horse';
 
