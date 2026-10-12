@@ -15,7 +15,7 @@
         "storage",
         "unlimitedStorage",
         "downloads",
-        "<all_urls>"
+        "scripting"
     ],
     "background": {
         "scripts": [
@@ -36,15 +36,7 @@
             "128": "../assets/icon128.png"
         }
     },
-    "content_scripts": [
-        {
-            "matches": [
-                "<all_urls>"
-            ],
-            "js": [
-                "../src/content/videoSeek.js"
-            ],
-            "run_at": "document_idle"
-        }
+    "optional_permissions": [
+        "<all_urls>"
     ]
 }

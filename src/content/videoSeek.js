@@ -7,6 +7,24 @@
 (function () {
     'use strict';
 
+    // Registered at runtime by the background script, only while the
+    // "Scroll to seek" setting is on. Pages opened before it was switched off
+    // keep this script until they reload, so it also watches the setting.
+    if (window.__tpVideoSeek) return;
+    window.__tpVideoSeek = true;
+    const ext = typeof browser !== 'undefined' ? browser : chrome;
+    let enabled = true;
+    try {
+        ext.storage.local.get('settings').then((d) => {
+            enabled = Boolean(d && d.settings && d.settings.videoSeek);
+        }).catch(() => {});
+        ext.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes.settings) {
+                enabled = Boolean(changes.settings.newValue && changes.settings.newValue.videoSeek);
+            }
+        });
+    } catch (e) { /* storage unavailable — stay enabled while registered */ }
+
     let lastScrollTime = 0;
     let scrollAccumulator = 0;
     const SCROLL_RESET_DELAY = 150; // ms to reset scroll speed detection
@@ -62,6 +80,7 @@
      * Handle wheel event on fullscreen video
      */
     function handleWheel(e) {
+        if (!enabled) return;
         const video = getFullscreenVideo();
         if (!video) return;
 
@@ -139,6 +158,4 @@
 
     // Listen for wheel events (capture phase to intercept early)
     document.addEventListener('wheel', handleWheel, { passive: false, capture: true });
-
-    console.log('[TabPaladin] Video scroll seek enabled');
 })();

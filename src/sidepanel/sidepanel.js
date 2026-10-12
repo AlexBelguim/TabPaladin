@@ -3038,16 +3038,11 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <!-- 4. Backend Sync -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backend Sync</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
-                <!-- URL and token are no longer typed. The address comes from
-                     src/utils/config.js, and the token is a session issued by
-                     signing in. Both stay as hidden inputs so the existing
-                     push/pull/test code keeps reading them exactly as before. -->
-                <input type="hidden" id="backend-url" value="${resolveServerUrl(settings.backend && settings.backend.url)}">
-                <input type="hidden" id="backend-token" value="${(settings.backend && settings.backend.token) || ''}">
-
-                <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
-                    Server: <code style="color:#93c5fd;">${resolveServerUrl(settings.backend && settings.backend.url)}</code>
-                </div>
+                <!-- The token is a session issued by signing in; it stays a
+                     hidden input so the push/pull/test code reads it as before. -->
+                <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Server address</div>
+                <input type="url" id="backend-url" value="${escapeHtml(resolveServerUrl(settings.backend && settings.backend.url))}" placeholder="https://bookmarks.example.com" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:10px;">
+                <input type="hidden" id="backend-token" value="${escapeHtml((settings.backend && settings.backend.token) || '')}">
 
                 <div id="backend-signed-in" style="display:${(settings.backend && settings.backend.token) ? 'block' : 'none'}; margin-bottom:10px;">
                     <div style="font-size:0.85rem; color:#ccc;">Signed in as <strong>${(settings.backend && settings.backend.username) || 'unknown'}</strong></div>
@@ -3079,6 +3074,18 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                         title="Copy this browser's own bookmarks into the tree as a new top-level folder (one-time)">
                     📚 Import this browser's bookmarks
                 </button>
+            </div>
+
+            <!-- Browsing extras -->
+            <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Video</h3>
+            <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                <label style="display:flex; align-items:center; cursor:pointer;">
+                    <input type="checkbox" id="video-seek-toggle" ${settings.videoSeek ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
+                    <span style="font-weight:bold;">Scroll to seek in fullscreen videos</span>
+                </label>
+                <div style="font-size:0.75rem; color:#666; margin-top:6px;">
+                    Scroll the mouse wheel over a fullscreen video to skip forward or back. Needs access to all sites, which the browser asks for when you switch it on.
+                </div>
             </div>
 
             <!-- 5. Imports -->
@@ -3536,11 +3543,31 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         document.getElementById('ai-key-wrapper').style.display = e.target.checked ? 'block' : 'none';
     });
 
+    // Applied immediately rather than on Save: switching it on has to ask for
+    // the all-sites permission, and that prompt only works during the click.
+    document.getElementById('video-seek-toggle').addEventListener('change', async (e) => {
+        const box = e.target;
+        let on = box.checked;
+        // Firefox's chrome.* is callback-style; browser.* returns promises.
+        const perms = (globalThis.browser || chrome).permissions;
+        try {
+            if (on) {
+                on = await perms.request({ origins: ['<all_urls>'] });
+            } else {
+                await perms.remove({ origins: ['<all_urls>'] }).catch(() => {});
+            }
+        } catch (err) {
+            on = false;
+            alert('Could not enable video seek: ' + err.message);
+        }
+        box.checked = on;
+        const current = await StorageManager.getSettings();
+        await StorageManager.saveSettings({ ...current, videoSeek: on });
+    });
+
     // Backend sync buttons
     const backendStatus = document.getElementById('backend-status');
     const getBackendConfig = () => ({
-        // resolveServerUrl keeps the hardcoded default authoritative even if the
-        // hidden field is somehow empty.
         url: resolveServerUrl(document.getElementById('backend-url').value),
         token: document.getElementById('backend-token').value.trim()
     });
@@ -3571,6 +3598,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const username = (document.getElementById('backend-username')?.value || '').trim();
         const password = document.getElementById('backend-password')?.value || '';
         authError('');
+        if (!base) { authError('Enter your server address first.'); return; }
         if (!username || !password) { authError('Username and password are both required.'); return; }
 
         // Ask first whether an account exists, so the very first sign-in creates
@@ -3949,7 +3977,10 @@ function tpToast(msg, ms = 3200) {
 async function getSyncConfig() {
     const settings = await StorageManager.getSettings();
     const cfg = settings.backend || {};
-    return { url: resolveServerUrl(cfg.url), token: cfg.token || '' };
+    const url = resolveServerUrl(cfg.url);
+    // A token without an address has nowhere to go; treat it as signed out
+    // rather than fetching relative paths against the extension's own origin.
+    return { url, token: url ? (cfg.token || '') : '' };
 }
 
 async function persistSyncStamp(kind) {

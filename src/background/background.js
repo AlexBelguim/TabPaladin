@@ -1,4 +1,5 @@
-// Background script: opens the app page + workflow auto-sync.
+// Background script: opens the app page, workflow auto-sync, and the
+// optional video scroll-seek content script.
 // Compatible with both Chrome (service worker) and Firefox (event page).
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
@@ -6,7 +7,6 @@ const api = typeof browser !== 'undefined' ? browser : chrome;
 const TRACK_STORE_KEY = 'tpOpenWorkflowTabs'; // { [tabId]: { workflowId, bookmarkId } }
 const APP_PAGE = 'src/app/app.html';
 
-console.log("TabPaladin background script loaded.");
 
 // --- Opening the app ---
 //
@@ -43,7 +43,6 @@ if (api.action && api.action.onClicked) {
 }
 
 api.runtime.onInstalled.addListener(() => {
-    console.log("TabPaladin installed.");
     // Clear stale tracking from previous session
     api.storage.local.remove(TRACK_STORE_KEY).catch(() => {});
 });
@@ -128,3 +127,50 @@ api.tabs.onRemoved.addListener(async (tabId) => {
         console.warn("TabPaladin autosync error:", e);
     }
 });
+
+// --- Video scroll-seek (opt-in) ---
+//
+// Scroll the wheel over a fullscreen video to seek. It needs access to every
+// site, which is not something to ask for at install for a side feature, so
+// the host permission is optional and the script is registered only while
+// Settings has it switched on and the permission is granted.
+const VIDEO_SEEK_ID = 'tp-video-seek';
+const ALL_SITES = { origins: ['<all_urls>'] };
+
+async function syncVideoSeek() {
+    if (!api.scripting || !api.scripting.registerContentScripts) return;
+    try {
+        const data = await api.storage.local.get('settings');
+        const wanted = Boolean(data && data.settings && data.settings.videoSeek);
+        const granted = await api.permissions.contains(ALL_SITES);
+        const existing = await api.scripting.getRegisteredContentScripts({ ids: [VIDEO_SEEK_ID] });
+        if (wanted && granted && !existing.length) {
+            const script = {
+                id: VIDEO_SEEK_ID,
+                matches: ['<all_urls>'],
+                js: ['src/content/videoSeek.js'],
+                runAt: 'document_idle'
+            };
+            try {
+                await api.scripting.registerContentScripts([{ ...script, persistAcrossSessions: true }]);
+            } catch (e) {
+                // Older Firefox lacks persistAcrossSessions; this runs on every
+                // background wake, so a session-only registration is enough.
+                await api.scripting.registerContentScripts([script]);
+            }
+        } else if ((!wanted || !granted) && existing.length) {
+            await api.scripting.unregisterContentScripts({ ids: [VIDEO_SEEK_ID] });
+        }
+    } catch (e) {
+        console.warn('TabPaladin: could not update video seek', e);
+    }
+}
+
+syncVideoSeek();
+api.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.settings) syncVideoSeek();
+});
+if (api.permissions && api.permissions.onAdded) {
+    api.permissions.onAdded.addListener(syncVideoSeek);
+    api.permissions.onRemoved.addListener(syncVideoSeek);
+}
