@@ -16,8 +16,17 @@ services:
       - PORT=18921
       - DATA_DIR=/data
       - PWA_DIR=/app/pwa
-      # CHANGE THIS to a long random string. The extension uses the same value.
-      - AUTH_TOKEN=${TABPALADIN_TOKEN:-7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b}
+      # First admin, created on the first start with no accounts; ignored after.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Optional legacy shared token / script key; acts as the first admin.
+      # Off unless set; at least 32 characters (openssl rand -hex 32).
+      - AUTH_TOKEN=${TABPALADIN_TOKEN:-}
+      # Proxies allowed to set X-Forwarded-*; default loopback, uniquelocal.
+      - TRUST_PROXY=${TRUST_PROXY:-}
+      # Extra CORS origins (extensions and this server's own origin always work).
+      - CORS_ORIGIN=${CORS_ORIGIN:-}
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
       - MAX_SNAPSHOTS=${MAX_SNAPSHOTS:-200}
       # Encrypts importer OAuth refresh tokens at rest. Set it in .env before
       # connecting an account — sync.db is the kind of file that ends up in a

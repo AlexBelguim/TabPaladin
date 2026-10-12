@@ -2471,17 +2471,21 @@ async function probeAuthStatus() {
         const btn = $('auth-submit');
         if (!data.hasAccount) {
             if (hint) {
-                hint.textContent = 'No account on this server yet — the details you enter will create it.';
+                hint.textContent = NO_ACCOUNT_HINT;
                 hint.classList.remove('hidden');
             }
-            if (btn) btn.textContent = 'Create account';
-        } else if (btn) {
+        }
+        if (btn) {
             btn.textContent = 'Sign in';
         }
     } catch (e) {
         // Server unreachable; the sign-in attempt will report it properly.
     }
 }
+
+// Accounts are created on the server from its .env, never from the app — an
+// open "first visitor creates the account" form let anyone claim a new server.
+const NO_ACCOUNT_HINT = "This server has no account yet. Set ADMIN_USERNAME and ADMIN_PASSWORD in the server's .env and restart it, then sign in.";
 
 async function submitAuth() {
     const base = currentServerUrl();
@@ -2507,7 +2511,8 @@ async function submitAuth() {
     }
 
     try {
-        const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
+        if (!hasAccount) return setErr(NO_ACCOUNT_HINT);
+        const res = await fetch(base + '/api/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })

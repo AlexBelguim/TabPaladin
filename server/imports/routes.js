@@ -3,6 +3,7 @@
 import * as reddit from './reddit.js';
 import { runSource } from './runner.js';
 import { classify, isManualProvider } from './manual.js';
+import { escapeHtml } from '../security.js';
 
 // Only Reddit can be created by hand; the manual archives create themselves the
 // first time something is shared into them.
@@ -40,7 +41,7 @@ export function publicSource(store, source) {
 function resultPage(title, body) {
     return `<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
+<title>${escapeHtml(title)}</title>
 <style>
   body { font: 16px/1.5 system-ui, sans-serif; margin: 0; min-height: 100vh;
          display: grid; place-items: center; background: #14161a; color: #e7e9ee; }
@@ -271,7 +272,7 @@ export function attachRoutes(app, { store, requireAuth }) {
         const { code, state, error } = req.query;
         if (error) {
             return res.status(400).type('html').send(resultPage('Connection refused',
-                `<h2>Reddit declined</h2><p><code>${String(error).slice(0, 100)}</code></p>`));
+                `<h2>Reddit declined</h2><p><code>${escapeHtml(String(error).slice(0, 100))}</code></p>`));
         }
         if (!code || !state) {
             return res.status(400).type('html').send(resultPage('Bad callback',
@@ -301,13 +302,13 @@ export function attachRoutes(app, { store, requireAuth }) {
             store.markRun(source.id, { status: 'connected' });
 
             res.type('html').send(resultPage('Connected',
-                `<h2>Connected as u/${username || '?'}</h2>
+                `<h2>Connected as u/${escapeHtml(username || '?')}</h2>
                  <p>TabPaladin will sweep your saved posts every ${source.intervalMinutes} minutes.</p>
                  <p>You can close this tab.</p>`));
         } catch (e) {
             store.markRun(source.id, { status: 'error', error: String(e && e.message || e) });
             res.status(502).type('html').send(resultPage('Failed',
-                `<h2>Could not complete the connection</h2><p><code>${String(e && e.message || e).slice(0, 300)}</code></p>`));
+                `<h2>Could not complete the connection</h2><p><code>${escapeHtml(String(e && e.message || e).slice(0, 300))}</code></p>`));
         }
     });
 }

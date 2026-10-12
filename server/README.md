@@ -19,15 +19,55 @@ Nothing is lost; old history rows stay readable.
 
 ```bash
 cd server
-# Set a long random token:
-echo 'TABPALADIN_TOKEN=7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b' > .env
-# And a second one, if you plan to use importers (see below):
-echo 'IMPORT_SECRET=change-me-to-something-long-and-random' >> .env
+cp .env.example .env
+# Edit .env: at least ADMIN_PASSWORD. Generate one with: openssl rand -base64 18
+mkdir -p data && sudo chown 1000:1000 data   # the container runs as uid 1000 (node)
 docker compose up -d --build
 ```
 
-The server listens on `http://<host>:18921`. Configure the same `TABPALADIN_TOKEN`
-in the extension settings (Backend section) and you're synced.
+The server listens on `http://<host>:18921`. On its first start it creates
+the admin account from `ADMIN_USERNAME` / `ADMIN_PASSWORD`; sign in with
+those in the PWA or the extension's Backend settings. After that the two
+variables are ignored, so editing `.env` later changes nobody's password —
+change it from the app instead. A server with no account and no
+`ADMIN_PASSWORD` refuses to start. There is no way to create an account over
+the network.
+
+### Environment
+
+| Variable | Default | |
+|---|---|---|
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / *(required on first start)* | First admin account. Ignored once any account exists. |
+| `TABPALADIN_TOKEN` | *(off)* | Legacy shared token, passed to the server as `AUTH_TOKEN`. Requests bearing it (`Authorization: Bearer` or `X-API-Key`) act as the first admin — for scripts, and for clients that predate logins. At least 32 characters; the old example value from this README is refused. Also the admin password on a first start without `ADMIN_PASSWORD`. |
+| `IMPORT_SECRET` | *(off)* | Encrypts importer OAuth refresh tokens at rest. |
+| `TRUST_PROXY` | `loopback, uniquelocal` | Express `trust proxy`: which proxies may set `X-Forwarded-For` / `-Proto`. Set `1` or `true` if your proxy reaches the server from a public address. |
+| `CORS_ORIGIN` | *(off)* | Extra comma-separated origins allowed to call the API cross-origin. The server's own origin and browser-extension origins (`chrome-extension://`, `moz-extension://`) are always allowed. |
+| `AUTH_MAX_FAILURES` / `AUTH_WINDOW_MINUTES` | `10` / `15` | Failed sign-ins allowed per IP per window before `429`. |
+| `BACKUP_KEEP` | `7` | Boot-time database backups to keep (see below). |
+| `SESSION_DAYS` | `180` | Session lifetime. |
+| `MAX_SNAPSHOTS` | `200` | Tree history rows kept. |
+| `HOST_PORT` | `18921` | Host port in docker-compose. |
+
+**Backups.** At boot, before any migration touches it, the server writes a
+consistent copy of the database to `data/sync.db.bak-<timestamp>` — whenever
+the schema is about to change, and otherwise at most once a day. The newest
+`BACKUP_KEEP` are kept. To restore, stop the container and copy one over
+`sync.db` (deleting `sync.db-wal` and `sync.db-shm`).
+
+### Upgrading an existing server
+
+Existing data, the existing account, its password and every signed-in device
+keep working; the account becomes the admin. Before the first start of the new
+image:
+
+1. The container no longer runs as root. Hand it the data directory once:
+   `sudo chown -R 1000:1000 ./data`. The server says so at boot if it can't
+   write there.
+2. If `TABPALADIN_TOKEN` is the example value this README used to publish, or
+   shorter than 32 characters, the server refuses to start. Replace it with
+   `openssl rand -hex 32` (and update anything still using it), or remove it
+   once every client signs in with an account. If it was never set, the old
+   compose file silently used that example value — it now defaults to off.
 
 ## The tree
 
@@ -73,11 +113,15 @@ can only be changed through the explicit import verbs below.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
+All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | server status |
+| GET | `/api/auth/status` | **no auth** — `{ hasAccount, legacyTokenEnabled }` |
+| GET | `/api/auth/me` | `{ user: { id, username, role } }` |
+| POST | `/api/login` | **no auth** — `{ username, password }` → session token; rate-limited per IP |
+| POST | `/api/auth/password` | `{ currentPassword, newPassword }`; revokes every session |
 | GET | `/api/tree` | the tree (+ virtual imports subtree) |
 | PUT | `/api/tree` | replace the tree `{ roots, baseVersion, deviceId?, force? }`; 409 on a stale baseVersion |
 | GET | `/api/tree/version` | cheap freshness probe |
@@ -231,7 +275,10 @@ node tools/test_items.mjs      # canonical tree store: migration, versioning, no
 node tools/test_treestore.mjs  # extension working copy: managers, facade, sync, import verbs
 node tools/test_imports.mjs    # importers: archive, virtual subtree, tombstones
 node tools/test_share_sw.mjs   # PWA service worker share handling
-node tools/test_auth.mjs --url http://127.0.0.1:18921 --legacy <token>   # against a live server
+node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
+node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
+ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 DATA_DIR=/tmp/tp node server/index.js &
+node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server
 ```
 
 ### Sharing from a phone

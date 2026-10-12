@@ -3586,8 +3586,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         if (!base) { authError('Enter your server address first.'); return; }
         if (!username || !password) { authError('Username and password are both required.'); return; }
 
-        // Ask first whether an account exists, so the very first sign-in creates
-        // it instead of failing with "wrong password" against an empty server.
+        // Ask first whether an account exists: accounts are created on the
+        // server from its .env, never from here, so an empty server gets
+        // directions instead of a confusing "wrong password".
         let hasAccount = true;
         try {
             const s = await fetch(base + '/api/auth/status').then(r => r.json());
@@ -3597,8 +3598,13 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             return;
         }
 
+        if (!hasAccount) {
+            authError("This server has no account yet. Set ADMIN_USERNAME and ADMIN_PASSWORD in the server's .env and restart it, then sign in.");
+            return;
+        }
+
         try {
-            const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
+            const res = await fetch(base + '/api/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, password })
