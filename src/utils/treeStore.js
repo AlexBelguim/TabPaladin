@@ -351,9 +351,19 @@ function stripVirtual(roots) {
 const IMPORTS_ROOT_TITLE = 'TabPaladin Imports';
 const SENTINELS = new Set(['__tabpaladin_root__', '__tabpaladin_meta__']);
 
+// Browser folders that hold nothing worth importing: Opera's and Vivaldi's
+// trash. Same spirit as NOISE_ROOT_TITLES in the sidepanel.
+const TRASH_TITLES = new Set(['trash', 'prullenbak', 'papierkorb', 'corbeille']);
+
 function convertBrowserNode(node) {
     if (!node) return null;
+    // Firefox separators are nodes with neither url nor children; without
+    // this they arrive as empty untitled folders.
+    if (node.type === 'separator') return null;
     if (node.url) {
+        // Firefox's smart folders ("Most Visited", "Recent Tags") are place:
+        // queries against its own history database — meaningless anywhere else.
+        if (node.url.startsWith('place:')) return null;
         if (SENTINELS.has(node.title)) return null;
         if (node.url.startsWith(DATA_PREFIX)) {
             const p = decodePayloadUrl(node.url) || {};
@@ -369,6 +379,7 @@ function convertBrowserNode(node) {
         return makeNode({ kind: 'bookmark', title: node.title || node.url, url: node.url });
     }
     if (node.title === IMPORTS_ROOT_TITLE) return null;
+    if (TRASH_TITLES.has((node.title || '').toLowerCase().trim())) return null;
     const folder = makeNode({ kind: 'folder', title: node.title || '' });
     folder.children = (node.children || []).map(convertBrowserNode).filter(Boolean);
     return folder;
@@ -413,6 +424,16 @@ export const TreeStore = {
 
     async load() {
         await ensureLoaded();
+    },
+
+    // Write the working copy to storage now instead of on the debounce.
+    // Anything about to close this page (saving a workflow closes its own
+    // tab along with the rest) must await this first, or the edit dies with
+    // the page before the timer fires.
+    async flush() {
+        await ensureLoaded();
+        if (persistTimer) clearTimeout(persistTimer);
+        await persistNow();
     },
 
     status() {

@@ -60,8 +60,11 @@ globalThis.chrome = {
                 { id: '1', title: 'Bookmarks Bar', children: [
                     { id: '10', title: 'HN', url: 'https://news.ycombinator.com' },
                     { id: '11', title: 'Old note', url: 'data:application/json,' + encodeURIComponent(JSON.stringify({ v: 1, content: 'legacy' })) },
-                    { id: '12', title: '__tabpaladin_root__', url: 'data:application/json,%7B%7D' }
+                    { id: '12', title: '__tabpaladin_root__', url: 'data:application/json,%7B%7D' },
+                    { id: '13', title: '', type: 'separator' },
+                    { id: '14', title: 'Most Visited', type: 'bookmark', url: 'place:sort=8&maxResults=10' }
                 ]},
+                { id: '3', title: 'Trash', children: [{ id: '30', title: 'deleted', url: 'https://deleted.example' }] },
                 { id: '2', title: 'Other Bookmarks', children: [
                     { id: '20', title: 'TabPaladin Imports', children: [{ id: '21', title: 'x', url: 'https://x' }] }
                 ]}
@@ -308,6 +311,24 @@ check('legacy data: note converted to a note node', flat.includes('"kind":"note"
 check('sentinels dropped', !flat.includes('__tabpaladin_root__'));
 check('browser TabPaladin Imports folder skipped', !flat.includes('TabPaladin Imports'));
 check('plain bookmarks came through', flat.includes('news.ycombinator.com'));
+check('Firefox separators are not imported as empty folders',
+    !JSON.stringify(importedFolder.children[0]).includes('"title":""'));
+check('Firefox place: queries are skipped', !flat.includes('place:'));
+check('Opera/Vivaldi trash is skipped', !flat.includes('deleted.example'));
+
+console.log('\n8. Saving a workflow survives the page closing right after');
+{
+    const { StorageManager } = await import('../src/utils/storageManager.js');
+    storageData.delete('tpTree');
+    const wf = await StorageManager.saveWorkflow('Research', [
+        { url: 'https://a.example', title: 'A' }, { url: 'https://b.example', title: 'B' }
+    ]);
+    await TreeStore.flush();
+    const onDisk = JSON.stringify(storageData.get('tpTree'));
+    check('flush writes the new workflow before the debounce fires',
+        onDisk.includes('"Research"') && onDisk.includes('b.example'));
+    check('saveWorkflow reports every tab', wf.tabs.length === 2);
+}
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);

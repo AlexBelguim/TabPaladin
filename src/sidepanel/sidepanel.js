@@ -190,19 +190,71 @@ function setupEventListeners() {
             const name = prompt("Name this session (e.g. 'Research', 'Private'):");
             if (!name) return;
 
-            await StorageManager.saveWorkflow(name, saveable);
+            // Remembered before saving: if the working copy already had
+            // unpushed edits, a conflict cannot be resolved by pulling
+            // without discarding them, so the workflow stays local instead.
+            const hadLocalEdits = TreeStore.status().dirty;
+            const saved = await StorageManager.saveWorkflow(name, saveable);
+
+            // The tabs are about to be closed, so the workflow has to be on
+            // disk first. The tree persists on a debounce, and when this page
+            // is a tab in the same window it used to close itself before the
+            // timer fired — the tabs were gone and the workflow never written.
+            await TreeStore.flush();
+            const expected = saveable.length;
+            if (!saved || saved.tabs.length !== expected) {
+                alert(`Workflow saved ${saved ? saved.tabs.length : 0} of ${expected} tabs — leaving your tabs open so nothing is lost.`);
+                loadWorkflows();
+                return;
+            }
+
+            // Never close the page doing the saving; only close tabs that
+            // were actually saved.
+            const self = api.tabs.getCurrent ? await api.tabs.getCurrent() : null;
+            const tabIds = saveable.map(t => t.id).filter(id => !self || id !== self.id);
 
             // Fresh tab so the window doesn't close when we remove the rest
-            await api.tabs.create({});
-
-            const tabIds = tabs.map(t => t.id);
+            if (!self) await api.tabs.create({});
             await api.tabs.remove(tabIds);
 
             loadWorkflows();
-            alert("Workflow saved!");
+            const synced = await pushSavedWorkflow(name, saveable, hadLocalEdits);
+            alert(`Workflow "${name}" saved (${expected} tabs). ${synced}`);
         } catch (err) {
             console.error("Save workflow error:", err);
             alert("Error saving workflow: " + err.message);
+        }
+    }
+
+    // A saved workflow is the only copy of tabs that were just closed, so it
+    // goes to the server straight away instead of waiting for a manual Push.
+    // When another device pushed in between, and this working copy has no
+    // other unpushed edits, pull their tree and save the workflow again on
+    // top of it — never force, which would erase what they pushed.
+    async function pushSavedWorkflow(name, tabs, hadLocalEdits) {
+        const cfg = await getSyncConfig();
+        if (!cfg.token) return 'Not signed in, so it is only on this computer — sign in and Push.';
+        try {
+            await TreeStore.sync.push(cfg);
+            await persistSyncStamp('push');
+            return 'Synced to the server.';
+        } catch (e) {
+            if (e.status !== 409) return `Kept on this computer — push failed: ${e.message}`;
+            if (hadLocalEdits) {
+                return 'Kept on this computer: the server has newer changes and you have other unpushed edits. Push when ready.';
+            }
+            try {
+                await TreeStore.sync.pull(cfg);
+                await StorageManager.saveWorkflow(name, tabs);
+                await TreeStore.flush();
+                await TreeStore.sync.push(cfg);
+                await persistSyncStamp('push');
+                loadWorkflows();
+                return 'Synced to the server (merged with changes from another device).';
+            } catch (e2) {
+                await TreeStore.flush().catch(() => {});
+                return `Kept on this computer — sync failed: ${e2.message}`;
+            }
         }
     }
 
