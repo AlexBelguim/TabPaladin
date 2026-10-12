@@ -19,15 +19,37 @@ Nothing is lost; old history rows stay readable.
 
 ```bash
 cd server
-# Set a long random token:
-echo 'TABPALADIN_TOKEN=7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b' > .env
-# And a second one, if you plan to use importers (see below):
-echo 'IMPORT_SECRET=change-me-to-something-long-and-random' >> .env
+# Only if you plan to use importers (see below) — encrypts their OAuth tokens:
+echo "IMPORT_SECRET=$(openssl rand -hex 32)" >> .env
+mkdir -p data && sudo chown 1000:1000 data   # the container runs as uid 1000 (node)
 docker compose up -d --build
+docker compose logs tabpaladin-sync | grep 'Setup code'
 ```
 
-The server listens on `http://<host>:18921`. Configure the same `TABPALADIN_TOKEN`
-in the extension settings (Backend section) and you're synced.
+The server listens on `http://<host>:18921`. Open the PWA or the extension's
+Backend settings, enter a username, a password and the **setup code** from the
+log, and the account is created. The code changes on every restart until an
+account exists. To skip it, set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`
+and the account is created at first boot instead.
+
+Upgrading a deployment that ran an older image as root: hand the data directory
+to the container's user once, with `sudo chown -R 1000:1000 ./data`. The server
+says so at boot if it cannot write there.
+
+**Legacy shared token.** Clients older than account logins authenticate with a
+shared `TABPALADIN_TOKEN` instead. It is off unless you set it; if you do, it
+must be at least 32 characters, and the server refuses to start with a short
+one or with the example value this README used to publish:
+
+```bash
+echo "TABPALADIN_TOKEN=$(openssl rand -hex 32)" >> .env
+```
+
+Sign-in and setup allow 10 failed attempts per IP per 15 minutes
+(`AUTH_MAX_FAILURES`, `AUTH_WINDOW_MINUTES`). Behind a reverse proxy the client
+IP comes from `X-Forwarded-For`, trusted only from loopback and private
+addresses by default; set `TRUST_PROXY` (any Express `trust proxy` value, e.g.
+`1` or `true`) if your proxy reaches the server from a public address.
 
 ## The tree
 
@@ -73,11 +95,15 @@ can only be changed through the explicit import verbs below.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <TABPALADIN_TOKEN>` except `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
+All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/auth/setup`, `/api/login`, `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | server status |
+| GET | `/api/auth/status` | **no auth** — `{ hasAccount, setupCodeRequired, legacyTokenEnabled }` |
+| POST | `/api/auth/setup` | **no auth** — first run `{ username, password, setupCode }` (or the legacy token as bearer); replacing the account needs `currentPassword` |
+| POST | `/api/login` | **no auth** — `{ username, password }` → session token; rate-limited per IP |
+| POST | `/api/auth/password` | `{ currentPassword, newPassword }`; revokes every session |
 | GET | `/api/tree` | the tree (+ virtual imports subtree) |
 | PUT | `/api/tree` | replace the tree `{ roots, baseVersion, deviceId?, force? }`; 409 on a stale baseVersion |
 | GET | `/api/tree/version` | cheap freshness probe |
@@ -231,7 +257,9 @@ node tools/test_items.mjs      # canonical tree store: migration, versioning, no
 node tools/test_treestore.mjs  # extension working copy: managers, facade, sync, import verbs
 node tools/test_imports.mjs    # importers: archive, virtual subtree, tombstones
 node tools/test_share_sw.mjs   # PWA service worker share handling
-node tools/test_auth.mjs --url http://127.0.0.1:18921 --legacy <token>   # against a live server
+node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
+SETUP_CODE=test-code AUTH_MAX_FAILURES=50 DATA_DIR=/tmp/tp node server/index.js &
+node tools/test_auth.mjs --url http://127.0.0.1:18921 --setup-code test-code [--legacy <token>]   # against a live server
 ```
 
 ### Sharing from a phone

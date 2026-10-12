@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { attachImports } from './imports/index.js';
 import { buildImportsTree } from './imports/project.js';
 import { makeItemsStore } from './items.js';
+import {
+    authTokenProblem, hashPassword, verifyPassword, sameSecret, makeRateLimiter
+} from './security.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,7 +20,32 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PWA_DIR = process.env.PWA_DIR || path.resolve(__dirname, '..', 'pwa');
 const MAX_SNAPSHOTS = Number(process.env.MAX_SNAPSHOTS || 200);
 
+// Refuse to run with a guessable legacy token: real deployments are reachable
+// from the internet, and "authenticated" with a published value is worse than
+// off.
+const tokenProblem = authTokenProblem(AUTH_TOKEN);
+if (tokenProblem) {
+    console.error(`[TabPaladin] Refusing to start: ${tokenProblem}`);
+    console.error('[TabPaladin] Or remove AUTH_TOKEN / TABPALADIN_TOKEN entirely to use account logins only.');
+    process.exit(1);
+}
+
 fs.mkdirSync(DATA_DIR, { recursive: true });
+// The image runs as the unprivileged `node` user now; a data directory written
+// by an older image running as root is not writable until it is handed over.
+// Say so plainly rather than die on an SQLite "readonly database" later.
+for (const f of ['', 'sync.db', 'sync.db-wal', 'sync.db-shm']) {
+    const p = path.join(DATA_DIR, f);
+    if (f && !fs.existsSync(p)) continue;
+    try {
+        fs.accessSync(p, fs.constants.W_OK);
+    } catch (e) {
+        const uid = typeof process.getuid === 'function' ? process.getuid() : '?';
+        console.error(`[TabPaladin] Refusing to start: ${p} is not writable by uid ${uid}.`);
+        console.error(`[TabPaladin] On the host, run once: sudo chown -R ${uid}:${uid} <your data directory>`);
+        process.exit(1);
+    }
+}
 const db = new Database(path.join(DATA_DIR, 'sync.db'));
 db.pragma('journal_mode = WAL');
 
@@ -101,9 +129,20 @@ if (bookmarksRoot.created) {
 }
 
 const app = express();
-app.set('trust proxy', true); // so req.protocol reflects X-Forwarded-Proto behind a reverse proxy
+// So req.protocol and req.ip reflect X-Forwarded-* behind a reverse proxy. Not
+// `true`: that trusts a client-supplied X-Forwarded-For when the server is hit
+// directly, which would let anyone dodge the login rate limit by inventing
+// IPs. The default trusts proxies on loopback and private networks — a reverse
+// proxy or tunnel container on the same host or LAN. Set TRUST_PROXY to
+// anything Express accepts ("true", a hop count, a subnet list) otherwise.
+const TRUST_PROXY = process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal';
+app.set('trust proxy', /^(true|false)$/.test(TRUST_PROXY) ? TRUST_PROXY === 'true'
+    : /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
 app.use(cors({ origin: true, credentials: false }));
-app.use(express.json({ limit: '50mb' }));
+// Small bodies everywhere except a tree push, which carries the whole tree.
+const jsonSmall = express.json({ limit: '1mb' });
+const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
+app.use((req, res, next) => (req.method === 'PUT' && req.path === '/api/tree' ? next() : jsonSmall(req, res, next)));
 
 // Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
 app.use('/api', (req, res, next) => {
@@ -113,38 +152,43 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-// --- Passwords ---
-//
-// scrypt from node:crypto rather than bcrypt/argon2, so logging in adds no
-// dependency to a server whose whole point is being easy to self-host.
-const SCRYPT_KEYLEN = 64;
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 180);
 
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-    const derived = crypto.scryptSync(String(password), salt, SCRYPT_KEYLEN).toString('hex');
-    return `scrypt:${salt}:${derived}`;
-}
-
-function verifyPassword(password, stored) {
-    const parts = String(stored || '').split(':');
-    if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
-    const [, salt, expected] = parts;
-    const actual = crypto.scryptSync(String(password), salt, SCRYPT_KEYLEN).toString('hex');
-    const a = Buffer.from(actual, 'hex');
-    const b = Buffer.from(expected, 'hex');
-    // Length check first: timingSafeEqual throws on a mismatch.
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-// Constant-time compare for the legacy shared token, so it can't be guessed a
-// character at a time by timing the response.
-function sameSecret(a, b) {
-    const x = Buffer.from(String(a));
-    const y = Buffer.from(String(b));
-    return x.length === y.length && crypto.timingSafeEqual(x, y);
-}
-
 const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+
+// --- First run ---
+//
+// Whoever reaches a fresh server first would otherwise own it, so creating the
+// account takes proof of access to the host: either ADMIN_PASSWORD in the
+// environment (the account is created at boot), or the one-time setup code
+// printed to the container log at startup. SETUP_CODE pins the code, for
+// scripted installs and tests.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+if (ADMIN_PASSWORD && userCount() === 0) {
+    if (ADMIN_PASSWORD.length < 8) {
+        console.error('[TabPaladin] Refusing to start: ADMIN_PASSWORD must be at least 8 characters.');
+        process.exit(1);
+    }
+    db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+        .run(ADMIN_USERNAME, await hashPassword(ADMIN_PASSWORD), new Date().toISOString());
+    console.log(`[TabPaladin] Created account "${ADMIN_USERNAME}" from ADMIN_PASSWORD. You can remove ADMIN_PASSWORD now.`);
+}
+const SETUP_CODE = process.env.SETUP_CODE || crypto.randomBytes(9).toString('base64url');
+
+// Failed sign-in / setup attempts per client IP.
+const authLimiter = makeRateLimiter({
+    max: Number(process.env.AUTH_MAX_FAILURES || 10),
+    windowMs: Number(process.env.AUTH_WINDOW_MINUTES || 15) * 60 * 1000
+});
+
+function rateLimited(req, res) {
+    const wait = authLimiter.retryAfter(req.ip);
+    if (!wait) return false;
+    res.set('Retry-After', String(wait));
+    res.status(429).json({ error: `Too many failed attempts. Try again in ${Math.ceil(wait / 60)} minute(s).` });
+    return true;
+}
 
 function issueSession(username) {
     const token = crypto.randomBytes(32).toString('hex');
@@ -203,55 +247,94 @@ function requireAuth(req, res, next) {
 // form or a first-run setup form before it has any credentials. Leaks only
 // whether an account exists, which the login form already implies.
 app.get('/api/auth/status', (req, res) => {
+    const hasAccount = userCount() > 0;
     res.json({
         ok: true,
-        hasAccount: userCount() > 0,
+        hasAccount,
+        // Tells a client to ask for the code from the server log.
+        setupCodeRequired: !hasAccount,
         legacyTokenEnabled: Boolean(AUTH_TOKEN)
     });
 });
 
-// First-run: create the one account. Allowed while no account exists, or with
-// the legacy token, so an existing deployment can set a password without
-// shelling into the container.
-app.post('/api/auth/setup', (req, res) => {
-    const { username, password } = req.body || {};
-    if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
-    if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+// Create the one account, or replace it.
+//
+// First run (no account): needs the setup code from the server log, or the
+// legacy token as a bearer — a deployment that has it already has full access,
+// and this lets it set a password without shelling into the container.
+//
+// Replacing an existing account: needs that account's current password. A
+// session alone is not enough — a lost phone's session must not be able to
+// lock the owner out.
+app.post('/api/auth/setup', async (req, res) => {
+    try {
+        if (rateLimited(req, res)) return;
+        const { username, password, setupCode, currentPassword } = req.body || {};
+        if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+        if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
 
-    const hasAccount = userCount() > 0;
-    if (hasAccount) {
-        const hdr = req.headers.authorization || '';
-        const m = hdr.match(/^Bearer\s+(.+)$/);
-        const viaLegacy = m && AUTH_TOKEN && sameSecret(m[1], AUTH_TOKEN);
-        const viaSession = m && sessionFor(m[1]);
-        if (!viaLegacy && !viaSession) {
-            return res.status(403).json({ error: 'An account already exists.' });
+        const existing = db.prepare('SELECT username, password_hash FROM users LIMIT 1').get();
+        if (existing) {
+            if (!currentPassword || !(await verifyPassword(currentPassword, existing.password_hash))) {
+                authLimiter.fail(req.ip);
+                return res.status(403).json({
+                    error: 'An account already exists. Replacing it needs its current password.'
+                });
+            }
+        } else {
+            const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/);
+            const viaLegacy = m && AUTH_TOKEN && sameSecret(m[1], AUTH_TOKEN);
+            const viaCode = setupCode && sameSecret(String(setupCode).trim(), SETUP_CODE);
+            if (!viaLegacy && !viaCode) {
+                authLimiter.fail(req.ip);
+                return res.status(403).json({
+                    error: 'Creating the account needs the setup code printed in the server log at startup.',
+                    setupCodeRequired: true
+                });
+            }
         }
-        db.prepare('DELETE FROM users').run();
-        db.prepare('DELETE FROM sessions').run(); // old sessions must not survive a password change
+
+        const hash = await hashPassword(password);
+        db.transaction(() => {
+            db.prepare('DELETE FROM users').run();
+            db.prepare('DELETE FROM sessions').run(); // old sessions must not survive a password change
+            db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+                .run(String(username), hash, new Date().toISOString());
+        })();
+        authLimiter.reset(req.ip);
+
+        const session = issueSession(String(username));
+        res.json({ ok: true, username: String(username), ...session });
+    } catch (e) {
+        console.error('[TabPaladin] Setup failed:', e);
+        res.status(500).json({ error: 'Setup failed.' });
     }
-
-    db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
-        .run(String(username), hashPassword(password), new Date().toISOString());
-
-    const session = issueSession(String(username));
-    res.json({ ok: true, username: String(username), ...session });
 });
 
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body || {};
-    if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+// A real hash to check against when the username is unknown, so a missing
+// account and a wrong password cost the same and can't be told apart.
+const DUMMY_HASH = await hashPassword(crypto.randomBytes(16).toString('hex'));
 
-    const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(String(username));
-    // Hash even when the user is unknown, so a missing account and a wrong
-    // password take the same time and can't be told apart.
-    const ok = row
-        ? verifyPassword(password, row.password_hash)
-        : (hashPassword(password), false);
-    if (!ok) return res.status(401).json({ error: 'Wrong username or password.' });
+app.post('/api/login', async (req, res) => {
+    try {
+        if (rateLimited(req, res)) return;
+        const { username, password } = req.body || {};
+        if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
 
-    const session = issueSession(row.username);
-    res.json({ ok: true, username: row.username, ...session });
+        const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(String(username));
+        const ok = await verifyPassword(password, row ? row.password_hash : DUMMY_HASH);
+        if (!row || !ok) {
+            authLimiter.fail(req.ip);
+            return res.status(401).json({ error: 'Wrong username or password.' });
+        }
+        authLimiter.reset(req.ip);
+
+        const session = issueSession(row.username);
+        res.json({ ok: true, username: row.username, ...session });
+    } catch (e) {
+        console.error('[TabPaladin] Login failed:', e);
+        res.status(500).json({ error: 'Sign in failed.' });
+    }
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
@@ -260,20 +343,28 @@ app.post('/api/logout', requireAuth, (req, res) => {
     res.json({ ok: true });
 });
 
-app.post('/api/auth/password', requireAuth, (req, res) => {
-    const { currentPassword, newPassword } = req.body || {};
-    if (!newPassword || String(newPassword).length < 8) {
-        return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+app.post('/api/auth/password', requireAuth, async (req, res) => {
+    try {
+        if (rateLimited(req, res)) return;
+        const { currentPassword, newPassword } = req.body || {};
+        if (!newPassword || String(newPassword).length < 8) {
+            return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+        }
+        const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(req.username || '');
+        if (!row) return res.status(400).json({ error: 'No account to change.' });
+        if (!(await verifyPassword(currentPassword, row.password_hash))) {
+            authLimiter.fail(req.ip);
+            return res.status(401).json({ error: 'Current password is wrong.' });
+        }
+        const hash = await hashPassword(newPassword);
+        db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(hash, row.username);
+        db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+        const session = issueSession(row.username);
+        res.json({ ok: true, ...session });
+    } catch (e) {
+        console.error('[TabPaladin] Password change failed:', e);
+        res.status(500).json({ error: 'Password change failed.' });
     }
-    const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(req.username || '');
-    if (!row) return res.status(400).json({ error: 'No account to change.' });
-    if (!verifyPassword(currentPassword, row.password_hash)) {
-        return res.status(401).json({ error: 'Current password is wrong.' });
-    }
-    db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(hashPassword(newPassword), row.username);
-    db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
-    const session = issueSession(row.username);
-    res.json({ ok: true, ...session });
 });
 
 // --- Health (no auth) ---
@@ -328,7 +419,7 @@ app.get('/api/tree/version', requireAuth, (req, res) => {
     res.json({ ok: true, version: items.version() });
 });
 
-app.put('/api/tree', requireAuth, (req, res) => {
+app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
     const { roots, baseVersion, deviceId, force } = req.body || {};
     if (!Array.isArray(roots)) {
         return res.status(400).json({ error: 'Missing roots (array of top-level nodes).' });
@@ -568,7 +659,11 @@ app.listen(PORT, '0.0.0.0', () => {
     const modes = [];
     if (accounts > 0) modes.push('login');
     if (AUTH_TOKEN) modes.push('legacy token');
-    console.log(`[TabPaladin] Server listening on :${PORT} (auth: ${modes.join(' + ') || 'NONE — open /api/auth/setup to create an account'})`);
+    console.log(`[TabPaladin] Server listening on :${PORT} (auth: ${modes.join(' + ') || 'NONE — sign in from the app to create the account'})`);
+    if (accounts === 0) {
+        console.log(`[TabPaladin] No account yet. Setup code: ${SETUP_CODE}`);
+        console.log('[TabPaladin] Enter it in the app when creating the account. It changes on every restart unless SETUP_CODE is set.');
+    }
     if (accounts > 0 && AUTH_TOKEN) {
         console.log('[TabPaladin] Both auth modes are on. Once every client has logged in, remove AUTH_TOKEN so only the login works.');
     }

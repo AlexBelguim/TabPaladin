@@ -16,8 +16,18 @@ services:
       - PORT=18921
       - DATA_DIR=/data
       - PWA_DIR=/app/pwa
-      # CHANGE THIS to a long random string. The extension uses the same value.
-      - AUTH_TOKEN=${TABPALADIN_TOKEN:-7f3b8e2a9c5d4f1e0b9a8c7d6e5f4a3b}
+      # Optional legacy shared token for clients that predate account logins.
+      # No default: leave TABPALADIN_TOKEN unset to use logins only. If set it
+      # must be at least 32 characters (openssl rand -hex 32) or the server
+      # refuses to start.
+      - AUTH_TOKEN=${TABPALADIN_TOKEN:-}
+      # Optional: create the account at first boot instead of using the setup
+      # code printed in the log. Ignored once an account exists.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Which proxies may set X-Forwarded-For / -Proto. The default trusts
+      # loopback and private networks (a reverse proxy or tunnel on your LAN).
+      - TRUST_PROXY=${TRUST_PROXY:-}
       - MAX_SNAPSHOTS=${MAX_SNAPSHOTS:-200}
       # Encrypts importer OAuth refresh tokens at rest. Set it in .env before
       # connecting an account — sync.db is the kind of file that ends up in a
