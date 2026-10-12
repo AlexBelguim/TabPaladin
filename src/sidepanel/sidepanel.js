@@ -725,7 +725,6 @@ function appendTabDomainGroups(container, tabs, sourceGroupId = null) {
             }));
             e.dataTransfer.effectAllowed = 'move';
             group.classList.add('dragging');
-            console.log('[TabPaladin] Drag start tab-domain', d, 'with', bulkPayload.length, 'tabs from group', sourceGroupId || '(unclaimed)');
             e.stopPropagation();
         });
         handle.addEventListener('dragend', () => group.classList.remove('dragging'));
@@ -811,7 +810,6 @@ function renderGroupCard(group) {
         }));
         e.dataTransfer.effectAllowed = 'move';
         card.classList.add('dragging');
-        console.log('[TabPaladin] Drag start group', group.name, 'with', group.items.length, 'tabs');
         e.stopPropagation();
     });
     handle.addEventListener('dragend', () => card.classList.remove('dragging'));
@@ -1342,7 +1340,6 @@ function buildOrganizeHeader(title, parentFolderId) {
             if (!name) return;
             try {
                 const created = await Tree.create({ parentId: parentFolderId, title: name });
-                console.log('[TabPaladin] Created folder', created);
                 // Refresh the top-level view if we're at this folder's breadcrumb.
                 const top = currentNavStack[currentNavStack.length - 1];
                 if (top && top.id === parentFolderId) {
@@ -1553,7 +1550,6 @@ function renderFolderCard(sub, depth = 0) {
         e.dataTransfer.setData('text/tp-parent-id', String(sub.parentId || ''));
         e.dataTransfer.effectAllowed = 'move';
         card.classList.add('dragging');
-        console.log('[TabPaladin] Drag start folder', sub.id, 'parent', sub.parentId);
         e.stopPropagation();
     });
     handle.addEventListener('dragend', () => card.classList.remove('dragging'));
@@ -1619,8 +1615,6 @@ function renderFolderCard(sub, depth = 0) {
         const tabPayload = e.dataTransfer.getData('text/tp-tab');
         const tabsPayload = e.dataTransfer.getData('text/tp-tabs');
         const groupPayload = e.dataTransfer.getData('text/tp-group');
-
-        console.log('[TabPaladin] Drop on folder', sub.id, '— bookmark:', bookmarkId || '(none)', 'group(bookmarks):', bookmarkIdsJson || '(none)', 'folder:', draggedFolderId || '(none)', 'tab:', tabPayload || '(none)', 'tabs:', tabsPayload || '(none)', 'aiGroup:', groupPayload || '(none)');
 
         const closeTabs = isMainViewVisible(); // honor main view's expectation
         const closedTabIds = [];
@@ -1692,14 +1686,13 @@ function renderFolderCard(sub, depth = 0) {
             } else if (bookmarkId) {
                 await moveBookmarksSmart([bookmarkId], sub.id);
             } else if (draggedFolderId) {
-                if (draggedFolderId === sub.id) { console.log('[TabPaladin] Skipped self-drop'); return; }
+                if (draggedFolderId === sub.id) return;
                 if (await isAncestorOf(draggedFolderId, sub.id)) {
                     alert("Can't move a folder into one of its own descendants.");
                     return;
                 }
                 await Tree.move(draggedFolderId, { parentId: sub.id });
             } else {
-                console.log('[TabPaladin] Drop ignored — no payload');
                 return;
             }
 
@@ -1825,7 +1818,6 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
             e.dataTransfer.setData('text/tp-parent-id', String(parentFolderId));
             e.dataTransfer.effectAllowed = 'move';
             group.classList.add('dragging');
-            console.log('[TabPaladin] Drag start group', d, 'with', ids.length, 'bookmarks from parent', parentFolderId);
             e.stopPropagation();
         });
         handle.addEventListener('dragend', () => group.classList.remove('dragging'));
@@ -2502,13 +2494,6 @@ document.getElementById('analyzeBtn').addEventListener('click', async () => {
             // If we have selected sources, USE THEM. Only fallback to Settings if no source selected (rare/impossible here).
             const contextIds = (cleanSourceIds.length > 0) ? cleanSourceIds : (settings.focusedFolderIds || []);
 
-            console.log("🔍 DEBUG CONTEXT (Fixed):", {
-                folderIds,
-                cleanSourceIds,
-                focusedSettings: settings.focusedFolderIds,
-                FINAL_CONTEXT: contextIds
-            });
-
             proposal = await BookmarkOrganizer.analyzeWithAI(folderIds, contextIds, settings.geminiApiKey, userHints);
         } else {
             proposal = await BookmarkOrganizer.proposeSmartOrganization(folderIds);
@@ -3028,7 +3013,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
                 <div id="ai-key-wrapper" style="display:${settings.useAI ? 'block' : 'none'}; margin-top:10px; padding-left:5px;">
                     <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Gemini API Key</div>
-                    <input type="password" id="gemini-api-key" value="${settings.geminiApiKey || ''}" placeholder="Paste API Key..." style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px;">
+                    <input type="password" id="gemini-api-key" value="${escapeHtml(settings.geminiApiKey || '')}" placeholder="Paste API Key..." style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px;">
                     <div style="font-size:0.75rem; color:#666; margin-top:6px;">
                         Keys are stored locally. <a href="#" style="color:#3b82f6;">Get Free Key</a>
                     </div>

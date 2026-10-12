@@ -55,14 +55,6 @@ ${itemsList}
 JSON Output:
 `;
 
-        // --- DEBUG LOGGING for User Verification ---
-        console.group("🧠 AI Context Debugger");
-        console.log("%cExisting Folders (Context):", "color: #10b981; font-weight: bold;", folderList);
-        console.log("%cBookmarks to Organize:", "color: #3b82f6; font-weight: bold;", itemsList);
-        console.log("%cFull Prompt Payload:", "color: #6366f1;", prompt);
-        console.groupEnd();
-        // -------------------------------------------
-
         try {
             const response = await fetch(API_URL, {
                 method: "POST",
@@ -159,11 +151,6 @@ ${itemsList}
 
 JSON Output:
 `;
-
-        // Debug Log
-        console.group("🏗️ AI Restructure Debug");
-        console.log("Items:", itemsList);
-        console.groupEnd();
 
         try {
             const response = await fetch(API_URL, {

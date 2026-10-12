@@ -14,5 +14,3 @@ server/.env
 *.sqlite-shm
 *.sqlite-wal
 
-# Not part of the server image.
-tools/mockups
