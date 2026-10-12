@@ -63,6 +63,9 @@ check('server refuses to boot with a short token',
 const weakAdmin = bootWith({ AUTH_TOKEN: '', ADMIN_PASSWORD: 'short' });
 check('server refuses to boot with a short ADMIN_PASSWORD',
     weakAdmin.status === 1 && /ADMIN_PASSWORD/.test(weakAdmin.stderr), `status ${weakAdmin.status} ${weakAdmin.stderr}`);
+const noAdmin = bootWith({ AUTH_TOKEN: '', ADMIN_PASSWORD: '' });
+check('server refuses to boot with no account and no ADMIN_PASSWORD',
+    noAdmin.status === 1 && /ADMIN_PASSWORD/.test(noAdmin.stderr), `status ${noAdmin.status} ${noAdmin.stderr}`);
 
 // --- 2. Passwords ---
 console.log('passwords');

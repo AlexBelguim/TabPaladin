@@ -1,15 +1,15 @@
-// Auth tests against a running server.
+// Auth tests against a running server, started with the test account:
 //
-//   SETUP_CODE=test-code AUTH_MAX_FAILURES=8 PORT=18999 DATA_DIR=/tmp/x node server/index.js
-//   node tools/test_auth.mjs --url http://127.0.0.1:18999 --setup-code test-code [--legacy <32+ char token>]
+//   ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 //     PORT=18999 DATA_DIR=/tmp/x node server/index.js
+//   node tools/test_auth.mjs --url http://127.0.0.1:18999 [--legacy <32+ char token>]
 //
-// Covers the cases worth getting wrong: setup needing the logged setup code,
-// setup once, login, session access, wrong password, unknown user, no
-// credentials, logout revoking the session, replacing the account needing its
-// current password, password change revoking every other session, the legacy
-// token still working during migration, body size limits, the OAuth callback
-// escaping what it echoes, and — last, because it locks this IP out — the
-// login rate limit (expects AUTH_MAX_FAILURES <= 20).
+// Covers the cases worth getting wrong: the over-the-network setup claim being
+// gone, login, session access, wrong password, unknown user, no credentials,
+// logout revoking the session, password change revoking every other session,
+// the legacy token acting as the admin, CORS for extension and foreign
+// origins, body size limits, the OAuth callback escaping what it echoes, and
+// — last, because it locks this IP out — the login rate limit (expects
+// AUTH_MAX_FAILURES <= 20).
 
 const arg = (n, d = null) => {
     const i = process.argv.indexOf('--' + n);
@@ -18,11 +18,6 @@ const arg = (n, d = null) => {
 
 const BASE = (arg('url') || 'http://127.0.0.1:18999').replace(/\/$/, '');
 const LEGACY = arg('legacy');
-const SETUP_CODE = arg('setup-code');
-if (!SETUP_CODE) {
-    console.error('Pass --setup-code (start the server with SETUP_CODE=... to pin it).');
-    process.exit(2);
-}
 
 const results = [];
 const check = (name, pass, detail = '') => results.push({ name, pass, detail });
@@ -45,45 +40,28 @@ const USER = 'tester';
 const PASS = 'correct horse battery';
 const NEWPASS = 'staple correct horse';
 
-// 1. Fresh server reports no account.
+// 1. Status is public and reports the env-created account.
 const status0 = await call('/api/auth/status');
-check('status is public and reports no account yet',
-    status0.status === 200 && status0.json.hasAccount === false,
-    `hasAccount=${status0.json?.hasAccount}`);
+check('status is public and reports the account',
+    status0.status === 200 && status0.json.hasAccount === true, `hasAccount=${status0.json?.hasAccount}`);
 
 // 2. Protected route rejects an unauthenticated caller.
 const noAuth = await call('/api/tree');
 check('pull without credentials is rejected', noAuth.status === 401, `HTTP ${noAuth.status}`);
 
-check('status asks for a setup code', status0.json?.setupCodeRequired === true);
-
-// 3a. Without the setup code, whoever arrives first can't claim the server.
-const noCode = await call('/api/auth/setup', { method: 'POST', body: { username: 'squatter', password: 'squatter-pass' } });
-check('setup without the setup code is refused', noCode.status === 403, `HTTP ${noCode.status}`);
-const badCode = await call('/api/auth/setup', { method: 'POST', body: { username: 'squatter', password: 'squatter-pass', setupCode: 'guess' } });
-check('setup with a wrong setup code is refused', badCode.status === 403, `HTTP ${badCode.status}`);
-
-// 3. Setup creates the account and returns a session.
-const setup = await call('/api/auth/setup', { method: 'POST', body: { username: USER, password: PASS, setupCode: SETUP_CODE } });
-check('setup creates the account and returns a session',
-    setup.status === 200 && typeof setup.json.token === 'string' && setup.json.token.length >= 32,
-    `HTTP ${setup.status}`);
-
-// 4. Short passwords are refused.
-const short = await call('/api/auth/setup', { method: 'POST', token: setup.json?.token, body: { username: USER, password: 'abc' } });
-check('short password refused', short.status === 400, `HTTP ${short.status}`);
-
-// 5. Setup is not open once an account exists.
-const reSetup = await call('/api/auth/setup', { method: 'POST', body: { username: 'someone', password: 'hunter2hunter2' } });
-check('setup refuses an unauthenticated second account', reSetup.status === 403, `HTTP ${reSetup.status}`);
-const reSetupCode = await call('/api/auth/setup', { method: 'POST', body: { username: 'someone', password: 'hunter2hunter2', setupCode: SETUP_CODE } });
-check('setup code is useless once an account exists', reSetupCode.status === 403, `HTTP ${reSetupCode.status}`);
-
-// 5b. A session alone can't replace the account — it needs the password.
-const viaSession = await call('/api/auth/setup', { method: 'POST', token: setup.json?.token, body: { username: 'thief', password: 'thief-password' } });
-check('session without current password cannot replace the account', viaSession.status === 403, `HTTP ${viaSession.status}`);
+// 3. Nobody can create or replace an account over the network any more.
+const claim = await call('/api/auth/setup', { method: 'POST', body: { username: 'squatter', password: 'squatter-pass' } });
+check('setup claim is gone', claim.status === 410, `HTTP ${claim.status}`);
 const stillOurs = await call('/api/login', { method: 'POST', body: { username: USER, password: PASS } });
-check('account untouched after the refused replace', stillOurs.status === 200, `HTTP ${stillOurs.status}`);
+check('env-created account signs in', stillOurs.status === 200 && stillOurs.json?.user?.role === 'admin',
+    `HTTP ${stillOurs.status} ${JSON.stringify(stillOurs.json?.user)}`);
+const setup = stillOurs; // the session the rest of the run starts from
+
+// 4. Who am I.
+const me = await call('/api/auth/me', { token: setup.json?.token });
+check('/api/auth/me returns id, username and role',
+    me.status === 200 && me.json?.user?.username === USER && me.json.user.role === 'admin' && Number.isInteger(me.json.user.id),
+    JSON.stringify(me.json));
 
 // 6. The issued session works.
 const withSession = await call('/api/tree', { token: setup.json?.token });
@@ -118,6 +96,9 @@ check('logout leaves other sessions alone', otherStillOk.status === 200, `HTTP $
 if (LEGACY) {
     const legacy = await call('/api/tree', { token: LEGACY });
     check('legacy shared token still works', legacy.status === 200, `HTTP ${legacy.status}`);
+    const legacyMe = await call('/api/auth/me', { token: LEGACY });
+    check('legacy token acts as the first admin', legacyMe.json?.user?.role === 'admin' && legacyMe.json.user.username === USER,
+        JSON.stringify(legacyMe.json));
 }
 
 // 12. Password change revokes every existing session.
@@ -133,15 +114,19 @@ check('new password works', newLogin.status === 200, `HTTP ${newLogin.status}`);
 const oldPassword = await call('/api/login', { method: 'POST', body: { username: USER, password: PASS } });
 check('old password no longer works', oldPassword.status === 401, `HTTP ${oldPassword.status}`);
 
-// 13. Replacing the account with its current password works and revokes sessions.
-const replaced = await call('/api/auth/setup', {
-    method: 'POST', token: newLogin.json?.token,
-    body: { username: USER, password: PASS, currentPassword: NEWPASS }
-});
-check('replace with the current password succeeds', replaced.status === 200, `HTTP ${replaced.status}`);
-const afterReplace = await call('/api/tree', { token: newLogin.json?.token });
-check('replace revokes earlier sessions', afterReplace.status === 401, `HTTP ${afterReplace.status}`);
-const token = replaced.json?.token;
+// 13. CORS: extensions and same-origin yes, other sites no.
+async function preflight(origin) {
+    const r = await fetch(BASE + '/api/tree', {
+        method: 'OPTIONS',
+        headers: { Origin: origin, 'Access-Control-Request-Method': 'PUT', 'Access-Control-Request-Headers': 'authorization,content-type' }
+    });
+    return r.headers.get('access-control-allow-origin');
+}
+check('chrome extension origin allowed', await preflight('chrome-extension://abcdefghijklmnop') === 'chrome-extension://abcdefghijklmnop');
+check('firefox extension origin allowed', await preflight('moz-extension://1234-abcd') === 'moz-extension://1234-abcd');
+check('same origin allowed', await preflight(BASE) === BASE);
+check('foreign website refused', !(await preflight('https://evil.example')));
+const token = newLogin.json?.token;
 
 // 14. Body limits: small everywhere, large only for a tree push.
 const big = 'x'.repeat(2 * 1024 * 1024);

@@ -9,8 +9,12 @@ import { attachImports } from './imports/index.js';
 import { buildImportsTree } from './imports/project.js';
 import { makeItemsStore } from './items.js';
 import {
-    authTokenProblem, hashPassword, verifyPassword, sameSecret, makeRateLimiter
+    authTokenProblem, hashPassword, verifyPassword, makeRateLimiter
 } from './security.js';
+import {
+    backupDatabase, migrateUsers, setSchemaVersion, bootstrapAdmin, userCount as countUsers,
+    userByName, publicUser, presentedToken, identify, MIN_PASSWORD_LENGTH
+} from './users.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,8 +50,15 @@ for (const f of ['', 'sync.db', 'sync.db-wal', 'sync.db-shm']) {
         process.exit(1);
     }
 }
-const db = new Database(path.join(DATA_DIR, 'sync.db'));
+const DB_PATH = path.join(DATA_DIR, 'sync.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+
+// Before any migration below touches the data: a consistent copy next to it,
+// sync.db.bak-<timestamp>. Taken whenever the schema is about to change and
+// otherwise at most daily; the newest BACKUP_KEEP are kept.
+const backup = backupDatabase(db, DB_PATH, { keep: Math.max(1, Number(process.env.BACKUP_KEEP || 7)) });
+if (backup) console.log(`[TabPaladin] Backed up the database to ${backup}`);
 
 db.exec(`
     -- History of the tree. Rows written before the items table existed hold
@@ -104,6 +115,7 @@ db.exec(`
 // Migrations for existing databases.
 try { db.prepare('ALTER TABLE note_proposals ADD COLUMN notebook TEXT').run(); } catch (e) { /* column already exists */ }
 try { db.prepare("ALTER TABLE note_proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'").run(); } catch (e) { /* column already exists */ }
+migrateUsers(db);
 
 // The canonical tree. On the first boot after the upgrade this converts the
 // newest browser-tree snapshot into rows, so nothing is lost switching over.
@@ -128,6 +140,25 @@ if (bookmarksRoot.created) {
         + (bookmarksRoot.moved ? ` and moved ${bookmarksRoot.moved} top-level folder(s) into it.` : '.'));
 }
 
+// --- Accounts ---
+//
+// The first admin is created here, from ADMIN_USERNAME / ADMIN_PASSWORD, on the
+// first start with no users; after that the environment is ignored. There is
+// no way to claim a server over HTTP.
+const SESSION_DAYS = Number(process.env.SESSION_DAYS || 180);
+const userCount = () => countUsers(db);
+
+const boot = await bootstrapAdmin(db, process.env);
+if (!boot.ok) {
+    console.error(`[TabPaladin] Refusing to start: ${boot.error}`);
+    process.exit(1);
+}
+if (boot.created) {
+    console.log(`[TabPaladin] Created admin account "${boot.created.username}"`
+        + (boot.fromToken ? ' with AUTH_TOKEN as its password (no ADMIN_PASSWORD was set).' : ' from ADMIN_PASSWORD.'));
+}
+setSchemaVersion(db);
+
 const app = express();
 // So req.protocol and req.ip reflect X-Forwarded-* behind a reverse proxy. Not
 // `true`: that trusts a client-supplied X-Forwarded-For when the server is hit
@@ -135,10 +166,30 @@ const app = express();
 // IPs. The default trusts proxies on loopback and private networks — a reverse
 // proxy or tunnel container on the same host or LAN. Set TRUST_PROXY to
 // anything Express accepts ("true", a hop count, a subnet list) otherwise.
-const TRUST_PROXY = process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal';
+const TRUST_PROXY = process.env.TRUST_PROXY || 'loopback, uniquelocal';
 app.set('trust proxy', /^(true|false)$/.test(TRUST_PROXY) ? TRUST_PROXY === 'true'
     : /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
-app.use(cors({ origin: true, credentials: false }));
+
+// CORS: the PWA is served from this origin and needs none. The browser
+// extension calls cross-origin from chrome-extension:// / moz-extension://
+// with a bearer token, so those are always allowed; any other origin (a
+// separately hosted client) must be listed in CORS_ORIGIN. No cookies are
+// used, so credentials stay off.
+const CORS_ORIGINS = new Set((process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean));
+const EXTENSION_ORIGIN = /^(chrome-extension|moz-extension|safari-web-extension):\/\/[\w.-]+$/;
+app.use(cors((req, cb) => {
+    const origin = req.headers.origin;
+    let allowed = !origin || EXTENSION_ORIGIN.test(origin) || CORS_ORIGINS.has(origin);
+    if (!allowed) {
+        try { allowed = new URL(origin).host === req.get('host'); } catch (e) { /* malformed */ }
+    }
+    cb(null, {
+        origin: allowed,
+        credentials: false,
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+    });
+}));
+
 // Small bodies everywhere except a tree push, which carries the whole tree.
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
@@ -152,31 +203,7 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-const SESSION_DAYS = Number(process.env.SESSION_DAYS || 180);
-
-const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
-
-// --- First run ---
-//
-// Whoever reaches a fresh server first would otherwise own it, so creating the
-// account takes proof of access to the host: either ADMIN_PASSWORD in the
-// environment (the account is created at boot), or the one-time setup code
-// printed to the container log at startup. SETUP_CODE pins the code, for
-// scripted installs and tests.
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-if (ADMIN_PASSWORD && userCount() === 0) {
-    if (ADMIN_PASSWORD.length < 8) {
-        console.error('[TabPaladin] Refusing to start: ADMIN_PASSWORD must be at least 8 characters.');
-        process.exit(1);
-    }
-    db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
-        .run(ADMIN_USERNAME, await hashPassword(ADMIN_PASSWORD), new Date().toISOString());
-    console.log(`[TabPaladin] Created account "${ADMIN_USERNAME}" from ADMIN_PASSWORD. You can remove ADMIN_PASSWORD now.`);
-}
-const SETUP_CODE = process.env.SETUP_CODE || crypto.randomBytes(9).toString('base64url');
-
-// Failed sign-in / setup attempts per client IP.
+// Failed sign-in attempts per client IP.
 const authLimiter = makeRateLimiter({
     max: Number(process.env.AUTH_MAX_FAILURES || 10),
     windowMs: Number(process.env.AUTH_WINDOW_MINUTES || 15) * 60 * 1000
@@ -201,114 +228,40 @@ function issueSession(username) {
     return { token, expiresAt: expires.toISOString() };
 }
 
-function sessionFor(token) {
-    const row = db.prepare('SELECT username, expires_at FROM sessions WHERE token = ?').get(token);
-    if (!row) return null;
-    if (new Date(row.expires_at).getTime() < Date.now()) {
-        db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-        return null;
-    }
-    return row;
-}
-
 // --- Auth middleware ---
 //
-// Accepts a session token from /api/login, or the legacy AUTH_TOKEN. The legacy
-// path stays so an extension that hasn't been updated keeps syncing while you
-// migrate — losing sync the moment the server updates would be worse than the
-// shared secret it replaces. Drop AUTH_TOKEN from the environment once every
-// client has logged in, and only sessions will work.
+// Accepts a session token from /api/login, or the legacy AUTH_TOKEN, which acts
+// as the first admin — for scripts, and so an extension that hasn't signed in
+// yet keeps syncing while you migrate. Sets req.user = { id, username, role }.
+// Bearer tokens only, never cookies, so cross-origin requests can't ride on a
+// browser's ambient credentials.
 function requireAuth(req, res, next) {
-    const hdr = req.headers.authorization || '';
-    const m = hdr.match(/^Bearer\s+(.+)$/);
-    if (!m) return res.status(401).json({ error: 'Unauthorized' });
-    const presented = m[1];
-
-    const session = sessionFor(presented);
-    if (session) {
-        req.username = session.username;
-        return next();
-    }
-
-    if (AUTH_TOKEN && sameSecret(presented, AUTH_TOKEN)) {
-        req.username = null; // legacy shared-token caller
-        return next();
-    }
-
-    if (!AUTH_TOKEN && userCount() === 0) {
-        return res.status(503).json({ error: 'Server not configured — no account exists yet.' });
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
+    const user = identify(db, AUTH_TOKEN, presentedToken(req));
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
+    next();
 }
 
 // --- Auth endpoints ---
 
-// Unauthenticated on purpose: a client needs to know whether to show a login
-// form or a first-run setup form before it has any credentials. Leaks only
-// whether an account exists, which the login form already implies.
+// Unauthenticated on purpose: a client needs to know whether the server is
+// usable before it has any credentials.
 app.get('/api/auth/status', (req, res) => {
-    const hasAccount = userCount() > 0;
     res.json({
         ok: true,
-        hasAccount,
-        // Tells a client to ask for the code from the server log.
-        setupCodeRequired: !hasAccount,
+        hasAccount: userCount() > 0,
         legacyTokenEnabled: Boolean(AUTH_TOKEN)
     });
 });
 
-// Create the one account, or replace it.
-//
-// First run (no account): needs the setup code from the server log, or the
-// legacy token as a bearer — a deployment that has it already has full access,
-// and this lets it set a password without shelling into the container.
-//
-// Replacing an existing account: needs that account's current password. A
-// session alone is not enough — a lost phone's session must not be able to
-// lock the owner out.
-app.post('/api/auth/setup', async (req, res) => {
-    try {
-        if (rateLimited(req, res)) return;
-        const { username, password, setupCode, currentPassword } = req.body || {};
-        if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
-        if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+// The old over-the-network first-run claim. Gone: whoever reached a fresh
+// server first owned it. Accounts come from the environment now.
+app.post('/api/auth/setup', (req, res) => res.status(410).json({
+    error: 'Accounts are no longer created from the app. Set ADMIN_USERNAME and ADMIN_PASSWORD in the server\'s .env and restart it, then sign in.'
+}));
 
-        const existing = db.prepare('SELECT username, password_hash FROM users LIMIT 1').get();
-        if (existing) {
-            if (!currentPassword || !(await verifyPassword(currentPassword, existing.password_hash))) {
-                authLimiter.fail(req.ip);
-                return res.status(403).json({
-                    error: 'An account already exists. Replacing it needs its current password.'
-                });
-            }
-        } else {
-            const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/);
-            const viaLegacy = m && AUTH_TOKEN && sameSecret(m[1], AUTH_TOKEN);
-            const viaCode = setupCode && sameSecret(String(setupCode).trim(), SETUP_CODE);
-            if (!viaLegacy && !viaCode) {
-                authLimiter.fail(req.ip);
-                return res.status(403).json({
-                    error: 'Creating the account needs the setup code printed in the server log at startup.',
-                    setupCodeRequired: true
-                });
-            }
-        }
-
-        const hash = await hashPassword(password);
-        db.transaction(() => {
-            db.prepare('DELETE FROM users').run();
-            db.prepare('DELETE FROM sessions').run(); // old sessions must not survive a password change
-            db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
-                .run(String(username), hash, new Date().toISOString());
-        })();
-        authLimiter.reset(req.ip);
-
-        const session = issueSession(String(username));
-        res.json({ ok: true, username: String(username), ...session });
-    } catch (e) {
-        console.error('[TabPaladin] Setup failed:', e);
-        res.status(500).json({ error: 'Setup failed.' });
-    }
+app.get('/api/auth/me', requireAuth, (req, res) => {
+    res.json({ ok: true, user: publicUser(req.user) });
 });
 
 // A real hash to check against when the username is unknown, so a missing
@@ -321,7 +274,7 @@ app.post('/api/login', async (req, res) => {
         const { username, password } = req.body || {};
         if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
 
-        const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(String(username));
+        const row = userByName(db, String(username).trim());
         const ok = await verifyPassword(password, row ? row.password_hash : DUMMY_HASH);
         if (!row || !ok) {
             authLimiter.fail(req.ip);
@@ -330,7 +283,7 @@ app.post('/api/login', async (req, res) => {
         authLimiter.reset(req.ip);
 
         const session = issueSession(row.username);
-        res.json({ ok: true, username: row.username, ...session });
+        res.json({ ok: true, username: row.username, user: publicUser(row), ...session });
     } catch (e) {
         console.error('[TabPaladin] Login failed:', e);
         res.status(500).json({ error: 'Sign in failed.' });
@@ -338,8 +291,9 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
-    const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/);
-    if (m) db.prepare('DELETE FROM sessions WHERE token = ?').run(m[1]);
+    if (req.user.via === 'session') {
+        db.prepare('DELETE FROM sessions WHERE token = ?').run(presentedToken(req));
+    }
     res.json({ ok: true });
 });
 
@@ -347,17 +301,17 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
     try {
         if (rateLimited(req, res)) return;
         const { currentPassword, newPassword } = req.body || {};
-        if (!newPassword || String(newPassword).length < 8) {
-            return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+        if (!newPassword || String(newPassword).length < MIN_PASSWORD_LENGTH) {
+            return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
         }
-        const row = db.prepare('SELECT username, password_hash FROM users WHERE username = ?').get(req.username || '');
+        const row = userByName(db, req.user.username);
         if (!row) return res.status(400).json({ error: 'No account to change.' });
         if (!(await verifyPassword(currentPassword, row.password_hash))) {
             authLimiter.fail(req.ip);
             return res.status(401).json({ error: 'Current password is wrong.' });
         }
         const hash = await hashPassword(newPassword);
-        db.prepare('UPDATE users SET password_hash = ? WHERE username = ?').run(hash, row.username);
+        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
         db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
         const session = issueSession(row.username);
         res.json({ ok: true, ...session });
@@ -369,7 +323,7 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
 
 // --- Health (no auth) ---
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, version: 2, configured: Boolean(AUTH_TOKEN) || userCount() > 0 });
+    res.json({ ok: true, version: 2, configured: userCount() > 0 });
 });
 
 // --- Importers ---
@@ -655,17 +609,11 @@ if (fs.existsSync(PWA_DIR)) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    const accounts = userCount();
-    const modes = [];
-    if (accounts > 0) modes.push('login');
-    if (AUTH_TOKEN) modes.push('legacy token');
-    console.log(`[TabPaladin] Server listening on :${PORT} (auth: ${modes.join(' + ') || 'NONE — sign in from the app to create the account'})`);
-    if (accounts === 0) {
-        console.log(`[TabPaladin] No account yet. Setup code: ${SETUP_CODE}`);
-        console.log('[TabPaladin] Enter it in the app when creating the account. It changes on every restart unless SETUP_CODE is set.');
-    }
-    if (accounts > 0 && AUTH_TOKEN) {
-        console.log('[TabPaladin] Both auth modes are on. Once every client has logged in, remove AUTH_TOKEN so only the login works.');
+    const modes = ['login'];
+    if (AUTH_TOKEN) modes.push('AUTH_TOKEN as first admin');
+    console.log(`[TabPaladin] Server listening on :${PORT} (${userCount()} account(s); auth: ${modes.join(' + ')})`);
+    if (AUTH_TOKEN) {
+        console.log('[TabPaladin] AUTH_TOKEN is on: anyone holding it acts as the first admin. Remove it once every client has signed in, unless scripts need it.');
     }
     console.log(`[TabPaladin] PWA served from ${PWA_DIR}`);
     console.log(`[TabPaladin] Data dir ${DATA_DIR}`);
