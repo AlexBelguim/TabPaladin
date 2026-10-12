@@ -9,7 +9,7 @@
   <link rel="icon" href="icons/icon192.png">
   <!-- Version query busts browser/proxy caches on each release.
        Bump the number together with SHELL_CACHE in sw.js. -->
-  <link rel="stylesheet" href="app.css?v=27">
+  <link rel="stylesheet" href="app.css?v=28">
 </head>
 <body>
   <header id="topbar">
@@ -101,6 +101,10 @@
           <span>Password</span>
           <input id="cfg-password" type="password" autocomplete="current-password">
         </label>
+        <label id="cfg-setup-code-field" class="field hidden">
+          <span>Setup code</span>
+          <input id="cfg-setup-code" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+        </label>
         <small id="auth-setup-hint" class="hint hidden"></small>
         <small id="auth-error" class="hint error hidden"></small>
         <button id="auth-submit" class="primary">Sign in</button>
@@ -160,6 +164,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=27" type="module"></script>
+  <script src="app.js?v=28" type="module"></script>
 </body>
 </html>

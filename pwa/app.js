@@ -2471,9 +2471,10 @@ async function probeAuthStatus() {
         const btn = $('auth-submit');
         if (!data.hasAccount) {
             if (hint) {
-                hint.textContent = 'No account on this server yet — the details you enter will create it.';
+                hint.textContent = 'No account on this server yet — the details you enter will create it. The setup code is printed in the server log.';
                 hint.classList.remove('hidden');
             }
+            $('cfg-setup-code-field')?.classList.remove('hidden');
             if (btn) btn.textContent = 'Create account';
         } else if (btn) {
             btn.textContent = 'Sign in';
@@ -2506,11 +2507,19 @@ async function submitAuth() {
         return setErr("Can't reach that server. Check the address, and that Tailscale is connected.");
     }
 
+    // Creating the account needs the one-time code the server printed in its
+    // log, so a stranger can't claim a fresh server first.
+    const setupCode = ($('cfg-setup-code')?.value || '').trim();
+    if (!hasAccount) {
+        $('cfg-setup-code-field')?.classList.remove('hidden');
+        if (!setupCode) return setErr('No account on this server yet. Enter the setup code from the server log to create it.');
+    }
+
     try {
         const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
+            body: JSON.stringify(hasAccount ? { username, password } : { username, password, setupCode })
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) return setErr(data.error || `Sign in failed (HTTP ${res.status}).`);
@@ -2522,6 +2531,8 @@ async function submitAuth() {
         localStorage.setItem(LS.username, data.username || username);
         mirrorConfigToSW();
         if ($('cfg-password')) $('cfg-password').value = '';
+        if ($('cfg-setup-code')) $('cfg-setup-code').value = '';
+        $('cfg-setup-code-field')?.classList.add('hidden');
         refreshAuthUi();
         hide($('settings-sheet'));
         bootstrap();

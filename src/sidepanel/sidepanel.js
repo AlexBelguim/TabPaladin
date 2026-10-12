@@ -3054,6 +3054,10 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                     <input type="text" id="backend-username" autocomplete="username" value="${(settings.backend && settings.backend.username) || ''}" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
                     <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Password</div>
                     <input type="password" id="backend-password" autocomplete="current-password" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                    <div id="backend-setup-code-wrap" style="display:none;">
+                        <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Setup code <span style="color:var(--text-muted);">(from the server log — first sign-in only)</span></div>
+                        <input type="text" id="backend-setup-code" autocomplete="off" spellcheck="false" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                    </div>
                     <div id="backend-auth-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
                     <button id="backend-signin-btn" class="primary-btn" style="width:100%;">Sign in</button>
                 </div>
@@ -3612,11 +3616,23 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             return;
         }
 
+        // Creating the account needs the one-time code the server printed in
+        // its log, so a stranger can't claim a fresh server first.
+        const setupCode = (document.getElementById('backend-setup-code')?.value || '').trim();
+        if (!hasAccount) {
+            const wrap = document.getElementById('backend-setup-code-wrap');
+            if (wrap) wrap.style.display = 'block';
+            if (!setupCode) {
+                authError('No account on this server yet. Enter the setup code from the server log to create it.');
+                return;
+            }
+        }
+
         try {
             const res = await fetch(base + (hasAccount ? '/api/login' : '/api/auth/setup'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
+                body: JSON.stringify(hasAccount ? { username, password } : { username, password, setupCode })
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) { authError(data.error || `Sign in failed (HTTP ${res.status}).`); return; }
