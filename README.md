@@ -63,7 +63,19 @@ and for any machine without the extension.
 ### Extension (desktop)
 
 - **Chrome**: `chrome://extensions` → Developer mode → **Load unpacked** → the repository folder
-- **Firefox**: `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → any file in `firefox/`
+- **Firefox**: build the package first (below), then `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → `dist/firefox.zip`
+
+#### Packaging for the stores
+
+```bash
+node tools/package.mjs
+```
+
+Writes `dist/chrome.zip` (Chrome Web Store, Opera, Edge) and `dist/firefox.zip`
+(AMO), each with its manifest at the zip root and only `src/` and the icons.
+No dependencies beyond Node. The Firefox manifest in `firefox/` uses `../`
+paths so it can live beside the Chrome one; the script rewrites them, so load
+Firefox from the zip, not from `firefox/`.
 
 ### Web app (phone + anywhere else)
 
@@ -91,9 +103,9 @@ HTML file in **Settings → Import bookmarks** — works with any browser.
 TabPaladin/
 ├── server/                 # Node + SQLite sync server — owns the bookmark tree
 ├── pwa/                    # The web app (desktop + phone), served by the server
-├── tools/                  # Headless tests and recovery scripts
+├── tools/                  # Headless tests, recovery scripts, package.mjs
 ├── manifest.json           # Chrome extension manifest (v3)
-├── firefox/                # Firefox add-on manifest (v2, points to ../src/)
+├── firefox/                # Firefox add-on manifest (v2; packaged by tools/package.mjs)
 ├── src/                    # Extension source (tab capture, workflows, organizer UI)
 └── assets/                 # Shared icons and images
 ```

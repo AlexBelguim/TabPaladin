@@ -25,3 +25,6 @@ server/.env
 
 # Logs
 *.log
+
+# Extension packages (node tools/package.mjs)
+dist/
