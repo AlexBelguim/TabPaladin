@@ -262,9 +262,6 @@ function setupEventListeners() {
             }
         }
     }
-
-    // Dynamic listeners for workflow items
-    document.getElementById('workflows-list').addEventListener('click', handleWorkflowClick);
 }
 
 // Browser roots that are not bookmark folders in any useful sense. They came
@@ -973,89 +970,6 @@ async function renderWorkflows() {
     list.replaceChildren(frag);
 }
 
-function renderWorkflowBody(wf, body) {
-    const byDomain = {};
-    wf.tabs.forEach(t => {
-        const d = tabDomain(t.url);
-        if (!byDomain[d]) byDomain[d] = [];
-        byDomain[d].push(t);
-    });
-
-    const domains = Object.keys(byDomain).sort();
-    const groupsHtml = domains.map(d => {
-        const tabsHtml = byDomain[d].map(t => `
-            <label class="wf-tab-row" style="display:flex; align-items:center; gap:8px; padding:4px 8px 4px 24px; cursor:pointer;">
-                <input type="checkbox" class="wf-tab-check" data-bookmark-id="${t.id}" data-domain="${escapeHtml(d)}">
-                <img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=16" width="16" height="16" style="flex-shrink:0;">
-                <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.85rem;" title="${escapeHtml(t.url)}">${escapeHtml(t.title || t.url)}</span>
-            </label>
-        `).join('');
-
-        return `
-            <div class="wf-domain-group" data-domain="${escapeHtml(d)}">
-                <label style="display:flex; align-items:center; gap:8px; padding:6px 8px; background:rgba(255,255,255,0.03); cursor:pointer; font-weight:600;">
-                    <input type="checkbox" class="wf-domain-check" data-domain="${escapeHtml(d)}">
-                    <span style="flex:1;">${escapeHtml(d)}</span>
-                    <span style="color:var(--text-muted); font-weight:400; font-size:0.8rem;">${byDomain[d].length}</span>
-                </label>
-                <div class="wf-tabs">${tabsHtml}</div>
-            </div>
-        `;
-    }).join('');
-
-    body.innerHTML = `
-        <div style="padding:8px; background:rgba(0,0,0,0.15); border-radius:6px; margin-top:6px;">
-            ${groupsHtml || '<div style="color:var(--text-muted); padding:8px;">No tabs in this workflow.</div>'}
-            <div style="display:flex; gap:6px; margin-top:10px; padding-top:10px; border-top:1px solid var(--border-color);">
-                <button class="sm-btn wf-open-selected-btn primary-btn" style="flex:1; padding:6px;">Open Selected</button>
-                <button class="sm-btn wf-open-here-btn" style="flex:1; padding:6px;" title="Open selected in current window">Open Here</button>
-            </div>
-        </div>
-    `;
-
-    // Wire domain-level checkboxes (toggle all tabs in that domain)
-    body.querySelectorAll('.wf-domain-check').forEach(domCb => {
-        domCb.addEventListener('change', () => {
-            const d = domCb.dataset.domain;
-            body.querySelectorAll(`.wf-tab-check[data-domain="${d}"]`).forEach(cb => {
-                cb.checked = domCb.checked;
-            });
-        });
-    });
-
-    // When a tab checkbox changes, reflect indeterminate state on the domain row
-    body.querySelectorAll('.wf-tab-check').forEach(tabCb => {
-        tabCb.addEventListener('change', () => {
-            const d = tabCb.dataset.domain;
-            const all = Array.from(body.querySelectorAll(`.wf-tab-check[data-domain="${d}"]`));
-            const checked = all.filter(c => c.checked).length;
-            const domCb = body.querySelector(`.wf-domain-check[data-domain="${d}"]`);
-            if (domCb) {
-                domCb.checked = checked === all.length;
-                domCb.indeterminate = checked > 0 && checked < all.length;
-            }
-        });
-    });
-
-    // Open Selected (new window)
-    body.querySelector('.wf-open-selected-btn').addEventListener('click', async () => {
-        const ids = collectCheckedBookmarkIds(body);
-        if (ids.length === 0) { alert("No tabs selected."); return; }
-        await StorageManager.restoreWorkflow(wf, { bookmarkIds: ids });
-    });
-
-    // Open Here (current window)
-    body.querySelector('.wf-open-here-btn').addEventListener('click', async () => {
-        const ids = collectCheckedBookmarkIds(body);
-        if (ids.length === 0) { alert("No tabs selected."); return; }
-        await StorageManager.restoreWorkflow(wf, { bookmarkIds: ids, inCurrentWindow: true });
-    });
-}
-
-function collectCheckedBookmarkIds(body) {
-    return Array.from(body.querySelectorAll('.wf-tab-check:checked')).map(c => c.dataset.bookmarkId);
-}
-
 // --- Import/Export Workflow Handlers ---
 document.getElementById('exportAllWorkflowsBtn').addEventListener('click', async () => {
     try {
@@ -1089,66 +1003,6 @@ document.getElementById('importFileInput').addEventListener('change', async (e) 
     }
     e.target.value = ''; // Reset file input
 });
-
-
-// Handle clicking a workflow (toggle expand, restore, delete, export)
-async function handleWorkflowClick(e) {
-    const wrapper = e.target.closest('.workflow-item-wrapper');
-    if (!wrapper) return;
-
-    const id = wrapper.dataset.id;
-    const wf = savedWorkflows.find(w => w.id === id);
-    if (!wf) return;
-
-    // Export single workflow
-    if (e.target.classList.contains('export-wf-btn')) {
-        e.stopPropagation();
-        try {
-            const blob = new Blob([JSON.stringify([wf], null, 2)], { type: "application/json" });
-            const url = URL.createObjectURL(blob);
-            const safeName = wf.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-            await chrome.downloads.download({
-                url: url,
-                filename: `workflow_${safeName}.json`
-            });
-        } catch (err) {
-            console.error("Export single failed:", err);
-            alert("Export failed: " + err.message);
-        }
-        return;
-    }
-
-    // Delete
-    if (e.target.classList.contains('delete-wf-btn')) {
-        e.stopPropagation();
-        if (confirm(`Delete workflow "${wf.name}"?`)) {
-            await StorageManager.deleteWorkflow(id);
-            loadWorkflows();
-        }
-        return;
-    }
-
-    // Open all in new window
-    if (e.target.classList.contains('restore-all-btn')) {
-        e.stopPropagation();
-        await StorageManager.restoreWorkflow(wf);
-        return;
-    }
-
-    // Toggle expand on header / caret / name
-    if (e.target.closest('.wf-toggle')) {
-        const body = wrapper.querySelector('.workflow-body');
-        const caret = wrapper.querySelector('.wf-caret');
-        if (body.style.display === 'none') {
-            renderWorkflowBody(wf, body);
-            body.style.display = 'block';
-            caret.textContent = '▼';
-        } else {
-            body.style.display = 'none';
-            caret.textContent = '▶';
-        }
-    }
-}
 
 // --- Bookmark Organizer Logic ---
 let currentProposal = null;
