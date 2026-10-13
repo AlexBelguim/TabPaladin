@@ -172,6 +172,12 @@ check('29 days -> day month', rt(at(2026, 8, 14)) === '14 Sep', rt(at(2026, 8, 1
 check('last year -> day month year', rt(at(2025, 2, 12)) === '12 Mar 2025', rt(at(2025, 2, 12)));
 check('missing -> empty', rt(null) === '' && rt('') === '' && rt('garbage') === '');
 check('accepts a Date or a number for now', NM.relativeTime(ago(2 * MIN), NOW.getTime()) === '2m');
+check('meta line with tasks', NM.noteMetaLine({ updatedAt: ago(2 * HOUR), tasks: { open: 2, done: 1, total: 3 } }, NOW)
+    === 'Edited 2h ago · 1 of 3 done');
+check('meta line phrasing', NM.noteMetaLine({ updatedAt: ago(10 * 1000) }, NOW) === 'Edited just now'
+    && NM.noteMetaLine({ updatedAt: ago(DAY) }, NOW) === 'Edited yesterday'
+    && NM.noteMetaLine({ updatedAt: at(2026, 8, 14) }, NOW) === 'Edited 14 Sep');
+check('meta line without a stamp or tasks is empty', NM.noteMetaLine({ updatedAt: null, tasks: { total: 0 } }, NOW) === '');
 
 const rb = (iso) => NM.recencyBucket(iso, NOW);
 check('bucket Today', rb(ago(5 * MIN)) === 'Today');

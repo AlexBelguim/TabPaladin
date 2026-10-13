@@ -246,6 +246,19 @@ export function relativeTime(iso, now = Date.now()) {
     return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
+// The line under a note's title: 'Edited 2h ago · 1 of 3 done'.
+export function noteMetaLine(note, now = Date.now()) {
+    const parts = [];
+    const r = relativeTime(note && note.updatedAt, now);
+    if (r === 'now') parts.push('Edited just now');
+    else if (/^\d+[mh]$/.test(r)) parts.push(`Edited ${r} ago`);
+    else if (r === 'Yesterday') parts.push('Edited yesterday');
+    else if (r) parts.push(`Edited ${r}`);
+    const t = note && note.tasks;
+    if (t && t.total) parts.push(`${t.done} of ${t.total} done`);
+    return parts.join(' · ');
+}
+
 export const RECENCY_BUCKETS = ['Today', 'Yesterday', 'Previous 7 days', 'Previous 30 days', 'Older', 'Undated'];
 
 export function recencyBucket(iso, now = Date.now()) {

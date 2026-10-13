@@ -60,7 +60,10 @@
           <div id="recent-workflows"></div>
         </div>
         <div class="home-panel">
-          <div class="home-section-head"><h3>Recent notes</h3></div>
+          <div class="home-section-head">
+            <h3>Recent notes</h3>
+            <button id="homeAllNotesBtn" class="home-head-link" type="button">All notes ›</button>
+          </div>
           <div id="recent-notes"></div>
         </div>
       </section>
@@ -119,31 +122,98 @@
         <ul id="workflows-list"></ul>
       </section>
 
-      <!-- Notes: editor and preview side by side, which the side panel never
-           had room for. sidepanel.js drives both; .notes-split just lays them out. -->
+      <!-- Notes: library, list and note side by side (notesView.js). The
+           section is still shown and hidden through style.display like every
+           other view; everything inside it is laid out by classes. -->
       <section id="notes-container" style="display:none;">
-        <div class="tp-section-head">
-          <h2>Notes</h2>
-          <button id="newNoteBtn" class="sm-btn" title="Create a new note">+ New Note</button>
-        </div>
-        <input type="text" id="notesSearchInput" placeholder="Search notes..." class="tp-field">
-        <div class="notes-split">
-          <ul id="notes-list"></ul>
-          <div id="note-editor" style="display:none;">
-            <input type="text" id="noteTitleInput" placeholder="Note title" class="tp-field tp-note-title">
-            <div class="note-panes">
-              <textarea id="noteContentInput" rows="18"
-                placeholder="Write here… Link notes with [[Note Title]] and paste URLs to link pages."></textarea>
-              <div id="notePreview" class="note-preview" style="display:none;"></div>
+        <div id="nv" class="nv nv-cols-3 nv-pane-list">
+          <aside class="nv-side" aria-label="Notebooks">
+            <button id="newNoteBtn" class="primary-btn nv-new" type="button" title="New note in the open notebook">+ New note</button>
+            <div id="nv-scopes" class="nv-scopes"></div>
+            <div class="nv-tree-head">
+              <span>Notebooks</span>
+              <button id="nv-new-notebook" class="nv-icon-btn" type="button" title="New notebook" aria-label="New notebook">+</button>
             </div>
-            <div class="note-actions">
-              <button id="saveNoteBtn" class="sm-btn primary-btn">Save</button>
-              <button id="previewNoteBtn" class="sm-btn">Preview</button>
-              <button id="deleteNoteBtn" class="sm-btn tp-danger">Delete</button>
+            <div id="nv-tree" class="nv-tree" role="tree" aria-label="Notebooks"></div>
+            <button id="nv-sync" class="nv-sync" type="button" title="Push your local changes to the sync server"></button>
+          </aside>
+
+          <div class="nv-list" role="region" aria-label="Notes">
+            <div class="nv-list-head">
+              <button id="nv-to-side" class="nv-link-btn nv-to-side" type="button">📓 Notebooks</button>
+              <div class="nv-list-title">
+                <h2 id="nv-list-name">All notes</h2>
+                <span id="nv-list-sub" class="nv-muted"></span>
+              </div>
+              <div class="nv-list-tools">
+                <input type="search" id="notesSearchInput" class="nv-search" placeholder="Search all notes"
+                  autocomplete="off" spellcheck="false" aria-label="Search notes">
+                <select id="nv-sort" class="nv-sort" aria-label="Sort notes" title="Sort">
+                  <option value="edited">Edited</option>
+                  <option value="title">Title A–Z</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
             </div>
-            <button id="closeNoteEditorBtn" class="sm-btn tp-back">Back to list</button>
+            <ul id="notes-list" class="nv-rows"></ul>
           </div>
+
+          <article id="note-editor" class="nv-note is-read" aria-label="Note">
+            <div id="nv-note-empty" class="nv-note-empty">Select a note, or press + to start one</div>
+            <div id="nv-note-main" class="nv-note-main" hidden>
+              <div class="nv-note-head">
+                <button id="nv-to-list" class="nv-icon-btn nv-to-list" type="button" aria-label="Back to the list">‹ Back</button>
+                <button id="nv-crumb" class="nv-crumb" type="button"></button>
+                <span id="nv-note-status" class="nv-note-status" aria-live="polite"></span>
+                <div id="nv-modes" class="nv-seg" role="group" aria-label="View">
+                  <button type="button" data-mode="read" aria-pressed="true">Read</button>
+                  <button type="button" data-mode="edit" aria-pressed="false">Edit</button>
+                  <button type="button" data-mode="split" aria-pressed="false" class="nv-split-btn">Split</button>
+                </div>
+                <button id="saveNoteBtn" class="primary-btn nv-save" type="button" title="Save (Ctrl+S)" disabled>Save</button>
+                <div class="nv-menu-wrap">
+                  <button id="nv-note-menu-btn" class="nv-icon-btn" type="button" aria-label="More" aria-haspopup="menu">⋯</button>
+                  <div id="nv-note-menu" class="nv-menu" role="menu" hidden>
+                    <button id="nv-move-note" type="button" role="menuitem">Move to…</button>
+                    <hr>
+                    <button id="deleteNoteBtn" type="button" role="menuitem" class="nv-danger">Delete note</button>
+                  </div>
+                </div>
+              </div>
+              <div id="nv-removed" class="nv-removed" hidden>
+                <span>This note was removed by the last pull.</span>
+                <button id="nv-keep" type="button" class="nv-btn">Keep my text as a new note</button>
+                <button id="nv-close-removed" type="button" class="nv-btn">Close</button>
+              </div>
+              <div class="nv-note-scroll">
+                <div class="nv-note-inner">
+                  <input type="text" id="noteTitleInput" class="nv-title" placeholder="Untitled" aria-label="Note title"
+                    autocomplete="off">
+                  <div id="nv-meta" class="nv-meta"></div>
+                  <div class="nv-panes">
+                    <textarea id="noteContentInput" class="nv-text" spellcheck="true"
+                      placeholder="Write here… Link notes with [[Note Title]] and paste URLs to link pages."></textarea>
+                    <div id="notePreview" class="note-preview nv-preview"></div>
+                  </div>
+                  <div id="nv-backlinks"></div>
+                </div>
+              </div>
+            </div>
+          </article>
         </div>
+
+        <div id="nv-popup" class="nv-menu nv-popup" role="menu" hidden></div>
+
+        <dialog id="nv-move-dialog" class="nv-dialog" aria-labelledby="nv-move-title">
+          <div class="nv-dialog-head">
+            <strong id="nv-move-title">Move to…</strong>
+            <button id="nv-move-cancel" class="nv-icon-btn" type="button" aria-label="Close">✕</button>
+          </div>
+          <div id="nv-move-list" class="nv-move-list"></div>
+          <div class="nv-dialog-foot">
+            <button id="nv-move-new" class="nv-btn" type="button">+ New notebook…</button>
+          </div>
+        </dialog>
       </section>
 
       <section id="settings-container" style="display:none;">
