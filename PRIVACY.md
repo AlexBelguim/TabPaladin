@@ -64,13 +64,14 @@ use read your notes and bookmarks and suggest changes, in two ways:
 
 - **A temporary link.** Settings or Notes make a link that works for one hour. Anyone who
   has it can read all your notes and your bookmarks (folder names, titles and addresses)
-  until it expires, so give it only to the chat you intend.
+  until it expires, so give it only to the chat you intend. Changing your password ends
+  every link at once.
 - **MCP tokens**, for Claude Code, Claude Desktop and other MCP clients. You make one in
   Settings; a chat holding it can read your notes and bookmarks and suggest changes for as
   long as the token exists. The server stores only a fingerprint (hash) of each token, with
   its name and when it was made and last used. Revoke a token in Settings at any time;
-  changing your password revokes all of them. A token cannot reach anything else on your
-  server.
+  changing your password revokes all of them, and ends your temporary links too. A token
+  cannot reach anything else on your server.
 
 What the chat reads goes to the company that runs that chat (for example Anthropic or
 OpenAI), under its own privacy terms, not TabPaladin's. The chat fetches it from your

@@ -16,7 +16,9 @@
 //   4. Deleting an account removes exactly its data, and its id is never
 //      handed out again.
 //   5. No SQL statement in the server touches an account-owned table without
-//      naming user_id, except an explicit allowlist, each entry with a reason.
+//      naming user_id, except an explicit allowlist, each entry with a reason;
+//      and the statements a password change and a reset revoke MCP tokens
+//      and LLM share links with are still there.
 //   6. End to end: the pre-multi-user server, checked out of git history, fills
 //      a data directory through its own API; this server upgrades it, serves
 //      the same data to the right account, verify_tenancy.js proves the
@@ -528,6 +530,14 @@ const ALLOWED = [
     ['server/imports/store.js', 'UPDATE import_sources SET pending_credentials = NULL, pending_username = NULL, pending_nonce_hash = NULL WHERE id = ?', 'clears a pending connection already resolved by nonce'],
     ['server/imports/store.js', 'SELECT 1 FROM import_sources WHERE id = ? AND deleted_at IS NULL', 'upsertItem: is the source still there at all']
 ].map(([file, sql, why]) => ({ file, sql, why, used: 0 }));
+// Account-scoped statements that must stay where they are: what a password
+// change or an admin reset revokes besides the sessions.
+const REQUIRED = [
+    ['server/index.js', 'DELETE FROM mcp_tokens WHERE user_id = ?', 'a password change revokes the MCP tokens'],
+    ['server/index.js', 'DELETE FROM share_tokens WHERE user_id = ?', 'a password change ends the LLM share links'],
+    ['server/admin.js', 'DELETE FROM mcp_tokens WHERE user_id = ?', 'a reset revokes the MCP tokens'],
+    ['server/admin.js', 'DELETE FROM share_tokens WHERE user_id = ?', 'a reset ends the LLM share links']
+].map(([file, sql, why]) => ({ file, sql, why, found: 0 }));
 
 function sqlLiterals(src) {
     const out = [];
@@ -568,6 +578,7 @@ function staticScan() {
         const src = fs.readFileSync(path.join(REPO, file), 'utf8');
         for (const { sql, line } of sqlLiterals(src)) {
             scanned++;
+            for (const r of REQUIRED) if (r.file === file && r.sql === sql) r.found++;
             if (!OWNED.test(sql) || /\buser_id\b/.test(sql)) continue;
             const allowed = ALLOWED.find(a => a.file === file && a.sql === sql);
             if (allowed) { allowed.used++; continue; }
@@ -578,6 +589,9 @@ function staticScan() {
     check('no statement touches an owned table without user_id', violations.length === 0, '\n      ' + violations.join('\n      '));
     const stale = ALLOWED.filter(a => a.used === 0);
     check('every allowlist entry still matches a statement', stale.length === 0, stale.map(a => a.sql).join(' | '));
+    const missing = REQUIRED.filter(r => r.found === 0);
+    check('a password change and a reset still revoke MCP tokens and share links', missing.length === 0,
+        missing.map(r => `${r.file}: ${r.sql} (${r.why})`).join(' | '));
 }
 
 // --- 4. End to end ----------------------------------------------------------------

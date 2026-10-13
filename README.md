@@ -166,9 +166,10 @@ suggestion would do before you approve it.
 4. Approve or reject on Home (bookmarks) or in Notes (notes).
 
 Anyone who has the link can read your notes and bookmarks until it expires
-(1 hour), so give it only to the chat you mean. Some chats fetch only links
-that appear on a page they already read; the page's paging and folder links
-do, a search address the chat makes up may not.
+(1 hour), so give it only to the chat you mean; changing your password ends
+every link at once. Some chats fetch only links that appear on a page they
+already read; the page's paging and folder links do, a search address the
+chat makes up may not.
 
 ### Claude Code
 
@@ -247,8 +248,8 @@ down in [server/README.md](server/README.md#mcp-ai-chats-with-a-token).
 **Settings → AI chats** lists your tokens with when each was made and last
 used, and revokes them. A token can read and suggest, nothing else: it opens
 no other part of the server. Changing your password (or an admin resetting
-it) revokes all of yours, and so does deleting the account. The server keeps
-only a hash of each.
+it) revokes all of yours and ends your share links, and so does deleting the
+account. The server keeps only a hash of each.
 
 ---
 

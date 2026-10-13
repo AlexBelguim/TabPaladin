@@ -497,8 +497,10 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
             if (!now || now.password_hash !== row.password_hash || !stillSignedIn(req)) return null;
             db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
             db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
-            // AI chats' tokens too: a new password is how you lock everyone out.
+            // AI chats' tokens and share links too: a new password is how
+            // you lock everyone out.
             db.prepare('DELETE FROM mcp_tokens WHERE user_id = ?').run(row.id);
+            db.prepare('DELETE FROM share_tokens WHERE user_id = ?').run(row.id);
             return issueSession(row.username);
         })();
         if (!session) return res.status(401).json({ error: 'Your password or session changed meanwhile. Sign in again.' });
