@@ -856,10 +856,16 @@ function stampsIn(list) {
     }));
 }
 
+// Settings as this module writes them back (loadCopy): without what an earlier
+// version kept for the built-in AI, which is gone, so it is never written
+// back once deleted.
+const RETIRED_SETTINGS = ['geminiApiKey', 'useAI'];
 async function readSettings() {
     try {
         const data = await api.storage.local.get(SETTINGS_KEY);
-        return (data && data[SETTINGS_KEY]) || {};
+        const settings = { ...((data && data[SETTINGS_KEY]) || {}) };
+        for (const k of RETIRED_SETTINGS) delete settings[k];
+        return settings;
     } catch (e) {
         return {};
     }

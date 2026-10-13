@@ -15,8 +15,10 @@
 export const BACKUP_FORMAT = 'tabpaladin-extension-backup';
 export const BACKUP_VERSION = 1;
 
-// Field names that hold a secret, wherever they appear.
-const SECRET_FIELD = /^(token|accesstoken|refreshtoken|sessiontoken|authtoken|password|secret|clientsecret|apikey|geminiapikey)$/i;
+// Field names that hold a secret, wherever they appear: a token, password,
+// secret or API key, whatever it is called before that (accessToken,
+// clientSecret, an older version's AI key...).
+const SECRET_FIELD = /(token|password|secret|apikey)$/i;
 // Maps whose keys are the user's own words (keyword categories), not field
 // names: never searched for secrets, so a category called "Token" is kept.
 const USER_KEYED = new Set(['customKeywords']);

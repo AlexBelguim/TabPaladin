@@ -1,17 +1,17 @@
 import { TabGrouper } from './tabGrouper.js';
-import { AIService } from './aiService.js';
 import { StorageManager } from './storageManager.js';
 import { TreeStore } from './treeStore.js';
 
 // All reads and writes go against the local working copy of the synced tree,
 // through its chrome.bookmarks-compatible facade.
+//
+// Organizing is keyword-based (TabGrouper's categories plus the user's own
+// keywords). There is no built-in AI any more: assistants work through the
+// sync server instead, where nothing they propose is applied until approved.
 const Tree = TreeStore.bookmarks;
 
 
 export const BookmarkOrganizer = {
-    // Export AIService for sidepanel to use directly if needed
-    AIService: AIService,
-
     /**
      * Getting top-level folder structure for user selection.
      */
@@ -425,148 +425,6 @@ export const BookmarkOrganizer = {
         // The Apply logic handles "If folder exists, use it", so parallel creates are safe-ish (race condition possible but unlikely in seq).
 
         return { groups: proposals.groups };
-    },
-
-    /**
-     * Helper: Get ALL items from a list of Folder IDs (Recursive).
-     * Used for "Restructure" mode where we want to grab everything and reshuffle.
-     */
-    getAllItemsInScope: async (folderIds) => {
-        let looseItems = [];
-
-        // Helper to recursively extract items
-        const extractItems = (node) => {
-            if (node.url) {
-                looseItems.push({
-                    id: node.id,
-                    title: node.title,
-                    url: node.url,
-                    parentId: node.parentId
-                });
-            } else if (node.children) {
-                node.children.forEach(extractItems);
-            }
-        };
-
-        for (const rawId of folderIds) {
-            // Check for explicit "Loose Only" mode
-            if (rawId.startsWith('loose-')) {
-                const realId = rawId.replace('loose-', '');
-                try {
-                    const children = await Tree.getChildren(realId);
-                    // Shallow fetch: only direct children that are items
-                    children.forEach(child => {
-                        if (child.url) {
-                            looseItems.push({
-                                id: child.id,
-                                title: child.title,
-                                url: child.url,
-                                parentId: child.parentId
-                            });
-                        }
-                    });
-                } catch (err) {
-                    console.error(`Failed to fetch children for loose ID ${realId}`, err);
-                }
-            } else {
-                // Recursive Fetch (Folder Mode)
-                try {
-                    const subTree = await Tree.getSubTree(rawId);
-                    if (subTree && subTree.length > 0) {
-                        extractItems(subTree[0]);
-                    }
-                } catch (err) {
-                    console.error(`Failed to fetch subtree for ID ${rawId}`, err);
-                }
-            }
-        }
-
-        // Deduplicate (in case user selected Parent AND Child, causing double fetch)
-        const unique = new Map();
-        looseItems.forEach(item => unique.set(item.id, item));
-        looseItems = Array.from(unique.values());
-
-        // For context, we don't strictly need 'folders' array for the AI prompt
-        // (the Prompt only asks for ITEMS list).
-        // But if we wanted to pass existing folders, we could.
-        // For Restructure, we check "Ignore existing folders", so empty array is fine.
-        return { looseItems, folders: [] };
-    },
-
-    /**
-     * AI-Powered Organization.
-     * Uses Gemini to map items to the full folder tree.
-     */
-    /**
-     * AI-Powered Organization.
-     * Uses Gemini to map items to the full folder tree.
-     */
-    analyzeWithAI: async (folderIds, contextIds, apiKey, hints) => {
-        // 1. Get scope
-        const { looseItems } = await BookmarkOrganizer.getAllItemsInScope(folderIds);
-        if (looseItems.length === 0) return { groups: [] };
-
-        // 2. Get Context
-        const allStructure = await BookmarkOrganizer.getFolderMap(contextIds);
-        const contextFolders = allStructure.map(f => ({ id: f.id, path: f.fullPath }));
-
-        // Pick a default root for NEW: proposals — first focused folder if available,
-        // otherwise first folder in scope, finally Other Bookmarks ('2').
-        const settings = await StorageManager.getSettings();
-        const focused = settings.focusedFolderIds || [];
-        const focusedRoot = focused.length
-            ? allStructure.find(f => f.id === focused[0])
-            : null;
-        const defaultRoot = focusedRoot || allStructure[0] || { id: '2', fullPath: 'Other Bookmarks' };
-
-        // 3. Call AI
-        const mapping = await AIService.organizeWithAI(looseItems, contextFolders, apiKey, hints);
-
-        // 4. Convert AI Map to Proposals
-        const groups = {};
-
-        looseItems.forEach(item => {
-            const decision = mapping && mapping[item.id];
-            if (!decision || decision === 'SKIP') return;
-
-            if (decision.startsWith('NEW:')) {
-                const newCat = decision.replace('NEW:', '').trim();
-                const groupKey = `NEW_${newCat}`;
-
-                if (!groups[groupKey]) {
-                    groups[groupKey] = {
-                        groupName: newCat,
-                        action: 'CREATE',
-                        targetId: defaultRoot.id,
-                        targetPath: defaultRoot.fullPath,
-                        newSubfolder: newCat,
-                        items: []
-                    };
-                }
-                groups[groupKey].items.push(item);
-
-            } else {
-                // Existing Folder ID
-                const folderId = decision;
-                const folderInfo = allStructure.find(f => f.id === folderId);
-
-                if (folderInfo) {
-                    if (!groups[folderId]) {
-                        groups[folderId] = {
-                            groupName: folderInfo.title, // Use Folder Name as Group Name
-                            action: 'MOVE',
-                            targetId: folderId,
-                            targetPath: folderInfo.fullPath,
-                            newSubfolder: '',
-                            items: []
-                        };
-                    }
-                    groups[folderId].items.push(item);
-                }
-            }
-        });
-
-        return { groups: Object.values(groups) };
     },
 
     /**

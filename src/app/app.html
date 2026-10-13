@@ -89,15 +89,9 @@
         <h2>Select Folders to Clean</h2>
         <div id="source-list" class="source-grid" style="margin-bottom:12px;"></div>
 
-        <div style="margin-bottom:10px;">
-          <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">AI Hints (Optional)</label>
-          <input type="text" id="aiHintsInput" placeholder="e.g. pop, kpop, fitness, react..." class="tp-field">
-        </div>
-
         <div style="display:flex; gap:8px; margin-bottom:8px;">
-          <button id="analyzeBtn" class="primary-btn" style="flex:1;">✨ Analyze &amp; Sort</button>
-          <button id="restructureBtn" class="primary-btn" style="flex:1; background-color: #8b5cf6;"
-            title="Revamp the entire folder structure">🏗️ Restructure</button>
+          <button id="analyzeBtn" class="primary-btn" style="flex:1;"
+            title="Sort the selected folders by your keywords (Settings › Custom Keywords)">✨ Analyze &amp; Sort</button>
         </div>
         <button id="cancelSourceBtn" class="sm-btn tp-back">Cancel</button>
       </section>
@@ -105,20 +99,7 @@
       <section id="organizer-container" style="display:none;">
         <h2>Bookmark Proposals</h2>
 
-        <div id="ai-regroup-controls">
-          <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">✨ Refine with AI
-            (Optional)</label>
-          <div class="input-group">
-            <input type="text" id="aiTabsHintsInput" placeholder="Hints e.g. Work, News...">
-            <button id="aiGroupTabsBtn" class="primary-btn">Re-Group</button>
-          </div>
-        </div>
-
         <div id="proposals-list"></div>
-        <label id="closeAfterApplyWrapper" style="display:none; align-items:center; gap:8px; padding:8px 4px; margin-top:8px; font-size:0.85rem; color:var(--text-muted); cursor:pointer;">
-          <input type="checkbox" id="closeAfterApplyToggle" checked>
-          <span>Close filed tabs after saving</span>
-        </label>
         <button id="applyOrganizerBtn" class="primary-btn" style="margin-top:10px;">Apply Changes</button>
         <button id="cancelOrganizerBtn" class="sm-btn tp-back">Back</button>
       </section>

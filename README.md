@@ -16,7 +16,7 @@
 
 ## ✨ What is TabPaladin?
 
-TabPaladin is a powerful browser extension that helps you **tame tab chaos** and **organize your digital life**. Save your browsing sessions as workflows, organize bookmarks with AI assistance, and never lose track of your research again.
+TabPaladin is a powerful browser extension that helps you **tame tab chaos** and **organize your digital life**. Save your browsing sessions as workflows, sort your bookmarks by your own keywords, and never lose track of your research again.
 
 > *"100 tabs open? No problem."* — Every TabPaladin user
 
@@ -29,10 +29,14 @@ TabPaladin is a powerful browser extension that helps you **tame tab chaos** and
 - **Restore Anytime** — Reopen entire workflows in a new window
 - **Import/Export** — Backup your workflows to JSON files
 
-### 🧠 **AI-Powered Organization** (Optional)
-- **Smart Grouping** — Let AI categorize your tabs and bookmarks
-- **Folder Suggestions** — Get intelligent folder recommendations
-- **Custom Hints** — Guide the AI with your own keywords
+### 🗂️ **Keyword Organization**
+- **Smart Grouping** — open tabs and bookmarks grouped by built-in categories and your own keywords
+- **Folder Suggestions** — Analyze & Sort and Split propose where each bookmark goes; nothing moves until you apply it
+- **Your keywords, your folders** — export and import your keywords and any folder as JSON
+
+There is no built-in AI and no API key to enter: nothing is sent to an AI service.
+An assistant can work with your notes through the sync server's temporary share
+link instead, and what it proposes is applied only once you approve it.
 
 ### 🗄️ **Server-owned bookmarks** (needs the sync server)
 - **One tree, any browser** — your bookmarks live in the sync server's database, not in any browser's own bookmark store, so Chrome, Firefox, Opera and the phone all see the identical tree
@@ -92,7 +96,7 @@ HTML file in **Settings → Import bookmarks** — works with any browser.
 1. **Click the TabPaladin icon** in your toolbar to open the app
 2. **Create Workflow** — Save all your current tabs (extension)
 3. **View Workflows** — Restore, open, or delete saved sessions (both clients)
-4. **Organize Bookmarks** — Use AI to clean up your bookmark mess
+4. **Organize Bookmarks** — Sort folders by keyword, reviewing every move first
 5. **Push / Pull** — git-style sync; edit offline, push when ready
 
 ---

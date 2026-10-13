@@ -20,10 +20,10 @@ on services you choose to connect.
 
 ## Where your data is stored
 
-- **On your device.** Your bookmark tree, workflows, notes and settings are kept in the
-  extension's local storage. If you set up AI organisation, your Gemini API key is also
-  stored there. In the web app, your server address and sign-in session are kept in that
-  browser's storage.
+- **On your device.** Your bookmark tree, workflows, notes and settings are kept in
+  the extension's local storage. In the web app, your server address and sign-in session
+  are kept in that browser's storage. TabPaladin has no built-in AI any more: a Gemini API
+  key entered in an earlier version is deleted from your device when the extension updates.
 - **On your own sync server, if you set one up.** TabPaladin can sync with a server that
   *you* host (for example in Docker on a home NAS). When you sign in and push, your
   bookmark tree, workflows and notes are sent to that server and stored in its database,
@@ -35,11 +35,6 @@ on services you choose to connect.
 
 TabPaladin only contacts these when you use the matching feature:
 
-- **Google Gemini (AI organisation).** Off by default. If you turn it on and enter your own
-  API key, the **titles** of the bookmarks being organised and your folder names are sent
-  to Google's Gemini API, along with any hints you type. Your API key is included in each
-  request. This is subject to
-  [Google's terms and privacy policy](https://policies.google.com/privacy).
 - **Google favicon service.** To show site icons, the extension and web app request each
   bookmark's icon from `www.google.com/s2/favicons`, which tells Google the domain of each
   bookmark being displayed (not the full address).
@@ -69,8 +64,8 @@ share it only with the assistant you intend.
 - **Extension:** removing the extension deletes everything it stored on your device.
 - **Sync server:** your data lives in the server's database file, which you control and
   can delete at any time.
-- **Gemini / Reddit:** disconnect them in TabPaladin's settings and revoke the API key or
-  app in your Google or Reddit account.
+- **Reddit:** disconnect it in TabPaladin's settings and revoke the app in your Reddit
+  account.
 
 ## Changes and contact
 

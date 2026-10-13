@@ -97,6 +97,7 @@ api.runtime.onInstalled.addListener((details) => {
     if (details && details.reason === 'install') {
         serialized(() => api.storage.local.remove(TRACK_STORE_KEY)).catch(() => {});
     }
+    purgeRetiredSettings();
     syncVideoSeek();
 });
 
@@ -218,6 +219,31 @@ api.tabs.onRemoved.addListener((tabId, removeInfo) => {
     serialized(() => untrackClosedTab(tabId, removeInfo))
         .catch((e) => console.warn('TabPaladin autosync error:', e));
 });
+
+
+// --- Settings that are gone ---
+//
+// The built-in AI is removed, and with it the Gemini API key an earlier
+// version kept in `settings`: it is deleted from this browser on the update
+// and on every wake after it, rather than left behind. The pages strip it
+// from every settings read and write too, so a page still open from before
+// cannot write it back.
+const RETIRED_SETTINGS = ['geminiApiKey', 'useAI'];
+
+async function purgeRetiredSettings() {
+    try {
+        const data = await api.storage.local.get('settings');
+        const settings = data && data.settings;
+        if (!settings || typeof settings !== 'object') return;
+        if (!RETIRED_SETTINGS.some(k => k in settings)) return;
+        const kept = { ...settings };
+        for (const k of RETIRED_SETTINGS) delete kept[k];
+        await api.storage.local.set({ settings: kept });
+    } catch (e) {
+        console.warn('TabPaladin: could not remove retired settings', e);
+    }
+}
+purgeRetiredSettings();
 
 
 // --- Video scroll-seek (opt-in) ---
