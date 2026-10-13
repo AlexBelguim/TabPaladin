@@ -11,6 +11,9 @@
 //   3. A clean copy switches accounts cleanly, and the per-device lists from
 //      before accounts are adopted by the server's owner only.
 //   4. Admins see the Users block; plain users do not.
+//   5. A share the server refuses while you are signed in (a full inbox) is
+//      kept on the phone, the app says why, and it is delivered once there is
+//      room.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -173,7 +176,10 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-pwa-accounts-'));
 const env = { ...process.env };
 for (const k of Object.keys(env)) if (/^(AUTH_TOKEN|ADMIN_|TENANCY_OWNER|IMPORT_|MAX_)/.test(k)) delete env[k];
 const server = spawn(process.execPath, [path.join(REPO, 'server', 'index.js')], {
-    env: { ...env, PORT: String(PORT), DATA_DIR: dataDir, PWA_DIR: path.join(REPO, 'pwa'), ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: PASSWORD, IMPORTS_SCHEDULER: 'off' },
+    env: {
+        ...env, PORT: String(PORT), DATA_DIR: dataDir, PWA_DIR: path.join(REPO, 'pwa'), ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: PASSWORD,
+        IMPORTS_SCHEDULER: 'off', MAX_INBOX_PER_USER: '2'
+    },
     stdio: ['ignore', 'pipe', 'pipe']
 });
 let serverLog = '';
@@ -279,6 +285,23 @@ try {
     check('an admin does', !byId('users-block').classList.contains('hidden') && /sam/.test(byId('users-list').innerHTML)
         && /pill owner/.test(byId('users-list').innerHTML), byId('users-list').innerHTML.slice(0, 200));
     check('labelled as admin and owner', byId('auth-role-label').textContent === ' (admin, owner)', byId('auth-role-label').textContent);
+
+    console.log('\n5. A share the inbox has no room for');
+    // alex's inbox holds the link from section 1; one more fills it.
+    await api('/api/shared', { method: 'POST', token: alexNew, body: { url: 'https://example.com/filler' } });
+    const ARTICLE = 'https://blog.example/an-article-i-want-to-keep';
+    currentUrl = new URL(BASE + '/?share=1&url=' + encodeURIComponent(ARTICLE) + '&title=Article');
+    await signIn('alex', 'new horse battery'); // any start runs the share through
+    const keptFull = JSON.parse(localStorageShim.getItem('tp_pending_shares') || '[]');
+    check('a link the full inbox refuses is kept on the phone, as alex\'s', keptFull.some(s => s.url === ARTICLE && s.userId === 1),
+        JSON.stringify(keptFull));
+    check('  and the app says why, in the server\'s words', dialogs.alert.some(m => /inbox already holds 2 links/.test(m)),
+        dialogs.alert.join(' | '));
+    const filler = (await api('/api/shared', { token: alexNew })).json.links.find(l => l.url === 'https://example.com/filler');
+    await api(`/api/shared/${filler.id}`, { method: 'DELETE', token: alexNew });
+    await signIn('alex', 'new horse battery');
+    check('once there is room, the next start delivers it',
+        (await api('/api/shared', { token: alexNew })).json.links.some(l => l.url === ARTICLE) && !localStorageShim.getItem('tp_pending_shares'));
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);

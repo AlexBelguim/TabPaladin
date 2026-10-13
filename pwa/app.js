@@ -2283,10 +2283,10 @@ function renderQuickFileSheet() {
 // /?share=1&title=...&text=...&url=... (configured in manifest). We capture and
 // POST to /api/shared so it lands in the inbox.
 //
-// Whatever stops that — signed out, a revoked session, offline — the share is
-// queued on the phone before the URL is cleaned, and delivered after the next
-// sign-in (see pendingShares.js). Losing what you shared is the one
-// unacceptable outcome.
+// Whatever stops that — signed out, a revoked session, offline, a full inbox —
+// the share is queued on the phone before the URL is cleaned, and delivered
+// after the next sign-in or start (see pendingShares.js). Losing what you
+// shared is the one unacceptable outcome.
 async function processShareTargetIfAny() {
     const params = new URLSearchParams(location.search);
     // Browsers vary in where they put the URL when share_target action is `/`.
@@ -2307,6 +2307,13 @@ async function processShareTargetIfAny() {
             showToast(captured.duplicate
                 ? `Already in your ${name} archive.`
                 : `Saved to ${name} — ${captured.items} archived.`);
+        } else if (taken.queued && configured() && taken.error && taken.error.status && taken.error.status !== 401) {
+            // Signed in, and the server said no — a full inbox (429), say.
+            // Show its reason: "sign in" would not help here.
+            const why = (taken.error.body && taken.error.body.error) || taken.error.message;
+            alert(`The server did not take this link:\n\n${why}\n\nIt is kept on this phone and tried again the next time the app starts.`);
+        } else if (taken.queued && configured()) {
+            showToast('Kept on this phone — the server could not be reached.');
         } else if (taken.queued) {
             showToast('Kept on this phone — it is added after you sign in.');
         }

@@ -62,9 +62,9 @@ async function readConfig() {
 // X or Instagram.
 //
 // Anything that stops this worker from finishing the job — no config mirrored
-// yet, server unreachable — redirects into the app instead, which handles the
-// same share the long way. Losing the link would be far worse than opening a
-// window.
+// yet, server unreachable, the inbox refusing the link — redirects into the
+// app instead, which handles the same share the long way. Losing the link
+// would be far worse than opening a window.
 async function handleShare(request) {
     // Absolute on purpose: Response.redirect resolves a relative URL against
     // the worker's base in a browser, but that is a subtlety worth not relying
@@ -107,9 +107,13 @@ async function handleShare(request) {
         const res = await post('/api/imports/capture', { url, title });
         if (res.ok) {
             const data = await res.json();
-            // Not X or Instagram — still worth keeping, just in the inbox.
-            if (!data.captured) await post('/api/shared', { url, title });
-            return new Response(null, { status: 204 });
+            if (data.captured) return new Response(null, { status: 204 });
+            // Not X or Instagram — still worth keeping, just in the inbox. A
+            // full inbox (429) or any other refusal goes to the app, which
+            // keeps the link on the phone and says why.
+            const inbox = await post('/api/shared', { url, title });
+            if (inbox.ok) return new Response(null, { status: 204 });
+            return fallback(url, title);
         }
         // An older server has no capture route; the inbox still works.
         if (res.status === 404) {

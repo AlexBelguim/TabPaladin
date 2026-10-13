@@ -11,9 +11,9 @@
 //      the link. Losing what you shared is the one unacceptable outcome.
 //   3. The URL is found wherever the sharing app puts it — X uses `text`.
 //   4. Where the worker hands a share to the app and the app cannot deliver
-//      it either (signed out, a revoked session), the app queues it on the
-//      phone; after sign-in the same account's queued shares are delivered
-//      and anyone else's wait for a yes.
+//      it either (signed out, a revoked session, a full inbox), the app
+//      queues it on the phone, knowing why; after sign-in the same account's
+//      queued shares are delivered and anyone else's wait for a yes.
 //
 // Run: node tools/test_share_sw.mjs
 
@@ -168,6 +168,21 @@ async function main() {
         check('no url -> redirect', redirected(res), `status=${res.status}`);
     }
     {
+        // A link the archive does not take, and an inbox that is full: the
+        // worker must not answer 204 over a refused inbox POST.
+        const fetchImpl = recordingFetch((url) => url.includes('/capture')
+            ? ok({ ok: true, captured: false })
+            : new Response(JSON.stringify({ error: 'Your inbox already holds 2 links, the most it keeps. File or clear some first.' }),
+                { status: 429, headers: { 'Content-Type': 'application/json' } }));
+        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
+        const res = await handleShare(shareRequest({ url: 'https://blog.example/an-article-i-want-to-keep' }));
+        check('full inbox (429) -> redirect, not a silent 204', redirected(res), `status=${res.status}`);
+        check('  after trying the inbox', fetchImpl.calls.length === 2 && fetchImpl.calls[1].url.endsWith('/api/shared'));
+        check('  and the link is carried into the app',
+            (res.headers.get('location') || '').includes(encodeURIComponent('https://blog.example/an-article-i-want-to-keep')),
+            res.headers.get('location'));
+    }
+    {
         // An older server that predates the capture route.
         const fetchImpl = recordingFetch((url) => url.includes('/capture')
             ? new Response('not found', { status: 404 })
@@ -250,6 +265,20 @@ async function pendingShareTests() {
     await pending.take({ url: 'https://example.com/unwanted', userId: null }, { canDeliver: false });
     const dropped = await pending.drain({ userId: 1, deliver: async () => {}, ask: async () => 'discard' });
     check('discarding is an explicit answer', dropped.discarded === 1 && pending.list().length === 0);
+
+    console.log('\n8. A share the server refuses');
+    const full = async () => {
+        const e = new Error('429 Too Many Requests');
+        e.status = 429;
+        e.body = { error: 'Your inbox already holds 5000 links, the most it keeps. File or clear some first.' };
+        throw e;
+    };
+    const refused = await pending.take({ url: 'https://blog.example/kept', userId: 1 }, { canDeliver: true, deliver: full });
+    check('a share the server refuses while signed in is queued', refused.queued && !refused.delivered
+        && pending.list().some(s => s.url === 'https://blog.example/kept'));
+    check('  and the caller learns why, to say so', refused.error && refused.error.status === 429 && /inbox already holds/.test(refused.error.body.error));
+    const retried = await pending.drain({ userId: 1, deliver: full, ask: async () => 'add' });
+    check('a drain while the inbox is still full keeps it', retried.added === 0 && pending.list().length === 1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

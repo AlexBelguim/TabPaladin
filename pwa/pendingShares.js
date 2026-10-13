@@ -40,17 +40,20 @@ export function makePendingShares({ storage, key = PENDING_SHARES_KEY }) {
 
         // A share as it arrives: delivered now when possible, queued — before
         // the caller cleans the URL — whenever it is not. Never both, never
-        // neither. Returns {delivered, queued, result}.
+        // neither. Returns {delivered, queued, result, error}: `error` is why
+        // a delivery that was tried failed, so the caller can say so.
         async take(share, { canDeliver, deliver }) {
+            let error = null;
             if (canDeliver) {
                 try {
-                    return { delivered: true, queued: false, result: await deliver(share) };
+                    return { delivered: true, queued: false, result: await deliver(share), error };
                 } catch (e) {
                     // Falls through to the queue.
+                    error = e;
                 }
             }
             pending.queue(share);
-            return { delivered: false, queued: true, result: null };
+            return { delivered: false, queued: true, result: null, error };
         },
 
         // Deliver what is queued, for the account now signed in (`userId`).
