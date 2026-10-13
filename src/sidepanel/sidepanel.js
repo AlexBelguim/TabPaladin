@@ -1211,7 +1211,7 @@ async function buildSourceGrid(out, folderId, budget) {
     if (content.looseCount > 0) {
         const looseChildren = (await Tree.getChildren(content.id)).filter(isVisibleBookmark);
         if (looseChildren.length > 0) {
-            out.appendChild(renderTopLevelLooseSection(content.id, looseChildren));
+            out.appendChild(renderTopLevelLooseSection(content.id, looseChildren, budget));
         }
     }
 
@@ -1222,7 +1222,7 @@ async function buildSourceGrid(out, folderId, budget) {
 }
 
 // Renders loose bookmarks of the current breadcrumb folder as a flat group above the subfolder cards.
-function renderTopLevelLooseSection(parentFolderId, looseBookmarks) {
+function renderTopLevelLooseSection(parentFolderId, looseBookmarks, budget) {
     const wrap = document.createElement('div');
     wrap.className = 'src-top-loose';
 
@@ -1231,7 +1231,7 @@ function renderTopLevelLooseSection(parentFolderId, looseBookmarks) {
     header.textContent = `Loose bookmarks here (${looseBookmarks.length})`;
     wrap.appendChild(header);
 
-    appendDomainGroups(wrap, looseBookmarks, parentFolderId);
+    appendDomainGroups(wrap, looseBookmarks, parentFolderId, budget);
     return wrap;
 }
 
@@ -1304,13 +1304,20 @@ const RESTORE_ROW_BUDGET = 2000;
 const RESTORE_SKIPPED_TIP = 'Open last time — not reopened automatically to keep the page fast. Click to open.';
 
 // `queue` holds the remembered-open cards built in this pass and not yet
-// reopened; restoreQueued works through it.
+// reopened, `paged` the bodies waiting to show their "Show more" pages
+// again; restoreQueued works through both.
 function newRestoreBudget() {
-    return { rows: RESTORE_ROW_BUDGET, queue: [] };
+    return { rows: RESTORE_ROW_BUDGET, queue: [], paged: [] };
 }
 
 // Folder card element -> its open/close controller (see renderFolderCard).
 const cardControls = new WeakMap();
+
+// Folder id -> Map(domain -> rows shown), for the bodies the user paged with
+// "Show more". This page session only. A rebuild (a drop, a pull, a refresh)
+// shows those rows again, so the scrollTop a column carries over still lands
+// on the row it was on rather than past the end of the first page.
+const pagedRows = new Map();
 
 // A folder card, built closed. When the user left it open it is queued on the
 // pass's budget, and the pass's restoreQueued reopens it before the view is
@@ -1326,7 +1333,7 @@ function buildFolderCard(sub, depth, budget) {
 // own remembered-open subfolders for the next level. So a top-level column is
 // never given up for a grandchild in another column, nor a folder for a
 // sibling's deep subtree. Past the budget: left closed, marked as open last
-// time.
+// time. Paged bodies get their extra rows last, out of what is left.
 async function restoreQueued(budget) {
     while (budget.queue.length) {
         const opening = [];
@@ -1341,6 +1348,7 @@ async function restoreQueued(budget) {
         }
         for (const card of opening) await cardControls.get(card).restore(budget);
     }
+    for (const build of budget.paged.splice(0)) build();
 }
 
 function folderStatsText(folderCount, fileCount) {
@@ -1450,12 +1458,17 @@ function renderFolderCard(sub, depth = 0) {
         header.removeAttribute('title');
     };
     const ctl = {
-        // The user opened or closed it: remembered on this device.
+        // The user opened or closed it: remembered on this device. Closing
+        // also drops its "Show more" pages, so it reopens on its first rows.
         async setOpen(open) {
             clearSkipped();
             ExpandState.set(sub.id, open);
-            if (open) await showBody(newRestoreBudget(), true);
-            else hideBody();
+            if (open) {
+                await showBody(newRestoreBudget(), true);
+            } else {
+                pagedRows.delete(String(sub.id));
+                hideBody();
+            }
         },
         // Drag-hover: open for the rest of this page session, never saved.
         async springOpen() {
@@ -1796,9 +1809,46 @@ function renderFolderCard(sub, depth = 0) {
 // reached sit behind one button at the end. Whatever a group header does —
 // drag, ▶ All, ▶ 10, delete — acts on the group's full list, never only on
 // the rows on screen.
-function appendDomainGroups(container, bookmarks, parentFolderId, { rowCap = BODY_ROW_CAP } = {}) {
+//
+// A folder the user paged further comes back paged (pagedRows), the rows
+// past the first page paid from the pass's restore `budget`. Open cards come
+// first, so that part is built at the end of the pass (restoreQueued), out of
+// what the cards left, into a spot held for it here.
+function appendDomainGroups(container, bookmarks, parentFolderId, budget = null) {
     if (!bookmarks || bookmarks.length === 0) return;
+    const key = String(parentFolderId);
+    if (!pagedRows.has(key)) {
+        fillDomainGroups(container, bookmarks, parentFolderId, new Map(), BODY_ROW_CAP);
+        return;
+    }
+    // This body takes over keeping the folder's pages (unless it was closed
+    // meanwhile, which forgets them).
+    const build = (into) => {
+        const remembered = pagedRows.get(key);
+        const pages = new Map();
+        if (remembered) pagedRows.set(key, pages);
+        fillDomainGroups(into, bookmarks, parentFolderId, pages, BODY_ROW_CAP, remembered, budget);
+    };
+    if (!budget) {
+        build(container);
+        return;
+    }
+    const spot = document.createElement('div');
+    container.appendChild(spot);
+    budget.paged.push(() => {
+        const frag = document.createDocumentFragment();
+        build(frag);
+        spot.replaceWith(frag);
+    });
+}
 
+// The groups themselves, first `rowCap` rows free. `pages` is the body's
+// record of rows shown per group, handed on when the end button continues
+// the body. With `remembered` (the folder's pages before this rebuild) each
+// group it showed gets the rows it had, the ones past `rowCap` charged to
+// `budget`; once that runs out, the groups left wait behind the end button.
+function fillDomainGroups(container, bookmarks, parentFolderId, pages, rowCap, remembered = null, budget = null) {
+    const key = String(parentFolderId);
     const byDomain = {};
     bookmarks.forEach(b => {
         const d = tabDomain(b.url);
@@ -1807,11 +1857,33 @@ function appendDomainGroups(container, bookmarks, parentFolderId, { rowCap = BOD
     });
 
     const domains = Object.keys(byDomain).sort();
-    let rowsLeft = rowCap;
+    // The last group shown before. One that has turned up ahead of it since
+    // (a drop) is shown whole rather than left behind the end button.
+    const reachedTo = remembered?.size ? [...remembered.keys()].sort().pop() : null;
+    let free = rowCap;
     let next = 0;
-    for (; next < domains.length && rowsLeft > 0; next++) {
+    for (; next < domains.length; next++) {
         const d = domains[next];
-        rowsLeft -= appendDomainGroup(container, d, byDomain[d], parentFolderId, rowsLeft);
+        const items = byDomain[d];
+        let want;
+        if (remembered?.has(d)) want = remembered.get(d);
+        else if (free > 0) want = free;
+        else if (reachedTo !== null && d < reachedTo) want = items.length;
+        else break;
+        want = Math.min(want, items.length);
+        const fromCap = Math.min(want, free);
+        let extra = want - fromCap;
+        if (budget) extra = Math.min(extra, Math.max(0, budget.rows));
+        if (want > 0 && fromCap + extra === 0) break;
+        if (budget) budget.rows -= extra;
+        free -= fromCap;
+        const shown = appendDomainGroup(container, d, items, parentFolderId, fromCap + extra, pages);
+        // Cut short by the budget: a later pass with more to spare shows the
+        // rest again. Likewise the groups it never reached, below.
+        if (shown < want) pages.set(d, want);
+    }
+    for (const d of domains.slice(next)) {
+        if (remembered?.has(d)) pages.set(d, remembered.get(d));
     }
     if (next === domains.length) return;
 
@@ -1824,16 +1896,18 @@ function appendDomainGroups(container, bookmarks, parentFolderId, { rowCap = BOD
     more.addEventListener('click', (e) => {
         e.stopPropagation();
         const frag = document.createDocumentFragment();
-        appendDomainGroups(frag, rest, parentFolderId, { rowCap: SHOW_MORE_STEP });
+        fillDomainGroups(frag, rest, parentFolderId, pages, SHOW_MORE_STEP);
         more.replaceWith(frag);
+        pagedRows.set(key, pages);
     });
     container.appendChild(more);
 }
 
 // One domain group showing its first `firstRows` rows. `items` is the group's
 // full list, rendered or not; a row deleted on its own is taken out of it, so
-// the header's bulk actions stay exact. Returns how many rows it built.
-function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
+// the header's bulk actions stay exact. `pages` (domain -> rows shown) is
+// kept current for the body it sits in. Returns how many rows it built.
+function appendDomainGroup(container, d, items, parentFolderId, firstRows, pages) {
     const group = document.createElement('div');
     group.className = 'src-domain-group';
     group.dataset.domain = d;
@@ -1882,6 +1956,7 @@ function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
             group.style.transform = 'translateX(20px)';
             setTimeout(async () => {
                 group.remove();
+                pages.delete(d);
                 await refreshFolderBodyIfOpen(parentFolderId);
             }, 200);
         } catch (err) {
@@ -1925,6 +2000,7 @@ function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
             moreBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 showRows(SHOW_MORE_STEP);
+                pagedRows.set(String(parentFolderId), pages);
             });
             group.appendChild(moreBtn);
         }
@@ -1938,6 +2014,7 @@ function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
         }
         group.insertBefore(frag, moreBtn);
         shown = end;
+        pages.set(d, shown);
         syncMore();
     };
     // After a single row's delete: the count comes from the list, not from
@@ -1949,6 +2026,7 @@ function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
             if (idx < shown) shown--;
         }
         if (items.length === 0) {
+            pages.delete(d);
             group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
             group.style.opacity = '0';
             group.style.transform = 'translateX(20px)';
@@ -1958,11 +2036,12 @@ function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
             }, 200);
             return;
         }
+        pages.set(d, shown);
         countSpan.textContent = `(${items.length})`;
         deleteBtn.title = `Delete all ${items.length} bookmarks under this domain`;
         syncMore();
-        // This body is already right; rebuilding it would fold away any
-        // "Show more" pages. Header stats, and other copies, still update.
+        // This body is already right, and rebuilding it would cost a whole
+        // pass. Header stats, and other copies, still update.
         await refreshFolderBodyIfOpen(parentFolderId, group.closest('.source-folder-card'));
     }
 
@@ -2066,7 +2145,7 @@ async function buildFolderBody(folderId, depth, inImports, budget) {
         }
 
         // Loose bookmarks grouped by domain.
-        appendDomainGroups(frag, looseBookmarks, folderId);
+        appendDomainGroups(frag, looseBookmarks, folderId, budget);
     } catch (e) {
         // Deleted while this was open (another view, a pull): say so instead
         // of leaving a half-built body behind.

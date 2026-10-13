@@ -12,8 +12,13 @@
 //   3. Row paging in big folders: a body shows its first rows with "Show
 //      more" buttons, and every bulk action on a domain group (drag, ▶ All,
 //      ▶ 10, delete) still acts on the whole group, not on the visible rows.
+//      A folder paged further comes back paged after a rebuild, its extra
+//      rows paid from what the pass's open cards leave.
 //      appendDomainGroups is lifted from sidepanel.js itself and run against
 //      a minimal DOM, since the sidepanel cannot be imported headless.
+//   4. Folder cards (lifted the same way, against the real TreeStore): open
+//      state restored while detached, the restore budget spent level by
+//      level, and refreshes that rebuild only the view on screen, once.
 //
 // Run: node tools/test_expand_state.mjs
 
@@ -336,9 +341,9 @@ const env = {
     setTimeout: (fn) => { fn(); return 0; }
 };
 const code = [
-    liftConst('BODY_ROW_CAP'), liftConst('SHOW_MORE_STEP'),
+    liftConst('BODY_ROW_CAP'), liftConst('SHOW_MORE_STEP'), liftConst('pagedRows'),
     lift('tabDomain'), lift('escapeHtml'),
-    lift('appendDomainGroups'), lift('appendDomainGroup'), lift('buildBookmarkRow'),
+    lift('appendDomainGroups'), lift('fillDomainGroups'), lift('appendDomainGroup'), lift('buildBookmarkRow'),
     'return { appendDomainGroups, BODY_ROW_CAP, SHOW_MORE_STEP };'
 ].join('\n\n');
 const paging = new Function(...Object.keys(env), code)(...Object.values(env));
@@ -426,6 +431,51 @@ for (const row of x.querySelectorAll('.src-tab-row')) {
 check('deleting the last row of a group removes the group',
     small.querySelectorAll('.src-domain-group').length === 1 && calls.refreshed.at(-1).length === 1);
 
+// A rebuild (every drop, pull and refresh) used to start a body over at its
+// first 200 rows, so the column's carried-over scrollTop landed past the end.
+console.log('paged rows across rebuilds');
+const archive = [...bm('a.com', 4000), ...bm('b.com', 1500), ...bm('c.com', 500)];
+const endMore = (el) => el.childNodes.find(c => c instanceof Element && c.classList.contains('src-more-btn'));
+const groupIn = (el, d) => el.querySelectorAll('.src-domain-group').find(g => g.dataset.domain === d);
+const paged = new Element('div');
+paging.appendDomainGroups(paged, archive, 'archive');
+fire(moreIn(groupIn(paged, 'a.com')), 'click');
+fire(endMore(paged), 'click');
+check('(paged in: 700 rows of a.com, 500 of b.com)',
+    rowsIn(groupIn(paged, 'a.com')) === 700 && rowsIn(groupIn(paged, 'b.com')) === 500);
+
+// What the pass hands over: a budget whose paged builds run once its cards
+// are open (restoreQueued).
+const passBudget = (rows) => ({ rows, queue: [], paged: [] });
+function rebuild(budget) {
+    const el = new Element('div');
+    paging.appendDomainGroups(el, archive, 'archive', budget);
+    const heldBack = rowsIn(el);
+    for (const build of budget.paged.splice(0)) build();
+    return { el, heldBack };
+}
+let budget = passBudget(2000);
+let again = rebuild(budget);
+check('a paged body waits for the pass\'s open cards before building', again.heldBack === 0);
+check('a rebuild comes back with the same pages',
+    rowsIn(groupIn(again.el, 'a.com')) === 700 && rowsIn(groupIn(again.el, 'b.com')) === 500
+    && endMore(again.el).textContent === 'Show 500 more bookmarks in 1 site',
+    `${rowsIn(again.el)} rows`);
+check('…the rows past the first 200 charged to the pass\'s budget', budget.rows === 1000, String(budget.rows));
+fire(moreIn(groupIn(again.el, 'b.com')), 'click');
+again = rebuild(passBudget(2000));
+check('…and paging on in the rebuilt body is kept too', rowsIn(groupIn(again.el, 'b.com')) === 1000);
+again = rebuild(passBudget(500));
+check('a short budget pages in what it can; the groups left wait behind the end button',
+    rowsIn(groupIn(again.el, 'a.com')) === 700 && !groupIn(again.el, 'b.com')
+    && endMore(again.el).textContent === `Show ${nf(2000)} more bookmarks in 2 sites`,
+    `${rowsIn(again.el)} rows`);
+again = rebuild(passBudget(2000));
+check('…and a later pass with room shows the rest again', rowsIn(groupIn(again.el, 'b.com')) === 1000);
+const unpaged = new Element('div');
+paging.appendDomainGroups(unpaged, archive, 'never-paged', passBudget(2000));
+check('a folder never paged still opens on its first 200 rows, at once', rowsIn(unpaged) === 200);
+
 // --- Folder cards ---------------------------------------------------------
 //
 // The card controller from sidepanel.js against the real TreeStore working
@@ -461,6 +511,7 @@ await local.set({
                 }))},
                 { id: 'd2', kind: 'folder', title: 'D2', children: bmk('d2', 250) }
             ]},
+            { id: 'huge', kind: 'folder', title: 'Huge', children: bmk('huge', 1500) },
             { id: 'wf', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [] }
         ]
     }
@@ -489,10 +540,10 @@ const cardEnv = {
 };
 const cardCode = [
     ...['BODY_ROW_CAP', 'SHOW_MORE_STEP', 'RESTORE_ROW_BUDGET', 'RESTORE_SKIPPED_TIP', 'IMPORTS_ROOT_TITLE',
-        'TP_META_TITLE', 'TP_ROOT_MARKER_TITLE', 'cardControls'].map(liftConst),
+        'TP_META_TITLE', 'TP_ROOT_MARKER_TITLE', 'cardControls', 'pagedRows'].map(liftConst),
     ...['tabDomain', 'escapeHtml', 'isInternalBookmark', 'isVisibleBookmark', 'newRestoreBudget', 'folderStatsText',
         'buildFolderCard', 'restoreQueued', 'renderFolderCard', 'buildFolderBody',
-        'appendDomainGroups', 'appendDomainGroup', 'buildBookmarkRow',
+        'appendDomainGroups', 'fillDomainGroups', 'appendDomainGroup', 'buildBookmarkRow',
         'inHiddenView', 'refreshFolderBodyIfOpen'].map(lift),
     'return { buildFolderCard, restoreQueued, renderFolderCard, newRestoreBudget, cardControls, refreshFolderBodyIfOpen };'
 ].join('\n\n');
@@ -664,6 +715,43 @@ await settle();
 check('…while a hidden Organize grid is not rebuilt for a drop elsewhere',
     view.grids.length === 0 && seenLevel.length === 1);
 view.gridVisible = true;
+
+console.log('paged folders');
+for (const id of ['fA', 'fB']) ExpandState.set(id, false);
+ExpandState.set('huge', true);
+const hugeSub = { id: 'huge', title: 'Huge', folderCount: 0, fileCount: 1500 };
+const hugeRows = (card) => card.querySelectorAll('.src-tab-row').length;
+const pageOn = (card) => fire(moreIn(bodyOf(card).querySelector('.src-domain-group')), 'click');
+let [huge] = await renderPass(hugeSub);
+pageOn(huge);
+pageOn(huge);
+check('(paged in to 1,200 rows)', hugeRows(huge) === 1200, String(hugeRows(huge)));
+[huge] = await renderPass(hugeSub);
+check('a re-render brings a paged folder back with the same rows', hugeRows(huge) === 1200, String(hugeRows(huge)));
+
+// Open cards come before pages. The Bookmarks column (13) and Huge (200)
+// open first, then eight Big folders (1600); Huge's 1000 extra rows get the
+// 187 left. Charged as Huge's body was built, they would have closed five
+// of the Big folders instead.
+for (let i = 0; i < 8; i++) ExpandState.set(`big${i}`, true);
+let bmWithBigs;
+[huge, bmWithBigs] = await renderPass(hugeSub, rootSub);
+const bigsNow = subCards(bmWithBigs).filter(c => c.dataset.id.startsWith('big'));
+check('open cards are reopened before a paged body takes its extra rows',
+    bigsNow.filter(isShownOpen).length === 8 && !bigsNow.some(c => c.classList.contains('restore-skipped')),
+    `${bigsNow.filter(isShownOpen).length} open`);
+check('…which gets what they left', hugeRows(huge) === 200 + 187, String(hugeRows(huge)));
+for (let i = 0; i < 8; i++) ExpandState.set(`big${i}`, false);
+[huge] = await renderPass(hugeSub);
+check('…and all its pages again once there is room', hugeRows(huge) === 1200, String(hugeRows(huge)));
+
+fire(headerOf(huge), 'click');
+await settle();
+fire(headerOf(huge), 'click');
+await settle();
+check('closing a folder by hand forgets its pages: it reopens on its first 200 rows',
+    isShownOpen(huge) && hugeRows(huge) === 200, String(hugeRows(huge)));
+ExpandState.set('huge', false);
 
 console.log(failures === 0 ? '\nAll expand-state tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);
