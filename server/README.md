@@ -505,7 +505,7 @@ node tools/test_pwa_release.mjs # the PWA's version numbers agree, and the shell
 node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
 node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
-node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, legacy routes, forced-push safety net (starts a server)
+node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, legacy routes, forced-push safety net, and an upgrade rehearsal on a database the schema-3 server wrote (starts servers: --port, --old-port)
 node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block
 ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off MAX_PROPOSALS_PER_USER=3 DATA_DIR=/tmp/tp node server/index.js &
 node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server
