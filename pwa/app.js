@@ -1293,6 +1293,17 @@ function stopEditing() {
     });
 }
 
+// Switching what the library or list column shows. A desktop keeps the note
+// column, and any edit in it, on screen, so there is nothing to ask; a phone
+// replaces the note, so a confirmed discard has to drop the draft as well —
+// or ✓ Done would later save what the user chose to throw away.
+function confirmLeaveNotePane() {
+    if (isDesktop()) return true;
+    if (!confirmDiscardEdit()) return false;
+    stopEditing();
+    return true;
+}
+
 // Notes from the topbar 📝 or the tab bar. A phone always lands on the
 // library; a desktop comes back to the last scope and note.
 function enterNotes() {
@@ -2200,11 +2211,11 @@ function onNotesClick(e) {
             requestAnimationFrame(() => document.getElementById('nv-search')?.focus());
             break;
         case 'scope':
-            if (!confirmDiscardEdit()) return;
+            if (!confirmLeaveNotePane()) return;
             openNotes({ pane: 'list', scope: t.dataset.scope, query: '' });
             break;
         case 'open-nb':
-            if (!confirmDiscardEdit()) return;
+            if (!confirmLeaveNotePane()) return;
             openNotes({ pane: 'list', scope: `nb:${id}`, query: '' }, { history: state.nv.pane === 'list' ? 'push' : 'auto' });
             break;
         case 'fold':
@@ -2399,6 +2410,7 @@ function onNotesKeydown(e) {
     if (e.key === '/' && !inField && !e.ctrlKey && !e.metaKey && search) {
         e.preventDefault();
         if (!isDesktop() && state.nv.pane !== 'list') {
+            if (!confirmLeaveNotePane()) return;
             openNotes({ pane: 'list' });
             requestAnimationFrame(() => document.getElementById('nv-search')?.focus());
         } else {
