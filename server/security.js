@@ -99,6 +99,107 @@ export function makeRateLimiter({ max = 10, windowMs = 15 * 60 * 1000, now = () 
     };
 }
 
+// --- Response headers ---
+//
+// The server used to send none of these, and serves HTML from more than the
+// web app (the Reddit connect pages under /api/imports, Express's error and
+// redirect pages). Now:
+//   - every response: X-Content-Type-Options nosniff (a JSON answer or an
+//     uploaded title is never sniffed into HTML) and Referrer-Policy
+//     no-referrer (no URL of this server leaks to the sites it links to);
+//   - the web app (every file under PWA_DIR, so the service worker too):
+//     APP_CSP enforced and APP_CSP_REPORT_ONLY reported; its HTML also gets
+//     Cross-Origin-Opener-Policy same-origin (every window the app opens is
+//     noopener) and X-Frame-Options DENY;
+//   - every other HTML response, and one with no type at all: STRICT_CSP, no
+//     script at all, and X-Frame-Options DENY.
+//
+// APP_CSP enforces only what cannot break the app as it is: scripts from this
+// origin, no plugins, no <base>, forms to this origin, never framed. Where the
+// app may connect and load images from is only reported for this release
+// (connect-src 'self' would refuse a phone still set to another server's
+// address), and enforced once the app's server address is locked to its own
+// origin.
+export const APP_CSP = [
+    "script-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'"
+].join('; ');
+
+export const APP_CSP_REPORT_ONLY = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https://www.google.com https://*.gstatic.com",
+    "connect-src 'self'",
+    "worker-src 'self'",
+    "manifest-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'"
+].join('; ');
+
+export const STRICT_CSP = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'"
+].join('; ');
+
+// A response the web app's static handler serves: call from its setHeaders.
+export function markAppResponse(res) {
+    if (res.locals) res.locals.tpApp = true;
+    else res.tpApp = true;
+}
+
+function contentTypeOf(res, args) {
+    // writeHead(status[, message][, headers]): headers given there win.
+    for (const a of args.slice(1)) {
+        if (a && typeof a === 'object' && !Array.isArray(a)) {
+            for (const [k, v] of Object.entries(a)) if (k.toLowerCase() === 'content-type') return String(v);
+        }
+    }
+    const t = res.getHeader('Content-Type');
+    return t === undefined || t === null ? '' : String(t);
+}
+
+function applyDocumentPolicy(res, args) {
+    const type = contentTypeOf(res, args).toLowerCase();
+    const html = type.startsWith('text/html') || type.startsWith('application/xhtml+xml');
+    if ((res.locals && res.locals.tpApp) || res.tpApp) {
+        res.setHeader('Content-Security-Policy', APP_CSP);
+        res.setHeader('Content-Security-Policy-Report-Only', APP_CSP_REPORT_ONLY);
+        if (html) {
+            res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+            res.setHeader('X-Frame-Options', 'DENY');
+        }
+        return;
+    }
+    if (html || !type) {
+        res.setHeader('Content-Security-Policy', STRICT_CSP);
+        res.setHeader('X-Frame-Options', 'DENY');
+    }
+}
+
+// Express middleware, mounted first. The document policy is decided when the
+// headers go out, from the type the response ended up with, so no route can
+// forget it (Express's own error pages set theirs and are overridden here).
+export function securityHeaders() {
+    return function setSecurityHeaders(req, res, next) {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        const writeHead = res.writeHead;
+        res.writeHead = function writeHeadWithPolicy(...args) {
+            if (!res.headersSent) applyDocumentPolicy(res, args);
+            return writeHead.apply(this, args);
+        };
+        next();
+    };
+}
+
 // --- HTML ---
 
 export function escapeHtml(s) {
