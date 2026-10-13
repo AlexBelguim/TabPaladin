@@ -81,6 +81,165 @@ export function taskStats(content) {
     return { open, done, total: open + done };
 }
 
+// --- Inline rendering ---------------------------------------------------------
+//
+// Both clients used to render a line by running regex replaces over escaped
+// HTML: wikilinks became chips with the target in an attribute, and then the
+// URL pattern ran over that markup too. [[https://a.com/x/onmouseover=...]]
+// came out as a link inside the chip's data-target, which broke out of the
+// attribute (stored XSS from a note's text). Now a line is split into tokens
+// here, and each client builds DOM nodes from them with textContent, dataset
+// and a checked href: nothing a note says is ever parsed as HTML.
+//
+// renderInlineTokens(text) returns a list of:
+//   {type: 'text', text}
+//   {type: 'code', text}                 `code`, shown literally
+//   {type: 'strong', children: [token]}  **bold**
+//   {type: 'em', children: [token]}      *italic*
+//   {type: 'wikilink', target, text}     [[Target]]; text is what shows ('[[Target]]')
+//   {type: 'url', href, text}            a bare http(s) URL; pass href through
+//                                        safeHref before using it as a link
+//
+// Read left to right, first match wins: a code span, a wikilink (both taken
+// literally: nothing inside them is linkified), **strong**, *em*, then a bare
+// URL. Strong and em hold the same tokens again, minus emphasis. A URL stops
+// at whitespace, quotes, '<', '>', backticks and ')'.
+
+const INLINE_URL_RE = /https?:\/\/[^\s<>"'`)]+/y;
+
+function scanInline(s, { emphasis = true } = {}) {
+    const out = [];
+    let text = '';
+    const flush = () => {
+        if (text) out.push({ type: 'text', text });
+        text = '';
+    };
+    // Set once a search finds no closing backtick: no later position can
+    // find one either, so a long line stays linear.
+    let noBacktick = false;
+    let i = 0;
+    while (i < s.length) {
+        const c = s[i];
+        if (c === '`' && !noBacktick) {
+            const end = s.indexOf('`', i + 1);
+            if (end === -1) noBacktick = true;
+            else if (end > i + 1) {
+                flush();
+                out.push({ type: 'code', text: s.slice(i + 1, end) });
+                i = end + 1;
+                continue;
+            }
+        }
+        if (c === '[' && s[i + 1] === '[') {
+            // The target holds no brackets: the first one after '[[' must
+            // start the closing ']]'.
+            let j = i + 2;
+            while (j < s.length && s[j] !== '[' && s[j] !== ']') j++;
+            const target = s.slice(i + 2, j).trim();
+            if (s[j] === ']' && s[j + 1] === ']' && target) {
+                flush();
+                out.push({ type: 'wikilink', target, text: `[[${target}]]` });
+                i = j + 2;
+                continue;
+            }
+        }
+        if (c === '*' && emphasis) {
+            if (s[i + 1] === '*') {
+                // **strong**: no '*' inside.
+                const end = s.indexOf('*', i + 2);
+                if (end > i + 2 && s[end + 1] === '*') {
+                    flush();
+                    out.push({ type: 'strong', children: scanInline(s.slice(i + 2, end), { emphasis: false }) });
+                    i = end + 2;
+                    continue;
+                }
+            } else if (s[i - 1] !== '*') {
+                // *em*: no '*' inside, and not the start of a '**'.
+                const end = s.indexOf('*', i + 1);
+                if (end > i + 1 && s[end + 1] !== '*') {
+                    flush();
+                    out.push({ type: 'em', children: scanInline(s.slice(i + 1, end), { emphasis: false }) });
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c === 'h') {
+            INLINE_URL_RE.lastIndex = i;
+            const m = INLINE_URL_RE.exec(s);
+            if (m) {
+                flush();
+                out.push({ type: 'url', href: m[0], text: m[0] });
+                i += m[0].length;
+                continue;
+            }
+        }
+        text += c;
+        i++;
+    }
+    flush();
+    return out;
+}
+
+// One line of note text (newlines are taken as plain text) as tokens.
+export function renderInlineTokens(text) {
+    return scanInline(String(text == null ? '' : text));
+}
+
+// The tokens as DOM nodes appended to `parent`. `doc` is the document to
+// build with, passed in so this file keeps no globals. Text only ever goes in
+// as text nodes and textContent, a wikilink's target through dataset, and a
+// URL becomes a link only when safeHref takes it (otherwise it stays text).
+// `link` holds extra properties for each <a>, such as {target, rel} or
+// {title}. Returns `parent`.
+export function appendInlineNodes(doc, parent, tokens, link = {}) {
+    const el = (tag, cls, text) => {
+        const node = doc.createElement(tag);
+        if (cls) node.className = cls;
+        if (text != null) node.textContent = text;
+        return node;
+    };
+    for (const t of tokens || []) {
+        if (!t) continue;
+        if (t.type === 'strong' || t.type === 'em') {
+            parent.appendChild(appendInlineNodes(doc, el(t.type), t.children, link));
+        } else if (t.type === 'code') {
+            parent.appendChild(el('code', 'note-code', t.text));
+        } else if (t.type === 'wikilink') {
+            const chip = el('span', 'note-wikilink', t.text);
+            chip.dataset.target = t.target;
+            parent.appendChild(chip);
+        } else if (t.type === 'url' && safeHref(t.href)) {
+            const a = el('a', 'note-urllink', t.text);
+            for (const [k, v] of Object.entries(link)) {
+                if (k !== 'href' && /^(target|rel|title)$/.test(k)) a[k] = String(v);
+            }
+            a.href = safeHref(t.href);
+            parent.appendChild(a);
+        } else {
+            parent.appendChild(doc.createTextNode(String(t.text == null ? '' : t.text)));
+        }
+    }
+    return parent;
+}
+
+// The URL to put in an href, or null when it must not be a link: only http
+// and https, everywhere a client renders a link — notes, bookmarks, pins,
+// workflow tabs. javascript:, data:, vbscript:, file: and the rest (a
+// bookmarklet brought in by a browser import, say) are shown as text instead.
+// Returns the parsed, normalized URL.
+export function safeHref(url) {
+    if (typeof url !== 'string') return null;
+    const s = url.trim();
+    if (!/^https?:\/\//i.test(s)) return null;
+    try {
+        const u = new URL(s);
+        return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 // --- Title rule -------------------------------------------------------------
 //
 // The stored title is canonical. The note's first non-blank line, when it is

@@ -445,5 +445,37 @@ let threw = false;
 try { NM.writeNotesUi(throwing, NM.defaultNotesUi()); NM.writeNotesUi(null, {}); } catch (e) { threw = true; }
 check('writes never throw', !threw);
 
+console.log('\n18. Inline tokens and safeHref (the renderers build DOM from these)');
+const tok = (s) => NM.renderInlineTokens(s);
+check('plain text is one text token', eq(tok('just words'), [{ type: 'text', text: 'just words' }]));
+check('empty and null give nothing', eq(tok(''), []) && eq(tok(null), []));
+check('**strong**, *em* and `code`', eq(tok('**a** *b* `c*d`'), [
+    { type: 'strong', children: [{ type: 'text', text: 'a' }] }, { type: 'text', text: ' ' },
+    { type: 'em', children: [{ type: 'text', text: 'b' }] }, { type: 'text', text: ' ' },
+    { type: 'code', text: 'c*d' }
+]), JSON.stringify(tok('**a** *b* `c*d`')));
+check('a wikilink keeps its trimmed target and shows [[target]]',
+    eq(tok('see [[ Bake-off ]]'), [{ type: 'text', text: 'see ' }, { type: 'wikilink', target: 'Bake-off', text: '[[Bake-off]]' }]));
+check('a bare URL, query string and all', eq(tok('at https://x.test/a?b=1&c=2 now'), [
+    { type: 'text', text: 'at ' }, { type: 'url', href: 'https://x.test/a?b=1&c=2', text: 'https://x.test/a?b=1&c=2' }, { type: 'text', text: ' now' }
+]));
+check('a URL in parentheses stops at ")"', eq(tok('(https://x.test)').map(t => t.type), ['text', 'url', 'text']) && tok('(https://x.test)')[1].href === 'https://x.test');
+check('emphasis holds wikilinks and URLs', eq(tok('**[[A]] https://x.test**'), [{ type: 'strong', children: [
+    { type: 'wikilink', target: 'A', text: '[[A]]' }, { type: 'text', text: ' ' }, { type: 'url', href: 'https://x.test', text: 'https://x.test' }
+] }]));
+check('nothing inside a wikilink or code span is linkified',
+    eq(tok('[[https://x.test]] `https://y.test`').map(t => t.type), ['wikilink', 'text', 'code']));
+check('unclosed markers are text', eq(tok('**a [[b `c *d'), [{ type: 'text', text: '**a [[b `c *d' }]));
+check('the twins tokenize alike', eq(tok('**x** [[y]] https://z.test `w`'), PWA_NM.renderInlineTokens('**x** [[y]] https://z.test `w`')));
+check('a 200 KB line of markers stays fast', (() => {
+    const t0 = Date.now();
+    NM.renderInlineTokens('[[a*`'.repeat(40000) + '**' + '*a'.repeat(20000));
+    return Date.now() - t0 < 2000;
+})());
+check('safeHref keeps http and https, normalized', NM.safeHref(' https://X.test/a ') === 'https://x.test/a' && NM.safeHref('http://x.test') === 'http://x.test/');
+check('safeHref refuses every other scheme',
+    ['javascript:alert(1)', 'JAVASCRIPT:x', 'data:text/html,x', 'vbscript:x', 'file:///C:/x', 'ftp://x.test', 'chrome://settings', 'https:x.test', '//x.test', 'x.test', '', null, 42]
+        .every(u => NM.safeHref(u) === null));
+
 console.log(failures === 0 ? '\nAll notes-model tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);
