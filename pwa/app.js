@@ -52,6 +52,8 @@ const state = {
     snapshot: null,           // wrapper { type:'root', children: [...] } around the server's top-level folders
     snapshotUserId: null,     // the account that snapshot belongs to (from the pull)
     snapshotUsername: null,   // its name, kept for the sign-in guard after a sign-out
+    snapshotUrl: '',          // the server it came from, and that server's id: ids
+    snapshotServerId: null,   // start at 1 on every server, so the id alone is not enough
     treeVersion: 0,           // server tree version this working copy is based on
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
@@ -390,6 +392,8 @@ async function pullSnapshot() {
         state.snapshot = { type: 'root', title: '', children: (data.roots || []).map(fromWire) };
         state.snapshotUserId = data.userId ?? currentUserId();
         state.snapshotUsername = localStorage.getItem(LS.username);
+        state.snapshotUrl = state.config.url.replace(/\/$/, '');
+        state.snapshotServerId = data.serverId || null;
         state.treeVersion = Number(data.version) || 0;
         state.pathIds = [getRootId(state.snapshot)];
         state.dirty = false;
@@ -1982,16 +1986,19 @@ async function pushSnapshot({ force = false } = {}) {
         }
     }
     const baseUserId = state.snapshotUserId ?? null;
+    const baseServerId = state.snapshotServerId || null;
     try {
         const data = await api('/api/tree', {
             method: 'PUT',
             body: JSON.stringify({
                 roots, baseVersion: state.treeVersion || 0, deviceId: 'pwa', force,
-                ...(baseUserId !== null ? { baseUserId } : {})
+                ...(baseUserId !== null ? { baseUserId } : {}),
+                ...(baseServerId ? { baseServerId } : {})
             })
         });
         state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
         if (data.userId !== undefined) state.snapshotUserId = data.userId;
+        if (data.serverId) state.snapshotServerId = data.serverId;
         state.dirty = false;
         state.editCount = 0;
     } catch (e) {
@@ -2695,18 +2702,23 @@ async function submitAuth() {
 
         // Unpushed edits are never discarded by a sign-in. The same account
         // keeps them (and bootstrap skips its pull); another account is
-        // refused until they are pushed or deliberately discarded.
+        // refused until they are pushed or deliberately discarded. The same
+        // id on another server is another account: ids start at 1 everywhere.
         const user = data.user || {};
         const name = data.username || username;
         const previousId = state.snapshotUserId ?? currentUserId();
         const previousName = state.snapshotUsername || localStorage.getItem(LS.username) || 'the previous account';
-        const sameAccount = user.id !== undefined && user.id !== null && previousId !== null
+        const sameServer = !state.snapshot
+            || ((!state.snapshotUrl || state.snapshotUrl === base)
+                && (!state.snapshotServerId || !data.serverId || state.snapshotServerId === data.serverId));
+        const sameAccount = sameServer && (user.id !== undefined && user.id !== null && previousId !== null
             ? Number(user.id) === Number(previousId)
-            : (state.snapshotUsername || localStorage.getItem(LS.username) || name) === name;
+            : (state.snapshotUsername || localStorage.getItem(LS.username) || name) === name);
         if (state.dirty && state.snapshot && !sameAccount) {
             fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
             const n = state.editCount || 1;
-            setErr(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${previousName}. Sign in as ${previousName} and push them, or discard them.`);
+            const where = sameServer ? '' : ` on ${state.snapshotUrl || 'another server'}`;
+            setErr(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${previousName}${where}. Sign in as ${previousName}${where ? ' there' : ''} and push them, or discard them.`);
             const discard = $('auth-discard');
             if (discard) {
                 discard.textContent = `Discard ${previousName}'s edits`;

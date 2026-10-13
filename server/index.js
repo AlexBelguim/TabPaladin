@@ -17,7 +17,7 @@ import {
     tenancyOwnerId, legacyTokenUserId, MIN_PASSWORD_LENGTH, SCHEMA_VERSION
 } from './users.js';
 import {
-    initTenancySchema, migrateOwnership, preflight, writeRefusal, checkOwnership
+    initTenancySchema, migrateOwnership, preflight, writeRefusal, checkOwnership, serverId
 } from './tenancy.js';
 import { attachPrefs } from './prefs.js';
 import { attachUserAdmin } from './admin.js';
@@ -215,6 +215,9 @@ if (tenancy.migrated) {
         + Object.entries(tenancy.adopted).map(([t, n]) => `${t} ${n}`).join(', '));
 }
 for (const warning of checkOwnership(db)) console.warn(`[TabPaladin] Ownership: ${warning}`);
+// Sent with every sign-in and tree response, so a client can tell this
+// server's accounts from another server's with the same ids (see tenancy.js).
+const SERVER_ID = serverId(db);
 
 // The owner's boot steps, only while the owner exists: rows for an account
 // that is gone would be refused by the guards anyway.
@@ -367,7 +370,7 @@ app.post('/api/auth/setup', (req, res) => res.status(410).json({
 const userFor = (u) => ({ ...publicUser(u), tenancyOwner: u.id === tenancyOwnerId(db) });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
-    res.json({ ok: true, user: userFor(req.user) });
+    res.json({ ok: true, user: userFor(req.user), serverId: SERVER_ID });
 });
 
 // The caller as things stand now. requireAuth looked before the handler's
@@ -404,7 +407,7 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Wrong username or password.' });
         }
         authOk(req, username);
-        res.json({ ok: true, username: row.username, user: userFor(row), ...session });
+        res.json({ ok: true, username: row.username, user: userFor(row), serverId: SERVER_ID, ...session });
     } catch (e) {
         console.error('[TabPaladin] Login failed:', e);
         res.status(500).json({ error: 'Sign in failed.' });
@@ -480,8 +483,8 @@ const { store: importsStore } = attachImports(app, {
 // and pushes it, and a push whose baseVersion is stale is refused so it cannot
 // silently overwrite what another device pushed in between.
 //
-// Both carry userId, so a client can stamp its working copy with the account
-// it belongs to and never push one account's tree into another's.
+// Both carry userId and serverId, so a client can stamp its working copy with
+// the account it belongs to and never push one account's tree into another's.
 app.get('/api/tree', requireAuth, (req, res) => {
     const store = items.forUser(req.user.id);
     const { version, roots } = store.readTree();
@@ -500,7 +503,7 @@ app.get('/api/tree', requireAuth, (req, res) => {
             roots.push(importsTree);
         }
     }
-    res.json({ ok: true, version, roots, userId: req.user.id });
+    res.json({ ok: true, version, roots, userId: req.user.id, serverId: SERVER_ID });
 });
 
 function findNode(nodes, id) {
@@ -515,22 +518,27 @@ function findNode(nodes, id) {
 // Cheap freshness probe so clients can show "the server has newer" without
 // downloading the whole tree.
 app.get('/api/tree/version', requireAuth, (req, res) => {
-    res.json({ ok: true, version: items.forUser(req.user.id).version(), userId: req.user.id });
+    res.json({ ok: true, version: items.forUser(req.user.id).version(), userId: req.user.id, serverId: SERVER_ID });
 });
 
 // 412, not 409, when the working copy belongs to another account: clients turn
 // a 409 into "pull or force", and both would be wrong here — a pull discards
 // that account's edits, a force writes them into this one. Force does not
-// override it.
+// override it. A copy from another server is another account too, even when
+// the id matches: ids start at 1 everywhere.
 const WRONG_ACCOUNT = 'This working copy belongs to another account.';
 
 app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
-    const { roots, baseVersion, baseUserId, deviceId, force } = req.body || {};
+    const { roots, baseVersion, baseUserId, baseServerId, deviceId, force } = req.body || {};
     if (!Array.isArray(roots)) {
         return res.status(400).json({ error: 'Missing roots (array of top-level nodes).' });
     }
-    if (baseUserId !== undefined && baseUserId !== null && Number(baseUserId) !== req.user.id) {
-        return res.status(412).json({ error: WRONG_ACCOUNT, code: 'wrong-account', userId: req.user.id });
+    const otherServer = baseServerId !== undefined && baseServerId !== null && String(baseServerId) !== SERVER_ID;
+    if (otherServer || (baseUserId !== undefined && baseUserId !== null && Number(baseUserId) !== req.user.id)) {
+        return res.status(412).json({
+            error: otherServer ? 'This working copy belongs to an account on another server.' : WRONG_ACCOUNT,
+            code: 'wrong-account', userId: req.user.id, serverId: SERVER_ID
+        });
     }
     const store = items.forUser(req.user.id);
     const current = store.version();
@@ -550,11 +558,11 @@ app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
         version = store.writeTree(roots, { deviceId: deviceId || null });
     } catch (e) {
         if (e instanceof ForeignIdError) {
-            return res.status(412).json({ error: WRONG_ACCOUNT, code: 'foreign-ids', count: e.count, userId: req.user.id });
+            return res.status(412).json({ error: WRONG_ACCOUNT, code: 'foreign-ids', count: e.count, userId: req.user.id, serverId: SERVER_ID });
         }
         throw e;
     }
-    res.json({ ok: true, version, userId: req.user.id });
+    res.json({ ok: true, version, userId: req.user.id, serverId: SERVER_ID });
 });
 
 // The old whole-browser-tree sync. Gone for good reason: it required mapping

@@ -45,7 +45,7 @@ import {
 } from '../server/users.js';
 import {
     initTenancySchema, migrateOwnership, digestTables, preflight, writeRefusal, checkOwnership,
-    deleteUserData, nextUserId, bumpTreeVersion, userStats, DIGEST_TABLES, PER_USER_TABLES, MARKER_FILE
+    deleteUserData, nextUserId, bumpTreeVersion, userStats, serverId, DIGEST_TABLES, PER_USER_TABLES, MARKER_FILE
 } from '../server/tenancy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -241,6 +241,9 @@ async function migrationTests() {
         const again = throws(() => migrateOwnership(db, { env: {} }));
         check('a second run after a push is a no-op, not a crash', again === null, again && again.message);
         check('and reports nothing migrated', migrateOwnership(db, { env: {} }).migrated === false);
+        const id = serverId(db);
+        check('the server gets an id of its own, made once', /^[0-9a-f]{24}$/.test(id) && serverId(db) === id
+            && digestTables(db, DIGEST_TABLES, { like: before, exclude: { import_sources: new Set([7, 9]) } }).items.sha256 === before.items.sha256);
         db.close();
     }
 
@@ -729,8 +732,9 @@ async function endToEnd() {
             llm: (await http(srv.base, `/llm/${shareToken}`)).text
         };
         check('the old session still works', newView.tree && newView.tree.ok === true);
-        check('the tree is identical, at the same version, stamped with alex\'s id',
-            JSON.stringify(withoutKeys(newView.tree, ['userId'])) === JSON.stringify(oldView.tree) && newView.tree.userId === 1);
+        check('the tree is identical, at the same version, stamped with alex\'s id and the server\'s',
+            JSON.stringify(withoutKeys(newView.tree, ['userId', 'serverId'])) === JSON.stringify(oldView.tree) && newView.tree.userId === 1
+            && /^[0-9a-f]{24}$/.test(newView.tree.serverId));
         for (const k of ['history', 'shared', 'proposals', 'items']) {
             check(`${k} identical`, JSON.stringify(newView[k]) === JSON.stringify(oldView[k]));
         }

@@ -490,6 +490,18 @@ export function nextUserId(db) {
     return id;
 }
 
+// A random name for this server's data, made once and never changed. Account
+// ids start at 1 on every server and the first admin is "admin" by default, so
+// a client cannot tell "admin #1 here" from "admin #1 on another server" by id
+// and name; it compares this instead, and the server refuses a push stamped
+// with another server's id (see PUT /api/tree).
+export function serverId(db) {
+    initTenancySchema(db);
+    db.prepare("INSERT OR IGNORE INTO server_meta (key, value) VALUES ('server_id', ?)")
+        .run(crypto.randomBytes(12).toString('hex'));
+    return getServerMeta(db, 'server_id');
+}
+
 // Every version bump, for every account, draws from one server-wide sequence,
 // so a stale baseVersion from another account can never match. Clients compare
 // versions only for equality, so the owner's numbers jumping when someone else

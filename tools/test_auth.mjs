@@ -13,9 +13,10 @@
 // accounts: who may manage them and how the owner is protected, two accounts
 // never reaching each other's tree, history, inbox, notes, proposals, imports
 // or prefs, a reset signing an account out (sign-ins racing it included), an
-// admin change decided by who is acting when it lands, and a delete removing
-// exactly that account; and — last, because it locks this IP out — the login
-// rate limit (expects AUTH_MAX_FAILURES between 8 and 20).
+// admin change decided by who is acting when it lands, a push stamped with
+// another server refused, and a delete removing exactly that account; and —
+// last, because it locks this IP out — the login rate limit (expects
+// AUTH_MAX_FAILURES between 8 and 20).
 
 const arg = (n, d = null) => {
     const i = process.argv.indexOf('--' + n);
@@ -68,6 +69,9 @@ const me = await call('/api/auth/me', { token: setup.json?.token });
 check('/api/auth/me returns id, username and role',
     me.status === 200 && me.json?.user?.username === USER && me.json.user.role === 'admin' && Number.isInteger(me.json.user.id),
     JSON.stringify(me.json));
+const SERVER_ID = stillOurs.json?.serverId;
+check('sign-in and /api/auth/me name this server', typeof SERVER_ID === 'string' && SERVER_ID.length >= 16
+    && me.json?.serverId === SERVER_ID, JSON.stringify([SERVER_ID, me.json?.serverId]));
 
 // 6. The issued session works.
 const withSession = await call('/api/tree', { token: setup.json?.token });
@@ -182,6 +186,11 @@ const foreign = await call('/api/tree', { method: 'PUT', token: samTok,
 check("sam pushing the owner's ids gets 412 foreign-ids", foreign.status === 412 && foreign.json.code === 'foreign-ids', JSON.stringify(foreign.json));
 const wrongAcct = await call('/api/tree', { method: 'PUT', token: samTok, body: { roots: [], baseUserId: OWNER_ID, force: true } });
 check("a copy stamped with the owner's id gets 412 wrong-account, even forced", wrongAcct.status === 412 && wrongAcct.json.code === 'wrong-account');
+check('the tree names this server', ownerTree.json.serverId === SERVER_ID);
+const otherServer = await call('/api/tree', { method: 'PUT', token,
+    body: { roots: ownerTree.json.roots, baseUserId: OWNER_ID, baseServerId: 'a-different-server', force: true } });
+check("the owner's id stamped by another server gets 412 too, even forced",
+    otherServer.status === 412 && otherServer.json.code === 'wrong-account' && otherServer.json.serverId === SERVER_ID, JSON.stringify(otherServer.json));
 await call('/api/shared', { method: 'POST', token, body: { url: 'https://owner-inbox.example' } });
 const ownerHistory = await call('/api/history', { token });
 check("sam gets 404 on the owner's history entry",

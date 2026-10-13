@@ -23,11 +23,11 @@
 // it always has; the facade decodes that url back into a payload on write.
 //
 // A working copy belongs to one account on one server, and says so: `owner`
-// ({url, userId, username}) is stamped from every pull and push. Signing in as
-// someone else never pushes this copy into their account and never discards
-// it: switchAccount sets it aside (tpTreeStash:<url>|<userId>, with the
-// per-account state that travels with it) and brings back the new account's
-// own set-aside copy, if this browser has one.
+// ({url, userId, username, serverId}) is stamped from every pull and push.
+// Signing in as someone else never pushes this copy into their account and
+// never discards it: switchAccount sets it aside (tpTreeStash:<url>|<userId>,
+// with the per-account state that travels with it) and brings back the new
+// account's own set-aside copy, if this browser has one.
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
@@ -72,7 +72,7 @@ const state = {
     dirty: false,
     lastSyncAt: null,
     lastSyncKind: null,
-    owner: null,        // {url, userId, username} of the account this copy belongs to; null = from before accounts
+    owner: null,        // {url, userId, username, serverId} of the account this copy belongs to; null = from before accounts
     editCount: 0,       // local edits since the last pull or push, for "N unpushed edits"
     rev: null           // stamp of the last write, to recognise our own storage events
 };
@@ -317,6 +317,20 @@ function detach(id) {
 
 function trim(url) { return String(url || '').replace(/\/$/, ''); }
 
+// One server address, however it was typed: host case, a default port and a
+// trailing slash make no difference.
+function sameUrl(a, b) {
+    const norm = (u) => {
+        try {
+            const x = new URL(trim(u));
+            return x.origin + x.pathname.replace(/\/$/, '');
+        } catch (e) {
+            return trim(u);
+        }
+    };
+    return norm(a) === norm(b);
+}
+
 function authHeader(token) {
     return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
@@ -363,17 +377,51 @@ async function apiFetch(config, path, opts = {}) {
 
 // --- Accounts -----------------------------------------------------------------
 
-function ownerFrom(config, userId, username) {
+function ownerFrom(config, userId, serverId = null) {
     if (userId === undefined || userId === null) return state.owner;
-    const keepName = state.owner && Number(state.owner.userId) === Number(userId) ? state.owner.username : null;
-    return { url: trim(config.url), userId: Number(userId), username: username || keepName || null };
+    const prev = state.owner && Number(state.owner.userId) === Number(userId) ? state.owner : null;
+    return {
+        url: trim(config.url),
+        userId: Number(userId),
+        username: prev ? prev.username : null,
+        serverId: serverId || (prev && prev.serverId) || null
+    };
 }
 
-// The same account: the same id on the same server. A changed server address
-// with the same id and name is taken to be the same server reached another way.
+const accountOf = ({ url, userId, username = null, serverId = null }) =>
+    ({ url: trim(url), userId: Number(userId), username, serverId: serverId || null });
+
+// The same account: the same id on the same server — the same address and,
+// where both are known, the same server id. Ids start at 1 on every server
+// and the first admin is "admin" by default, so a matching id and name prove
+// nothing on their own.
 function sameAccount(a, b) {
     if (!a || !b || Number(a.userId) !== Number(b.userId)) return false;
-    return trim(a.url) === trim(b.url) || Boolean(a.username && b.username && a.username === b.username);
+    if (a.serverId && b.serverId && a.serverId !== b.serverId) return false;
+    return sameUrl(a.url, b.url);
+}
+
+// The same id on a server that reports the same server id, reached at another
+// address: most likely the server moved — but a copy of its database reports
+// the same id, and only the user can tell the two apart. So it is never
+// assumed; it is offered as a restore the user confirms.
+function movedServer(a, b) {
+    if (!a || !b || Number(a.userId) !== Number(b.userId) || sameAccount(a, b)) return false;
+    return Boolean(a.serverId && b.serverId && a.serverId === b.serverId);
+}
+
+// May `account` restore this set-aside copy? 'same' for its own, 'moved' for
+// its own on what looks like the same server at a new address (the caller
+// confirms first), null otherwise. An unstamped copy from before accounts is
+// the server owner's, on the server it was set aside from.
+function stashMatch(stash, account) {
+    if (!stash || !account || account.userId === undefined || account.userId === null) return null;
+    const target = accountOf(account);
+    if (stash.owner) {
+        if (sameAccount(stash.owner, target)) return 'same';
+        return movedServer(stash.owner, target) ? 'moved' : null;
+    }
+    return account.tenancyOwner && sameUrl(stash.url, target.url) ? 'same' : null;
 }
 
 const stashKeyFor = (owner, url) => STASH_PREFIX + `${trim(owner ? owner.url : url)}|${owner ? owner.userId : 'legacy'}`;
@@ -444,6 +492,23 @@ async function takeStash(key) {
     await api.storage.local.set({ [STASH_INDEX_KEY]: index.filter(k => k !== key) });
     await api.storage.local.remove(key);
     return stash;
+}
+
+// The first set-aside copy that is `target`'s own — matched on the stamp, not
+// the key, since a key names the address and id but not the server. With
+// `legacy`, an unstamped copy from before accounts set aside from this
+// address instead.
+async function takeStashFor(target, { legacy = false } = {}) {
+    const keys = await stashIndex();
+    if (!keys.length) return null;
+    const data = await api.storage.local.get(keys);
+    const key = keys.find(k => {
+        const s = data[k];
+        if (!s) return false;
+        if (legacy) return !s.owner && sameUrl(s.url, target.url);
+        return Boolean(s.owner) && sameAccount(s.owner, target);
+    });
+    return key ? takeStash(key) : null;
 }
 
 // Make `stash` (or, with none, an empty copy for `owner`) the working copy,
@@ -617,10 +682,10 @@ export const TreeStore = {
 
     // --- Accounts ---------------------------------------------------------
 
-    // Would signing in as {url, userId, tenancyOwner} set this copy aside?
-    // An unstamped copy predates accounts and is the owner's.
-    wouldSetAside({ url, userId, username = null, tenancyOwner = false }) {
-        const target = { url: trim(url), userId: Number(userId), username };
+    // Would signing in as {url, userId, serverId, tenancyOwner} set this copy
+    // aside? An unstamped copy predates accounts and is the owner's.
+    wouldSetAside({ url, userId, username = null, serverId = null, tenancyOwner = false }) {
+        const target = accountOf({ url, userId, username, serverId });
         if (state.owner) return !sameAccount(state.owner, target);
         return !tenancyOwner && (state.roots.length > 0 || state.dirty);
     },
@@ -631,13 +696,18 @@ export const TreeStore = {
     // otherwise the copy is set aside (never discarded) and this account's own
     // set-aside copy comes back, or an empty one ready to pull.
     // Returns {action: 'same'|'adopted'|'restored'|'fresh', setAside}.
-    async switchAccount({ url, userId, username = null, tenancyOwner = false, previousUsername = null }) {
+    async switchAccount({ url, userId, username = null, serverId = null, tenancyOwner = false, previousUsername = null }) {
         await ensureLoaded();
         await applyPendingRemovals();
-        const target = { url: trim(url), userId: Number(userId), username };
+        const target = accountOf({ url, userId, username, serverId });
         if (state.owner && sameAccount(state.owner, target)) {
-            if (username && state.owner.username !== username) {
-                state.owner = { ...state.owner, username };
+            const next = {
+                ...state.owner,
+                username: username || state.owner.username,
+                serverId: state.owner.serverId || target.serverId
+            };
+            if (next.username !== state.owner.username || next.serverId !== state.owner.serverId) {
+                state.owner = next;
                 await persistNow();
             }
             return { action: 'same', setAside: null };
@@ -648,8 +718,8 @@ export const TreeStore = {
             return { action: 'adopted', setAside: null };
         }
         const setAside = await stashCurrent({ fallbackUrl: target.url, username: previousUsername });
-        const restored = await takeStash(stashKeyFor(target))
-            || (tenancyOwner ? await takeStash(stashKeyFor(null, target.url)) : null);
+        const restored = await takeStashFor(target)
+            || (tenancyOwner ? await takeStashFor(target, { legacy: true }) : null);
         await loadCopy(restored, target);
         return { action: restored ? 'restored' : 'fresh', setAside };
     },
@@ -657,15 +727,18 @@ export const TreeStore = {
     // Set this copy aside and start an empty one for the signed-in account,
     // ready to pull. The answer to a 412: never pull over the copy (that
     // discards it) and never force it (that writes it into this account).
-    async setAsideAndReset({ url, userId, username = null }) {
+    async setAsideAndReset({ url, userId, username = null, serverId = null }) {
         await ensureLoaded();
         await applyPendingRemovals();
         const setAside = await stashCurrent({ fallbackUrl: url });
-        await loadCopy(null, { url: trim(url), userId: Number(userId), username });
+        await loadCopy(null, accountOf({ url, userId, username, serverId }));
         return { setAside };
     },
 
-    async listStashes() {
+    // With `account`, each copy also says whether that account may restore
+    // it: `match` is 'same', 'moved' (its own, apparently on the same server
+    // at a new address — confirm first) or null.
+    async listStashes(account = null) {
         const keys = await stashIndex();
         if (!keys.length) return [];
         const data = await api.storage.local.get(keys);
@@ -679,22 +752,24 @@ export const TreeStore = {
                 dirty: Boolean(s.dirty),
                 editCount: s.dirty ? Math.max(1, Number(s.editCount) || 0) : 0,
                 items: countItems(s.roots),
-                setAsideAt: s.setAsideAt
+                setAsideAt: s.setAsideAt,
+                match: account ? stashMatch(s, account) : null
             };
         });
     },
 
-    // Bring a set-aside copy back. Only for the account it belongs to (an
-    // unstamped one: the tenancy owner); whatever is current is set aside in
-    // its place, so a restore never discards anything either.
-    async restoreStash(key, { url, userId, username = null, tenancyOwner = false }) {
+    // Bring a set-aside copy back. Only for the account it belongs to (see
+    // stashMatch); one from what looks like the same server at a new address
+    // only with `moved`, once the user has said it is. Whatever is current is
+    // set aside in its place, so a restore never discards anything either.
+    async restoreStash(key, { url, userId, username = null, serverId = null, tenancyOwner = false }, { moved = false } = {}) {
         await ensureLoaded();
         const data = await api.storage.local.get(key);
         const stash = data && data[key];
         if (!stash) throw new Error('That set-aside copy is gone.');
-        const target = { url: trim(url), userId: Number(userId), username };
-        const allowed = stash.owner ? sameAccount(stash.owner, target) : tenancyOwner;
-        if (!allowed) throw new Error('Sign in as the account this copy belongs to first.');
+        const target = accountOf({ url, userId, username, serverId });
+        const match = stashMatch(stash, { ...target, tenancyOwner });
+        if (!match || (match === 'moved' && !moved)) throw new Error('Sign in as the account this copy belongs to first.');
         await applyPendingRemovals();
         const setAside = await stashCurrent({ fallbackUrl: target.url });
         await takeStash(key);
@@ -817,7 +892,7 @@ export const TreeStore = {
             state.baseVersion = Number(body.version) || 0;
             state.dirty = false;
             state.editCount = 0;
-            state.owner = ownerFrom(config, body.userId);
+            state.owner = ownerFrom(config, body.userId, body.serverId);
             state.lastSyncAt = new Date().toISOString();
             state.lastSyncKind = 'pull';
             reindex();
@@ -829,7 +904,8 @@ export const TreeStore = {
         // Replace the server's tree with the working copy. Refused with a
         // conflict error when the server moved on since our last pull, and
         // with a 412 (err.code) when the copy belongs to another account —
-        // which the server checks against baseUserId and the pushed ids.
+        // which the server checks against baseUserId, baseServerId and the
+        // pushed ids.
         async push(config, { force = false } = {}) {
             await ensureLoaded();
             const body = await apiFetch(config, '/api/tree', {
@@ -838,6 +914,7 @@ export const TreeStore = {
                     roots: stripVirtual(state.roots),
                     baseVersion: state.baseVersion,
                     ...(state.owner ? { baseUserId: state.owner.userId } : {}),
+                    ...(state.owner && state.owner.serverId ? { baseServerId: state.owner.serverId } : {}),
                     deviceId: 'extension',
                     force
                 })
@@ -845,7 +922,7 @@ export const TreeStore = {
             state.baseVersion = Number(body.version) || state.baseVersion + 1;
             state.dirty = false;
             state.editCount = 0;
-            state.owner = ownerFrom(config, body.userId);
+            state.owner = ownerFrom(config, body.userId, body.serverId);
             state.lastSyncAt = new Date().toISOString();
             state.lastSyncKind = 'push';
             await persistNow();

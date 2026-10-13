@@ -3675,34 +3675,41 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
             const name = data.username || username;
             const user = data.user || {};
-            const account = { url: base, userId: user.id, username: name, tenancyOwner: Boolean(user.tenancyOwner) };
+            const serverId = data.serverId || null;
+            const account = { url: base, userId: user.id, username: name, serverId, tenancyOwner: Boolean(user.tenancyOwner) };
             const known = user.id !== undefined && user.id !== null;
 
-            // The working copy here may belong to someone else. It is never
-            // pushed into this account and never discarded: it is set aside.
-            // With unpushed edits in it, say so first — Cancel signs nothing in.
+            // The working copy here may belong to someone else — on this
+            // server, or the same id on another one. It is never pushed into
+            // this account and never discarded: it is set aside. With
+            // unpushed edits in it, say so first — Cancel signs nothing in.
             const st = TreeStore.status();
+            const edits = `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}`;
+            let question = null;
             if (known && st.dirty && TreeStore.wouldSetAside(account)) {
                 const previous = (await StorageManager.getSettings()).backend || {};
                 const oldName = st.owner ? (st.owner.username || previous.username || `account #${st.owner.userId}`) : null;
-                const ok = confirm(
-                    `This browser holds ${oldName ? oldName + "'s" : 'an older'} working copy `
-                    + `(${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}).\n\n`
-                    + `Signing in as ${name} sets it aside: it stays here (Settings › Set-aside copies) `
-                    + `and comes back when you sign in as ${oldName || "the server's owner"}.`
-                );
-                if (!ok) {
-                    fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
-                    authError('Sign-in cancelled — nothing changed.');
-                    return;
-                }
+                const where = st.owner && st.owner.url !== base ? ` on ${st.owner.url}` : '';
+                // Same id at another address: maybe this server, moved. Only
+                // the user knows, so it is set aside and offered back from there.
+                const maybeMoved = where && Number(st.owner.userId) === Number(user.id)
+                    && !(st.owner.serverId && serverId && st.owner.serverId !== serverId);
+                question = `This browser holds ${oldName ? oldName + "'s" : 'an older'} working copy${where} (${edits}).\n\n`
+                    + `Signing in as ${name} here sets it aside: it stays in this browser (Settings › Set-aside copies) `
+                    + `and comes back when you sign in as ${oldName || "the server's owner"}${where ? ' there' : ''}.`
+                    + (maybeMoved ? `\n\nIf ${base} is the same server at a new address, restore it from Set-aside copies once signed in.` : '');
+            }
+            if (question && !confirm(question)) {
+                fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
+                authError('Sign-in cancelled — nothing changed.');
+                return;
             }
 
             document.getElementById('backend-token').value = data.token;
             const pw = document.getElementById('backend-password');
             if (pw) pw.value = '';
             const previousName = ((await StorageManager.getSettings()).backend || {}).username || null;
-            await persistBackendConfig({ username: name, userId: known ? user.id : null, role: user.role || null, tenancyOwner: Boolean(user.tenancyOwner) });
+            await persistBackendConfig({ username: name, userId: known ? user.id : null, role: user.role || null, tenancyOwner: Boolean(user.tenancyOwner), serverId });
             setSignedInUi(true, name);
             setRoleLabel(user);
 
@@ -3760,10 +3767,11 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         try {
             const res = await fetch(cfg.url.replace(/\/$/, '') + '/api/auth/me', { headers: { Authorization: 'Bearer ' + cfg.token } });
             if (!res.ok) return null;
-            const user = (await res.json()).user;
+            const me = await res.json();
+            const user = me.user;
             if (!user) return null;
             setRoleLabel(user);
-            await persistBackendConfig({ userId: user.id, role: user.role, tenancyOwner: Boolean(user.tenancyOwner) });
+            await persistBackendConfig({ userId: user.id, role: user.role, tenancyOwner: Boolean(user.tenancyOwner), serverId: me.serverId || null });
             return user;
         } catch (e) {
             return null;
@@ -4271,15 +4279,20 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const block = document.getElementById('stash-block');
         const list = document.getElementById('stash-list');
         if (!block || !list) return;
-        const stashes = await TreeStore.listStashes().catch(() => []);
-        block.style.display = stashes.length ? 'block' : 'none';
-        if (!stashes.length) return;
+        // Which copies the account signed in now may restore is the tree
+        // store's call (TreeStore.listStashes): its own on this server, or
+        // its own at an old address of what looks like the same server.
         const backend = (await StorageManager.getSettings()).backend || {};
         const signedIn = Boolean(getBackendConfig().token) && backend.userId !== undefined && backend.userId !== null;
-        const mine = (st) => signedIn && (st.userId === null
-            ? Boolean(backend.tenancyOwner)
-            : Number(st.userId) === Number(backend.userId)
-                && (st.url === resolveServerUrl(backend.url).replace(/\/$/, '') || st.username === backend.username));
+        const account = signedIn ? {
+            url: getBackendConfig().url, userId: backend.userId, username: backend.username || null,
+            serverId: backend.serverId || null, tenancyOwner: Boolean(backend.tenancyOwner)
+        } : null;
+        const stashes = await TreeStore.listStashes(account).catch(() => []);
+        block.style.display = stashes.length ? 'block' : 'none';
+        if (!stashes.length) return;
+        const restoreAttrs = (st) => !st.match ? 'disabled title="Sign in as this account to restore it"'
+            : st.match === 'moved' ? 'title="Made at another address of this server — restoring asks first"' : '';
         list.innerHTML = stashes.map(st => `
             <div data-stash-key="${escapeHtml(st.key)}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
                 <div style="color:#ddd;"><strong>${escapeHtml(st.username || (st.userId === null ? 'An older copy' : 'account #' + st.userId))}</strong>
@@ -4289,7 +4302,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                     · set aside ${escapeHtml(st.setAsideAt ? new Date(st.setAsideAt).toLocaleDateString() : '')}
                 </div>
                 <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
-                    <button class="sm-btn" data-stash-act="restore" style="flex:1;" ${mine(st) ? '' : 'disabled title="Sign in as this account to restore it"'}>Restore</button>
+                    <button class="sm-btn" data-stash-act="restore" style="flex:1;" ${restoreAttrs(st)}>Restore</button>
                     <button class="sm-btn" data-stash-act="export" style="flex:1;">Export bookmarks.html</button>
                     <button class="sm-btn" data-stash-act="discard" style="flex:1; color:var(--danger-color);">Discard…</button>
                 </div>
@@ -4299,13 +4312,13 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             btn.addEventListener('click', () => {
                 const key = btn.closest('[data-stash-key]').dataset.stashKey;
                 const st = stashes.find(x => x.key === key);
-                handleStashAction(st, btn.dataset.stashAct, backend)
+                handleStashAction(st, btn.dataset.stashAct, account)
                     .catch(e => { const el = document.getElementById('stash-status'); if (el) el.textContent = e.message; });
             });
         });
     };
 
-    async function handleStashAction(st, act, backend) {
+    async function handleStashAction(st, act, account) {
         const status = document.getElementById('stash-status');
         if (act === 'export') {
             const html = await TreeStore.exportStashHtml(st.key);
@@ -4326,9 +4339,11 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             return;
         }
         if (act === 'restore') {
-            await TreeStore.restoreStash(st.key, {
-                url: getBackendConfig().url, userId: backend.userId, username: backend.username, tenancyOwner: Boolean(backend.tenancyOwner)
-            });
+            const moved = st.match === 'moved';
+            if (moved && !confirm(`This copy was made on ${st.url}. Restore it here, on ${account.url}?\n\n`
+                + 'Only if that is the same server at a new address. A copy of the server\'s database reports the same id, '
+                + 'and what you push to a copy never reaches the original.')) return;
+            await TreeStore.restoreStash(st.key, account, { moved });
             await pruneStaleFocusedFolders().catch(() => 0);
             await loadWorkflows();
             status.textContent = 'Restored. Whatever was here before is set aside in its place.';
@@ -4444,7 +4459,10 @@ async function getSyncConfig() {
 async function signedInAccount(cfg) {
     const backend = (await StorageManager.getSettings()).backend || {};
     if (!cfg.token || backend.userId === undefined || backend.userId === null) return null;
-    return { url: cfg.url, userId: Number(backend.userId), username: backend.username || null, tenancyOwner: Boolean(backend.tenancyOwner) };
+    return {
+        url: cfg.url, userId: Number(backend.userId), username: backend.username || null,
+        serverId: backend.serverId || null, tenancyOwner: Boolean(backend.tenancyOwner)
+    };
 }
 
 // The working copy belongs to another account. Pulling over it would discard
@@ -4460,7 +4478,7 @@ async function setAsideAndPull(cfg, err) {
     const me = await signedInAccount(cfg);
     const userId = me ? me.userId : err && err.userId;
     if (userId === undefined || userId === null) return 'Open Settings once so this browser learns which account it is signed in as, then try again.';
-    await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null });
+    await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null });
     const { version } = await TreeStore.sync.pull(cfg);
     await persistSyncStamp('pull');
     return `Set the other account's copy aside and pulled (v${version}).`;

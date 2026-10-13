@@ -167,6 +167,10 @@ IMPORTS_SCHEDULER=off DATA_DIR=/tmp/rehearsal PORT=18930 node index.js
 ```
 
 `IMPORTS_SCHEDULER=off` stops the copy sweeping your real Reddit account.
+A copy of an already upgraded database reports the same `serverId` as the
+original; the clients still treat it as a different server because its address
+differs, so a browser signed in to it sets the real server's working copy
+aside rather than pushing it there.
 
 **Verify.** Compare the frozen copies on either side of the migration — not
 the live database, which your devices are already pushing to:
@@ -187,8 +191,11 @@ restore.
 
 ## The tree
 
-`GET /api/tree` returns `{ version, roots, userId }` — an array of top-level
-folders, no browser roots, and the account they belong to. Nodes are:
+`GET /api/tree` returns `{ version, roots, userId, serverId }` — an array of
+top-level folders, no browser roots, and the account they belong to on which
+server. `serverId` is random, made on first start and kept in the database:
+account ids start at 1 on every server, so a client tells "admin #1 here" from
+"admin #1 on another server" by it. Nodes are:
 
 ```jsonc
 { "id": "ab12cd34ef56aa00",       // permanent; survives every push/pull
@@ -217,17 +224,19 @@ bookmarks", "Firefox bookmarks" — so a second import cannot merge into the
 first.
 
 `PUT /api/tree` replaces the caller's whole tree: `{ roots, baseVersion,
-baseUserId, deviceId }`. If `baseVersion` is not the server's current version —
-another device pushed in between — the push is refused with **409** and the
-client must pull first (or send `force: true`). Every accepted write bumps the
-version and lands a `{format: 2, roots}` row in the history table.
+baseUserId, baseServerId, deviceId }`. If `baseVersion` is not the server's
+current version — another device pushed in between — the push is refused with
+**409** and the client must pull first (or send `force: true`). Every accepted
+write bumps the version and lands a `{format: 2, roots}` row in the history
+table.
 
 A working copy that belongs to another account is refused with **412**, which
 `force` does not override: `code: "wrong-account"` when `baseUserId` names
-someone else, `code: "foreign-ids"` when the pushed tree contains items stored
-under another account. Clients set such a copy aside rather than pull over it.
-Versions are drawn from one server-wide sequence, so no two accounts ever share
-one; clients only compare them for equality.
+someone else or `baseServerId` another server, `code: "foreign-ids"` when the
+pushed tree contains items stored under another account. Clients set such a
+copy aside rather than pull over it. Versions are drawn from one server-wide
+sequence, so no two accounts ever share one; clients only compare them for
+equality.
 
 The response of `GET /api/tree` also carries a **virtual imports subtree**
 (`id: "imports:root"`, flagged `virtual`/`readOnly`) composed at read time from
@@ -242,8 +251,8 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 |---|---|---|
 | GET | `/api/health` | server status |
 | GET | `/api/auth/status` | **no auth** — `{ hasAccount, legacyTokenEnabled }` |
-| GET | `/api/auth/me` | `{ user: { id, username, role, tenancyOwner } }` |
-| POST | `/api/login` | **no auth** — `{ username, password }` → session token and `user`; rate-limited per IP and username |
+| GET | `/api/auth/me` | `{ user: { id, username, role, tenancyOwner }, serverId }` |
+| POST | `/api/login` | **no auth** — `{ username, password }` → session token, `user` and `serverId`; rate-limited per IP and username |
 | POST | `/api/auth/password` | `{ currentPassword, newPassword }`; revokes every session |
 | GET | `/api/users` | admin session — every account with role, owner flag and what it holds |
 | POST | `/api/users` | admin session — `{ username, password, role, currentPassword }` |
@@ -252,8 +261,8 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/prefs`, `/api/prefs/:key` | the caller's preferences |
 | PUT | `/api/prefs/:key` | `{ value, baseUpdatedAt? }`; 409 with `current` when stale; 64 KB per value, 100 keys |
 | DELETE | `/api/prefs/:key` | remove one |
-| GET | `/api/tree` | the tree (+ virtual imports subtree) and `userId` |
-| PUT | `/api/tree` | replace the tree `{ roots, baseVersion, baseUserId?, deviceId?, force? }`; 409 on a stale baseVersion, 412 for another account's copy |
+| GET | `/api/tree` | the tree (+ virtual imports subtree), `userId` and `serverId` |
+| PUT | `/api/tree` | replace the tree `{ roots, baseVersion, baseUserId?, baseServerId?, deviceId?, force? }`; 409 on a stale baseVersion, 412 for another account's or server's copy |
 | GET | `/api/tree/version` | cheap freshness probe |
 | GET | `/api/history` | list of past tree versions |
 | GET | `/api/history/:id` | fetch a specific past version |

@@ -16,6 +16,10 @@
 //      and queued removals and brings it back later, an unstamped copy is
 //      adopted only by the tenancy owner, and a 412 is answered by setting
 //      the copy aside — never by losing it.
+//   6. An account is an id on one server: the same id and name on another
+//      server (or a rebuilt one at the same address) is someone else, and a
+//      server reached at a new address gets its copy back only when the user
+//      says it is the same server.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -102,6 +106,15 @@ const server = {
 };
 const serverLog = [];
 
+// What each address reports as its server id. moved.test is server.test
+// reached at a new address; other.test is another server whose first admin is
+// also #1 'alex'.
+const SERVER_IDS = { 'https://server.test': 'srv-main', 'https://moved.test': 'srv-main', 'https://other.test': 'srv-other' };
+const serverC = {
+    version: 77,
+    roots: [{ id: 'other-root', kind: 'folder', title: 'Other server stuff', children: [] }]
+};
+
 // A second account on the same server, reached with token 'tok-b'.
 const serverB = {
     version: 1000,
@@ -120,18 +133,20 @@ globalThis.fetch = async (url, opts = {}) => {
         json: async () => body, text: async () => JSON.stringify(body)
     });
     const who = ((opts.headers || {}).Authorization || '').endsWith(' tok-b') ? 2 : 1;
-    const srv = who === 2 ? serverB : server;
+    const serverId = SERVER_IDS[new URL(u).origin];
+    const srv = serverId === 'srv-other' ? serverC : who === 2 ? serverB : server;
 
     if (u.endsWith('/api/health')) return json({ ok: true, version: 2, configured: true });
-    if (u.endsWith('/api/tree/version')) return json({ ok: true, version: srv.version, userId: who });
+    if (u.endsWith('/api/tree/version')) return json({ ok: true, version: srv.version, userId: who, serverId });
     if (u.endsWith('/api/tree') && method === 'GET') {
-        return json({ ok: true, version: srv.version, roots: JSON.parse(JSON.stringify(srv.roots)), userId: who });
+        return json({ ok: true, version: srv.version, roots: JSON.parse(JSON.stringify(srv.roots)), userId: who, serverId });
     }
     if (u.endsWith('/api/tree') && method === 'PUT') {
         const body = JSON.parse(opts.body);
         lastPutBody = body;
-        if (body.baseUserId !== undefined && Number(body.baseUserId) !== who) {
-            return json({ error: 'This working copy belongs to another account.', code: 'wrong-account', userId: who }, 412);
+        if ((body.baseUserId !== undefined && Number(body.baseUserId) !== who)
+            || (body.baseServerId !== undefined && body.baseServerId !== serverId)) {
+            return json({ error: 'This working copy belongs to another account.', code: 'wrong-account', userId: who, serverId }, 412);
         }
         if (!body.force && Number(body.baseVersion) !== srv.version) {
             return json({ error: 'The tree changed on the server since your last pull. Pull, then push again.', version: srv.version }, 409);
@@ -141,7 +156,7 @@ globalThis.fetch = async (url, opts = {}) => {
         // The server keeps the virtual subtree out of storage; mimic by storing
         // user roots and re-serving the virtual one on top.
         srv.roots = [...body.roots, srv.roots.find(r => r.id === 'imports:root')].filter(Boolean);
-        return json({ ok: true, version: srv.version, userId: who });
+        return json({ ok: true, version: srv.version, userId: who, serverId });
     }
     if (/\/api\/imports\/1\/items\/(delete|file)$/.test(u) && method === 'POST') {
         const body = JSON.parse(opts.body);
@@ -445,6 +460,76 @@ console.log('\n9. A working copy belongs to one account');
     // Another context switching accounts: this page adopts the stamp too.
     await chrome.storage.local.set({ tpTree: { baseVersion: 7, roots: [], dirty: false, owner: { url: URL_A, userId: 9, username: 'kim' }, rev: 'other-page' } });
     check('a copy written by another page brings its owner with it', TreeStore.status().owner && TreeStore.status().owner.userId === 9);
+}
+
+const MAIN = 'https://server.test';
+const OTHER = 'https://other.test';
+const MOVED = 'https://moved.test';
+const clearStashes = async () => { for (const st of await TreeStore.listStashes()) await TreeStore.discardStash(st.key); };
+
+console.log('\n10. The same id and name on another server is another account');
+{
+    await TreeStore.setAsideAndReset({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main' });
+    await clearStashes();
+    await TreeStore.sync.pull({ url: MAIN, token: 'tok' });
+    check('a pull stamps the server id as well', TreeStore.status().owner.serverId === 'srv-main', JSON.stringify(TreeStore.status().owner));
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'NAS-only edit' });
+    check('an unpushed edit on the NAS copy', TreeStore.status().dirty);
+
+    const otherAlex = { url: OTHER, userId: 1, username: 'alex', serverId: 'srv-other', tenancyOwner: true };
+    check('alex #1 on another server would set the copy aside, despite the same id and name',
+        TreeStore.wouldSetAside(otherAlex) === true);
+    check('  so would that server when it does not say its id: the address differs',
+        TreeStore.wouldSetAside({ url: OTHER, userId: 1, username: 'alex' }) === true);
+    check('  and a rebuilt server at the same address, with a new server id',
+        TreeStore.wouldSetAside({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-rebuilt' }) === true);
+    check('the same server, address and id would not',
+        TreeStore.wouldSetAside({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main' }) === false);
+    check('  nor the same address typed differently', TreeStore.wouldSetAside({ url: 'https://SERVER.test:443/', userId: 1, serverId: 'srv-main' }) === false);
+
+    // The extension's URL field changed but the token still opens the other
+    // server: the push names the server its copy came from, and is refused.
+    let wrongServer = null;
+    try { await TreeStore.sync.push({ url: OTHER, token: 'tok' }); } catch (e) { wrongServer = e; }
+    check('a push of the NAS copy to the other server names its server and is refused (412)',
+        lastPutBody.baseServerId === 'srv-main' && wrongServer && wrongServer.status === 412 && wrongServer.code === 'wrong-account',
+        wrongServer && wrongServer.message);
+    check('  leaving the copy as it was', TreeStore.status().dirty && TreeStore.status().owner.url === MAIN);
+
+    const toOther = await TreeStore.switchAccount({ ...otherAlex, previousUsername: 'alex' });
+    check('signing in there sets the NAS copy aside and starts empty',
+        toOther.action === 'fresh' && toOther.setAside && TreeStore.status().isEmpty && TreeStore.status().owner.url === OTHER);
+    const nasStash = (await TreeStore.listStashes(otherAlex)).find(st => st.url === MAIN);
+    check('  the NAS copy is kept, unpushed edit and all, and is not that account\'s to restore',
+        nasStash && nasStash.dirty && nasStash.match === null, JSON.stringify(nasStash));
+    let crossRestore = null;
+    try { await TreeStore.restoreStash(nasStash.key, otherAlex, { moved: true }); } catch (e) { crossRestore = e; }
+    check('  not even when asked to treat it as moved', crossRestore !== null && TreeStore.status().owner.url === OTHER);
+    await TreeStore.sync.pull({ url: OTHER, token: 'tok' });
+    check('the other server\'s tree comes into a copy of its own',
+        (await TreeStore.getNode('other-root')) !== null && (await TreeStore.getNode('f1')) === null
+        && TreeStore.status().owner.serverId === 'srv-other');
+
+    const backToNas = await TreeStore.switchAccount({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true });
+    check('back on the NAS, its copy comes back with the edit',
+        backToNas.action === 'restored' && TreeStore.status().dirty
+        && (await Tree.getChildren('0')).some(n => n.title === 'NAS-only edit'));
+
+    // The same server at a new address: offered back, never assumed.
+    const movedAlex = { url: MOVED, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const toMoved = await TreeStore.switchAccount({ ...movedAlex, previousUsername: 'alex' });
+    check('a new address is not assumed to be the same server: the copy is set aside', toMoved.action === 'fresh' && toMoved.setAside);
+    const offered = (await TreeStore.listStashes(movedAlex)).find(st => st.url === MAIN && st.dirty);
+    check('  and offered back as "moved", since the server id matches', offered && offered.match === 'moved', JSON.stringify(offered));
+    check('  while the other server\'s copy is not offered', (await TreeStore.listStashes(movedAlex)).filter(st => st.url === OTHER).every(st => st.match === null));
+    let unconfirmed = null;
+    try { await TreeStore.restoreStash(offered.key, movedAlex); } catch (e) { unconfirmed = e; }
+    check('  restoring it needs the user to say it is the same server', unconfirmed !== null);
+    await TreeStore.restoreStash(offered.key, movedAlex, { moved: true });
+    check('once they do, it comes back stamped with the new address',
+        TreeStore.status().owner.url === MOVED && TreeStore.status().owner.serverId === 'srv-main' && TreeStore.status().dirty);
+    await TreeStore.sync.push({ url: MOVED, token: 'tok' });
+    check('  and pushes there as the same account', server.pushedRoots.some(r => r.title === 'NAS-only edit') && !TreeStore.status().dirty);
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);

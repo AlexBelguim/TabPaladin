@@ -189,8 +189,8 @@ server.stdout.on('data', d => { serverLog += d; });
 server.stderr.on('data', d => { serverLog += d; });
 const serverExited = new Promise(r => server.on('exit', r));
 
-async function signIn(username, password) {
-    byId('cfg-url').value = BASE;
+async function signIn(username, password, url = BASE) {
+    byId('cfg-url').value = url;
     byId('cfg-username').value = username;
     byId('cfg-password').value = password;
     byId('auth-error').textContent = '';
@@ -330,6 +330,10 @@ try {
     await signIn('sam', 'sam-password-1');
     check('sam cannot sign in over alex\'s unpushed edits',
         /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent)
+        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    // The same account id at another address is not taken on trust either.
+    await signIn('alex', 'new horse battery', `http://localhost:${PORT}`);
+    check('nor can alex #1 at another server address', /for alex on http:\/\/127\.0\.0\.1/.test(byId('auth-error').textContent)
         && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
     await signIn('alex', 'new horse battery');
     check('alex signs back in to his edits, with no pull over them',
