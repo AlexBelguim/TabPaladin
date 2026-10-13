@@ -234,14 +234,18 @@ async function bootstrap() {
         if (arrived) showToast(SIGN_IN_TO_IMPORT);
         return;
     }
-    const me = await refreshWhoAmI();
+    await refreshWhoAmI();
     if (!configured()) {
         // The server has just said the kept session is over (api() says so
         // and opens the sign-in): nothing to pull, and the link is nobody's.
         if (arrived) showToast(SIGN_IN_TO_IMPORT);
         return;
     }
-    if (arrived && me) claimPendingImport(arrived.id);
+    // Still signed in after asking the server: the session is this account's,
+    // or the server could not be reached and the kept session stands until it
+    // says otherwise. Only a rejected session (handled above) leaves the link
+    // to whoever signs in next.
+    if (arrived) claimPendingImport(arrived.id);
     // A pull replaces the working copy, so it never runs over unpushed edits
     // — after a sign-out and back in they are still here, waiting.
     if (state.dirty && state.snapshot) {
@@ -327,8 +331,11 @@ function pendingImportVisible(p) {
     if (p.account === key) return true;
     const base = key.slice(0, key.lastIndexOf('|name:'));
     const id = currentUserId();
+    // A name that reads as a number could equal another account's id key,
+    // so the name form only counts for names that cannot.
+    const name = localStorage.getItem(LS.username) || '';
     return (id !== null && p.account === `${base}|${id}`)
-        || p.account === `${base}|${localStorage.getItem(LS.username)}`;
+        || (!/^\d+$/.test(name) && p.account === `${base}|${name}`);
 }
 
 // The links whose notes, batch or order are in this working copy but not on
@@ -2221,6 +2228,26 @@ async function saveNoteEdit() {
         }
         const note = hit.node;
         const meta = decodeNote(note);
+        // The note changed under the editor (a Pull, an approved proposal or
+        // an import brought another device's version in): never overwrite
+        // that. The edit is saved as a note of its own right next to it.
+        if (nv.loaded != null && meta.content !== nv.loaded) {
+            const mine = {
+                type: 'bookmark',
+                title: `${note.title} (my edit)`,
+                url: encodeNoteUrl({ content, createdAt: now, updatedAt: now })
+            };
+            assignIds(mine);
+            hit.parent.children.splice(hit.index + 1, 0, mine);
+            stopEditing();
+            nv.noteId = mine._pwaId;
+            history.replaceState(nvHistoryState(), '', location.pathname);
+            saveNotesPrefs();
+            renderView();
+            await commitNotesEdit('Saving…', `“${note.title}” changed on another device — your edit is saved next to it as “${mine.title}”.`);
+            renderView();
+            return;
+        }
         const r = NM.resolveTitleOnSave({
             storedTitle: note.title,
             loadedContent: nv.loaded == null ? meta.content : nv.loaded,
@@ -3273,6 +3300,14 @@ async function pushSnapshot({ force = false } = {}) {
                 ...(baseServerId ? { baseServerId } : {})
             })
         });
+        // The copy was replaced while the push was on its way (a pull, a
+        // sign-out, another account signing in): the server has what was
+        // sent, and nothing here describes the copy now on screen, so none of
+        // its version, owner or edit count may be stamped onto it.
+        if (state.snapshot !== copy) {
+            if (carried.length) dropPendingImports(carried);
+            return;
+        }
         state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
         if (data.userId !== undefined) state.snapshotUserId = data.userId;
         if (data.serverId) state.snapshotServerId = data.serverId;
@@ -3292,7 +3327,14 @@ async function pushSnapshot({ force = false } = {}) {
         // A stale baseVersion means another device pushed since our last pull.
         // Never overwrite that silently — ask.
         if (/^409[\s:]/.test(e.message) || /changed on the server/i.test(e.message)) {
+            if (state.snapshot !== copy) {
+                throw new Error('The working copy changed while pushing — nothing was overwritten. Push again.');
+            }
             if (confirm('Another device pushed changes since this phone last pulled.\n\nOK = overwrite the server with THIS phone\'s version\nCancel = keep both as they are (pull later to see theirs — your edit is then lost)')) {
+                // The dialog waits on the user; the copy may change meanwhile.
+                if (state.snapshot !== copy) {
+                    throw new Error('The working copy changed while you decided — nothing was overwritten. Push again.');
+                }
                 return pushSnapshot({ force: true });
             }
         }
