@@ -131,6 +131,29 @@
           <button id="users-add" class="ghost-block">+ Add user</button>
         </div>
       </div>
+
+      <!-- Where the working copy is kept on this device, and whether the
+           browser may clear it to make room. Signed in or not: a copy kept
+           for its account over a sign-out lives here too. -->
+      <div id="storage-block">
+        <hr class="sep">
+        <strong class="block-title">Storage</strong>
+        <p id="storage-status" class="hint"></p>
+        <small id="storage-error" class="hint error hidden"></small>
+        <button id="storage-persist" class="ghost-block hidden" type="button">Keep my data on this device</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Another tab or window of the app edits this device's copy: one at a
+       time, so two never write over each other (see showGuard). -->
+  <div id="primary-guard" class="primary-guard hidden" role="dialog" aria-modal="true" aria-labelledby="primary-guard-title">
+    <div class="primary-guard-card">
+      <img src="icons/icon192.png" alt="" width="48" height="48">
+      <strong id="primary-guard-title">TabPaladin is open in another tab</strong>
+      <p id="primary-guard-text" class="hint"></p>
+      <button id="primary-take" class="primary" type="button">Use here</button>
+      <small id="primary-guard-note" class="hint"></small>
     </div>
   </div>
 
