@@ -1,8 +1,9 @@
 {
     "manifest_version": 2,
     "name": "TabPaladin",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Group tabs, save workflows, and manage your browsing sessions efficiently.",
+    "incognito": "not_allowed",
     "browser_specific_settings": {
         "gecko": {
             "id": "tabpaladin@extension",
