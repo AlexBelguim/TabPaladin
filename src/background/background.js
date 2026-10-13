@@ -167,6 +167,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
         return true;
     }
+
+    if (msg.type === 'tp:update-ready') {
+        noteUpdateReady(msg);
+        return;
+    }
 });
 
 // --- Workflow auto-sync without touching the tree ---
@@ -296,4 +301,84 @@ api.storage.onChanged.addListener((changes, area) => {
 if (api.permissions && api.permissions.onAdded) {
     api.permissions.onAdded.addListener(syncVideoSeek);
     api.permissions.onRemoved.addListener(syncVideoSeek);
+}
+
+
+// --- Updates ---
+//
+// Applying an update reloads the extension, which ends every extension page
+// at once: whatever a page held only in memory — edits on the working copy's
+// debounce, a note being typed — would go with it. So when the browser says
+// an update is ready, the open pages are asked to write what they hold first
+// ('tp:prepare-update'); each answers 'tp:update-ready' once it has, and the
+// update is applied when all have, or after 5 s whatever happens.
+//
+// A sideloaded install updated by hand (git pull, then Reload) never gets
+// here: for that, pages write on hide and pagehide, and keep the open note's
+// text as a live draft.
+const UPDATE_WAIT_MS = 5000;
+let updating = null;
+let awaitingPages = null; // { nonce, ready: Set, expected: number|null, done }
+
+// How many extension pages are open, or null when this browser cannot say.
+async function openExtensionPages() {
+    try {
+        if (typeof api.runtime.getContexts === 'function') {
+            const contexts = await api.runtime.getContexts({ contextTypes: ['TAB', 'POPUP', 'SIDE_PANEL'] });
+            return Array.isArray(contexts) ? contexts.length : null;
+        }
+    } catch (e) { /* older Chrome */ }
+    try {
+        if (api.extension && typeof api.extension.getViews === 'function') {
+            return api.extension.getViews({ type: 'tab' }).length + api.extension.getViews({ type: 'popup' }).length;
+        }
+    } catch (e) { /* no views API */ }
+    return null;
+}
+
+function noteUpdateReady(msg) {
+    const waiting = awaitingPages;
+    if (!waiting || !msg || msg.nonce !== waiting.nonce) return;
+    waiting.ready.add(String(msg.page || waiting.ready.size));
+    if (waiting.expected === null) {
+        // Not knowing how many pages there are: a moment for the others.
+        setTimeout(waiting.done, 500);
+    } else if (waiting.ready.size >= waiting.expected) {
+        waiting.done();
+    }
+}
+
+async function prepareForUpdate() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const nonce = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    const expected = await openExtensionPages();
+    const allReady = new Promise((resolve) => {
+        awaitingPages = { nonce, ready: new Set(), expected, done: resolve };
+        setTimeout(resolve, UPDATE_WAIT_MS);
+    });
+    if (expected === 0) {
+        awaitingPages.done();
+    } else {
+        try {
+            const sent = api.runtime.sendMessage({ type: 'tp:prepare-update', nonce });
+            // Rejected when no page is listening: nothing to wait for.
+            if (sent && typeof sent.then === 'function') sent.catch(() => { if (awaitingPages) awaitingPages.done(); });
+        } catch (e) {
+            awaitingPages.done();
+        }
+    }
+    await allReady;
+    awaitingPages = null;
+    // And this script's own tracking writes.
+    await chain;
+}
+
+if (api.runtime.onUpdateAvailable) {
+    api.runtime.onUpdateAvailable.addListener(() => {
+        if (updating) return;
+        updating = prepareForUpdate()
+            .catch((e) => console.warn('TabPaladin: preparing for the update failed', e))
+            .then(() => api.runtime.reload());
+    });
 }

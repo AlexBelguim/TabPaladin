@@ -6,7 +6,14 @@
 // how the side panel already behaved — one section at a time — just with room
 // to breathe.
 import { initHome } from './home.js';
-import { initNotesView, canLeave } from './notesView.js';
+import { initNotesView, canLeave, saveLiveDraft } from './notesView.js';
+import { TreeStore } from '../utils/treeStore.js';
+import { ExpandState } from '../utils/expandState.js';
+import { listenForUpdate } from '../utils/pageMessages.js';
+
+// An update is about to reload this page: write the working copy, the open
+// cards and the open note's unsaved text first.
+listenForUpdate(() => Promise.allSettled([TreeStore.flush(), ExpandState.flush(), saveLiveDraft()]));
 
 const HOME_IDS = ['home-container', 'actions', 'home-recents'];
 // Sections that take over the page when open.
