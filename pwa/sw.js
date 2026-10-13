@@ -45,17 +45,34 @@ self.addEventListener('install', (event) => {
     self.skipWaiting();
 });
 
-// Only older shells go. tp-config, tp-outbox and tp-data are not versions:
-// dropping one would sign the share handler out, lose shares not yet
-// uploaded, or the working copy kept for a reload.
+// The caches of ours that hold data rather than code. Dropping one would sign
+// the share handler out, lose shares not yet uploaded, or the working copy
+// kept for a reload, so no release ever does.
+const DATA_CACHES = new Set([CONFIG_CACHE, 'tp-outbox', Share.OUTBOX_CACHE, 'tp-data']);
+
+// Every other cache of ours goes: older shells, and any 'tp-' cache this
+// worker does not know, which only script that once ran on this origin (the
+// old note XSS, say) could have made. Nothing put in Cache Storage that way
+// outlives a release. Caches outside the 'tp-' names are not ours to touch,
+// and are never read here either (see shellMatch).
 self.addEventListener('activate', (event) => {
     event.waitUntil(
         caches.keys().then(keys => Promise.all(
-            keys.filter(k => k.startsWith('tp-shell-') && k !== SHELL_CACHE).map(k => caches.delete(k))
+            keys.filter(k => k.startsWith('tp-') && k !== SHELL_CACHE && !DATA_CACHES.has(k)).map(k => caches.delete(k))
         ))
     );
     self.clients.claim();
 });
+
+// A file of the app, from this release's shell cache only: never from
+// whatever other cache happens to hold the same URL.
+async function shellMatch(req) {
+    try {
+        return (await (await caches.open(SHELL_CACHE)).match(req)) || null;
+    } catch (e) {
+        return null;
+    }
+}
 
 async function readConfig() {
     try {
@@ -176,8 +193,8 @@ self.addEventListener('fetch', (event) => {
         event.respondWith(navigation(event, url));
         return;
     }
-    // Everything else, network-first: fresh files when online, cached when
-    // not.
+    // Everything else — app.js and its modules included — network-first:
+    // fresh files whenever online, this release's cached copy only when not.
     event.respondWith(
         fetch(req)
             .then(res => {
@@ -187,7 +204,7 @@ self.addEventListener('fetch', (event) => {
                 }
                 return res;
             })
-            .catch(() => caches.match(req).then(hit => hit || Response.error()))
+            .catch(() => shellMatch(req).then(hit => hit || Response.error()))
     );
 });
 

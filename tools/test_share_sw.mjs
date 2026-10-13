@@ -19,7 +19,10 @@
 //      account is never uploaded as another.
 //   5. The shell: a navigation is cached under '/' only, never under its
 //      query; a share navigation is served from cache first; install survives
-//      one shell file failing; activate removes only older shells.
+//      one shell file failing; activate removes older shells and any other
+//      unknown tp- cache, never tp-config, tp-outbox or tp-data; the app's
+//      files are network-first, and offline come from this release's shell
+//      cache only.
 //
 // Run: node tools/test_share_sw.mjs
 
@@ -311,13 +314,39 @@ async function main() {
         const keys = [...caches.stores.get(SHELL_NAME).keys()];
         check('install caches every other shell file when one fails', keys.length >= 8 && !keys.includes('/notesModel.js')
             && keys.includes(`/app.js?v=${V}`) && keys.includes(`/shareCore.js?v=${V}`), JSON.stringify(keys));
-        for (const name of [`tp-shell-v${V - 1}`, `tp-shell-v${V - 2}`, 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) await caches.open(name);
+        for (const name of [`tp-shell-v${V - 1}`, `tp-shell-v${V - 2}`, `tp-shell-v${Number(V) + 5}`, 'tp-injected', 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) {
+            await caches.open(name);
+        }
         const ext2 = [];
         w.listeners.activate({ waitUntil: (p) => ext2.push(p) });
         await Promise.all(ext2);
-        check('activate removes older shells only, keeping tp-config, tp-outbox and tp-data',
+        check('activate removes every other tp- cache (older shells, unknown ones), keeping tp-config, tp-outbox and tp-data',
             JSON.stringify([...caches.stores.keys()].sort()) === JSON.stringify(['other-app-cache', 'tp-config', 'tp-data', 'tp-outbox', SHELL_NAME]),
             JSON.stringify([...caches.stores.keys()]));
+    }
+    {
+        // A file of the app is fetched network-first, and offline it comes
+        // from this release's shell only — never from another cache holding
+        // the same URL (one script on this origin could once have written).
+        const caches = makeCaches();
+        const appUrl = `/app.js?v=${V}`;
+        await (await caches.open('other-app-cache')).put(appUrl, new Response('injected'));
+        let online = true;
+        const fetchImpl = async () => {
+            if (!online) throw new TypeError('Failed to fetch');
+            return new Response('fresh from the server', { status: 200 });
+        };
+        const w = loadWorker({ caches, fetchImpl });
+        await (await caches.open(SHELL_NAME)).put(appUrl, new Response('cached last time'));
+        const { res: fresh } = await dispatchFetch(w, new Request(ORIGIN + appUrl));
+        check('app.js comes from the network while online, over a cached copy', (await fresh.text()) === 'fresh from the server'
+            && (await (await (await caches.open(SHELL_NAME)).match(appUrl)).text()) === 'fresh from the server');
+        online = false;
+        const { res: cached } = await dispatchFetch(w, new Request(ORIGIN + appUrl));
+        check('  offline, from this release\'s shell cache', (await cached.text()) === 'fresh from the server');
+        await (await caches.open(SHELL_NAME)).delete(appUrl);
+        const { res: none } = await dispatchFetch(w, new Request(ORIGIN + appUrl));
+        check('  and never from another cache holding the same URL', none && none.type === 'error');
     }
     {
         const caches = makeCaches();
