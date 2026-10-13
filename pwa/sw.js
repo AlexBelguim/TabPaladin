@@ -23,6 +23,7 @@ const SHELL = [
     '/shareSheet.js',
     '/bookmarksHtml.js',
     '/notesModel.js',
+    '/durableCopy.js',
     '/manifest.webmanifest',
     '/icons/icon192.png'
 ];
