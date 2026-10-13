@@ -116,10 +116,13 @@ export function httpUrl(value) {
 }
 
 // The app a link counts towards when the client did not say: its host. The
-// clients group hosts into apps (X, YouTube, …) with the same fallback.
+// clients group hosts into apps (X, YouTube, …) with the same fallback. A
+// www., m. or mobile. that is the site's own name (mobile.de, m.me) stays.
 function appFallback(url) {
     try {
-        const host = new URL(url).hostname.toLowerCase().replace(/^(www|m|mobile)\./, '');
+        const full = new URL(url).hostname.toLowerCase();
+        const stripped = full.replace(/^(www|m|mobile)\./, '');
+        const host = stripped.includes('.') ? stripped : full;
         const app = 'site:' + host;
         return APP_RE.test(app) ? app : 'site:unknown';
     } catch (e) {
@@ -129,6 +132,32 @@ function appFallback(url) {
 
 class BadRequest extends Error {
     constructor(message) { super(message); this.status = 400; }
+}
+
+// `raw` is only context (what the phone's share target received), never a
+// reason to refuse the link it came with: past MAX_RAW its text is cut, then
+// its title, and what still does not fit is dropped.
+function fitRaw(value) {
+    if (value == null) return null;
+    const size = (v) => Buffer.byteLength(typeof v === 'string' ? v : JSON.stringify(v), 'utf8');
+    if (size(value) <= MAX_RAW) return typeof value === 'string' ? value : JSON.stringify(value);
+    if (typeof value !== 'object' || Array.isArray(value)) return null;
+    const o = { ...value };
+    for (const key of ['text', 'title']) {
+        if (typeof o[key] !== 'string') continue;
+        // The most of it that fits, by code points, never half a character.
+        const chars = Array.from(o[key]);
+        let lo = 0;
+        let hi = chars.length;
+        while (lo < hi) {
+            const mid = Math.ceil((lo + hi) / 2);
+            if (size({ ...o, [key]: chars.slice(0, mid).join('') }) <= MAX_RAW) lo = mid;
+            else hi = mid - 1;
+        }
+        o[key] = chars.slice(0, lo).join('');
+        if (size(o) <= MAX_RAW) return JSON.stringify(o);
+    }
+    return null;
 }
 
 function parseIntake(body, { legacy = false } = {}) {
@@ -149,11 +178,7 @@ function parseIntake(body, { legacy = false } = {}) {
     if (b.app != null && (typeof b.app !== 'string' || !APP_RE.test(b.app))) throw new BadRequest('app: 1-80 of a-z, 0-9 and :._-');
     if (b.urlKey != null && (typeof b.urlKey !== 'string' || b.urlKey.length > MAX_URL)) throw new BadRequest(`urlKey: at most ${MAX_URL} characters.`);
     if (b.source != null && !SOURCES.has(b.source)) throw new BadRequest(`source: one of ${[...SOURCES].join(', ')}.`);
-    let raw = null;
-    if (b.raw != null) {
-        raw = typeof b.raw === 'string' ? b.raw : JSON.stringify(b.raw);
-        if (Buffer.byteLength(raw, 'utf8') > MAX_RAW) throw new BadRequest(`raw: at most ${MAX_RAW / 1024} KB.`);
-    }
+    const raw = fitRaw(b.raw);
     return {
         sid: b.sid, url, title: title || null, app: b.app || appFallback(url), urlKey: b.urlKey || url,
         source: b.source || 'share', raw
@@ -443,17 +468,30 @@ export function makeSharesStore(db, { items, importsStore = null, maxPending = 5
                 return apps;
             },
 
-            // After a forced push from an older base: filings made since that
-            // base whose bookmark is gone were erased by it, not deleted by
-            // anyone who saw them. They go, and a share left with none waits in
-            // the inbox again, saying why. Filings the pusher had seen are left
-            // alone — deleting a bookmark it could see was deliberate.
-            reopenAfterForce({ baseVersion = 0, deviceId = null } = {}) {
-                const rows = db.prepare(`
-                    SELECT f.id, f.share_id FROM share_filings f
+            // Before a forced push from an older base, in its transaction: the
+            // filings made since that base whose bookmark is in the tree now —
+            // the only ones the push can erase. One whose bookmark is already
+            // gone was deleted by a device that saw it, and stays as it is.
+            filingsAtRisk({ baseVersion = 0 } = {}) {
+                return db.prepare(`
+                    SELECT f.id FROM share_filings f
                     WHERE f.user_id = ? AND f.tree_version > ?
+                      AND EXISTS (SELECT 1 FROM items i WHERE i.user_id = f.user_id AND i.id = f.bookmark_id)
+                `).all(userId, Number(baseVersion) || 0).map(r => r.id);
+            },
+
+            // After that push, in the same transaction: of those filings, the
+            // ones whose bookmark is gone now were erased by it, not deleted by
+            // anyone who saw them. They go, and a share left with none waits in
+            // the inbox again, saying why. Filings the pusher had seen, and
+            // bookmarks deleted on purpose before it, are left alone.
+            reopenAfterForce({ filingIds = [], deviceId = null } = {}) {
+                const erased = db.prepare(`
+                    SELECT f.id, f.share_id FROM share_filings f
+                    WHERE f.user_id = ? AND f.id = ?
                       AND NOT EXISTS (SELECT 1 FROM items i WHERE i.user_id = f.user_id AND i.id = f.bookmark_id)
-                `).all(userId, Number(baseVersion) || 0);
+                `);
+                const rows = (filingIds || []).map(id => erased.get(userId, Number(id))).filter(Boolean);
                 if (!rows.length) return { reopened: 0, dropped: 0 };
                 const del = db.prepare('DELETE FROM share_filings WHERE user_id = ? AND id = ?');
                 for (const r of rows) del.run(userId, r.id);
@@ -518,8 +556,22 @@ export function attachShareRoutes(app, { store, items, requireAuth, serverId = n
         return res.status(500).json({ error: 'The share could not be saved.' });
     };
     const mine = (req) => store.forUser(req.user.id);
+    // The account (and server) the client means, when it says: a share kept
+    // on a phone for one account is never taken in, filed or changed under
+    // another — a page still holding an older session's token, say. 412, as
+    // PUT /api/tree answers a copy of another account's; the client leaves
+    // the share as it was.
+    const refusedAccount = (req, res) => {
+        const b = req.body || {};
+        const otherUser = b.expectUserId !== undefined && b.expectUserId !== null && Number(b.expectUserId) !== req.user.id;
+        const otherServer = b.expectServerId !== undefined && b.expectServerId !== null && serverId && String(b.expectServerId) !== serverId;
+        if (!otherUser && !otherServer) return false;
+        res.status(412).json({ error: 'This share belongs to another account.', code: 'wrong-account', userId: req.user.id, serverId });
+        return true;
+    };
 
     app.post('/api/shares', requireAuth, (req, res) => {
+        if (refusedAccount(req, res)) return;
         try {
             const out = mine(req).intake(req.body);
             res.json({ ok: true, created: out.created, share: out.share, archived: out.archived });
@@ -544,16 +596,20 @@ export function attachShareRoutes(app, { store, items, requireAuth, serverId = n
         res.json({ ok: true, share });
     });
 
+    // A filing and its undo say whose tree they changed, as /api/tree/ops
+    // does: a client folds them only into that account's copy.
     app.post('/api/shares/:sid/file', requireAuth, (req, res) => {
+        if (refusedAccount(req, res)) return;
         try {
             const out = mine(req).file(req.params.sid, req.body);
             if (!out) return res.status(404).json({ error: 'No such share.' });
             if (out.refused) return res.status(422).json({ error: 'None of those folders can take it.', failed: out.failed });
-            res.json({ ok: true, ...out });
+            res.json({ ok: true, ...out, userId: req.user.id, serverId });
         } catch (e) { fail(res, e); }
     });
 
     app.post('/api/shares/:sid/unfile', requireAuth, (req, res) => {
+        if (refusedAccount(req, res)) return;
         const folderIds = (req.body || {}).folderIds;
         if (folderIds !== undefined && (!Array.isArray(folderIds) || folderIds.length > 64)) {
             return res.status(400).json({ error: 'folderIds: an array of folder ids.' });
@@ -561,12 +617,13 @@ export function attachShareRoutes(app, { store, items, requireAuth, serverId = n
         try {
             const out = mine(req).unfile(req.params.sid, { folderIds: folderIds || null });
             if (!out) return res.status(404).json({ error: 'No such share.' });
-            res.json({ ok: true, ...out });
+            res.json({ ok: true, ...out, userId: req.user.id, serverId });
         } catch (e) { fail(res, e); }
     });
 
     for (const verb of ['dismiss', 'restore']) {
         app.post(`/api/shares/:sid/${verb}`, requireAuth, (req, res) => {
+            if (refusedAccount(req, res)) return;
             const share = mine(req)[verb](req.params.sid);
             if (!share) return res.status(404).json({ error: 'No such share.' });
             res.json({ ok: true, share });

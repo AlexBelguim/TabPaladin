@@ -7,8 +7,10 @@
 //      the owner's, pending, and come back from the legacy GET /api/shared
 //      exactly as before. Running it again is a no-op.
 //   2. Intake: idempotent on sid; only http(s) links; oversized fields
-//      refused; accounts never see or touch each other's shares; an X link is
-//      archived on arrival, as the capture route always did.
+//      refused, except raw, which is cut to fit; accounts never see or touch
+//      each other's shares, and a share meant for another account (or
+//      server) is refused with 412; an X link is archived on arrival, as the
+//      capture route always did.
 //   3. Filing: a bookmark at the end of each folder, one version bump, one
 //      logged append and no history snapshot; a retry is "already" and moves
 //      nothing; missing folders are reported, all-missing is a 422 that
@@ -23,7 +25,8 @@
 //      only dismiss the caller's waiting links.
 //   6. A forced push from an older base that erases a filed link puts the
 //      share back in the inbox, saying why; a push that saw the bookmark and
-//      deleted it leaves the share filed, marked not present.
+//      deleted it leaves the share filed, marked not present, and so does
+//      every later forced push, which did not erase it.
 //   7. The rehearsal: a database the schema-3 server (with accounts, before
 //      this inbox) wrote through its own API is upgraded by this one. A
 //      pre-upgrade copy is taken first; every table's rows are still there;
@@ -244,7 +247,6 @@ async function liveTests() {
             ['a data: URL', { url: 'data:text/html,<script>alert(1)</script>' }],
             ['an over-long URL', { url: 'https://example.com/' + 'x'.repeat(5000) }],
             ['an over-long title', { title: 't'.repeat(1001) }],
-            ['an over-large raw', { raw: { text: 'r'.repeat(11 * 1024) } }],
             ['a malformed sid', { sid: 'short' }],
             ['a malformed app', { app: 'Not An App!' }],
             ['an unknown source', { source: 'carrier-pigeon' }]
@@ -252,6 +254,32 @@ async function liveTests() {
             const r = await intake(A, 900 + Math.floor(Math.random() * 99), extra);
             check(`${what} is refused with 400`, r.status === 400, `HTTP ${r.status} ${JSON.stringify(r.json)}`);
         }
+        // raw is only context: past 10 KB it is cut to fit, never a reason to
+        // lose the link. 3,500 CJK characters and a long subject are over it.
+        const rawOf = (n) => { const d = raw(); const r = d.prepare('SELECT raw FROM shared_links WHERE user_id = 1 AND sid = ?').get(sid(n)); d.close(); return r && r.raw; };
+        const big = await intake(A, 880, { raw: { title: 'Т'.repeat(3000), text: '中'.repeat(3500), url: 'https://example.com/page-880' } });
+        const bigRaw = rawOf(880);
+        check('an over-large raw is taken in, its text cut to fit', big.status === 200 && big.json.created === true && bigRaw
+            && Buffer.byteLength(bigRaw, 'utf8') <= 10 * 1024 && JSON.parse(bigRaw).url === 'https://example.com/page-880'
+            && /^中+$/.test(JSON.parse(bigRaw).text) && JSON.parse(bigRaw).text.length < 3500 && JSON.parse(bigRaw).title.length === 3000,
+            `HTTP ${big.status} ${bigRaw && Buffer.byteLength(bigRaw, 'utf8')}`);
+        const huge = await intake(A, 881, { raw: { title: 't'.repeat(11 * 1024), text: 'r'.repeat(11 * 1024) } });
+        const hugeRaw = rawOf(881);
+        check('  and its title too when the text alone is not enough', huge.status === 200 && hugeRaw && JSON.parse(hugeRaw).text === ''
+            && Buffer.byteLength(hugeRaw, 'utf8') <= 10 * 1024 && JSON.parse(hugeRaw).title.length > 0, `HTTP ${huge.status}`);
+        const blob = await intake(A, 882, { raw: 'x'.repeat(11 * 1024) });
+        check('  and a raw string that does not fit is dropped', blob.status === 200 && rawOf(882) === null, `HTTP ${blob.status}`);
+
+        // A share kept on a phone for one account is never taken in by another.
+        const me = (await http('/api/auth/me', { token: A })).json;
+        const otherUser = await intake(A, 883, { expectUserId: 999 });
+        const otherServer = await intake(A, 884, { expectServerId: 'another-server' });
+        check('a share meant for another account or server: 412 wrong-account, nothing taken in',
+            otherUser.status === 412 && otherUser.json.code === 'wrong-account' && otherServer.status === 412
+            && (await http(`/api/shares/${sid(883)}`, { token: A })).status === 404 && (await http(`/api/shares/${sid(884)}`, { token: A })).status === 404,
+            JSON.stringify([otherUser.json, otherServer.json]));
+        const rightOne = await intake(A, 885, { expectUserId: me.user.id, expectServerId: me.serverId });
+        check('  and one meant for this account goes in', rightOne.status === 200 && rightOne.json.created === true, JSON.stringify(rightOne.json));
         const xs = await http('/api/shares', { method: 'POST', token: A, body: { sid: sid(2), url: 'https://x.com/nasa/status/123', title: 'Post by @nasa', app: 'x', urlKey: 'x.com/nasa/status/123' } });
         check('an X link is archived on arrival', xs.json.share.status === 'archived' && xs.json.archived && xs.json.archived.provider === 'x'
             && xs.json.archived.duplicate === false, JSON.stringify(xs.json));
@@ -291,6 +319,8 @@ async function liveTests() {
         check('  as a logged append, with no history snapshot', opsOf()[0].kind === 'append' && snaps() === snaps0);
         check('  and the share is filed, with both filings present', f1.json.share.status === 'filed' && f1.json.share.filedAt
             && f1.json.share.filings.length === 2 && f1.json.share.filings.every(f => f.present));
+        check('  the answer says whose tree it changed, on which server', f1.json.userId === 1 && typeof f1.json.serverId === 'string' && f1.json.serverId.length > 0,
+            JSON.stringify({ userId: f1.json.userId, serverId: f1.json.serverId }));
         const ops1 = await http(`/api/tree/ops?since=${v0}`, { token: A });
         check('/api/tree/ops from before it is complete, naming the account and the server', ops1.json.complete === true && ops1.json.ops.length === 1
             && ops1.json.ops[0].payload.nodes.length === 2 && ops1.json.userId === 1 && typeof ops1.json.serverId === 'string', JSON.stringify(ops1.json));
@@ -301,6 +331,10 @@ async function liveTests() {
 
         await intake(A, 3);
         const vBefore3 = (await http('/api/tree/version', { token: A })).json.version;
+        const wrongFile = await http(`/api/shares/${sid(3)}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'dev' }], expectUserId: 999 } });
+        check('a filing meant for another account: 412, nothing filed', wrongFile.status === 412 && wrongFile.json.code === 'wrong-account'
+            && (await http(`/api/shares/${sid(3)}`, { token: A })).json.share.status === 'pending'
+            && (await http('/api/tree/version', { token: A })).json.version === vBefore3);
         const missing = await http(`/api/shares/${sid(3)}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'nowhere' }] } });
         check('a missing folder: 422, failed[] says why, nothing changes', missing.status === 422 && missing.json.failed[0].reason === 'missing'
             && (await http(`/api/shares/${sid(3)}`, { token: A })).json.share.status === 'pending'
@@ -433,6 +467,25 @@ async function liveTests() {
         const s12 = (await http(`/api/shares/${sid(12)}`, { token: A })).json.share;
         check('a push that saw the bookmark and deleted it leaves the share filed, marked not present',
             deliberate.status === 200 && s12.status === 'filed' && s12.filings.length === 1 && s12.filings[0].present === false, JSON.stringify(s12));
+        // A device that last pulled before both the filing and that delete
+        // forces its copy up: it erased nothing of 12's, which was gone already.
+        const laterForce = await http('/api/tree', { method: 'PUT', token: A, body: { roots: (await http('/api/tree', { token: A })).json.roots.filter(r => !r.virtual),
+            baseVersion: f12.json.baseVersion, force: true, deviceId: 'laptop-b' } });
+        const s12b = (await http(`/api/shares/${sid(12)}`, { token: A })).json.share;
+        check('a later forced push from before the filing leaves a link deleted on purpose deleted: still filed, no note',
+            laterForce.status === 200 && s12b.status === 'filed' && s12b.filings.length === 1 && !s12b.note, JSON.stringify(s12b));
+        const fresh = await http('/api/tree', { method: 'PUT', token: A, body: { roots: (await http('/api/tree', { token: A })).json.roots.filter(r => !r.virtual),
+            force: true, deviceId: 'fresh-install' } });
+        const s12c = (await http(`/api/shares/${sid(12)}`, { token: A })).json.share;
+        check('  and so does a forced push with no base at all that erases nothing', fresh.status === 200 && s12c.status === 'filed' && !s12c.note,
+            JSON.stringify(s12c));
+        await intake(A, 13);
+        const t13 = (await http('/api/tree', { token: A })).json;
+        const f13 = await http(`/api/shares/${sid(13)}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'dev' }] } });
+        const forced13 = await http('/api/tree', { method: 'PUT', token: A, body: { roots: t13.roots.filter(r => !r.virtual), force: true, deviceId: 'fresh-install' } });
+        const s13 = (await http(`/api/shares/${sid(13)}`, { token: A })).json.share;
+        check('  while one that does erase a filed link still gives it back', f13.status === 200 && forced13.status === 200 && s13.status === 'pending'
+            && s13.note === 'Removed by a forced push from fresh-install', JSON.stringify(s13));
 
         console.log('\n8. Later boots');
         await srv.stop();

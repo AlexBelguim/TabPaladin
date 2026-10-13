@@ -580,16 +580,17 @@ app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
     }
     // A forced push from an older base may erase links filed from the phone
     // since (they were never in the pusher's copy): those shares go back to
-    // the inbox, in the same transaction as the push.
+    // the inbox, in the same transaction as the push. Only links this push
+    // erases: the filings whose bookmark was there just before it.
     const base = Number(baseVersion);
     const erasesUnseen = Boolean(force) && !(Number.isFinite(base) && base >= current);
     let version;
     try {
         version = db.transaction(() => {
+            const myShares = erasesUnseen ? shares.forUser(req.user.id) : null;
+            const atRisk = myShares ? myShares.filingsAtRisk({ baseVersion: Number.isFinite(base) ? base : 0 }) : [];
             const v = store.writeTree(roots, { deviceId: deviceId || null });
-            if (erasesUnseen) {
-                shares.forUser(req.user.id).reopenAfterForce({ baseVersion: Number.isFinite(base) ? base : 0, deviceId: deviceId || null });
-            }
+            if (atRisk.length) myShares.reopenAfterForce({ filingIds: atRisk, deviceId: deviceId || null });
             return v;
         })();
     } catch (e) {

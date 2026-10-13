@@ -303,11 +303,11 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/history` | list of past tree versions |
 | GET | `/api/history/:id` | fetch a specific past version |
 | POST | `/api/push`, GET `/api/pull` | **410 Gone** — the legacy snapshot sync, kept only to tell old clients to update |
-| POST | `/api/shares` | take a share in `{ sid, url, title?, app?, urlKey?, source?, raw? }`; idempotent on `sid`; X / Instagram links are archived on arrival |
+| POST | `/api/shares` | take a share in `{ sid, url, title?, app?, urlKey?, source?, raw?, expectUserId?, expectServerId? }`; idempotent on `sid`; X / Instagram links are archived on arrival; `raw` past 10 KB is cut to fit, never refused |
 | GET | `/api/shares` | `?status=pending\|filed\|archived\|dismissed&limit&before` — shares with their filings |
 | GET | `/api/shares/:sid` | one share (`id-<n>` addresses a share taken in without a sid) |
-| POST | `/api/shares/:sid/file` | `{ targets: [{folderId} \| {newFolder: {id, title, parentId}, existing?}], folders?, title?, url?, app? }` → `{ baseVersion, version, share, created, already, failed }`; 422 when every target failed |
-| POST | `/api/shares/:sid/unfile` | `{ folderIds? }` — undo: removes the bookmarks it made while unchanged and the folders it made while empty |
+| POST | `/api/shares/:sid/file` | `{ targets: [{folderId} \| {newFolder: {id, title, parentId}, existing?}], folders?, title?, url?, app? }` → `{ baseVersion, version, share, created, already, failed, userId, serverId }`; 422 when every target failed |
+| POST | `/api/shares/:sid/unfile` | `{ folderIds? }` — undo: removes the bookmarks it made while unchanged and the folders it made while empty; answers with `userId` and `serverId` too |
 | POST | `/api/shares/:sid/dismiss`, `/restore` | out of the inbox (never deleted), and back |
 | GET | `/api/shares/stats` | `{ apps: { <app>: [{ folderId, n, last }] } }` over the last year |
 | GET | `/api/prefs/share` | the share sheet's pins and hidden folders per app (an ordinary pref) |
@@ -365,10 +365,18 @@ while they are empty, and logs an unappend.
 
 **A forced push** from a copy that never saw a filing can erase it. When a
 `force` push's `baseVersion` is older than the server's, filings made since
-whose bookmark is gone are dropped, and a share left with none goes back to
-the inbox with the note *Removed by a forced push from <device>*. A push that
-saw the bookmark and deleted it was deliberate: the share stays filed, its
-filing marked `present: false`.
+whose bookmark was in the tree just before the push and is gone after it are
+dropped, and a share left with none goes back to the inbox with the note
+*Removed by a forced push from <device>*. A push that saw the bookmark and
+deleted it was deliberate, and so was any delete before the forced push: the
+share stays filed, its filing marked `present: false`.
+
+**Whose share.** Every share route that changes something (`POST /api/shares`,
+`file`, `unfile`, `dismiss`, `restore`) takes an optional `expectUserId` and
+`expectServerId`: the account a phone kept the share for. When they name
+another account or server than the session's, the answer is **412**
+`code: "wrong-account"` and nothing changes — a page still holding an older
+session's token never files one account's share into another's tree.
 
 ## LLM share links
 
