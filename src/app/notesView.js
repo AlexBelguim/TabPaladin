@@ -483,7 +483,8 @@ function renderNoteChrome() {
     if (!has) return;
 
     const note = currentNote();
-    const nbId = view.isNew ? view.newParentId : note ? note.notebookId : null;
+    // A removed note shows where 'Keep my text' would file it: its last notebook.
+    const nbId = view.isNew || view.removed ? view.newParentId : note ? note.notebookId : null;
     const nb = nbId ? view.lib.notebooks.get(nbId) : null;
     const crumb = $('nv-crumb');
     if (view.isNew) {
@@ -491,7 +492,7 @@ function renderNoteChrome() {
         crumb.title = 'Choose where the new note is filed';
     } else {
         crumb.textContent = nb ? `📓 ${NM.pathLabel(nb.path)}` : '📥 Unfiled';
-        crumb.title = `${nb ? nb.path.join(' › ') : 'Unfiled'} — Move to…`;
+        crumb.title = `${nb ? nb.path.join(' › ') : 'Unfiled'}${view.removed ? '' : ' — Move to…'}`;
     }
     crumb.disabled = view.removed;
 
@@ -524,6 +525,7 @@ function showNote(note, { mode = null } = {}) {
     view.noteId = note.id;
     view.isNew = false;
     view.removed = false;
+    view.newParentId = null;
     view.restoreNoteId = note.id;
     fillEditor(note.title, note.content);
     view.shown = mode || view.mode;
@@ -561,12 +563,15 @@ function discardDraft() {
 // Write the editor to the local working copy. Returns true when saved.
 async function saveNote() {
     if (view.removed) {
-        // The note is gone; saving keeps the text as a new note.
+        // The note is gone; saving keeps the text as a new note, in the
+        // notebook it was last seen in (refresh() noted it in newParentId).
         view.isNew = true;
         view.removed = false;
         view.noteId = null;
-        if (view.newParentId && !view.lib.notebooks.has(view.newParentId)) view.newParentId = null;
     }
+    // A pull can remove the notebook a draft was meant for; the crumb then
+    // already reads Unfiled, so file it there (as the PWA does) rather than fail.
+    if (view.isNew && view.newParentId && !view.lib.notebooks.has(view.newParentId)) view.newParentId = null;
     if (!view.isNew && !view.noteId) return true;
     const titleInput = $('noteTitleInput');
     const textarea = $('noteContentInput');
@@ -585,11 +590,14 @@ async function saveNote() {
             const created = await NotesManager.createNote(result.title, result.content, { parentId: view.newParentId });
             view.noteId = created.id;
             view.isNew = false;
+            view.newParentId = null;
             view.restoreNoteId = created.id;
         } else {
             const stored = await TreeStore.getNode(view.noteId);
             if (!stored) {
+                const gone = currentNote();
                 view.removed = true;
+                view.newParentId = gone ? gone.notebookId : null;
                 renderNoteChrome();
                 return false;
             }
@@ -1036,6 +1044,7 @@ async function moveSelection(dir) {
 // --- refresh -------------------------------------------------------------------------------
 
 async function refresh() {
+    const before = view.noteId && !view.isNew && !view.removed ? currentNote() : null;
     view.lib = await NotesManager.getLibrary();
     const nbId = NM.notebookIdOf(view.scope);
     if (nbId && !view.lib.notebooks.has(nbId)) view.scope = 'all';
@@ -1044,7 +1053,9 @@ async function refresh() {
         const note = currentNote();
         if (!note) {
             // A pull (or another page) removed the note while it was open.
+            // 'Keep my text' files it where it was, if that notebook is left.
             view.removed = true;
+            view.newParentId = before ? before.notebookId : null;
         } else if (!isDirty() && (note.title !== view.loaded.title || note.content !== view.loaded.content)
             && !$('note-editor').contains(document.activeElement)) {
             // Changed elsewhere while it sat here unedited: show the new text.
