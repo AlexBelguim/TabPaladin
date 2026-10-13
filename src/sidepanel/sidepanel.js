@@ -119,6 +119,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         };
     })();
     TreeStore.onChanged(scheduleRefresh);
+    TreeStore.onChanged(() => { if (!isSourceGridVisible()) sourceGridStale = true; });
 
     setupDragAutoScroll();
     showStartupSyncBanner();
@@ -350,6 +351,12 @@ async function loadCurrentTabs() {
 function isMainViewVisible() {
     const c = document.getElementById('groups-container');
     return c && c.style.display !== 'none' && c.classList.contains('main-view');
+}
+
+// The Organize ("Sources") grid. Hidden in the markup until first shown.
+function isSourceGridVisible() {
+    const c = document.getElementById('organizer-source-container');
+    return !!c && c.style.display !== 'none' && c.style.display !== '';
 }
 
 // --- Folder export / import ---
@@ -1120,9 +1127,14 @@ async function openWorkflowAsTabs(folderId, folderTitle) {
 // Same build-then-swap as the main view; drill, Back and drops all land here,
 // and each level comes back with its remembered-open cards already open.
 let sourceRenderSeq = 0;
+// Out of date: never built, or the tree changed while the grid was hidden
+// (refreshes skip hidden views). Back from a proposal is the one way back to
+// the grid that does not rebuild it, so it checks this.
+let sourceGridStale = true;
 
 async function renderSourceGrid(folderId) {
     const seq = ++sourceRenderSeq;
+    sourceGridStale = false; // an edit landing while this builds sets it again
     const sourceList = document.getElementById('source-list');
     const frag = document.createDocumentFragment();
     const budget = newRestoreBudget();
@@ -1463,8 +1475,8 @@ function renderFolderCard(sub, depth = 0) {
             header.title = RESTORE_SKIPPED_TIP;
         },
         // The folder's contents changed: rebuild the body if it is showing.
-        async refresh() {
-            if (card.dataset.open === '1') await showBody(newRestoreBudget(), true);
+        async refresh(budget = newRestoreBudget()) {
+            if (card.dataset.open === '1') await showBody(budget, true);
         }
     };
     cardControls.set(card, ctl);
@@ -1481,7 +1493,7 @@ function renderFolderCard(sub, depth = 0) {
         drillBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
             const organize = document.getElementById('organizer-source-container');
-            if (organize.style.display !== 'none' && organize.style.display !== '') {
+            if (isSourceGridVisible()) {
                 currentNavStack.push({ id: sub.id, title: sub.title });
                 renderSourceGrid(sub.id);
                 return;
@@ -1754,16 +1766,17 @@ function renderFolderCard(sub, depth = 0) {
                 } catch (err) { console.warn('Tab close failed', err); }
             }
 
-            // Refresh whichever view we're in.
+            // Refresh whichever view we're in. When the Organize level on
+            // screen is the source or the target, rebuilding it covers every
+            // card of both; otherwise both folders' open bodies are rebuilt in
+            // one go, and a target card inside the rebuilt source body only once.
+            const top = currentNavStack[currentNavStack.length - 1];
             if (isMainViewVisible()) {
                 await renderMainView({ regroup: false });
+            } else if (isSourceGridVisible() && top && (top.id === sourceParentId || top.id === sub.id)) {
+                await renderSourceGrid(top.id);
             } else {
-                if (sourceParentId) await refreshFolderBodyIfOpen(sourceParentId);
-                await refreshFolderBodyIfOpen(sub.id);
-                const top = currentNavStack[currentNavStack.length - 1];
-                if (top && (top.id === sourceParentId || top.id === sub.id)) {
-                    await renderSourceGrid(top.id);
-                }
+                await refreshFolderBodyIfOpen([sourceParentId, sub.id]);
             }
         } catch (err) {
             console.error('[TabPaladin] Drop action failed:', err);
@@ -2099,16 +2112,32 @@ async function updateFolderCardStats(folderId) {
     }
 }
 
-// Surgical refresh: re-render only the open body of the given folder card(s).
-// Used after a drop so expanded siblings remain expanded — and the rebuilt
-// body reopens its own remembered-open subfolders. `except` is a card the
-// caller has already brought up to date.
-async function refreshFolderBodyIfOpen(folderId, except = null) {
-    if (!folderId) return;
-    await updateFolderCardStats(folderId);
-    for (const card of folderCardsFor(folderId)) {
-        if (card !== except) await cardControls.get(card)?.refresh();
+// A card in a view that is not on screen (the main view while Organize
+// shows, say). Every way of showing a view again rebuilds it, so rebuilding
+// its cards meanwhile is wasted work.
+function inHiddenView(el) {
+    const view = el.closest('section');
+    return !!view && view.style.display === 'none';
+}
+
+// Surgical refresh: re-render only the open bodies of the given folder(s)'
+// cards in the view on screen. Used after a drop so expanded siblings remain
+// expanded — and each rebuilt body reopens its own remembered-open
+// subfolders. One restore budget covers the whole call, and a card inside
+// another one being rebuilt is left to that rebuild rather than built twice.
+// `except` is a card the caller has already brought up to date.
+async function refreshFolderBodyIfOpen(folderIds, except = null) {
+    const ids = [...new Set([].concat(folderIds).filter(Boolean))];
+    const open = [];
+    for (const id of ids) {
+        await updateFolderCardStats(id);
+        for (const card of folderCardsFor(id)) {
+            if (card !== except && card.dataset.open === '1' && !inHiddenView(card)) open.push(card);
+        }
     }
+    const outermost = open.filter(card => !open.some(o => o !== card && o.contains(card)));
+    const budget = newRestoreBudget();
+    for (const card of outermost) await cardControls.get(card)?.refresh(budget);
 }
 
 async function runSplitOnFolder(folderId, folderTitle) {
@@ -2720,6 +2749,12 @@ document.getElementById('restructureBtn').addEventListener('click', async () => 
 document.getElementById('cancelOrganizerBtn').addEventListener('click', () => {
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('organizer-source-container').style.display = 'block';
+    // Kept as it was (with its selected cards) unless the tree changed while
+    // it was hidden, e.g. a Split started from the main view.
+    if (sourceGridStale) {
+        if (currentNavStack.length === 0) currentNavStack = [{ id: VIRTUAL_ROOT_ID, title: 'Sources' }];
+        renderSourceGrid(currentNavStack[currentNavStack.length - 1].id);
+    }
 });
 
 // Step 3: Apply
@@ -2748,6 +2783,9 @@ document.getElementById('applyOrganizerBtn').addEventListener('click', async () 
 
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('groups-container').style.display = 'block';
+    // The main view was hidden while the tree changed under it (refreshes
+    // skip hidden views), so rebuild it like every other way back does.
+    if (isMainViewVisible()) await renderMainView({ regroup: false });
 });
 
 async function applyTabModeGroups(approvedGroups) {

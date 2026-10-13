@@ -211,6 +211,10 @@ class Node {
         x.parentNode = null;
     }
     remove() { if (this.parentNode) this.parentNode._drop(this); }
+    contains(n) {
+        for (let e = n; e; e = e.parentNode) if (e === this) return true;
+        return false;
+    }
     replaceWith(...nodes) {
         const p = this.parentNode;
         if (!p) return;
@@ -462,20 +466,35 @@ await local.set({
     }
 });
 
+// The page the card tests attach to: folderCardsFor searches it, as the real
+// one searches the document.
+const page = new Element('div');
+// What the drop handler sees of the page around it.
+const view = { mainVisible: false, gridVisible: true, grids: [] };
+const navStack = [];
+const { refreshFolderBodyIfOpen: _stub, ...envForCards } = env;
 const cardEnv = {
-    ...env,
+    ...envForCards,
     Tree: TreeStore.bookmarks,
     TreeStore,
     ExpandState,
-    findWorkflowRootSilent: async () => TreeStore.findRoleRoot('workflows')
+    findWorkflowRootSilent: async () => TreeStore.findRoleRoot('workflows'),
+    folderCardsFor: (id) => page.querySelectorAll('.source-folder-card').filter(c => c.dataset.id === String(id)),
+    updateFolderCardStats: async () => {},
+    isMainViewVisible: () => view.mainVisible,
+    isSourceGridVisible: () => view.gridVisible,
+    currentNavStack: navStack,
+    renderSourceGrid: async (id) => { view.grids.push(id); },
+    moveBookmarksSmart: async () => {}
 };
 const cardCode = [
     ...['BODY_ROW_CAP', 'SHOW_MORE_STEP', 'RESTORE_ROW_BUDGET', 'RESTORE_SKIPPED_TIP', 'IMPORTS_ROOT_TITLE',
         'TP_META_TITLE', 'TP_ROOT_MARKER_TITLE', 'cardControls'].map(liftConst),
     ...['tabDomain', 'escapeHtml', 'isInternalBookmark', 'isVisibleBookmark', 'newRestoreBudget', 'folderStatsText',
         'buildFolderCard', 'restoreQueued', 'renderFolderCard', 'buildFolderBody',
-        'appendDomainGroups', 'appendDomainGroup', 'buildBookmarkRow'].map(lift),
-    'return { buildFolderCard, restoreQueued, renderFolderCard, newRestoreBudget, cardControls };'
+        'appendDomainGroups', 'appendDomainGroup', 'buildBookmarkRow',
+        'inHiddenView', 'refreshFolderBodyIfOpen'].map(lift),
+    'return { buildFolderCard, restoreQueued, renderFolderCard, newRestoreBudget, cardControls, refreshFolderBodyIfOpen };'
 ].join('\n\n');
 const cards = new Function(...Object.keys(cardEnv), cardCode)(...Object.values(cardEnv));
 
@@ -588,6 +607,63 @@ const ghost = cards.renderFolderCard({ id: 'deadbeefdeadbeef', title: 'Gone', fo
 await cards.cardControls.get(ghost).setOpen(true);
 check('opening a folder deleted elsewhere says so instead of throwing',
     bodyOf(ghost).textContent === 'Folder no longer exists.');
+
+console.log('refreshes');
+// The view on screen holds the Bookmarks column, with A open inside it, and
+// A again as a column of its own; a hidden view holds a third copy of A.
+// Refresh spies record the budget each card's rebuild was given.
+const onScreen = new Element('section');
+const offScreen = new Element('section');
+offScreen.style.display = 'none';
+page.replaceChildren(onScreen, offScreen);
+const aSub = { id: 'fA', title: 'A', parentId: 'bm', folderCount: 2, fileCount: 3 };
+ExpandState.set('fA', true);
+const [bmCol, aCol] = await renderPass(rootSub, aSub);
+const [aHidden] = await renderPass(aSub);
+onScreen.replaceChildren(bmCol, aCol);
+offScreen.appendChild(aHidden);
+function spyRefresh(card) {
+    const ctl = cards.cardControls.get(card);
+    const real = ctl.refresh;
+    const seen = [];
+    ctl.refresh = (budget) => { seen.push(budget); return real(budget); };
+    return seen;
+}
+const aNested = subCard(bmCol, 'fA');
+const seenBm = spyRefresh(bmCol), seenA = spyRefresh(aCol);
+const seenNested = spyRefresh(aNested), seenHidden = spyRefresh(aHidden);
+const hiddenFirst = bodyOf(aHidden).childNodes[0];
+check('(all three copies of A are open)', [aNested, aCol, aHidden].every(isShownOpen));
+await cards.refreshFolderBodyIfOpen(['bm', 'fA', 'bm']);
+check('a refresh rebuilds every open copy on screen, once each',
+    seenBm.length === 1 && seenA.length === 1 && subCard(bmCol, 'fA') !== aNested && isShownOpen(subCard(bmCol, 'fA')),
+    `${seenBm.length} / ${seenA.length}`);
+check('…a copy inside a body being rebuilt is left to that rebuild', seenNested.length === 0);
+check('…all of them out of one restore budget', !!seenBm[0] && seenBm[0] === seenA[0]);
+check('…and a view that is not on screen is not touched',
+    seenHidden.length === 0 && bodyOf(aHidden).childNodes[0] === hiddenFirst);
+
+// Organize, drilled into Bookmarks: a loose bookmark of Bookmarks dropped on
+// open folder A. The level is rebuilt once; A's own refresh would only build
+// what that rebuild builds again.
+navStack.splice(0, navStack.length, { id: '__virtual_root__', title: 'Sources' }, { id: 'bm', title: 'Bookmarks' });
+const [aLevel] = await renderPass(aSub);
+onScreen.replaceChildren(aLevel);
+const seenLevel = spyRefresh(aLevel);
+const dropPayload = { 'text/tp-bookmark-id': 'b-0', 'text/tp-parent-id': 'bm' };
+fire(aLevel, 'drop', { dataTransfer: { getData: (k) => dropPayload[k] || '' } });
+await settle();
+check('an Organize drop on the level shown rebuilds that level once, and nothing else',
+    view.grids.join() === 'bm' && seenLevel.length === 0, `${view.grids.join()} / ${seenLevel.length}`);
+// The same drop with Organize hidden (the Workflows view, say) leaves the
+// hidden grid alone and rebuilds the open card instead.
+view.gridVisible = false;
+view.grids.length = 0;
+fire(aLevel, 'drop', { dataTransfer: { getData: (k) => dropPayload[k] || '' } });
+await settle();
+check('…while a hidden Organize grid is not rebuilt for a drop elsewhere',
+    view.grids.length === 0 && seenLevel.length === 1);
+view.gridVisible = true;
 
 console.log(failures === 0 ? '\nAll expand-state tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);
