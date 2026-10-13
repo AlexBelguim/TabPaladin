@@ -39,6 +39,12 @@
 //      names the note drafts parked with it that only it would bring back,
 //      offers them as a Markdown file first, and lets them go only with the
 //      copy, once confirmed — never one another copy would bring back.
+//  12. Every answer applies only to the copy it was about (doPush, lifted
+//      with setAsideAndPull): "pull the server's tree" after a refused push
+//      never pulls into another account's copy brought in meanwhile, a push's
+//      success is never applied to it, a pull agreed to stops when the copy
+//      is edited before it lands, and Discard discards nothing — drafts
+//      included — once the copy it listed was restored or replaced.
 //
 // Run: node tools/test_notes_view_accounts.mjs
 
@@ -81,7 +87,8 @@ globalThis.chrome = {
                     changes[k] = { oldValue: storageData.get(k), newValue: clone(v) };
                     storageData.set(k, clone(v));
                 }
-                for (const fn of storageListeners) fn(changes, 'local');
+                // Each page gets its own copy of what was written, as in the browser.
+                for (const fn of storageListeners) fn(clone(changes), 'local');
             },
             remove: async (k) => { for (const key of [].concat(k)) storageData.delete(key); }
         },
@@ -179,14 +186,16 @@ const server = {
 };
 const authMeCalls = [];
 let authMeDown = false;
-// Run once while a request to `path` is in flight: another page acting
-// between a pull's awaits.
+// Run once while a request to `path` (with `method`, any by default) is in
+// flight: another page acting between a pull's or a push's awaits.
 let duringFetch = null;
+const puts = [];
 globalThis.fetch = async (url, opts = {}) => {
     const token = String((opts.headers || {}).Authorization || '').replace('Bearer ', '');
     const acct = server[token];
-    const reply = (body) => ({ ok: true, status: 200, statusText: 'OK', json: async () => body, text: async () => JSON.stringify(body) });
-    if (duringFetch && String(url).endsWith(duringFetch.path)) {
+    const method = opts.method || 'GET';
+    const reply = (body, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? 'OK' : 'Refused', json: async () => body, text: async () => JSON.stringify(body) });
+    if (duringFetch && String(url).endsWith(duringFetch.path) && (!duringFetch.method || duringFetch.method === method)) {
         const { fn } = duringFetch;
         duringFetch = null;
         await fn();
@@ -197,6 +206,18 @@ globalThis.fetch = async (url, opts = {}) => {
         return reply({ ok: true, user: { id: acct.userId, username: acct.username, role: 'user', tenancyOwner: acct.tenancyOwner }, serverId: 'srv' });
     }
     if (!acct || !String(url).endsWith('/api/tree')) throw new Error(`unexpected fetch ${url}`);
+    if (method === 'PUT') {
+        const body = JSON.parse(opts.body);
+        puts.push({ token, body });
+        if (body.baseUserId !== undefined && Number(body.baseUserId) !== acct.userId) {
+            return reply({ error: 'This working copy belongs to another account.', code: 'wrong-account', userId: acct.userId }, 412);
+        }
+        if (!body.force && Number(body.baseVersion) !== acct.version) return reply({ error: 'conflict', version: acct.version }, 409);
+        const pushed = clone(body.roots);
+        acct.version += 1;
+        acct.roots = () => clone(pushed);
+        return reply({ ok: true, version: acct.version, userId: acct.userId, serverId: 'srv' });
+    }
     return reply({ ok: true, version: acct.version, roots: acct.roots(), userId: acct.userId, serverId: 'srv' });
 };
 
@@ -228,6 +249,20 @@ let pullToken = 'tok-b';
 let pullSettings = { backend: { url: URL_S } };
 const doPull = new Function('TreeStore', 'StorageManager', 'getSyncConfig', 'persistSyncStamp', 'Tree', 'pruneStaleExpandState', 'beforeAccountSwitch',
     `${pullSrc.join('\n')}\nreturn doPull;`)(
+    TreeStore,
+    { getSettings: async () => clone(pullSettings) },
+    async () => ({ url: URL_S, token: pullToken }),
+    async () => {},
+    TreeStore.bookmarks,
+    async () => {},
+    beforeAccountSwitch
+);
+// And doPush, with the answers to a refused push it gives (setAsideAndPull,
+// and doPull for "pull the server's tree").
+const pushSrc = [lift('signedInAccount'), lift('setAsideAndPull'), lift('doPush'), lift('doPull')];
+check('sidepanel.js has setAsideAndPull and doPush', pushSrc.every(Boolean));
+const doPush = new Function('TreeStore', 'StorageManager', 'getSyncConfig', 'persistSyncStamp', 'Tree', 'pruneStaleExpandState', 'beforeAccountSwitch',
+    `${pushSrc.join('\n')}\nreturn doPush;`)(
     TreeStore,
     { getSettings: async () => clone(pullSettings) },
     async () => ({ url: URL_S, token: pullToken }),
@@ -774,6 +809,174 @@ console.log('\n11. Discarding a set-aside copy offers the drafts parked with it'
     check('discarding that copy names its draft and lets it go with it',
         prompts[p].includes('1 unsaved note draft (“Diary”)') && prompts[p].includes('Type alice')
         && !(await TreeStore.listStashes()).some(s => s.key === old.key) && parked().length === 0, prompts[p]);
+}
+
+console.log('\n12. Every answer applies only to the copy it was about');
+{
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    const stored = () => storageData.get('tpTree');
+    const stashWith = (text) => [...storageData.entries()].filter(([k]) => k.startsWith('tpTreeStash:')).map(([, v]) => v).find(s => has(s.roots, text));
+    // bob's copy, set aside earlier in this browser with an edit he never pushed.
+    const bobAside = async () => {
+        const key = `tpTreeStash:${URL_S}|2`;
+        const roots = bobRoots();
+        roots[0].children.push({ id: 'b-unpushed', kind: 'folder', title: 'BOB UNPUSHED', children: [] });
+        await chrome.storage.local.set({
+            [key]: { roots, baseVersion: 9, dirty: true, editCount: 1, owner: { ...BOB }, origin: null, url: URL_S, username: 'bob',
+                setAsideAt: new Date().toISOString(), focusedFolderIds: [], expanded: {}, pendingRemovals: [] },
+            tpTreeStashIndex: [...((await chrome.storage.local.get('tpTreeStashIndex')).tpTreeStashIndex || []).filter(k => k !== key), key]
+        });
+    };
+    const aliceUnpushed = () => {
+        const roots = aliceRoots();
+        roots[0].children.push({ id: 'a-unpushed', kind: 'folder', title: 'ALICE UNPUSHED', children: [] });
+        return roots;
+    };
+    // Another page signing bob in, as doSignIn does: the token first, then the switch.
+    const bobSignsInElsewhere = async () => {
+        pullToken = 'tok-b';
+        await OtherPage.switchAccount({ ...BOB, previousUsername: 'alice' });
+    };
+    pullSettings = { backend: { url: URL_S } };
+
+    // With nobody else acting, every answer to a refused push still works.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceUnpushed(), { baseVersion: server['tok-a'].version - 1, dirty: true, editCount: 1 });
+    await settle();
+    pullToken = 'tok-a';
+    answers = [true];
+    const pulledTheirs = await doPush();
+    answers = [];
+    check('a push refused as out of date, answered "pull the server’s tree", pulls it into the copy that was refused',
+        /^Pulled \d+ item/.test(pulledTheirs) && stored().owner.userId === 1 && !stored().dirty
+        && stored().baseVersion === server['tok-a'].version && !has(stored().roots, 'ALICE UNPUSHED'), pulledTheirs);
+    await otherPageLoads(ALICE, aliceUnpushed(), { baseVersion: server['tok-a'].version - 1, dirty: true, editCount: 1 });
+    await settle();
+    answers = [false, true];
+    const forced = await doPush();
+    answers = [];
+    check('  answered "force", it force-pushes that copy', /^Force-pushed \(v\d+\)\.$/.test(forced) && !stored().dirty
+        && has(server['tok-a'].roots(), 'ALICE UNPUSHED'), forced);
+    await otherPageLoads(ALICE, aliceUnpushed(), { dirty: true, editCount: 1 });
+    await settle();
+    pullToken = 'tok-b';
+    answers = [true];
+    const asideMsg = await doPush();
+    answers = [];
+    check('a push refused as another account’s (412) sets that copy aside and pulls this account’s tree',
+        /^Set the other account's copy aside and pulled/.test(asideMsg) && stored().owner.userId === 2
+        && Boolean(stashWith('ALICE UNPUSHED')), asideMsg);
+
+    // A push refused as out of date while bob signs in elsewhere; the answer
+    // is "pull the server's tree".
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceUnpushed(), { baseVersion: server['tok-a'].version - 1, dirty: true, editCount: 1 });
+    await bobAside();
+    await settle();
+    pullToken = 'tok-a';
+    duringFetch = { path: '/api/tree', method: 'PUT', fn: bobSignsInElsewhere };
+    answers = [true];
+    const theirs = await doPush();
+    duringFetch = null;
+    answers = [];
+    await settle();
+    check('a push refused while bob signed in elsewhere, answered "pull the server’s tree": nothing is pulled into bob’s copy',
+        theirs === 'Account changed during pull — nothing was replaced.', theirs);
+    check('  bob’s copy is the working copy, with his unpushed edit', stored().owner.userId === 2 && stored().dirty
+        && has(stored().roots, 'BOB UNPUSHED') && TreeStore.status().owner.userId === 2);
+    check('  and alice’s unpushed edit waits in her set-aside copy', stashWith('ALICE UNPUSHED') && stashWith('ALICE UNPUSHED').owner.userId === 1
+        && stashWith('ALICE UNPUSHED').dirty);
+
+    // A push that goes through while bob signs in elsewhere.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceUnpushed(), { baseVersion: server['tok-a'].version, dirty: true, editCount: 1 });
+    await bobAside();
+    await settle();
+    pullToken = 'tok-a';
+    duringFetch = { path: '/api/tree', method: 'PUT', fn: bobSignsInElsewhere };
+    const pushedMsg = await doPush();
+    duringFetch = null;
+    await settle();
+    check('a push that goes through while bob signs in elsewhere says the copy here was left as it is',
+        /^Pushed \(v\d+\)\. The working copy here is another account’s now/.test(pushedMsg)
+        && has(server['tok-a'].roots(), 'ALICE UNPUSHED'), pushedMsg);
+    check('  bob’s copy is not marked pushed or stamped as alice’s: his edit is still his, unpushed',
+        stored().owner.userId === 2 && stored().dirty && stored().baseVersion === 9 && has(stored().roots, 'BOB UNPUSHED')
+        && !puts.some(p => p.token === 'tok-a' && has(p.body.roots, 'BOB UNPUSHED')));
+
+    // A pull agreed to over unpushed edits, while another page saves a link
+    // during the question.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceUnpushed(), { dirty: true, editCount: 1 });
+    await settle();
+    pullToken = 'tok-a';
+    let savedElsewhere = null;
+    const realConfirm = globalThis.confirm;
+    globalThis.confirm = (msg) => {
+        confirms.push(msg);
+        savedElsewhere = (async () => {
+            await OtherPage.createNode({ parentId: null, kind: 'bookmark', title: 'SAVED DURING THE QUESTION', url: 'https://saved.example' });
+            await OtherPage.flush();
+        })();
+        return true;
+    };
+    const agreed = await doPull();
+    globalThis.confirm = realConfirm;
+    await savedElsewhere;
+    await settle();
+    check('a link saved elsewhere while “pull anyway?” is open stops the pull: “Changed during pull — nothing was replaced; pull again.”',
+        agreed === 'Changed during pull — nothing was replaced; pull again.', agreed);
+    check('  the link and the unpushed edit are both kept', has(stored().roots, 'SAVED DURING THE QUESTION') && has(stored().roots, 'ALICE UNPUSHED')
+        && stored().dirty);
+
+    // Discard on a copy restored meanwhile.
+    await clearStashes();
+    ls.delete('tp_notes_parked_v1');
+    await otherPageLoads(null, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nDRAFT OF A COPY RESTORED MEANWHILE');
+    leaveNotes();
+    await OtherPage.switchAccount({ ...BOB, tenancyOwner: false });
+    await settle();
+    const listed = (await TreeStore.listStashes()).find(s => s.userId === null);
+    check('(the copy from before accounts is set aside, its draft parked)', listed && parked().some(d => d.content.includes('RESTORED MEANWHILE')));
+    await OtherPage.switchAccount({ ...ALICE, tenancyOwner: true, previousUsername: 'bob' });
+    await settle();
+    answers = [false];
+    promptAnswers = ['discard'];
+    await handleStashAction(listed, 'discard', null);
+    answers = [];
+    promptAnswers = [];
+    check('Discard on a copy the owner restored meanwhile discards nothing, and says so',
+        /no longer set aside.*Nothing was discarded/.test($('stash-status').textContent)
+        && TreeStore.status().owner.userId === 1 && TreeStore.status().restoredFrom.some(s => s.origin === 'pre-accounts'), $('stash-status').textContent);
+    await NV.openNotes();
+    await settle();
+    check('  its draft is not dropped: it comes back with the copy', $('noteContentInput').value.includes('DRAFT OF A COPY RESTORED MEANWHILE')
+        && parked().length === 0, JSON.stringify(parked()));
+    await discardDraft();
+    leaveNotes();
+
+    // Discard on a copy set aside again since, under the same key.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceUnpushed(), { dirty: true, editCount: 1 });
+    await settle();
+    await OtherPage.switchAccount({ ...BOB, tenancyOwner: false, previousUsername: 'alice' });
+    const first = (await TreeStore.listStashes()).find(s => s.userId === 1);
+    await sleep(5);
+    await OtherPage.switchAccount({ ...ALICE, previousUsername: 'bob' });
+    await OtherPage.createNode({ parentId: null, kind: 'folder', title: 'ALICE LATER EDIT', });
+    await OtherPage.flush();
+    await OtherPage.switchAccount({ ...BOB, tenancyOwner: false, previousUsername: 'alice' });
+    const again = (await TreeStore.listStashes()).find(s => s.userId === 1);
+    promptAnswers = ['alice'];
+    await handleStashAction(first, 'discard', null);
+    promptAnswers = [];
+    check('Discard on a copy set aside again since under the same key leaves that copy, with its later edit',
+        again && again.key === first.key && again.setAsideAt !== first.setAsideAt
+        && (await TreeStore.listStashes()).some(s => s.key === first.key) && has(stashWith('ALICE LATER EDIT'), 'ALICE UNPUSHED')
+        && /Nothing was discarded/.test($('stash-status').textContent), $('stash-status').textContent);
 }
 
 console.log(failures === 0 ? '\nAll notes-view account tests passed.\n' : `\n${failures} test(s) failed.\n`);

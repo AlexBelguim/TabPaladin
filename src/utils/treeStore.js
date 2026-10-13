@@ -46,6 +46,28 @@
 // stamps it was set aside under (`restoredFrom`): from before accounts, or at
 // the old address of a server that moved. What was left with it on this
 // device, such as a note draft, can then find its way back to it.
+//
+// Every extension page (the side panel, the app tab) runs its own instance of
+// this module over the one working copy in storage. So everything that reads
+// the copy and then replaces or re-stamps it — a pull, a push, switching
+// accounts, setting a copy aside, restoring or discarding one, and writing
+// edits — runs under one lock that all pages share (withCopyLock), and starts
+// by reading the copy from storage rather than trusting memory (reconcile):
+// another page's switch is seen even before its storage event arrives here.
+// Network waits happen outside the lock; what a pull or push saw before
+// waiting is checked again under it before anything is written, and when
+// the copy is another one now, or was edited meanwhile, nothing is replaced
+// or marked pushed (see copyToken/sameCopy). Callers that asked the user
+// about one copy pass that copy along (`expect`), so the answer is never
+// applied to another.
+//
+// Edits stay instant and in memory and are written on a short debounce,
+// under the same lock. Until written, each is also kept as a step that can be
+// applied again: when another page wrote this copy first (an edit, a pull, a
+// push), the steps are applied again on top of what it wrote; when another
+// page brought another copy in, they go to the copy they were made in, which
+// was set aside (adoptStored, saveOrphan). An edit is never written over
+// another page's copy, and never lost to one.
 
 import { ExpandState } from './expandState.js';
 
@@ -97,8 +119,16 @@ const state = {
     editCount: 0,       // local edits since the last pull or push, for "N unpushed edits"
     copyId: null,       // new each time another copy becomes the working copy (loadCopy)
     restoredFrom: [],   // stamps of the set-aside copies this one came back from, latest first (see stampOf)
-    rev: null           // stamp of the last write, to recognise our own storage events
+    rev: null,          // stamp of the stored version this memory holds (last write here or adopted)
+    seq: 0,             // that version's place in line: every write is one more than the one before
+    baseId: null        // new with each pull, push and copy: edits since then are this copy's own
 };
+
+// Edits made here and not written yet, each as a step that applies it again
+// (see recordEdit). Cleared by a write.
+let pendingOps = [];
+// How many writes from other pages this page has taken in.
+let adoptedWrites = 0;
 
 // Rebuilt after every change: node id -> { node, parent (node|null), index }.
 let index = new Map();
@@ -134,19 +164,33 @@ async function applyPendingRemovals() {
         return;
     }
     if (!list.length) return;
-    let removed = 0;
-    for (const id of list) {
-        const e = index.get(String(id));
-        if (!e || inVirtual(id)) continue;
-        detach(id);
-        removed++;
-    }
+    const step = removeStep(list.map(String));
+    const removed = step();
     try { await api.storage.local.remove(PENDING_REMOVALS_KEY); } catch (e) { /* retried next load */ }
     if (removed) {
-        reindex();
-        markDirty();
+        recordEdit(step);
         emit('removed');
     }
+}
+
+// The copy as stored (or as another page's storage event carries it) into
+// memory.
+function applyStored(stored) {
+    state.baseVersion = Number(stored.baseVersion) || 0;
+    state.roots = Array.isArray(stored.roots) ? stored.roots : [];
+    state.dirty = Boolean(stored.dirty);
+    state.lastSyncAt = stored.lastSyncAt || null;
+    state.lastSyncKind = stored.lastSyncKind || null;
+    state.owner = stored.owner || null;
+    state.origin = originOf(stored);
+    state.editCount = Number(stored.editCount) || (state.dirty ? 1 : 0);
+    state.copyId = stored.copyId || null;
+    state.restoredFrom = stampsIn(stored.restoredFrom);
+    state.rev = stored.rev || null;
+    state.seq = Number(stored.seq) || 0;
+    state.baseId = stored.baseId || null;
+    state.loaded = true;
+    reindex();
 }
 
 let loadPromise = null;
@@ -156,29 +200,58 @@ async function ensureLoaded() {
         loadPromise = (async () => {
             const data = await api.storage.local.get(STORE_KEY);
             const stored = data && data[STORE_KEY];
-            if (stored && Array.isArray(stored.roots)) {
-                state.baseVersion = Number(stored.baseVersion) || 0;
-                state.roots = stored.roots;
-                state.dirty = Boolean(stored.dirty);
-                state.lastSyncAt = stored.lastSyncAt || null;
-                state.lastSyncKind = stored.lastSyncKind || null;
-                state.owner = stored.owner || null;
-                state.origin = originOf(stored);
-                state.editCount = Number(stored.editCount) || (state.dirty ? 1 : 0);
-                state.copyId = stored.copyId || null;
-                state.restoredFrom = stampsIn(stored.restoredFrom);
-                state.rev = stored.rev || null;
-            } else {
-                // Nothing here yet: whatever is made before someone signs in
-                // belongs to nobody so far.
-                state.origin = 'local';
+            // A storage event may have brought a later version meanwhile.
+            if (!state.loaded) {
+                if (stored && Array.isArray(stored.roots)) {
+                    applyStored(stored);
+                } else {
+                    // Nothing here yet: whatever is made before someone signs
+                    // in belongs to nobody so far.
+                    state.origin = 'local';
+                    reindex();
+                    state.loaded = true;
+                }
             }
-            reindex();
-            state.loaded = true;
             await applyPendingRemovals();
         })();
     }
     return loadPromise;
+}
+
+// --- The lock, and writing --------------------------------------------------
+
+const LOCK_NAME = 'tp-working-copy';
+let lockChain = Promise.resolve();
+
+// Run `fn` holding the working-copy lock. Web Locks are shared by every page
+// of the extension, in Chrome and Firefox alike; where they are missing, a
+// promise chain still keeps this page's own operations in line. Not
+// re-entrant: nothing that runs under the lock may ask for it again.
+function withCopyLock(fn) {
+    const locks = typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
+        ? navigator.locks : null;
+    if (locks) return locks.request(LOCK_NAME, () => fn());
+    const run = lockChain.then(() => fn());
+    lockChain = run.catch(() => {});
+    return run;
+}
+
+function record() {
+    return {
+        baseVersion: state.baseVersion,
+        roots: state.roots,
+        dirty: state.dirty,
+        lastSyncAt: state.lastSyncAt,
+        lastSyncKind: state.lastSyncKind,
+        owner: state.owner,
+        origin: state.owner ? null : state.origin,
+        editCount: state.editCount,
+        copyId: state.copyId,
+        restoredFrom: state.restoredFrom,
+        rev: state.rev,
+        seq: state.seq,
+        baseId: state.baseId
+    };
 }
 
 // Persist with a small debounce so a burst of edits (recreating a folder,
@@ -186,34 +259,139 @@ async function ensureLoaded() {
 let persistTimer = null;
 function schedulePersist() {
     if (persistTimer) return;
-    persistTimer = setTimeout(persistNow, 150);
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        withCopyLock(reconcile).catch((e) => console.warn('[TabPaladin] Failed to persist tree', e));
+    }, 150);
 }
 
-async function persistNow() {
-    persistTimer = null;
+// Write the copy in memory. Under the lock only, after reconcile: what it
+// replaces in storage is then what this page last saw there.
+async function writeCopy() {
+    if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+    }
+    const ops = pendingOps;
+    const prev = { rev: state.rev, seq: state.seq };
+    pendingOps = [];
     state.rev = newId();
+    state.seq = prev.seq + 1;
     try {
-        await api.storage.local.set({
-            [STORE_KEY]: {
-                baseVersion: state.baseVersion,
-                roots: state.roots,
-                dirty: state.dirty,
-                lastSyncAt: state.lastSyncAt,
-                lastSyncKind: state.lastSyncKind,
-                owner: state.owner,
-                origin: state.owner ? null : state.origin,
-                editCount: state.editCount,
-                copyId: state.copyId,
-                restoredFrom: state.restoredFrom,
-                rev: state.rev
-            }
-        });
+        await api.storage.local.set({ [STORE_KEY]: record() });
     } catch (e) {
+        // Not written, so still this page's to write.
+        state.rev = prev.rev;
+        state.seq = prev.seq;
+        pendingOps = [...ops, ...pendingOps];
         console.warn('[TabPaladin] Failed to persist tree', e);
     }
 }
 
-// Another context (background vs. app page) wrote the tree — adopt its copy.
+// Bring this page up to the copy in storage before acting on it — another
+// page may have written it, or brought another copy in, and its storage event
+// may not have arrived yet — then write this page's own unwritten edits.
+// Under the lock only.
+async function reconcile() {
+    await ensureLoaded();
+    let stored = null;
+    try {
+        const data = await api.storage.local.get(STORE_KEY);
+        stored = (data && data[STORE_KEY]) || null;
+    } catch (e) { /* storage unreadable: memory is all there is */ }
+    if (stored && (stored.rev || null) !== state.rev) {
+        const orphan = adoptStored(stored);
+        if (orphan) await saveOrphan(orphan);
+    }
+    if (pendingOps.length) await writeCopy();
+}
+
+// Take in a version of the copy that another page wrote. This page's
+// unwritten edits are made again on top of it when it is the same copy; when
+// it is another copy, they belong to the one they were made in, and come back
+// for saveOrphan to put with it. Listeners hear 'switch' for another copy,
+// as the page that brought it in did, and 'external' otherwise.
+function adoptStored(stored) {
+    const switched = state.loaded && (stored.copyId || null) !== state.copyId;
+    const ops = pendingOps;
+    pendingOps = [];
+    if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+    }
+    const orphan = switched && ops.length ? { copyId: state.copyId, rev: state.rev, ops, copy: record() } : null;
+    applyStored(stored);
+    adoptedWrites++;
+    if (!switched && ops.length) {
+        const { kept, applied } = replay(ops);
+        pendingOps = kept;
+        if (applied) {
+            state.dirty = true;
+            state.editCount += applied;
+        }
+        if (kept.length) schedulePersist();
+    }
+    emit(switched ? 'switch' : 'external');
+    return orphan;
+}
+
+// Make these edits again on the tree in state now. Returns those that changed
+// something, and how many of them count as edits.
+function replay(ops) {
+    const kept = [];
+    let applied = 0;
+    for (const op of ops) {
+        let changed = false;
+        try { changed = op.step() !== false; } catch (e) { changed = false; }
+        if (!changed) continue;
+        kept.push(op);
+        if (op.dirty) applied++;
+    }
+    reindex();
+    return { kept, applied };
+}
+
+// The same, on another tree (a set-aside copy's), leaving state as it was.
+function replayOnto(roots, ops) {
+    const saved = { roots: state.roots, index };
+    state.roots = roots;
+    reindex();
+    try {
+        const { applied } = replay(ops);
+        return { roots: state.roots, applied };
+    } finally {
+        state.roots = saved.roots;
+        index = saved.index;
+    }
+}
+
+// Edits made here to a copy that another page has since set aside go to that
+// copy where it waits (the set-aside copy made from it), or, when it is not
+// there any more, into a set-aside copy of their own: never into the copy
+// that came in, and never dropped. Under the lock only.
+async function saveOrphan(orphan) {
+    const keys = await stashIndex();
+    const data = keys.length ? await api.storage.local.get(keys) : {};
+    const key = keys.find(k => data[k] && orphan.copyId && data[k].copyId === orphan.copyId)
+        || keys.find(k => data[k] && orphan.rev && data[k].fromRev === orphan.rev);
+    if (key) {
+        const stash = data[key];
+        const { roots, applied } = replayOnto(Array.isArray(stash.roots) ? stash.roots : [], orphan.ops);
+        await api.storage.local.set({
+            [key]: {
+                ...stash,
+                roots,
+                dirty: Boolean(stash.dirty) || applied > 0,
+                editCount: (Number(stash.editCount) || 0) + applied
+            }
+        });
+        return key;
+    }
+    const settings = await readSettings();
+    return writeStash(orphan.copy, { fallbackUrl: (settings.backend && settings.backend.url) || '' });
+}
+
+// Another page wrote the tree, or brought another copy in: take it in.
 if (api.storage && api.storage.onChanged) {
     api.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local') return;
@@ -223,31 +401,103 @@ if (api.storage && api.storage.onChanged) {
         }
         if (!changes[STORE_KEY]) return;
         const next = changes[STORE_KEY].newValue;
-        if (!next || next.rev === state.rev) return;
-        // Another page brought another account's copy in: the same 'switch'
-        // its own listeners heard.
-        const switched = state.loaded && (next.copyId || null) !== state.copyId;
-        state.baseVersion = Number(next.baseVersion) || 0;
-        state.roots = Array.isArray(next.roots) ? next.roots : [];
-        state.dirty = Boolean(next.dirty);
-        state.lastSyncAt = next.lastSyncAt || null;
-        state.lastSyncKind = next.lastSyncKind || null;
-        state.owner = next.owner || null;
-        state.origin = originOf(next);
-        state.editCount = Number(next.editCount) || 0;
-        state.copyId = next.copyId || null;
-        state.restoredFrom = stampsIn(next.restoredFrom);
-        state.rev = next.rev || null;
-        state.loaded = true;
-        reindex();
-        emit(switched ? 'switch' : 'external');
+        if (!next || (next.rev || null) === state.rev) return;
+        // Older than what this page already read from storage under the lock:
+        // the event arrived after that read.
+        if (Number(next.seq) > 0 && Number(next.seq) < state.seq) return;
+        const orphan = adoptStored(next);
+        if (orphan) {
+            withCopyLock(() => saveOrphan(orphan))
+                .catch((e) => console.warn('[TabPaladin] Could not keep edits to a copy set aside elsewhere', e));
+        }
     });
 }
 
-function markDirty() {
-    state.dirty = true;
-    state.editCount++;
+// --- Edits, kept as steps until written ----------------------------------------
+//
+// Each edit is made at once, and also kept as a step that makes it again on
+// whatever tree is in state.roots when the step runs: this copy as another
+// page wrote it, or the set-aside copy it was made in (see adoptStored). A
+// step says whether it changed anything; what is no longer there is skipped,
+// and a new item whose folder is gone is kept at the top level, not dropped.
+
+const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+
+function clampAt(at, length) {
+    return (at === undefined || at === null || at < 0 || at > length) ? length : at;
+}
+
+function recordEdit(step, { dirty = true } = {}) {
+    pendingOps.push({ step, dirty });
+    if (dirty) {
+        state.dirty = true;
+        state.editCount++;
+    }
     schedulePersist();
+}
+
+function insertStep(node, parentId, at) {
+    const saved = clone(node);
+    return () => {
+        if (index.has(saved.id)) return false;
+        const top = isTopLevelParent(parentId);
+        const parent = top ? null : index.get(String(parentId));
+        const intoParent = Boolean(parent) && parent.node.kind === 'folder' && !inVirtual(parent.node.id);
+        const siblings = intoParent ? (parent.node.children = parent.node.children || []) : state.roots;
+        siblings.splice(top || intoParent ? clampAt(at, siblings.length) : siblings.length, 0, clone(saved));
+        reindex();
+        return true;
+    };
+}
+
+function changeStep(id, apply) {
+    return () => {
+        const e = index.get(String(id));
+        if (!e || inVirtual(id)) return false;
+        apply(e.node);
+        return true;
+    };
+}
+
+function moveStep(id, parentId, at) {
+    return () => {
+        const e = index.get(String(id));
+        if (!e || inVirtual(id)) return false;
+        let siblings = state.roots;
+        if (!isTopLevelParent(parentId)) {
+            const p = index.get(String(parentId));
+            if (!p || p.node.kind !== 'folder' || inVirtual(parentId)) return false;
+            for (let q = p; q; q = q.parent ? index.get(q.parent.id) : null) {
+                if (q.node.id === e.node.id) return false;
+            }
+            siblings = p.node.children = p.node.children || [];
+        }
+        detach(id);
+        siblings.splice(clampAt(at, siblings.length), 0, e.node);
+        reindex();
+        return true;
+    };
+}
+
+// Removes the items with these ids: the user's own, or with `virtual` only
+// rows of the imports archive.
+function removeStep(ids, { virtual = false } = {}) {
+    return () => {
+        let n = 0;
+        for (const id of ids) {
+            if (!index.has(String(id)) || inVirtual(id) !== virtual) continue;
+            detach(id);
+            n++;
+        }
+        if (n) reindex();
+        return n > 0;
+    };
+}
+
+function applyFields(node, { title, url, payload }) {
+    if (title !== undefined) node.title = String(title);
+    if (url !== undefined && node.kind === 'bookmark') node.url = String(url);
+    if (payload !== undefined) node.payload = payload;
 }
 
 // --- Lookup helpers ---------------------------------------------------------
@@ -336,10 +586,9 @@ function makeNode({ kind, title, url, payload, role }) {
 
 function insertNode(node, parentId, at) {
     const siblings = siblingsOf(parentId);
-    const idx = (at === undefined || at === null || at < 0 || at > siblings.length) ? siblings.length : at;
-    siblings.splice(idx, 0, node);
+    siblings.splice(clampAt(at, siblings.length), 0, node);
     reindex();
-    markDirty();
+    recordEdit(insertStep(node, parentId, at));
     emit('created');
     return node;
 }
@@ -422,9 +671,11 @@ function originOf(stored) {
     return stored && stored.owner ? null : (stored && stored.origin) || 'pre-accounts';
 }
 
-function ownerFrom(config, userId, serverId = null) {
-    if (userId === undefined || userId === null) return state.owner;
-    const prev = state.owner && Number(state.owner.userId) === Number(userId) ? state.owner : null;
+// The account a pull or push answered for, keeping what `current` (the copy's
+// stamp) knew of it. A server too old to say keeps `current`.
+function ownerFrom(config, userId, serverId = null, current = state.owner) {
+    if (userId === undefined || userId === null) return current;
+    const prev = current && Number(current.userId) === Number(userId) ? current : null;
     return {
         url: trim(config.url),
         userId: Number(userId),
@@ -481,10 +732,10 @@ const stashKeyFor = (owner, url) => STASH_PREFIX + `${trim(owner ? owner.url : u
 // accounts only when they are the server's owner, which /api/auth/me says.
 // When it does not answer, nothing is set aside on a guess and nothing is
 // pulled: the caller says so and the user tries again.
-async function pullPlan(config, owner) {
+async function pullPlan(config, owner, copy) {
     if (!owner) return 'into';
-    if (state.owner) return sameAccount(state.owner, owner) ? 'into' : 'aside';
-    if (state.origin === 'local' || !(state.roots.length > 0 || state.dirty)) return 'into';
+    if (copy.owner) return sameAccount(copy.owner, owner) ? 'into' : 'aside';
+    if (copy.origin === 'local' || (copy.isEmpty && !copy.dirty)) return 'into';
     let me = null;
     try {
         me = await apiFetch(config, '/api/auth/me');
@@ -496,26 +747,46 @@ async function pullPlan(config, owner) {
     return user.tenancyOwner ? 'into' : 'aside';
 }
 
-// The working copy as a pull found it. Another page can bring another
-// account's copy in (or stamp this one) while the pull waits on the server;
-// the pull then writes nothing, since what it decided was about a copy that
-// is no longer here.
-function currentCopy() {
-    return { copyId: state.copyId, owner: state.owner };
+// The working copy as an operation found it, read under the lock: which copy,
+// whose, and which version of it. A pull or push holds on to it across its
+// network wait and checks it again before writing; callers that asked the
+// user about a copy hand it back (`expect`), so that the answer is applied
+// to that copy and no other.
+function copyToken() {
+    return {
+        copyId: state.copyId,
+        owner: state.owner ? { ...state.owner } : null,
+        origin: state.owner ? null : state.origin,
+        rev: state.rev,
+        seq: state.seq,
+        baseId: state.baseId,
+        baseVersion: state.baseVersion,
+        editCount: state.editCount,
+        dirty: state.dirty,
+        isEmpty: state.roots.length === 0,
+        adopted: adoptedWrites
+    };
 }
 
-function stillCopy(copy) {
-    if (state.copyId !== copy.copyId) return false;
-    if (!state.owner || !copy.owner) return !state.owner && !copy.owner;
-    return sameAccount(state.owner, copy.owner);
+// Two tokens for the same copy: the same copyId, stamped with the same
+// account, or both unstamped. Another page bringing another copy in gives it
+// a new copyId; stamping an unstamped one (claimed, adopted) changes its owner.
+function sameCopy(a, b) {
+    if (!a || !b || (a.copyId || null) !== (b.copyId || null)) return false;
+    if (!a.owner || !b.owner) return !a.owner && !b.owner;
+    return sameAccount(a.owner, b.owner);
 }
 
-// Why a pull stopped without changing anything. `code` is for callers;
+// Why an operation stopped without changing anything. `code` is for callers;
 // the message is for the user.
-function pullStopped(code, setAside = null) {
-    const err = new Error(code === 'account-changed'
-        ? 'Account changed during pull — nothing was replaced.'
-        : 'Couldn’t confirm the account — try again. Nothing was changed.');
+const STOPPED = {
+    'account-changed': 'Account changed during pull — nothing was replaced.',
+    'edited-during-pull': 'Changed during pull — nothing was replaced; pull again.',
+    'account-unconfirmed': 'Couldn’t confirm the account — try again. Nothing was changed.'
+};
+
+function stopped(code, message = STOPPED[code], setAside = null) {
+    const err = new Error(message);
     err.code = code;
     err.setAside = setAside;
     return err;
@@ -573,8 +844,11 @@ function countItems(roots) {
 // folders and which of its folder cards are open (both hold this account's
 // item ids, and ExpandState prunes ids the next account's tree lacks) and any
 // tab-close removals still queued. Never overwrites an earlier stash. Returns
-// its key, or null when there was nothing to keep.
+// its key, or null when there was nothing to keep. Under the lock only.
 async function stashCurrent({ fallbackUrl, username = null } = {}) {
+    // What is set aside is what is stored: the version another page's
+    // unwritten edits go looking for (saveOrphan).
+    if (pendingOps.length) await writeCopy();
     if (!state.roots.length && !state.dirty) return null;
     const settings = await readSettings();
     let pendingRemovals = [];
@@ -583,30 +857,42 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
     } catch (e) { /* nothing queued */ }
     let expanded = {};
     try { expanded = await ExpandState.entriesFor((id) => index.has(id)); } catch (e) { /* UI state only */ }
+    const key = await writeStash(record(), {
+        fallbackUrl, username, focusedFolderIds: settings.focusedFolderIds || [], expanded, pendingRemovals
+    });
+    if (pendingRemovals.length) await api.storage.local.remove(PENDING_REMOVALS_KEY);
+    return key;
+}
+
+// A set-aside copy of `copy` (as record() gives it). It says which copy it was
+// made from, and from which stored version of it, for saveOrphan.
+async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [] } = {}) {
     const keys = await stashIndex();
-    let key = stashKeyFor(state.owner, fallbackUrl);
-    if (keys.includes(key)) key += '#' + Date.now();
-    const owner = state.owner ? { ...state.owner, username: state.owner.username || username } : null;
+    const base = stashKeyFor(copy.owner, fallbackUrl);
+    let key = base;
+    for (let n = 0; keys.includes(key); n++) key = `${base}#${Date.now()}${n ? `-${n}` : ''}`;
+    const owner = copy.owner ? { ...copy.owner, username: copy.owner.username || username } : null;
     await api.storage.local.set({
         [key]: {
-            roots: state.roots,
-            baseVersion: state.baseVersion,
-            dirty: state.dirty,
-            editCount: state.editCount,
-            lastSyncAt: state.lastSyncAt,
+            roots: copy.roots,
+            baseVersion: copy.baseVersion,
+            dirty: copy.dirty,
+            editCount: copy.editCount,
+            lastSyncAt: copy.lastSyncAt,
             owner,
-            origin: owner ? null : state.origin,
+            origin: owner ? null : copy.origin,
             url: trim(owner ? owner.url : fallbackUrl),
             username: owner ? owner.username : username,
             setAsideAt: new Date().toISOString(),
-            focusedFolderIds: settings.focusedFolderIds || [],
+            focusedFolderIds,
             expanded,
             pendingRemovals,
-            restoredFrom: state.restoredFrom
+            restoredFrom: copy.restoredFrom,
+            copyId: copy.copyId || null,
+            fromRev: copy.rev || null
         },
         [STASH_INDEX_KEY]: [...keys, key]
     });
-    if (pendingRemovals.length) await api.storage.local.remove(PENDING_REMOVALS_KEY);
     return key;
 }
 
@@ -643,10 +929,16 @@ async function takeStashFor(target, { legacy = false } = {}) {
 // stamp it was set aside under, so the copy it becomes still knows it once
 // stamped `owner` — the server's owner adopting a copy from before accounts,
 // or an account restoring its copy from a server's old address. Returns the
-// copy it made (see currentCopy).
+// copy it made (see copyToken). Under the lock only.
 async function loadCopy(stash, owner) {
-    const copy = { copyId: newId(), owner };
-    state.copyId = copy.copyId;
+    // Edits made here to the outgoing copy after it was set aside go with it.
+    const orphan = pendingOps.length ? { copyId: state.copyId, rev: state.rev, ops: pendingOps, copy: record() } : null;
+    pendingOps = [];
+    if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+    }
+    state.copyId = newId();
     state.roots = stash ? stash.roots || [] : [];
     state.baseVersion = stash ? Number(stash.baseVersion) || 0 : 0;
     state.dirty = stash ? Boolean(stash.dirty) : false;
@@ -656,7 +948,9 @@ async function loadCopy(stash, owner) {
     state.owner = owner;
     state.origin = null;
     state.restoredFrom = stash ? stampsIn([stampOf(stash), ...stampsIn(stash.restoredFrom)]) : [];
+    state.baseId = newId();
     reindex();
+    if (orphan) await saveOrphan(orphan);
     const settings = await readSettings();
     await api.storage.local.set({ [SETTINGS_KEY]: { ...settings, focusedFolderIds: stash ? stash.focusedFolderIds || [] : [] } });
     if (stash && stash.expanded) {
@@ -666,9 +960,9 @@ async function loadCopy(stash, owner) {
         await api.storage.local.set({ [PENDING_REMOVALS_KEY]: stash.pendingRemovals });
         await applyPendingRemovals();
     }
-    await persistNow();
+    await writeCopy();
     emit('switch');
-    return copy;
+    return copyToken();
 }
 
 function htmlEscape(s) {
@@ -799,8 +1093,24 @@ export const TreeStore = {
     // the page before the timer fires.
     async flush() {
         await ensureLoaded();
-        if (persistTimer) clearTimeout(persistTimer);
-        await persistNow();
+        await withCopyLock(reconcile);
+    },
+
+    // The working copy as it is in storage now, with this page's edits
+    // written: a token to hand back as `expect` to sync.pull, sync.push and
+    // setAsideAndReset, so that they act on this copy or stop.
+    async currentCopy() {
+        await ensureLoaded();
+        return withCopyLock(async () => {
+            await reconcile();
+            return copyToken();
+        });
+    },
+
+    // Are two tokens (from currentCopy, or carried by a result or an error)
+    // the same copy? See sameCopy.
+    sameCopy(a, b) {
+        return sameCopy(a, b);
     },
 
     status() {
@@ -837,47 +1147,60 @@ export const TreeStore = {
     // asks first when it holds edits); a copy from before accounts is adopted
     // when this account is the server's tenancy owner; otherwise the copy is
     // set aside (never discarded) and this account's own set-aside copy comes
-    // back, or an empty one ready to pull.
-    // Returns {action: 'same'|'claimed'|'adopted'|'restored'|'fresh', setAside}.
+    // back, or an empty one ready to pull. Decided on the copy as stored
+    // now, under the lock, whatever another page did since this page asked.
+    // Returns {action: 'same'|'claimed'|'adopted'|'restored'|'fresh', setAside, copy}.
     async switchAccount({ url, userId, username = null, serverId = null, tenancyOwner = false, previousUsername = null }) {
         await ensureLoaded();
-        await applyPendingRemovals();
-        const target = accountOf({ url, userId, username, serverId });
-        if (state.owner && sameAccount(state.owner, target)) {
-            const next = {
-                ...state.owner,
-                username: username || state.owner.username,
-                serverId: state.owner.serverId || target.serverId
-            };
-            if (next.username !== state.owner.username || next.serverId !== state.owner.serverId) {
-                state.owner = next;
-                await persistNow();
+        return withCopyLock(async () => {
+            await reconcile();
+            await applyPendingRemovals();
+            const target = accountOf({ url, userId, username, serverId });
+            if (state.owner && sameAccount(state.owner, target)) {
+                const next = {
+                    ...state.owner,
+                    username: username || state.owner.username,
+                    serverId: state.owner.serverId || target.serverId
+                };
+                if (next.username !== state.owner.username || next.serverId !== state.owner.serverId || pendingOps.length) {
+                    state.owner = next;
+                    await writeCopy();
+                }
+                return { action: 'same', setAside: null, copy: copyToken() };
             }
-            return { action: 'same', setAside: null };
-        }
-        if (!state.owner && (state.origin === 'local' || tenancyOwner)) {
-            const action = state.origin === 'local' ? 'claimed' : 'adopted';
-            state.owner = target;
-            state.origin = null;
-            await persistNow();
-            return { action, setAside: null };
-        }
-        const setAside = await stashCurrent({ fallbackUrl: target.url, username: previousUsername });
-        const restored = await takeStashFor(target)
-            || (tenancyOwner ? await takeStashFor(target, { legacy: true }) : null);
-        await loadCopy(restored, target);
-        return { action: restored ? 'restored' : 'fresh', setAside };
+            if (!state.owner && (state.origin === 'local' || tenancyOwner)) {
+                const action = state.origin === 'local' ? 'claimed' : 'adopted';
+                state.owner = target;
+                state.origin = null;
+                await writeCopy();
+                return { action, setAside: null, copy: copyToken() };
+            }
+            const setAside = await stashCurrent({ fallbackUrl: target.url, username: previousUsername });
+            const restored = await takeStashFor(target)
+                || (tenancyOwner ? await takeStashFor(target, { legacy: true }) : null);
+            const copy = await loadCopy(restored, target);
+            return { action: restored ? 'restored' : 'fresh', setAside, copy };
+        });
     },
 
     // Set this copy aside and start an empty one for the signed-in account,
     // ready to pull. The answer to a 412: never pull over the copy (that
     // discards it) and never force it (that writes it into this account).
-    async setAsideAndReset({ url, userId, username = null, serverId = null }) {
+    // With `expect`, only that copy: when another page has brought another
+    // one in, nothing is set aside (err.code 'account-changed').
+    // Returns {setAside, copy}: copy is the new one, for sync.pull's expect.
+    async setAsideAndReset({ url, userId, username = null, serverId = null, expect = null }) {
         await ensureLoaded();
-        await applyPendingRemovals();
-        const setAside = await stashCurrent({ fallbackUrl: url });
-        await loadCopy(null, accountOf({ url, userId, username, serverId }));
-        return { setAside };
+        return withCopyLock(async () => {
+            await reconcile();
+            if (expect && !sameCopy(copyToken(), expect)) {
+                throw stopped('account-changed', 'Account changed — nothing was set aside.');
+            }
+            await applyPendingRemovals();
+            const setAside = await stashCurrent({ fallbackUrl: url });
+            const copy = await loadCopy(null, accountOf({ url, userId, username, serverId }));
+            return { setAside, copy };
+        });
     },
 
     // With `account`, each copy also says whether that account may restore
@@ -913,21 +1236,34 @@ export const TreeStore = {
     // set aside in its place, so a restore never discards anything either.
     async restoreStash(key, { url, userId, username = null, serverId = null, tenancyOwner = false }, { moved = false } = {}) {
         await ensureLoaded();
-        const data = await api.storage.local.get(key);
-        const stash = data && data[key];
-        if (!stash) throw new Error('That set-aside copy is gone.');
-        const target = accountOf({ url, userId, username, serverId });
-        const match = stashMatch(stash, { ...target, tenancyOwner });
-        if (!match || (match === 'moved' && !moved)) throw new Error('Sign in as the account this copy belongs to first.');
-        await applyPendingRemovals();
-        const setAside = await stashCurrent({ fallbackUrl: target.url });
-        await takeStash(key);
-        await loadCopy(stash, target);
-        return { setAside };
+        return withCopyLock(async () => {
+            await reconcile();
+            const data = await api.storage.local.get(key);
+            const stash = data && data[key];
+            if (!stash) throw new Error('That set-aside copy is gone.');
+            const target = accountOf({ url, userId, username, serverId });
+            const match = stashMatch(stash, { ...target, tenancyOwner });
+            if (!match || (match === 'moved' && !moved)) throw new Error('Sign in as the account this copy belongs to first.');
+            await applyPendingRemovals();
+            const setAside = await stashCurrent({ fallbackUrl: target.url });
+            await takeStash(key);
+            const copy = await loadCopy(stash, target);
+            return { setAside, copy };
+        });
     },
 
-    async discardStash(key) {
-        await takeStash(key);
+    // Discard a set-aside copy for good. With `setAsideAt` (as listStashes
+    // gave it), only the copy that was listed: not one set aside under the
+    // same key since. Says whether it removed anything — the copy may have
+    // been restored meanwhile, in this page or another.
+    async discardStash(key, { setAsideAt = null } = {}) {
+        await ensureLoaded();
+        return withCopyLock(async () => {
+            const data = await api.storage.local.get(key);
+            const stash = data && data[key];
+            if (!stash || (setAsideAt && stash.setAsideAt !== setAsideAt)) return false;
+            return Boolean(await takeStash(key));
+        });
     },
 
     async exportStashHtml(key) {
@@ -978,10 +1314,9 @@ export const TreeStore = {
         await ensureLoaded();
         assertWritable(id);
         const e = entry(id);
-        if (title !== undefined) e.node.title = String(title);
-        if (url !== undefined && e.node.kind === 'bookmark') e.node.url = String(url);
-        if (payload !== undefined) e.node.payload = payload;
-        markDirty();
+        applyFields(e.node, { title, url, payload });
+        const saved = clone({ title, url, payload });
+        recordEdit(changeStep(id, (node) => applyFields(node, clone(saved))));
         emit('changed');
         return e.node;
     },
@@ -1002,10 +1337,9 @@ export const TreeStore = {
         detach(id);
         reindex();
         const siblings = siblingsOf(parentId);
-        const idx = (at === undefined || at === null || at < 0 || at > siblings.length) ? siblings.length : at;
-        siblings.splice(idx, 0, e.node);
+        siblings.splice(clampAt(at, siblings.length), 0, e.node);
         reindex();
-        markDirty();
+        recordEdit(moveStep(String(id), parentId, at));
         emit('moved');
         return e.node;
     },
@@ -1015,7 +1349,7 @@ export const TreeStore = {
         assertWritable(id);
         detach(id);
         reindex();
-        markDirty();
+        recordEdit(removeStep([String(id)]));
         emit('removed');
     },
 
@@ -1039,71 +1373,126 @@ export const TreeStore = {
         // it is signed in as), the copy is set aside here and the tree comes
         // into a new one — `setAside` is its stash key.
         //
-        // Two ways it stops having written nothing, rejecting with err.code:
-        // 'account-changed' when another page brought another copy in while
-        // it waited on the server (that copy is never replaced), and
+        // It replaces only the copy it started on, as it was then: with
+        // `expect` (a token from currentCopy), the copy the caller asked the
+        // user about. Otherwise it stops having written nothing, rejecting
+        // with err.code: 'account-changed' when another copy came in (in this
+        // page or another; that copy is never replaced), 'edited-during-pull'
+        // when the copy was edited, pulled or pushed while the pull waited (an
+        // edit made after Pull was pressed is never discarded), and
         // 'account-unconfirmed' when whose copy this is was the server's to
         // say and it did not answer (the copy is never set aside on a guess).
-        async pull(config) {
+        // Returns {version, setAside, copy}.
+        async pull(config, { expect = null } = {}) {
             await ensureLoaded();
-            const started = currentCopy();
+            const started = await withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (expect && !sameCopy(now, expect)) throw stopped('account-changed');
+                if (expect && expect.rev !== now.rev) throw stopped('edited-during-pull');
+                return now;
+            });
             const body = await apiFetch(config, '/api/tree');
-            if (!stillCopy(started)) throw pullStopped('account-changed');
-            const owner = ownerFrom(config, body.userId, body.serverId);
-            const plan = await pullPlan(config, owner);
-            if (!stillCopy(started)) throw pullStopped('account-changed');
-            if (plan === 'unconfirmed') throw pullStopped('account-unconfirmed');
-            let setAside = null;
-            if (plan === 'aside') {
-                await applyPendingRemovals();
-                if (!stillCopy(started)) throw pullStopped('account-changed');
-                setAside = await stashCurrent({ fallbackUrl: owner.url });
-                // The copy is in its stash now. If another one came in
-                // meanwhile, no fresh copy replaces it.
-                if (!stillCopy(started)) throw pullStopped('account-changed', setAside);
-                const fresh = await loadCopy(null, owner);
-                if (!stillCopy(fresh)) throw pullStopped('account-changed', setAside);
-            }
-            state.roots = Array.isArray(body.roots) ? body.roots : [];
-            state.baseVersion = Number(body.version) || 0;
-            state.dirty = false;
-            state.editCount = 0;
-            state.owner = owner;
-            state.lastSyncAt = new Date().toISOString();
-            state.lastSyncKind = 'pull';
-            reindex();
-            await persistNow();
-            emit('pull');
-            return { version: state.baseVersion, setAside };
+            const owner = ownerFrom(config, body.userId, body.serverId, started.owner);
+            const plan = await pullPlan(config, owner, started);
+            return withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (!sameCopy(now, started)) throw stopped('account-changed');
+                if (now.rev !== started.rev) throw stopped('edited-during-pull');
+                if (plan === 'unconfirmed') throw stopped('account-unconfirmed');
+                let setAside = null;
+                if (plan === 'aside') {
+                    await applyPendingRemovals();
+                    setAside = await stashCurrent({ fallbackUrl: owner.url });
+                    await loadCopy(null, owner);
+                }
+                // Anything edited here since (only while the copy was being
+                // set aside) is the new copy's, and stays on top.
+                const ops = pendingOps;
+                pendingOps = [];
+                state.roots = Array.isArray(body.roots) ? body.roots : [];
+                state.baseVersion = Number(body.version) || 0;
+                state.dirty = false;
+                state.editCount = 0;
+                state.owner = owner;
+                state.lastSyncAt = new Date().toISOString();
+                state.lastSyncKind = 'pull';
+                state.baseId = newId();
+                reindex();
+                if (ops.length) {
+                    const { kept, applied } = replay(ops);
+                    pendingOps = kept;
+                    state.dirty = applied > 0;
+                    state.editCount = applied;
+                }
+                await writeCopy();
+                emit('pull');
+                return { version: state.baseVersion, setAside, copy: copyToken() };
+            });
         },
 
         // Replace the server's tree with the working copy. Refused with a
         // conflict error when the server moved on since our last pull, and
         // with a 412 (err.code) when the copy belongs to another account —
         // which the server checks against baseUserId, baseServerId and the
-        // pushed ids.
-        async push(config, { force = false } = {}) {
+        // pushed ids. Either error carries `copy`: the copy that was refused,
+        // for the caller's answer (pull theirs, force, set aside) to go to it
+        // and no other.
+        //
+        // With `expect`, only that copy is pushed: when another one came in,
+        // nothing is (err.code 'account-changed'). What the server says is
+        // only ever applied to the copy that was pushed: when another copy is
+        // here by then, or this one was pulled or pushed elsewhere meanwhile,
+        // it is left as it is (`left` says why); edits made to it during the
+        // push stay unpushed edits, on top of the version pushed.
+        // Returns {version, copy, left, message}.
+        async push(config, { force = false, expect = null } = {}) {
             await ensureLoaded();
-            const body = await apiFetch(config, '/api/tree', {
-                method: 'PUT',
-                body: JSON.stringify({
+            const started = await withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (expect && !sameCopy(now, expect)) throw stopped('account-changed', 'Account changed — nothing was pushed.');
+                const payload = JSON.stringify({
                     roots: stripVirtual(state.roots),
                     baseVersion: state.baseVersion,
                     ...(state.owner ? { baseUserId: state.owner.userId } : {}),
                     ...(state.owner && state.owner.serverId ? { baseServerId: state.owner.serverId } : {}),
                     deviceId: 'extension',
                     force
-                })
+                });
+                return { copy: now, payload };
             });
-            state.baseVersion = Number(body.version) || state.baseVersion + 1;
-            state.dirty = false;
-            state.editCount = 0;
-            state.owner = ownerFrom(config, body.userId, body.serverId);
-            state.lastSyncAt = new Date().toISOString();
-            state.lastSyncKind = 'push';
-            await persistNow();
-            emit('push');
-            return { version: state.baseVersion };
+            const { copy } = started;
+            let body;
+            try {
+                body = await apiFetch(config, '/api/tree', { method: 'PUT', body: started.payload });
+            } catch (e) {
+                e.copy = copy;
+                throw e;
+            }
+            return withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                const version = Number(body.version) || copy.baseVersion + 1;
+                if (!sameCopy(now, copy)) {
+                    return { version, copy: now, left: 'account-changed', message: 'The working copy here is another account’s now, so it was left as it is.' };
+                }
+                if (now.baseId !== copy.baseId) {
+                    return { version, copy: now, left: 'synced', message: 'The working copy here was pulled or pushed elsewhere meanwhile, so it was left as it is.' };
+                }
+                const gained = now.rev === copy.rev ? 0 : Math.max(0, state.editCount - copy.editCount);
+                state.baseVersion = version;
+                state.dirty = gained > 0;
+                state.editCount = gained;
+                state.owner = ownerFrom(config, body.userId, body.serverId, state.owner);
+                state.lastSyncAt = new Date().toISOString();
+                state.lastSyncKind = 'push';
+                state.baseId = newId();
+                await writeCopy();
+                emit('push');
+                return { version: state.baseVersion, copy: copyToken(), left: null, message: null };
+            });
         }
     },
 
@@ -1131,6 +1520,7 @@ export const TreeStore = {
                 bySource.get(p.sourceId).push({ id, externalId: p.externalId });
             }
             let removed = 0;
+            const gone = [];
             for (const [sourceId, items] of bySource) {
                 await apiFetch(config, `/api/imports/${sourceId}/items/delete`, {
                     method: 'POST',
@@ -1141,11 +1531,12 @@ export const TreeStore = {
                 // are never pushed anyway.
                 for (const it of items) {
                     try { detach(it.id); } catch (e) { /* already gone locally */ }
+                    gone.push(String(it.id));
                     removed++;
                 }
             }
             reindex();
-            schedulePersist();
+            recordEdit(removeStep(gone, { virtual: true }), { dirty: false });
             emit('removed');
             return removed;
         },
@@ -1163,6 +1554,7 @@ export const TreeStore = {
                 bySource.get(p.sourceId).push({ id, externalId: p.externalId, title: e.node.title, url: e.node.url });
             }
             let filed = 0;
+            const steps = [];
             for (const [sourceId, items] of bySource) {
                 await apiFetch(config, `/api/imports/${sourceId}/items/file`, {
                     method: 'POST',
@@ -1170,13 +1562,16 @@ export const TreeStore = {
                 });
                 for (const it of items) {
                     const siblings = siblingsOf(targetFolderId);
-                    siblings.push(makeNode({ kind: 'bookmark', title: it.title, url: it.url }));
+                    const node = makeNode({ kind: 'bookmark', title: it.title, url: it.url });
+                    siblings.push(node);
+                    steps.push(insertStep(node, targetFolderId));
                     try { detach(it.id); } catch (e) { /* already gone locally */ }
+                    steps.push(removeStep([String(it.id)], { virtual: true }));
                     filed++;
                 }
             }
             reindex();
-            markDirty();
+            recordEdit(() => steps.map(step => step()).some(Boolean));
             emit('moved');
             return filed;
         }
@@ -1299,17 +1694,20 @@ export const TreeStore = {
             await ensureLoaded();
             assertWritable(id);
             const e = entry(id);
-            if (title !== undefined) e.node.title = String(title);
-            if (url !== undefined) {
-                if (e.node.kind === 'note' && url.startsWith(DATA_PREFIX)) {
-                    const p = decodePayloadUrl(url) || {};
-                    delete p.v;
-                    e.node.payload = p;
-                } else if (e.node.kind === 'bookmark') {
-                    e.node.url = String(url);
+            const apply = (node) => {
+                if (title !== undefined) node.title = String(title);
+                if (url !== undefined) {
+                    if (node.kind === 'note' && url.startsWith(DATA_PREFIX)) {
+                        const p = decodePayloadUrl(url) || {};
+                        delete p.v;
+                        node.payload = p;
+                    } else if (node.kind === 'bookmark') {
+                        node.url = String(url);
+                    }
                 }
-            }
-            markDirty();
+            };
+            apply(e.node);
+            recordEdit(changeStep(id, apply));
             emit('changed');
             return viewOf(id, false);
         },

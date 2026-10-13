@@ -67,8 +67,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         // looks exactly like "all my bookmarks are gone", when in fact the
         // data is on the server and only the fetch failed.
         console.warn('[TabPaladin] Initial pull failed:', e.message);
-        // Another page brought a copy in meanwhile: nothing is missing here.
-        if (e.code !== 'account-changed') startupSyncError = e.message;
+        // Another page brought a copy in, or edited this one, meanwhile:
+        // nothing is missing here.
+        if (e.code !== 'account-changed' && e.code !== 'edited-during-pull') startupSyncError = e.message;
     }
 
     // Drop focused-folder ids that no longer resolve.
@@ -193,10 +194,11 @@ function setupEventListeners() {
             const name = prompt("Name this session (e.g. 'Research', 'Private'):");
             if (!name) return;
 
-            // Remembered before saving: if the working copy already had
-            // unpushed edits, a conflict cannot be resolved by pulling
-            // without discarding them, so the workflow stays local instead.
-            const hadLocalEdits = TreeStore.status().dirty;
+            // The copy as it was before saving: if it already had unpushed
+            // edits, a conflict cannot be resolved by pulling without
+            // discarding them, so the workflow stays local instead. And the
+            // push goes only to this copy (see pushSavedWorkflow).
+            const before = await TreeStore.currentCopy();
             const saved = await StorageManager.saveWorkflow(name, saveable);
 
             // The tabs are about to be closed, so the workflow has to be on
@@ -221,7 +223,7 @@ function setupEventListeners() {
             await api.tabs.remove(tabIds);
 
             loadWorkflows();
-            const synced = await pushSavedWorkflow(name, saveable, hadLocalEdits);
+            const synced = await pushSavedWorkflow(name, saveable, before);
             alert(`Workflow "${name}" saved (${expected} tabs). ${synced}`);
         } catch (err) {
             console.error("Save workflow error:", err);
@@ -234,25 +236,37 @@ function setupEventListeners() {
     // When another device pushed in between, and this working copy has no
     // other unpushed edits, pull their tree and save the workflow again on
     // top of it — never force, which would erase what they pushed.
-    async function pushSavedWorkflow(name, tabs, hadLocalEdits) {
+    //
+    // `before` is the copy as it was before the save. Only that copy is
+    // pushed: when another page brought another one in meanwhile, the
+    // workflow went with this copy (set aside, see TreeStore) and stays there.
+    async function pushSavedWorkflow(name, tabs, before) {
         const cfg = await getSyncConfig();
         if (!cfg.token) return 'Not signed in, so it is only on this computer — sign in and Push.';
         try {
-            await TreeStore.sync.push(cfg);
+            const pushed = await TreeStore.sync.push(cfg, { expect: before });
             await persistSyncStamp('push');
-            return 'Synced to the server.';
+            return pushed.left ? `Synced to the server. ${pushed.message}` : 'Synced to the server.';
         } catch (e) {
+            if (e.code === 'account-changed') {
+                return 'Kept on this computer, with the working copy it was saved in — another account’s copy came in before it could be pushed.';
+            }
             // Never pull over or force a copy that belongs to another account.
             if (e.status === 412) return 'Kept on this computer — this working copy belongs to another account.';
             if (e.status !== 409) return `Kept on this computer — push failed: ${e.message}`;
-            if (hadLocalEdits) {
+            // Pulling discards everything unpushed in the copy that was
+            // refused: only when that is nothing but this workflow — no
+            // unpushed edits before it, and nothing from another page since.
+            const onlyThisSave = !before.dirty && e.copy && TreeStore.sameCopy(e.copy, before)
+                && e.copy.baseId === before.baseId && e.copy.adopted === before.adopted;
+            if (!onlyThisSave) {
                 return 'Kept on this computer: the server has newer changes and you have other unpushed edits. Push when ready.';
             }
             try {
-                await TreeStore.sync.pull(cfg);
+                const pulled = await TreeStore.sync.pull(cfg, { expect: e.copy });
                 await StorageManager.saveWorkflow(name, tabs);
                 await TreeStore.flush();
-                await TreeStore.sync.push(cfg);
+                await TreeStore.sync.push(cfg, { expect: pulled.copy });
                 await persistSyncStamp('push');
                 loadWorkflows();
                 return 'Synced to the server (merged with changes from another device).';
@@ -3627,6 +3641,10 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const account = { url: base, userId: user.id, username: name, serverId, tenancyOwner: Boolean(user.tenancyOwner) };
             const known = user.id !== undefined && user.id !== null;
 
+            // The questions below are about the copy as it is now, not as
+            // this page last heard of it (switchAccount decides on it again).
+            await TreeStore.currentCopy().catch(() => null);
+
             // A note left unsaved in Notes goes with the copy it was written
             // in, never into this account's: saved into it first or discarded.
             // Asked before the question below, which then counts that save.
@@ -3682,7 +3700,8 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 if (switched.action === 'claimed' && !TreeStore.status().isEmpty) note = 'Signed in. What you made while signed out is in your working copy.';
                 if (TreeStore.status().isEmpty) {
                     try {
-                        await TreeStore.sync.pull(getBackendConfig());
+                        // Only into the copy this sign-in made this account's.
+                        await TreeStore.sync.pull(getBackendConfig(), { expect: switched.copy });
                         await persistSyncStamp('pull');
                     } catch (e) {
                         note += ` Pull failed: ${e.message}`;
@@ -4316,9 +4335,21 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const goes = [st.editCount ? `its ${st.editCount} unpushed edit(s)` : '', n ? `its ${draftsText}` : ''].filter(Boolean).join(' and ');
             const typed = prompt(`Discard this working copy for good${goes ? `, with ${goes}` : ''}?\n\nType ${word} to confirm.`);
             if (typed !== word) return;
-            await TreeStore.discardStash(st.key);
-            dropParkedDrafts(drafts);
-            status.textContent = n ? `Discarded, with its ${n === 1 ? 'note draft' : `${n} note drafts`}.` : 'Discarded.';
+            // Only the copy listed: restored meanwhile (here or in another
+            // page), it is the working copy now and nothing is discarded —
+            // nor are the drafts it brings back.
+            if (!(await TreeStore.discardStash(st.key, { setAsideAt: st.setAsideAt }))) {
+                status.textContent = 'That copy is no longer set aside — it was restored or replaced meanwhile. Nothing was discarded.';
+                await renderStashes();
+                return;
+            }
+            // The drafts go with it only while nothing kept here would bring
+            // them back now.
+            const stillOnly = new Set(parkedDraftsOnlyWith(st.stamps, (await TreeStore.listStashes()).map(x => x.stamps))
+                .map(d => JSON.stringify(d)));
+            const gone = drafts.filter(d => stillOnly.has(JSON.stringify(d)));
+            dropParkedDrafts(gone);
+            status.textContent = gone.length ? `Discarded, with its ${gone.length === 1 ? 'note draft' : `${gone.length} note drafts`}.` : 'Discarded.';
             await renderStashes();
             return;
         }
@@ -4469,7 +4500,8 @@ async function signedInAccount(cfg) {
 // The working copy belongs to another account. Pulling over it would discard
 // that account's edits and forcing would write them into this one, so the
 // only offer is to set it aside (kept, under Settings › Set-aside copies) and
-// pull this account's tree.
+// pull this account's tree. Only the copy the server refused (err.copy) is set
+// aside, and the pull goes only into the copy started for this account.
 async function setAsideAndPull(cfg, err) {
     if (!confirm('This working copy belongs to another account.\n\n'
         + 'OK = Set it aside and pull this account\'s tree. The copy stays in this browser (Settings › Set-aside copies).\n'
@@ -4480,10 +4512,19 @@ async function setAsideAndPull(cfg, err) {
     const userId = me ? me.userId : err && err.userId;
     if (userId === undefined || userId === null) return 'Couldn’t confirm the account — try again. Nothing was changed.';
     if (!(await beforeAccountSwitch('Pulling this account’s tree'))) return 'Push cancelled — this working copy belongs to another account.';
-    await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null });
+    let reset;
+    try {
+        reset = await TreeStore.setAsideAndReset({
+            url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null,
+            expect: (err && err.copy) || null
+        });
+    } catch (e) {
+        if (e.code === 'account-changed') return 'Account changed meanwhile — nothing was set aside or pulled.';
+        throw e;
+    }
     let version;
     try {
-        ({ version } = await TreeStore.sync.pull(cfg));
+        ({ version } = await TreeStore.sync.pull(cfg, { expect: reset.copy }));
     } catch (e) {
         return `Set the other account’s copy aside (Settings), but the pull did not happen: ${e.message}`;
     }
@@ -4506,19 +4547,25 @@ async function doPush() {
         alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
         return 'Not signed in.';
     }
+    // The copy this push is for. Another page can bring another account's
+    // copy in meanwhile: then nothing is pushed, and once the push is under
+    // way, what the server answers is only ever applied to this copy — the
+    // success (TreeStore.sync.push) and every answer to a refusal below.
+    const copy = await TreeStore.currentCopy();
     // A fresh install has an empty working copy; pushing it (especially with
     // force after the inevitable conflict) would erase the whole tree on the
     // server for every device. Pull is almost always what was meant.
-    if (TreeStore.status().isEmpty) {
+    if (copy.isEmpty) {
         if (!confirm('Your local working copy is EMPTY. Pushing it would erase the entire tree on the server.\n\nIf this is a fresh install, press Cancel and Pull instead.\n\nReally push an empty tree?')) {
             return 'Push cancelled — working copy is empty.';
         }
     }
     try {
-        const { version } = await TreeStore.sync.push(cfg);
+        const pushed = await TreeStore.sync.push(cfg, { expect: copy });
         await persistSyncStamp('push');
-        return `Pushed (v${version}).`;
+        return pushed.left ? `Pushed (v${pushed.version}). ${pushed.message}` : `Pushed (v${pushed.version}).`;
     } catch (e) {
+        if (e.code === 'account-changed') return e.message;
         if (e.status === 412) return setAsideAndPull(cfg, e);
         if (e.status === 409) {
             const takeTheirs = confirm(
@@ -4527,11 +4574,20 @@ async function doPush() {
                 'Cancel = Do nothing, so you can look first.\n\n' +
                 'To overwrite the server instead, push again after this dialog and confirm the force prompt.'
             );
-            if (takeTheirs) return doPull({ skipConfirm: true });
+            // Both answers are about the copy that was refused (e.copy), as
+            // it was then: never another account's copy brought in since,
+            // nor edits made since.
+            if (takeTheirs) return doPull({ skipConfirm: true, expect: e.copy });
             if (confirm('Force-push YOUR tree and overwrite the server\'s newer version? This discards what the other device pushed.')) {
-                const { version } = await TreeStore.sync.push(cfg, { force: true });
-                await persistSyncStamp('push');
-                return `Force-pushed (v${version}).`;
+                try {
+                    const forced = await TreeStore.sync.push(cfg, { force: true, expect: e.copy });
+                    await persistSyncStamp('push');
+                    return forced.left ? `Force-pushed (v${forced.version}). ${forced.message}` : `Force-pushed (v${forced.version}).`;
+                } catch (e2) {
+                    if (e2.code === 'account-changed') return e2.message;
+                    alert('Push failed: ' + e2.message);
+                    return 'Push failed: ' + e2.message;
+                }
             }
             return 'Push cancelled — pull first.';
         }
@@ -4540,15 +4596,13 @@ async function doPush() {
     }
 }
 
-async function doPull({ skipConfirm = false } = {}) {
-    // The copy this pull was asked for. Another page can bring another
-    // account's copy in while this one waits on the server or on a question:
-    // then nothing is replaced, and the pull says so.
-    const copyNow = () => {
-        const s = TreeStore.status();
-        return JSON.stringify([s.copyId, s.owner && s.owner.url, s.owner && s.owner.userId]);
-    };
-    const startedOn = copyNow();
+async function doPull({ skipConfirm = false, expect = null } = {}) {
+    // The copy this pull is for: the one here when Pull was pressed or, from
+    // a refused push, the one that was refused (expect). Another page can
+    // bring another account's copy in, or this one can be edited, while the
+    // pull waits on the server or on a question: then nothing is replaced,
+    // and the pull says so (TreeStore.sync.pull).
+    const startedOn = expect || await TreeStore.currentCopy();
     const accountChanged = 'Account changed during pull — nothing was replaced.';
     const cfg = await getSyncConfig();
     if (!cfg.token) {
@@ -4560,14 +4614,24 @@ async function doPull({ skipConfirm = false } = {}) {
     // server says whose session this is. When it cannot, the pull goes by
     // whose tree the server sends, or stops (TreeStore.sync.pull).
     const me = await signedInAccount(cfg);
-    if (copyNow() !== startedOn) return accountChanged;
+    if (!TreeStore.sameCopy(await TreeStore.currentCopy(), startedOn)) return accountChanged;
     const status = TreeStore.status();
     let setAside = false;
+    let into = startedOn;
     if (me && TreeStore.wouldSetAside(me)) {
         if (!(await beforeAccountSwitch('This pull'))) return 'Pull cancelled.';
-        if (copyNow() !== startedOn) return accountChanged;
+        // Only the copy this pull was for is set aside, and the pull goes
+        // only into the copy started in its place.
+        let reset;
+        try {
+            reset = await TreeStore.setAsideAndReset({ ...me, expect: startedOn });
+        } catch (e) {
+            if (e.code === 'account-changed') return accountChanged;
+            throw e;
+        }
         // An empty copy has nothing to set aside, and nothing to say about it.
-        setAside = Boolean((await TreeStore.setAsideAndReset(me)).setAside);
+        setAside = Boolean(reset.setAside);
+        into = reset.copy;
     } else if (!skipConfirm && status.dirty) {
         if (!confirm('You have local edits that were never pushed. Pulling replaces your working copy with the server\'s tree and discards them.\n\nPull anyway?')) {
             return 'Pull cancelled.';
@@ -4576,7 +4640,7 @@ async function doPull({ skipConfirm = false } = {}) {
     try {
         // The pull sets the copy aside itself when the tree turns out to be
         // another account's than the copy's (see TreeStore.sync.pull).
-        const pulled = await TreeStore.sync.pull(cfg);
+        const pulled = await TreeStore.sync.pull(cfg, { expect: into });
         const version = pulled.version;
         if (pulled.setAside) setAside = true;
         await persistSyncStamp('pull');
@@ -4595,10 +4659,10 @@ async function doPull({ skipConfirm = false } = {}) {
             ? `Pulled (v${version}) — but the server's tree is EMPTY.`
             : `Pulled ${items} item(s) (v${version}).`) + aside;
     } catch (e) {
-        // Stopped before anything was written: another copy came in, or the
-        // server could not say whose copy this is. Not a failure to alarm
-        // anyone over — pulling again is the answer.
-        if (e.code === 'account-changed' || e.code === 'account-unconfirmed') {
+        // Stopped before anything was written: another copy came in, the copy
+        // was edited meanwhile, or the server could not say whose copy this
+        // is. Not a failure to alarm anyone over — pulling again is the answer.
+        if (e.code === 'account-changed' || e.code === 'account-unconfirmed' || e.code === 'edited-during-pull') {
             return e.message + (setAside || e.setAside ? ' The other account’s working copy is set aside (Settings).' : '');
         }
         alert('Pull failed: ' + e.message);

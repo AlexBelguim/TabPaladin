@@ -34,6 +34,16 @@
 //   9. Another page bringing another copy in (or stamping this one) while a
 //      pull waits on /api/tree or /api/auth/me stops the pull: that copy is
 //      never replaced, and the one the pull started on is kept.
+//  10. One lock, tp-working-copy, shared by every page, around everything
+//      that reads the copy and replaces or re-stamps it, starting from the
+//      copy in storage: a push's success is never applied to another copy,
+//      or to edits made while it was in flight; a pull never discards an
+//      edit made while it waited; a switch is seen before its storage event
+//      arrives; an edit made here on a copy another page has since set aside
+//      goes to that copy, and one made at the same time as another page's
+//      write is made again on top of it; two switches at once run one after
+//      the other; and a set-aside copy is discarded only if it is still the
+//      one listed.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -51,8 +61,16 @@ function check(name, cond, detail) {
 
 const storageData = new Map();
 const storageListeners = [];
+// In the browser a storage event reaches each page some time after the write.
+// A delay (ms) lets a test act in that gap.
+let eventDelay = 0;
 function fireStorageChange(changes) {
-    for (const fn of storageListeners) fn(changes, 'local');
+    for (const fn of storageListeners) {
+        // Each page gets its own copy of what was written, as in the browser.
+        const own = JSON.parse(JSON.stringify(changes));
+        if (eventDelay) setTimeout(() => fn(own, 'local'), eventDelay);
+        else fn(own, 'local');
+    }
 }
 globalThis.chrome = {
     storage: {
@@ -143,15 +161,15 @@ let authMeDown = false;
 // /api/auth/me answering for another user than the token's, as no server
 // should (a session swapped between the two requests).
 let authMeAs = null;
-// Run once while a request to `path` is in flight: another page acting
-// between a pull's awaits.
+// Run once while a request to `path` (a GET, or `method`) is in flight:
+// another page acting between a pull's or a push's awaits.
 let duringFetch = null;
 
 globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
     const method = (opts.method || 'GET').toUpperCase();
     serverLog.push(`${method} ${u}`);
-    if (duringFetch && u.endsWith(duringFetch.path) && method === 'GET') {
+    if (duringFetch && u.endsWith(duringFetch.path) && method === (duringFetch.method || 'GET')) {
         const { fn } = duringFetch;
         duringFetch = null;
         await fn();
@@ -973,6 +991,235 @@ console.log('\n13. Another page switching accounts while a pull waits on the ser
     const plain = await pullDuring('/api/tree', asAlex, async () => {});
     check('with nothing changing meanwhile, the pull goes through', !plain.err && (await TreeStore.getNode('alex-server-mark-2')) !== null
         && TreeStore.status().owner.userId === 1, plain.err && plain.err.message);
+}
+
+console.log('\n14. One lock for the working copy, in every page');
+{
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const lee = { url: MAIN, userId: 3, username: 'lee', serverId: 'srv-main', tenancyOwner: false };
+    const asAlex = { url: MAIN, token: 'tok' };
+    const { TreeStore: OtherPage } = await import('../src/utils/treeStore.js?lock-other-page');
+    await OtherPage.load();
+    const wait = (ms = 0) => new Promise(r => setTimeout(r, ms));
+    const stored = () => storageData.get('tpTree');
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    const stashes = () => [...storageData.entries()].filter(([k]) => k.startsWith('tpTreeStash:')).map(([, v]) => v);
+    const stashWith = (text) => stashes().find(s => has(s.roots, text));
+    const samAside = async (setAsideAt = new Date().toISOString()) => {
+        const key = `tpTreeStash:${MAIN}|2`;
+        await chrome.storage.local.set({
+            [key]: {
+                roots: [{ id: 'sam-root', kind: 'folder', title: 'Sam stuff', children: [{ id: 'sam-unpushed', kind: 'folder', title: 'SAM UNPUSHED', children: [] }] }],
+                baseVersion: 1000, dirty: true, editCount: 1, owner: { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main' }, origin: null, url: MAIN, username: 'sam',
+                setAsideAt, focusedFolderIds: [], expanded: {}, pendingRemovals: []
+            },
+            tpTreeStashIndex: [...((await chrome.storage.local.get('tpTreeStashIndex')).tpTreeStashIndex || []).filter(k => k !== key), key]
+        });
+    };
+    // alex's own copy, just pulled, with one unpushed edit.
+    let marks = 0;
+    const alexWithEdit = async (title) => {
+        await clearStashes();
+        await TreeStore.switchAccount({ ...alex });
+        server.roots = [{ id: `alex-lock-mark-${++marks}`, kind: 'folder', title: 'Alex on the server', children: [] }];
+        await TreeStore.sync.pull(asAlex);
+        await TreeStore.createNode({ parentId: null, kind: 'folder', title });
+        await TreeStore.flush();
+    };
+    const during = async (path, method, act, run) => {
+        duringFetch = { path, method, fn: act };
+        let err = null;
+        let result = null;
+        try { result = await run(); } catch (e) { err = e; }
+        duringFetch = null;
+        return { err, result };
+    };
+
+    // A push in flight when another page signs sam in.
+    await alexWithEdit('ALEX PUSHED');
+    await samAside();
+    const v0 = server.version;
+    const pushed = await during('/api/tree', 'PUT', () => OtherPage.switchAccount({ ...sam, previousUsername: 'alex' }), () => TreeStore.sync.push(asAlex));
+    check('another page signs sam in while alex\'s push is in flight: alex\'s copy is pushed',
+        !pushed.err && pushed.result.version === v0 + 1 && has(server.pushedRoots, 'ALEX PUSHED'), pushed.err && pushed.err.message);
+    check('  and the success is not applied to sam\'s copy, which is here now: it is left as it is, and the push says so',
+        pushed.result && pushed.result.left === 'account-changed' && /another account/.test(pushed.result.message)
+        && stored().owner.userId === 2 && stored().dirty && stored().baseVersion === 1000 && has(stored().roots, 'SAM UNPUSHED')
+        && TreeStore.status().owner.userId === 2 && TreeStore.status().dirty, JSON.stringify(stored().owner));
+    check('  alex\'s copy waits, set aside, under his own stamp', stashWith('ALEX PUSHED') && stashWith('ALEX PUSHED').owner.userId === 1);
+    let refused = null;
+    try { await TreeStore.sync.push(asAlex); } catch (e) { refused = e; }
+    check('  sam\'s copy pushed with alex\'s session still names sam, so the server refuses it (412)',
+        refused && refused.status === 412 && lastPutBody.baseUserId === 2 && !has(server.pushedRoots, 'SAM UNPUSHED'));
+
+    // Edits made while the push is in flight, here and in another page.
+    for (const [page, label] of [[TreeStore, 'here'], [OtherPage, 'in another page']]) {
+        await alexWithEdit('ALEX BEFORE PUSH');
+        const v1 = server.version;
+        const mid = await during('/api/tree', 'PUT', async () => {
+            await page.createNode({ parentId: null, kind: 'folder', title: 'ALEX DURING PUSH' });
+            await page.flush();
+        }, () => TreeStore.sync.push(asAlex));
+        check(`an edit made ${label} while the push is in flight is not marked pushed: it stays an unpushed edit`,
+            !mid.err && !mid.result.left && !has(server.pushedRoots, 'ALEX DURING PUSH') && has(server.pushedRoots, 'ALEX BEFORE PUSH')
+            && TreeStore.status().dirty && TreeStore.status().editCount === 1 && stored().dirty && has(stored().roots, 'ALEX DURING PUSH'),
+            mid.err ? mid.err.message : JSON.stringify(TreeStore.status()));
+        check('  on top of the version pushed: the next push goes straight through', TreeStore.status().baseVersion === v1 + 1
+            && !(await TreeStore.sync.push(asAlex)).left && has(server.pushedRoots, 'ALEX DURING PUSH') && !TreeStore.status().dirty);
+    }
+
+    // Another page pulls this copy while the push is in flight.
+    await alexWithEdit('ALEX THEN PULLED ELSEWHERE');
+    const v2 = server.version;
+    const elsewhere = await during('/api/tree', 'PUT', () => OtherPage.sync.pull(asAlex), () => TreeStore.sync.push(asAlex));
+    check('another page pulls this copy while the push is in flight: the push is not applied to what that pull left',
+        !elsewhere.err && elsewhere.result.left === 'synced' && stored().baseVersion === v2 && !stored().dirty
+        && has(server.pushedRoots, 'ALEX THEN PULLED ELSEWHERE'), elsewhere.err ? elsewhere.err.message : JSON.stringify(elsewhere.result));
+
+    // A link saved while a pull waits: here (still unwritten) or in another page.
+    for (const [page, label, write] of [[TreeStore, 'here', false], [OtherPage, 'in another page', true]]) {
+        await alexWithEdit('ALEX BEFORE PULL');
+        await TreeStore.sync.pull(asAlex);
+        const r = await during('/api/tree', 'GET', async () => {
+            await page.createNode({ parentId: null, kind: 'bookmark', title: 'SAVED DURING PULL', url: 'https://saved.example' });
+            if (write) await page.flush();
+        }, () => TreeStore.sync.pull(asAlex));
+        check(`a link saved ${label} while the pull waits: the pull stops, "Changed during pull — nothing was replaced; pull again."`,
+            r.err && r.err.code === 'edited-during-pull' && r.err.message === 'Changed during pull — nothing was replaced; pull again.',
+            r.err ? r.err.message : 'pulled');
+        check('  the link is kept, an unpushed edit in the working copy', has(stored().roots, 'SAVED DURING PULL') && stored().dirty
+            && (await TreeStore.bookmarks.search('saved.example')).length === 1);
+    }
+
+    // Another page's edit, still unwritten when the pull lands.
+    await alexWithEdit('ALEX BEFORE PULL 2');
+    await TreeStore.sync.pull(asAlex);
+    server.roots = [{ id: 'alex-lock-pulled', kind: 'folder', title: 'Pulled meanwhile', children: [] }];
+    const unwritten = await during('/api/tree', 'GET',
+        () => OtherPage.createNode({ parentId: null, kind: 'folder', title: 'OTHER PAGE UNWRITTEN' }), () => TreeStore.sync.pull(asAlex));
+    await wait(300);
+    check('another page\'s edit, not yet written when a pull lands, is made again on top of the pulled tree',
+        !unwritten.err && has(stored().roots, 'alex-lock-pulled') && has(stored().roots, 'OTHER PAGE UNWRITTEN') && stored().dirty
+        && (await TreeStore.getNode('alex-lock-pulled')) !== null && TreeStore.status().dirty
+        && has(await TreeStore.bookmarks.getTree(), 'OTHER PAGE UNWRITTEN'), unwritten.err && unwritten.err.message);
+
+    // Storage events arrive late: another page's switch is in storage before
+    // this page hears of it.
+    await alexWithEdit('ALEX LATE HEARING');
+    await samAside();
+    eventDelay = 5;
+    const late = await during('/api/tree', 'GET', () => OtherPage.switchAccount({ ...sam, previousUsername: 'alex' }), () => TreeStore.sync.pull(asAlex));
+    eventDelay = 0;
+    await wait(50);
+    check('a switch already in storage, its event not yet here, still stops the pull: the copy is read from storage under the lock',
+        late.err && late.err.code === 'account-changed' && stored().owner.userId === 2 && has(stored().roots, 'SAM UNPUSHED')
+        && !has(stored().roots, 'alex-lock-mark') && TreeStore.status().owner.userId === 2 && Boolean(stashWith('ALEX LATE HEARING')),
+        late.err ? late.err.message : 'pulled');
+
+    // An edit made here on alex's copy after another page switched to sam's,
+    // before this page heard: written under the lock, it never lands in sam's
+    // copy, and goes to alex's where it waits.
+    await alexWithEdit('ALEX BASE');
+    await samAside();
+    eventDelay = 50;
+    await OtherPage.switchAccount({ ...sam, previousUsername: 'alex' });
+    const stillAlex = TreeStore.status().owner.userId === 1;
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'ALEX LATE EDIT' });
+    await TreeStore.flush();
+    eventDelay = 0;
+    await wait(100);
+    check('an edit made on alex\'s copy after another page switched to sam\'s is never written over sam\'s copy',
+        stillAlex && stored().owner.userId === 2 && has(stored().roots, 'SAM UNPUSHED') && !has(stored().roots, 'ALEX LATE EDIT')
+        && TreeStore.status().owner.userId === 2);
+    const alexAside = stashWith('ALEX LATE EDIT');
+    check('  it goes to alex\'s set-aside copy, with his earlier edit, as an unpushed edit (one copy, not two)',
+        alexAside && alexAside.owner.userId === 1 && alexAside.dirty && has(alexAside.roots, 'ALEX BASE')
+        && (await TreeStore.listStashes()).filter(s => s.userId === 1).length === 1, JSON.stringify(stashes().map(s => [s.owner, s.roots.map(r => r.title)])));
+
+    // The same, heard at once: the edit was still waiting to be written.
+    await alexWithEdit('ALEX BASE 2');
+    await samAside();
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'ALEX UNWRITTEN AT SWITCH' });
+    await OtherPage.switchAccount({ ...sam, previousUsername: 'alex' });
+    await TreeStore.flush();
+    const alexAside2 = stashWith('ALEX UNWRITTEN AT SWITCH');
+    check('an edit still unwritten here when another page switches goes with alex\'s copy, not into sam\'s',
+        !has(stored().roots, 'ALEX UNWRITTEN AT SWITCH') && stored().owner.userId === 2
+        && alexAside2 && alexAside2.owner.userId === 1 && has(alexAside2.roots, 'ALEX BASE 2')
+        && (await TreeStore.listStashes()).filter(s => s.userId === 1).length === 1);
+
+    // Two pages editing the same copy at once.
+    await alexWithEdit('ALEX BASE 3');
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'EDIT HERE' });
+    await OtherPage.createNode({ parentId: null, kind: 'folder', title: 'EDIT THERE' });
+    await OtherPage.flush();
+    await TreeStore.flush();
+    await wait(0);
+    check('two pages editing the same copy at once: both edits are kept, in storage and in both pages',
+        has(stored().roots, 'EDIT HERE') && has(stored().roots, 'EDIT THERE') && has(stored().roots, 'ALEX BASE 3') && stored().dirty
+        && has(await TreeStore.bookmarks.getTree(), 'EDIT THERE') && has(await OtherPage.bookmarks.getTree(), 'EDIT HERE'));
+
+    // A caller's copy (expect): only that one is set aside, or pulled into.
+    const asked = await TreeStore.currentCopy();
+    await samAside();
+    await OtherPage.switchAccount({ ...sam, previousUsername: 'alex' });
+    const nStashes = (await TreeStore.listStashes()).length;
+    let notAside = null;
+    try { await TreeStore.setAsideAndReset({ ...lee, expect: asked }); } catch (e) { notAside = e; }
+    check('setting aside the copy the user was asked about, when another one came in: nothing is set aside',
+        notAside && notAside.code === 'account-changed' && (await TreeStore.listStashes()).length === nStashes
+        && stored().owner.userId === 2 && has(stored().roots, 'SAM UNPUSHED'), notAside && notAside.message);
+    const askedSam = await TreeStore.currentCopy();
+    await OtherPage.createNode({ parentId: null, kind: 'folder', title: 'AFTER THE QUESTION' });
+    await OtherPage.flush();
+    const revBefore = stored().rev;
+    const fetches = serverLog.length;
+    let notPulled = null;
+    try { await TreeStore.sync.pull({ url: MAIN, token: 'tok-b' }, { expect: askedSam }); } catch (e) { notPulled = e; }
+    check('a pull agreed to on a copy since edited stops before it starts: nothing fetched, nothing written',
+        notPulled && notPulled.code === 'edited-during-pull' && stored().rev === revBefore && serverLog.length === fetches
+        && has(stored().roots, 'AFTER THE QUESTION'), notPulled && notPulled.message);
+    let notPushed = null;
+    try { await TreeStore.sync.push(asAlex, { expect: asked }); } catch (e) { notPushed = e; }
+    check('a push of the copy the user saw, when another one came in: nothing is pushed',
+        notPushed && notPushed.code === 'account-changed' && serverLog.length === fetches, notPushed && notPushed.message);
+
+    // Discard says whether it removed anything.
+    await clearStashes();
+    await samAside('2026-01-01T00:00:00.000Z');
+    const [listed] = await TreeStore.listStashes();
+    check('discardStash says it removed the copy listed', (await TreeStore.discardStash(listed.key, { setAsideAt: listed.setAsideAt })) === true
+        && (await TreeStore.listStashes()).length === 0);
+    check('  and that there was nothing to remove once it is gone', (await TreeStore.discardStash(listed.key)) === false);
+    await samAside('2026-02-02T00:00:00.000Z');
+    check('  and leaves a copy set aside under the same key since: not the one listed',
+        (await TreeStore.discardStash(listed.key, { setAsideAt: listed.setAsideAt })) === false && (await TreeStore.listStashes()).length === 1);
+
+    // Two pages switching accounts at the same moment.
+    await alexWithEdit('ALEX BEFORE TWO SWITCHES');
+    await Promise.all([TreeStore.switchAccount({ ...sam, previousUsername: 'alex' }), OtherPage.switchAccount({ ...lee, previousUsername: 'alex' })]);
+    const alexKept = (await TreeStore.listStashes()).filter(s => s.userId === 1);
+    check('two pages switching accounts at the same moment take turns: alex\'s copy is set aside once, and every page agrees on the copy',
+        alexKept.length === 1 && has(stashWith('ALEX BEFORE TWO SWITCHES').roots, 'ALEX BEFORE TWO SWITCHES')
+        && TreeStore.status().copyId === OtherPage.status().copyId && stored().copyId === TreeStore.status().copyId
+        && [2, 3].includes(stored().owner.userId), JSON.stringify(alexKept));
+
+    // It is one lock, by name, for every page.
+    let release = null;
+    const held = navigator.locks.request('tp-working-copy', () => new Promise(r => { release = r; }));
+    await wait(0);
+    let written = false;
+    const revHeld = stored().rev;
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'WAITS FOR THE LOCK' });
+    const flushing = TreeStore.flush().then(() => { written = true; });
+    await wait(30);
+    const waited = !written && stored().rev === revHeld && !has(stored().roots, 'WAITS FOR THE LOCK');
+    release();
+    await held;
+    await flushing;
+    check('every page writes the copy only holding the one lock, "tp-working-copy"', waited && written && has(stored().roots, 'WAITS FOR THE LOCK'),
+        JSON.stringify({ waited, written }));
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
