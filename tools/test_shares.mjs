@@ -24,17 +24,26 @@
 //   6. A forced push from an older base that erases a filed link puts the
 //      share back in the inbox, saying why; a push that saw the bookmark and
 //      deleted it leaves the share filed, marked not present.
+//   7. The rehearsal: a database the schema-3 server (with accounts, before
+//      this inbox) wrote through its own API is upgraded by this one. A
+//      pre-upgrade copy is taken first; every table's rows are still there;
+//      each account's tree (same version), history, inbox, proposals,
+//      archives and prefs read back identically; the inbox rows are pending
+//      shares on the new routes; and a client pushes and pulls unchanged.
 //
-// Run: node tools/test_shares.mjs [--port 18985]
+// Run: node tools/test_shares.mjs [--port 18985] [--old-port 18987] [--schema3-rev 2d7eec3]
 //
-// Starts this checkout's server on the port, on a throwaway data directory
-// made from a database written the way the server before accounts wrote it.
+// Starts this checkout's server on the port, on throwaway data directories:
+// one made from a database written the way the server before accounts wrote
+// it, and one written by the schema-3 server read out of git (skipped without
+// git).
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { spawn, execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import { hashPassword } from '../server/security.js';
 import { migrateUsers } from '../server/users.js';
@@ -50,6 +59,8 @@ const arg = (name, fallback = null) => {
 };
 const PORT = Number(arg('port') || 18985);
 const BASE = `http://127.0.0.1:${PORT}`;
+const OLD_PORT = Number(arg('old-port') || 18987);
+const SCHEMA3_REV = arg('schema3-rev') || '2d7eec3';
 const PASSWORD = 'correct horse battery';
 const T = '2026-09-01T00:00:00.000Z';
 
@@ -135,11 +146,11 @@ async function migrationTests() {
 
 // --- The live server ----------------------------------------------------------------
 
-function startServer(dataDir) {
+function startServer(dataDir, { entry = path.join(REPO, 'server', 'index.js'), port = PORT } = {}) {
     const env = { ...process.env };
     for (const k of Object.keys(env)) if (/^(AUTH_TOKEN|TABPALADIN_TOKEN|ADMIN_|TENANCY_OWNER|IMPORT_|MAX_)/.test(k)) delete env[k];
-    const child = spawn(process.execPath, [path.join(REPO, 'server', 'index.js')], {
-        env: { ...env, PORT: String(PORT), DATA_DIR: dataDir, PWA_DIR: path.join(REPO, 'pwa'), IMPORTS_SCHEDULER: 'off',
+    const child = spawn(process.execPath, [entry], {
+        env: { ...env, PORT: String(port), DATA_DIR: dataDir, PWA_DIR: path.join(REPO, 'pwa'), IMPORTS_SCHEDULER: 'off',
             ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: PASSWORD, MAX_INBOX_PER_USER: '50' },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -148,12 +159,14 @@ function startServer(dataDir) {
     child.stderr.on('data', d => { log += d; });
     let exitCode;
     const exited = new Promise(r => child.on('exit', code => { exitCode = code; r(code); }));
+    const base = `http://127.0.0.1:${port}`;
     return {
+        base,
         log: () => log,
         async ready() {
             for (let i = 0; i < 150; i++) {
                 if (exitCode !== undefined) throw new Error(`server exited (${exitCode}):\n${log}`);
-                try { if ((await fetch(BASE + '/api/health')).ok) return; } catch (e) { /* not yet */ }
+                try { if ((await fetch(base + '/api/health')).ok) return; } catch (e) { /* not yet */ }
                 await new Promise(r => setTimeout(r, 100));
             }
             throw new Error('server did not come up:\n' + log);
@@ -162,8 +175,8 @@ function startServer(dataDir) {
     };
 }
 
-async function http(p, { method = 'GET', token, body } = {}) {
-    const res = await fetch(BASE + p, {
+async function http(p, { method = 'GET', token, body, base = BASE } = {}) {
+    const res = await fetch(base + p, {
         method,
         headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: 'Bearer ' + token } : {}) },
         body: body !== undefined ? JSON.stringify(body) : undefined
@@ -436,8 +449,126 @@ async function liveTests() {
     }
 }
 
+// --- 9. The rehearsal: a schema-3 server's database, upgraded -----------------------
+
+// The server at `rev`, read out of git into a temporary directory, its bare
+// imports pointed at this checkout's node_modules (nothing installed).
+function serverFromGit(rev) {
+    try {
+        const files = execFileSync('git', ['-C', REPO, 'ls-tree', '-r', '--name-only', rev, '--', 'server'], { encoding: 'utf8' })
+            .split('\n').filter(f => /^server\/.*\.js$/.test(f));
+        if (!files.length) return null;
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-schema3-server-'));
+        const req = createRequire(path.join(REPO, 'server', 'package.json'));
+        const bare = (name) => pathToFileURL(req.resolve(name)).href;
+        for (const f of files) {
+            let src = execFileSync('git', ['-C', REPO, 'show', `${rev}:${f}`], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+            src = src.replace(/from '(express|cors|better-sqlite3)'/g, (_, name) => `from '${bare(name)}'`);
+            const out = path.join(dir, f);
+            fs.mkdirSync(path.dirname(out), { recursive: true });
+            fs.writeFileSync(out, src);
+        }
+        return { dir, entry: path.join(dir, 'server', 'index.js') };
+    } catch (e) {
+        return null;
+    }
+}
+
+async function rehearsal() {
+    console.log(`\n9. Rehearsal: a database the schema-3 server (${SCHEMA3_REV}) wrote, upgraded`);
+    const old = serverFromGit(SCHEMA3_REV);
+    if (!old) {
+        console.log(`  SKIP  could not read server/ at ${SCHEMA3_REV} from git`);
+        return;
+    }
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-rehearsal-'));
+    let srv = null;
+    const TABLES = ['items', 'snapshots', 'shared_links', 'share_tokens', 'note_proposals', 'import_sources', 'import_items',
+        'users', 'sessions', 'user_prefs', 'user_tree_meta'];
+    const counts = () => {
+        const d = new Database(path.join(dataDir, 'sync.db'), { readonly: true });
+        const out = {};
+        for (const t of TABLES) out[t] = d.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+        const v = d.pragma('user_version', { simple: true });
+        d.close();
+        return { rows: out, version: v };
+    };
+    try {
+        srv = startServer(dataDir, { entry: old.entry, port: OLD_PORT });
+        await srv.ready();
+        const B = srv.base;
+        const login = async (username, password, base) => (await http('/api/login', { method: 'POST', body: { username, password }, base })).json.token;
+        const A = await login('alex', PASSWORD, B);
+        const t0 = (await http('/api/tree', { token: A, base: B })).json;
+        const bm = t0.roots.find(r => r.role === 'bookmarks');
+        bm.children = [{ id: 'r-ai', kind: 'folder', title: 'AI', children: [{ id: 'r-b1', kind: 'bookmark', title: 'HN', url: 'https://news.ycombinator.com' }] }];
+        const roots = [bm, { id: 'r-notes', kind: 'folder', role: 'notes', title: 'Notes', children: [
+            { id: 'r-n1', kind: 'note', title: 'Diary', payload: { content: '# Diary', createdAt: T, updatedAt: T } }] }];
+        await http('/api/tree', { method: 'PUT', token: A, base: B, body: { roots, baseVersion: t0.version, deviceId: 'laptop' } });
+        await http('/api/shared', { method: 'POST', token: A, base: B, body: { url: 'https://inbox.example/1', title: 'One' } });
+        await http('/api/shared', { method: 'POST', token: A, base: B, body: { url: 'https://inbox.example/2' } });
+        await http('/api/imports/capture', { method: 'POST', token: A, base: B, body: { url: 'https://x.com/a/status/1' } });
+        const llm = (await http('/api/share', { method: 'POST', token: A, base: B })).json;
+        await http(new URL(llm.url).pathname + '/propose', { method: 'POST', base: B, body: { title: 'Idea', content: '# Idea' } });
+        await http('/api/prefs/share.targets', { method: 'PUT', token: A, base: B, body: { value: { v: 1 } } });
+        const made = await http('/api/users', { method: 'POST', token: A, base: B,
+            body: { username: 'sam', password: 'sam-password-1', role: 'user', currentPassword: PASSWORD } });
+        const S = await login('sam', 'sam-password-1', B);
+        await http('/api/shared', { method: 'POST', token: S, base: B, body: { url: 'https://sam.example/1', title: 'Sams' } });
+        const views = async (base) => ({
+            tree: (await http('/api/tree', { token: A, base })).json,
+            history: (await http('/api/history', { token: A, base })).json,
+            inbox: (await http('/api/shared', { token: A, base })).json,
+            proposals: (await http('/api/proposals', { token: A, base })).json,
+            imports: (await http('/api/imports', { token: A, base })).json,
+            prefs: (await http('/api/prefs', { token: A, base })).json,
+            'sam\'s tree': (await http('/api/tree', { token: S, base })).json,
+            'sam\'s inbox': (await http('/api/shared', { token: S, base })).json
+        });
+        const before = await views(B);
+        await srv.stop();
+        srv = null;
+        const c0 = counts();
+        check('the schema-3 server wrote a schema-3 database with two accounts', c0.version === 3 && made.status === 200 && c0.rows.users === 2,
+            JSON.stringify(c0));
+
+        srv = startServer(dataDir);
+        await srv.ready();
+        const files = fs.readdirSync(dataDir);
+        check('this server takes a pre-upgrade copy before anything else, then adds the inbox\'s columns',
+            files.some(f => f.startsWith('sync.db.pre-v4-')) && /Backed up the database to \S+sync\.db\.pre-v4-/.test(srv.log())
+            && srv.log().indexOf('pre-v4') < srv.log().indexOf('Share inbox: added sid'), srv.log());
+        const c1 = counts();
+        check('every table keeps every row, and the schema is 4', JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c1.rows[t]])))
+            === JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c0.rows[t]]))) && c1.version === 4,
+            JSON.stringify([c0, c1]));
+        const after = await views(BASE);
+        for (const k of Object.keys(before)) {
+            check(`  ${k} reads back identically`, JSON.stringify(after[k]) === JSON.stringify(before[k]),
+                `${JSON.stringify(before[k]).slice(0, 200)} vs ${JSON.stringify(after[k]).slice(0, 200)}`);
+        }
+        const pending = (await http('/api/shares', { token: A })).json.shares;
+        check('alex\'s inbox rows are his pending shares on the new routes, sam\'s are sam\'s', pending.length === 2
+            && pending.every(x => x.status === 'pending' && x.source === 'legacy')
+            && (await http('/api/shares', { token: S })).json.shares.map(x => x.url).join() === 'https://sam.example/1');
+        const push = await http('/api/tree', { method: 'PUT', token: A, body: {
+            roots: after.tree.roots, baseVersion: after.tree.version, baseUserId: after.tree.userId, baseServerId: after.tree.serverId, deviceId: 'extension' } });
+        check('a client pushes and pulls as before', push.status === 200
+            && (await http('/api/tree', { token: A })).json.version === push.json.version, JSON.stringify(push.json));
+    } catch (e) {
+        failures++;
+        console.error('FAIL  rehearsal stopped:', e, srv ? '\n' + srv.log() : '');
+    } finally {
+        if (srv) await srv.stop();
+        for (const d of [dataDir, old.dir]) {
+            try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch (e) { /* temp */ }
+        }
+    }
+}
+
 await migrationTests();
 await liveTests();
+await rehearsal();
 
 console.log(failures === 0 ? '\nAll share tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exitCode = failures === 0 ? 0 : 1;
