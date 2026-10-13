@@ -17,10 +17,12 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Loaded as classic scripts: the service worker, the MV2/MV3 background
-// script and the content script.
+// Loaded as classic scripts: the service worker and the share core it
+// imports (which the page loads with a plain <script> too), the MV2/MV3
+// background script and the content script.
 const CLASSIC = new Set([
     'pwa/sw.js',
+    'pwa/shareCore.js',
     'src/background/background.js',
     'src/content/videoSeek.js'
 ]);
