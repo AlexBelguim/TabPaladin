@@ -207,7 +207,9 @@ Object.assign(globalThis, {
     document: {
         getElementById: byId,
         createElement: (tag) => makeElement(null, tag),
-        createTextNode: (t) => ({ textContent: t }),
+        // Kept with the elements, so a check for text that must not be drawn
+        // also sees what a renderer put in as a text node (the note preview).
+        createTextNode: (t) => { const n = { nodeType: 3, textContent: String(t) }; created.push(n); return n; },
         body: makeElement('body'),
         documentElement: makeElement('html'),
         addEventListener(ev, fn) { (documentListeners[ev] = documentListeners[ev] || []).push(fn); },

@@ -1052,18 +1052,34 @@ function renderFolderRow(folder) {
     return row;
 }
 
+// Only an http(s) bookmark is a link. Anything else (a javascript:
+// bookmarklet from a browser import, a file: or data: URL) is shown as text,
+// so tapping it can neither run script here nor open what a page may not.
 function renderBookmarkRow(b) {
     const row = document.createElement('div');
     row.className = 'row bookmark';
+    const href = NM.safeHref(b.url);
     let domain = '';
-    try { domain = new URL(b.url).hostname.replace(/^www\./, ''); } catch (e) {}
-    const favicon = domain
-        ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32">`
-        : '<span class="icon">🔖</span>';
-    row.innerHTML = `
-        ${favicon}
-        <a href="${escapeAttr(b.url)}" target="_blank" rel="noopener">${escapeHtml(b.title || b.url)}</a>
-    `;
+    try { if (href) domain = new URL(href).hostname.replace(/^www\./, ''); } catch (e) {}
+    if (domain) {
+        const img = document.createElement('img');
+        img.alt = '';
+        img.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32`;
+        row.appendChild(img);
+    } else {
+        row.appendChild(nvEl('span', 'icon', '🔖'));
+    }
+    if (href) {
+        const a = nvEl('a', null, b.title || b.url);
+        a.href = href;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        row.appendChild(a);
+    } else {
+        const text = nvEl('span', 'bookmark-inert', b.title || b.url);
+        text.title = `Not a web link, so it does not open from here: ${String(b.url).slice(0, 200)}`;
+        row.appendChild(text);
+    }
     return row;
 }
 
@@ -1147,13 +1163,24 @@ function colorFor(url) {
 }
 
 // A bare domain goes to the site; anything with a space, or without a dot, is
-// a query. Same rule as the extension's home screen.
+// a query. Same rule as the extension's home screen. A typed http(s) URL
+// opens as it is; any other scheme is searched for, never opened.
 function searchTargetFor(text) {
     const t = String(text || '').trim();
     if (!t) return null;
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return t;
-    if (!/\s/.test(t) && /^[^.]+\.[^.]{2,}/.test(t)) return 'https://' + t;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t) && NM.safeHref(t)) return NM.safeHref(t);
+    if (!/\s/.test(t) && /^[^.]+\.[^.]{2,}/.test(t) && NM.safeHref('https://' + t)) return 'https://' + t;
     return DDG + encodeURIComponent(t);
+}
+
+// Every page this app opens goes through here: only an http(s) URL (see
+// NM.safeHref), always in a new tab that cannot reach back into this one
+// (noopener, which the app's Cross-Origin-Opener-Policy also relies on).
+// Returns what window.open did, or null for a refused URL.
+function openExternal(url) {
+    const href = NM.safeHref(url);
+    if (!href) return null;
+    return window.open(href, '_blank', 'noopener');
 }
 
 // One source, fetched the way the bookmark rows on this page already fetch
@@ -1204,7 +1231,7 @@ function renderHome(root) {
         if (!target) return;
         e.target.value = '';
         e.target.blur();
-        window.open(target, '_blank', 'noopener');
+        openExternal(target);
     });
     wrap.appendChild(search);
 
@@ -1222,15 +1249,18 @@ function renderHome(root) {
         const grid = document.createElement('div');
         grid.className = 'pins-grid';
         for (const p of pins) {
-            const tile = document.createElement('a');
-            tile.className = 'pin-tile';
             // A pin saved as a bare host has no scheme, and a scheme-less href
-            // resolves against this app's origin instead of the web.
-            tile.href = /^[a-z][a-z0-9+.-]*:/i.test(String(p.url).trim())
-                ? p.url
-                : `https://${String(p.url).trim()}`;
-            tile.target = '_blank';
-            tile.rel = 'noopener';
+            // resolves against this app's origin instead of the web. Only an
+            // http(s) pin is a link; any other scheme is an inert tile.
+            const raw = String(p.url).trim();
+            const href = NM.safeHref(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
+            const tile = document.createElement(href ? 'a' : 'span');
+            tile.className = 'pin-tile' + (href ? '' : ' pin-inert');
+            if (href) {
+                tile.href = href;
+                tile.target = '_blank';
+                tile.rel = 'noopener';
+            }
             // Icon only. The name lives in title/aria-label so the tile is
             // still identifiable on hover and to a screen reader — a row of
             // unlabelled squares would otherwise be unusable without sight.
@@ -1252,7 +1282,7 @@ function renderHome(root) {
             fav.appendChild(initials);
 
             // Initials show through if the icon never arrives.
-            attachFavicon(fav, tile.href);
+            if (href) attachFavicon(fav, href);
             tile.appendChild(fav);
             grid.appendChild(tile);
         }
@@ -1377,16 +1407,22 @@ function workflowTabs(folder) {
 }
 
 // One user gesture is usually allowed one popup; the rest need the user to
-// allow pop-ups for this site once. Count what got through and say so.
+// allow pop-ups for this site once. Count what got through and say so. A tab
+// that is not an http(s) page (file:, a browser's own pages) is not opened
+// from here at all.
 function openWorkflowTabs(folder) {
-    const tabs = workflowTabs(folder);
-    if (!tabs.length) { showToast('This workflow has no tabs.'); return; }
+    const all = workflowTabs(folder);
+    if (!all.length) { showToast('This workflow has no tabs.'); return; }
+    const tabs = all.filter(t => NM.safeHref(t.url));
+    const skipped = all.length - tabs.length;
     let opened = 0;
     for (const t of tabs) {
-        const w = window.open(t.url, '_blank', 'noopener');
+        const w = openExternal(t.url);
         if (w) opened++;
     }
-    if (opened < tabs.length) {
+    if (skipped) {
+        showToast(`Opened ${tabs.length} of ${all.length} — ${skipped} ${skipped === 1 ? 'is not a web page' : 'are not web pages'} and cannot be opened from here.`);
+    } else if (opened < tabs.length) {
         showToast(`Opened ${opened} of ${tabs.length} — allow pop-ups for this site to open all at once.`);
     }
 }
@@ -2224,13 +2260,27 @@ function renderNvNote(lib) {
         if (meta) page.appendChild(nvEl('div', 'note-meta', meta));
         const body = nvEl('div', 'note-preview-body');
         body.id = 'note-preview';
-        body.innerHTML = renderNotePreviewHtml(note.content, note.title)
-            || '<span style="color:var(--muted);">Empty note. Tap ✏️ to write.</span>';
+        const blocks = renderNotePreview(document, note.content, note.title);
+        if (blocks.length) {
+            for (const b of blocks) body.appendChild(b);
+        } else {
+            const empty = nvEl('span', null, 'Empty note. Tap ✏️ to write.');
+            empty.style.color = 'var(--muted)';
+            body.appendChild(empty);
+        }
         const links = NM.backlinksTo(lib, note.title, note.id);
         if (links.length) {
-            body.insertAdjacentHTML('beforeend', '<div class="note-backlinks"><span style="color:var(--muted);">Linked from:</span> '
-                + links.map(n => `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title || 'Untitled')}</span>`).join(' ')
-                + '</div>');
+            const box = nvEl('div', 'note-backlinks');
+            const label = nvEl('span', null, 'Linked from:');
+            label.style.color = 'var(--muted)';
+            box.appendChild(label);
+            for (const n of links) {
+                box.appendChild(document.createTextNode(' '));
+                const chip = nvEl('span', 'note-wikilink note-backlink', n.title || 'Untitled');
+                chip.dataset.target = n.title || '';
+                box.appendChild(chip);
+            }
+            body.appendChild(box);
         }
         page.appendChild(body);
     }
@@ -3181,29 +3231,36 @@ function applyNoteOrder(notesRoot, order) {
     sortFolder(notesRoot);
 }
 
-// Render note content as safe HTML, GitHub/Obsidian-style: # headings,
-// real - and 1. lists, **bold**, *italic*, [[wiki-links]] as clickable
-// chips, bare URLs as links. Everything else is escaped text.
-// Zero-dependency, mirrors the extension sidepanel renderer.
-function renderNoteInline(escapedLine) {
-    let html = escapedLine;
-    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-    html = html.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
-        `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
-    html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
-        `<a href="$1" class="note-urllink" target="_blank" rel="noopener">$1</a>`);
-    return html;
-}
-
+// Render note content GitHub/Obsidian-style: # headings, real - and 1.
+// lists, tasks, **bold**, *italic*, `code`, [[wiki-links]] as clickable chips,
+// bare URLs as links. Returns the block elements, built as DOM nodes: the
+// inline parts come from notesModel's tokens (NM.appendInlineNodes), so a
+// note's text only ever goes in as text, a chip's target through dataset and
+// a link's href through safeHref. It used to be an HTML string, and a URL
+// inside a wikilink broke out of the chip's attribute.
+//
+// Uses only NM and `doc`, nothing else from this file:
+// tools/test_render_safety.mjs evaluates it on its own.
+//
 // `skipTitle` drops a leading '# Title' that repeats the note's title, which
 // the page already shows as its heading.
-function renderNotePreviewHtml(content, skipTitle = '') {
-    const out = [];
-    let listTag = null; // 'ul' | 'ol' | null
-    const closeList = () => {
-        if (listTag) { out.push(`</${listTag}>`); listTag = null; }
+function renderNotePreview(doc, content, skipTitle = '') {
+    const blocks = [];
+    const el = (tag, cls) => {
+        const node = doc.createElement(tag);
+        if (cls) node.className = cls;
+        return node;
     };
+    const inline = (parent, text) => NM.appendInlineNodes(doc, parent, NM.renderInlineTokens(text), { target: '_blank', rel: 'noopener' });
+    let list = null; // { tag: 'ul' | 'ol', node }
+    const listOf = (tag, cls) => {
+        if (!list || list.tag !== tag) {
+            list = { tag, node: el(tag, cls) };
+            blocks.push(list.node);
+        }
+        return list.node;
+    };
+    const closeList = () => { list = null; };
     const lines = String(content || '').split('\n');
     const first = lines.findIndex(l => l.trim());
     const skip = String(skipTitle || '').trim().toLowerCase();
@@ -3213,51 +3270,48 @@ function renderNotePreviewHtml(content, skipTitle = '') {
             const h1 = rawLine.match(/^#\s+(.+?)\s*$/);
             if (h1 && h1[1].trim().toLowerCase() === skip) continue;
         }
-        const line = escapeHtml(rawLine);
-        const trimmed = line.trim();
+        const trimmed = rawLine.trim();
         if (!trimmed) { closeList(); continue; }
 
         // Task items before the plain-bullet rule — "- [ ] x" is also a bullet.
         // data-line ties the box back to its source line for the write-back.
         const task = NM.parseTaskLine(rawLine);
         if (task) {
-            if (listTag !== 'ul') { closeList(); out.push('<ul class="note-tasks">'); listTag = 'ul'; }
-            out.push(
-                `<li class="note-task${task.checked ? ' done' : ''}"` +
-                (task.indent ? ` style="margin-left:${task.indent * 12}px"` : '') + '>' +
-                `<input type="checkbox" class="note-task-box" data-line="${i}"${task.checked ? ' checked' : ''}>` +
-                `<span>${renderNoteInline(escapeHtml(task.label))}</span></li>`
-            );
+            const li = el('li', 'note-task' + (task.checked ? ' done' : ''));
+            if (task.indent) li.style.marginLeft = `${task.indent * 12}px`;
+            const box = el('input', 'note-task-box');
+            box.type = 'checkbox';
+            box.dataset.line = String(i);
+            box.checked = task.checked;
+            li.appendChild(box);
+            li.appendChild(inline(el('span'), task.label));
+            listOf('ul', 'note-tasks').appendChild(li);
             continue;
         }
 
         const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
         if (heading) {
             closeList();
-            const level = heading[1].length;
-            out.push(`<h${level}>${renderNoteInline(heading[2])}</h${level}>`);
+            blocks.push(inline(el(`h${heading[1].length}`), heading[2]));
             continue;
         }
 
         const bullet = rawLine.match(/^\s*[-*]\s+(.+)$/);
         if (bullet) {
-            if (listTag !== 'ul') { closeList(); out.push('<ul>'); listTag = 'ul'; }
-            out.push(`<li>${renderNoteInline(escapeHtml(bullet[1]))}</li>`);
+            listOf('ul').appendChild(inline(el('li'), bullet[1]));
             continue;
         }
 
         const numbered = rawLine.match(/^\s*\d+[.)]\s+(.+)$/);
         if (numbered) {
-            if (listTag !== 'ol') { closeList(); out.push('<ol>'); listTag = 'ol'; }
-            out.push(`<li>${renderNoteInline(escapeHtml(numbered[1]))}</li>`);
+            listOf('ol').appendChild(inline(el('li'), numbered[1]));
             continue;
         }
 
         closeList();
-        out.push(`<p>${renderNoteInline(line)}</p>`);
+        blocks.push(inline(el('p'), rawLine));
     }
-    closeList();
-    return out.join('\n');
+    return blocks;
 }
 
 // --- Bottom tab bar ---
@@ -4284,7 +4338,7 @@ function renderImporters() {
         <div class="import-row removed" data-id="${escapeAttr(src.id)}">
           <div class="import-head">
             <span class="import-name">${escapeHtml(src.label || src.provider)}</span>
-            <span class="import-count">${src.items} archived</span>
+            <span class="import-count">${Number(src.items) || 0} archived</span>
           </div>
           <div class="import-meta">Removed — the archive is kept until you delete it.</div>
           <div class="import-actions">
@@ -4296,7 +4350,7 @@ function renderImporters() {
         <div class="import-row" data-id="${escapeAttr(src.id)}">
           <div class="import-head">
             <span class="import-name">${escapeHtml(src.label || src.provider)}</span>
-            <span class="import-count">${src.items} saved</span>
+            <span class="import-count">${Number(src.items) || 0} saved</span>
           </div>
           <div class="import-meta${src.lastStatus === 'error' ? ' error' : ''}">${escapeHtml(importerSubtitle(src))}</div>
           <div class="import-actions">
@@ -4376,7 +4430,7 @@ async function runImporterAction(id, act, btn) {
         const data = await api('/api/imports/' + id + '/authorize');
         // Opened rather than navigated: losing the PWA to a redirect chain and
         // coming back to a cold start is a bad way to connect an account.
-        window.open(data.url, '_blank', 'noopener');
+        openExternal(data.url);
         setStatus('Approve the app on Reddit, then come back and sweep.');
         return;
     }
@@ -4434,7 +4488,7 @@ async function submitImporter() {
         // Straight into the consent flow — a source with no credentials cannot
         // do anything, so stopping here would just be a dead end.
         const auth = await api('/api/imports/' + created.source.id + '/authorize');
-        window.open(auth.url, '_blank', 'noopener');
+        openExternal(auth.url);
         setStatus('Approve the app on Reddit, then come back and sweep.');
     } catch (e) {
         err.textContent = e.message;
@@ -4458,7 +4512,40 @@ function refreshAuthUi() {
     if (!signedIn) hide($('users-block'));
     const setupHint = $('auth-setup-hint');
     if (setupHint) setupHint.classList.add('hidden');
+    updateOriginNotice();
     if (!signedIn) probeAuthStatus();
+}
+
+// The server in Settings, when it is not the one this app was opened from:
+// say so and offer that one. A coming release talks only to the server the
+// app is opened from (its pages may then only connect there).
+function updateOriginNotice() {
+    const box = $('cfg-origin-notice');
+    if (!box) return;
+    const here = defaultServerUrl();
+    const there = currentServerUrl();
+    let differs = false;
+    try {
+        differs = Boolean(here && there) && new URL(there).origin !== new URL(here).origin;
+    } catch (e) {
+        differs = Boolean(here && there);
+    }
+    box.classList.toggle('hidden', !differs);
+    const text = $('cfg-origin-text');
+    if (text) {
+        text.textContent = differs
+            ? `This app was opened from ${here} but syncs with ${there}. A coming release only talks to the server it is opened from.`
+            : '';
+    }
+}
+
+// Puts this app's own server in the field; Sign in, or Save server when
+// signed in, then switches to it the usual way.
+function useOriginServer() {
+    const urlEl = $('cfg-url');
+    if (urlEl) urlEl.value = defaultServerUrl();
+    updateOriginNotice();
+    showToast(state.config.token ? 'Press Save server to switch, then sign in there if asked.' : 'Now sign in to this server.');
 }
 
 // Tells the user whether to sign in or create the first account.
@@ -5141,6 +5228,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
+    safeAddListener('cfg-url', 'input', updateOriginNotice);
+    safeAddListener('cfg-use-origin', 'click', useOriginServer);
 
     // Import a browser's exported bookmarks file — the no-extension way in.
     // Signed in only: a copy kept over a sign-out belongs to its account, and

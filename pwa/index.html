@@ -78,6 +78,12 @@
         <input id="cfg-url" type="url" placeholder="https://sync.example.com">
       </label>
       <small class="hint">Defaults to wherever this app is served from — you only need to change it if you host the app somewhere else.</small>
+      <!-- Shown when the server above is not the one this app was opened
+           from: a later release talks only to that one. -->
+      <div id="cfg-origin-notice" class="origin-notice hidden">
+        <small id="cfg-origin-text" class="hint"></small>
+        <button id="cfg-use-origin" type="button" class="ghost-block">Use this server</button>
+      </div>
 
       <div id="auth-signed-out">
         <label class="field">
