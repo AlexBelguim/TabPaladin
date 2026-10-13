@@ -574,8 +574,10 @@ async function saveNote() {
     try {
         let result;
         if (view.isNew) {
+            // A draft's 'stored' title is the one it was opened with (a
+            // wikilink's target, say), so its '# Target' line follows a rename.
             result = NM.resolveTitleOnSave({
-                storedTitle: '',
+                storedTitle: view.loaded.title,
                 loadedContent: view.loaded.content,
                 newContent,
                 titleField: titleInput.value

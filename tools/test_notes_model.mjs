@@ -211,13 +211,30 @@ check('rule 1: no H1 means nothing to rewrite',
         { title: 'New', content: 'body' }));
 check('rule 1: a blank field means Untitled',
     R({ storedTitle: 'Old', loadedContent: 'x', newContent: 'x', titleField: '  ' }).title === 'Untitled');
-check('rule 1: a pure rename of a diverged note rewrites its stale H1',
+check('rule 1: a rename leaves an opening heading that is not the title alone',
+    eq(R({ storedTitle: 'Recipes', loadedContent: '# Pasta\n- spaghetti', newContent: '# Pasta\n- spaghetti', titleField: 'Italian recipes' }),
+        { title: 'Italian recipes', content: '# Pasta\n- spaghetti' }));
+check('rule 1: a pure rename of a diverged note leaves its stale H1 alone',
     eq(R({ storedTitle: 'New', loadedContent: '# Old\nb', newContent: '# Old\nb', titleField: 'Newer' }),
-        { title: 'Newer', content: '# Newer\nb' }));
+        { title: 'Newer', content: '# Old\nb' }));
+check('rule 1: the title line matches ignoring case',
+    eq(R({ storedTitle: 'alpha', loadedContent: '# Alpha\nb', newContent: '# Alpha\nb', titleField: 'Beta' }),
+        { title: 'Beta', content: '# Beta\nb' }));
 check('rule 2: editing the first-line H1 renames',
     eq(R({ storedTitle: 'Old', loadedContent: '# Old\nb', newContent: '# Fresh\nb' }), { title: 'Fresh', content: '# Fresh\nb' }));
 check('rule 2: an unchanged title field does not block it',
     R({ storedTitle: 'Old', loadedContent: '# Old\nb', newContent: '# Fresh\nb', titleField: 'Old' }).title === 'Fresh');
+check('rule 2: editing an opening heading that is not the title never renames',
+    eq(R({ storedTitle: 'Recipes', loadedContent: '# Pasta\n- spaghetti', newContent: '# Pasta carbonara\n- spaghetti' }),
+        { title: 'Recipes', content: '# Pasta carbonara\n- spaghetti' }));
+check('rule 2: ... nor through an untouched title field',
+    R({ storedTitle: 'Recipes', loadedContent: '# Pasta\nx', newContent: '# Pasta carbonara\nx', titleField: 'Recipes' }).title === 'Recipes');
+check('rule 2: a heading added to a titled note is only a heading',
+    R({ storedTitle: 'Plan', loadedContent: 'intro', newContent: '# Week 1\nintro' }).title === 'Plan');
+check('rule 2: an Untitled note takes the H1 it gains',
+    R({ storedTitle: 'Untitled', loadedContent: 'milk', newContent: '# Groceries\nmilk' }).title === 'Groceries');
+check('rule 2: a case-only edit of the title line renames',
+    R({ storedTitle: 'alpha', loadedContent: '# alpha\nb', newContent: '# Alpha\nb' }).title === 'Alpha');
 check('rule 3: a diverged legacy note keeps its stored title',
     R({ storedTitle: 'New', loadedContent: '# Old\nbody', newContent: '# Old\nbody edited' }).title === 'New');
 check('rule 3: a later # Section never renames',
@@ -226,6 +243,9 @@ check('rule 3: a new note takes its H1', R({ storedTitle: null, loadedContent: '
 check('rule 3: a new note with no H1 is Untitled', R({ storedTitle: null, loadedContent: '', newContent: 'just text' }).title === 'Untitled');
 check('rule 3: a wikilink-prefilled note keeps its title',
     R({ storedTitle: '', loadedContent: '# Target\n\n', newContent: '# Target\n\nbody' }).title === 'Target');
+check('rule 1: a prefilled draft renamed in its field rewrites its title line',
+    eq(R({ storedTitle: 'Target', loadedContent: '# Target\n\n', newContent: '# Target\n\nbody', titleField: 'Target 2' }),
+        { title: 'Target 2', content: '# Target 2\n\nbody' }));
 check('leading blank lines are preserved on rewrite',
     R({ storedTitle: 'A', loadedContent: '\n# A\nb', newContent: '\n# A\nb', titleField: 'B' }).content === '\n# B\nb');
 

@@ -84,9 +84,11 @@ export function taskStats(content) {
 // --- Title rule -------------------------------------------------------------
 //
 // The stored title is canonical. The note's first non-blank line, when it is
-// "# X", is kept in step with it: renaming rewrites that line, and changing
-// that line during an edit renames the note. A "# " further down is only a
-// heading. The PWA used to take the first "# " line anywhere as the title, so a
+// "# X" and X is the stored title (ignoring case), is the title line and is
+// kept in step with it: renaming rewrites that line, and changing that line
+// during an edit renames the note. Any other "# " — further down, or a first
+// line that never matched the title ('Recipes' opening with '# Pasta') — is
+// only a heading. The PWA used to take the first "# " line anywhere as the title, so a
 // later "# Section" silently renamed the note — and a note renamed in the
 // extension was renamed back by the next phone save.
 
@@ -120,27 +122,29 @@ function replaceLeadingTitle(content, title) {
 
 // Decide the title (and content) a save writes. Rules, in order:
 //  1. A title field that differs from the stored title wins (blank means
-//     'Untitled'), and the first line is rewritten when it still carries the
-//     old title — either the stored one or the one the editor loaded.
-//  2. A first-line "# X" that changed during this edit renames the note.
+//     'Untitled'), and the first line is rewritten when it is the title line.
+//  2. Editing the title line renames the note. A note with no real title yet
+//     (none, or 'Untitled') takes a first-line "# X" this edit gave it.
 //  3. Otherwise the stored title stays; a brand-new note takes its "# X", or
 //     'Untitled'.
-// Rule 2 is what keeps diverged notes (stored 'New', body still '# Old') from
-// being renamed back: the H1 only counts when this edit changed it.
+// Only the title line follows the title, so a diverged note (stored 'New',
+// body still '# Old') is never renamed back, and neither a rename nor an edit
+// of some other opening heading touches the other one.
 export function resolveTitleOnSave({ storedTitle = null, loadedContent = '', newContent = '', titleField } = {}) {
     const stored = typeof storedTitle === 'string' ? storedTitle.trim() : '';
     const content = String(newContent == null ? '' : newContent);
     const newH1 = leadingTitle(content);
     const loadedH1 = leadingTitle(loadedContent);
+    const isTitleLine = (h1) => h1 !== null && stored !== '' && h1.toLowerCase() === stored.toLowerCase();
+    const untitled = stored === '' || stored.toLowerCase() === 'untitled';
 
     if (typeof titleField === 'string' && titleField.trim() !== stored) {
         const title = titleField.trim() || 'Untitled';
-        if (newH1 !== null && (newH1 === stored || newH1 === loadedH1)) {
-            return { title, content: replaceLeadingTitle(content, title) };
-        }
-        return { title, content };
+        return { title, content: isTitleLine(newH1) ? replaceLeadingTitle(content, title) : content };
     }
-    if (newH1 !== null && newH1 !== loadedH1) return { title: newH1, content };
+    if (newH1 !== null && newH1 !== loadedH1 && (untitled || isTitleLine(loadedH1))) {
+        return { title: newH1, content };
+    }
     return { title: stored || newH1 || 'Untitled', content };
 }
 
