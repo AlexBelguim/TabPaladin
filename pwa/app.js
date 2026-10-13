@@ -222,7 +222,10 @@ async function bootstrap() {
 
     // An import link that opened the app is kept on the phone before anything
     // else can fail; it opens at the end, or waits for a sign-in or a pull.
-    const arrived = stashImportHash();
+    // It is nobody's until the server has said whose session this is: a
+    // token kept from last time may have expired while the app was closed,
+    // and then the link waits for whoever signs in next.
+    const arrived = stashImportHash({ claim: false });
 
     await processShareTargetIfAny();
 
@@ -231,7 +234,14 @@ async function bootstrap() {
         if (arrived) showToast(SIGN_IN_TO_IMPORT);
         return;
     }
-    await refreshWhoAmI();
+    const me = await refreshWhoAmI();
+    if (!configured()) {
+        // The server has just said the kept session is over (api() says so
+        // and opens the sign-in): nothing to pull, and the link is nobody's.
+        if (arrived) showToast(SIGN_IN_TO_IMPORT);
+        return;
+    }
+    if (arrived && me) claimPendingImport(arrived.id);
     // A pull replaces the working copy, so it never runs over unpushed edits
     // — after a sign-out and back in they are still here, waiting.
     if (state.dirty && state.snapshot) {
@@ -262,7 +272,12 @@ const IMPORT_HASH_RE = /^#(note|notes|reorder)=/;
 // account's (`account`), as is one opened for review under an account; it
 // waits for that account alone, through a sign-out. One tapped while nobody
 // is signed in goes to whoever signs in next: it came from a tap on this
-// phone. [{ id, hash, at, account }], oldest first.
+// phone. So does one that opened the app, until the server has confirmed the
+// session it found: a session that turns out expired is nobody's. Imported is
+// not yet kept, either: what a link imports goes into the working copy, which
+// lives in this page alone, so the link stays on the phone until a push that
+// carries it succeeds (see copyImportIds). [{ id, hash, at, account }],
+// oldest first.
 const PENDING_IMPORT_KEY = 'tp_pending_import';
 const SIGN_IN_TO_IMPORT = 'Sign in to import this link — it is kept on this phone until then.';
 
@@ -284,25 +299,62 @@ function savePendingImports(list) {
     }
 }
 
-// Imported, or dismissed on purpose.
+// Dismissed on purpose, or on the server now.
 function dropPendingImport(id) {
-    if (id) savePendingImports(pendingImports().filter(p => p.id !== id));
+    if (id) dropPendingImports([id]);
 }
 
-function pinPendingImport(id) {
-    savePendingImports(pendingImports().map(p => (p.id === id ? { ...p, account: accountKey() } : p)));
+function dropPendingImports(ids) {
+    if (ids.length) savePendingImports(pendingImports().filter(p => !ids.includes(p.id)));
 }
 
+// Tie a link that is nobody's yet to the account signed in now: it was
+// opened for review under it, or it opened the app and the server has since
+// confirmed the session. A link already some account's stays that one's.
+function claimPendingImport(id) {
+    const key = accountKey();
+    if (!id || !key) return;
+    savePendingImports(pendingImports().map(p => (p.id === id && !p.account ? { ...p, account: key } : p)));
+}
+
+// A kept link is for whoever is signed in when it is nobody's, or this
+// account's: by its key, or by one an earlier build kept it under — the
+// account id, or the name as stored for a session from before ids.
 function pendingImportVisible(p) {
-    return !p.account || p.account === accountKey();
+    if (!p.account) return true;
+    const key = accountKey();
+    if (!key) return false;
+    if (p.account === key) return true;
+    const base = key.slice(0, key.lastIndexOf('|name:'));
+    const id = currentUserId();
+    return (id !== null && p.account === `${base}|${id}`)
+        || p.account === `${base}|${localStorage.getItem(LS.username)}`;
 }
 
-// Pending links for whoever is here, other than the one under review.
+// The links whose notes, batch or order are in this working copy but not on
+// the server yet. They are kept on the copy itself, so they last exactly as
+// long as it does: the push that carries them up drops them from the phone
+// (pushSnapshot), and a pull or a discard that throws the copy away gives
+// them back to the waiting block, since what they hold never got anywhere.
+// Meanwhile they are neither waiting nor opened a second time.
+function copyImportIds() {
+    return (state.snapshot && state.snapshot._importIds) || [];
+}
+
+function holdImportInCopy(id) {
+    if (!id || !state.snapshot) return;
+    const ids = state.snapshot._importIds || (state.snapshot._importIds = []);
+    if (!ids.includes(id)) ids.push(id);
+}
+
+// Pending links for whoever is here, other than the one under review and
+// those already in this copy.
 function waitingImports() {
     const open = new Set([
         state.importBatch && state.importBatch.importId,
         state.nv.editing && state.nv.importId,
-        state.keptDraft && state.keptDraft.importId
+        state.keptDraft && state.keptDraft.importId,
+        ...copyImportIds()
     ].filter(Boolean));
     return pendingImports().filter(p => pendingImportVisible(p) && !open.has(p.id));
 }
@@ -312,7 +364,8 @@ function waitingImports() {
 // arrived as a history entry of its own; it takes over whatever is on screen,
 // so back still behaves. Returns the kept link, or null when there was none —
 // or nowhere to keep it, in which case the fragment stays where it is.
-function stashImportHash() {
+// `claim: false` keeps a new link nobody's, for a session not confirmed yet.
+function stashImportHash({ claim = true } = {}) {
     const hash = location.hash;
     if (!IMPORT_HASH_RE.test(hash)) return null;
     let rec = null;
@@ -320,7 +373,7 @@ function stashImportHash() {
         const list = pendingImports();
         rec = list.find(p => p.hash === hash && pendingImportVisible(p)) || null;
         if (!rec) {
-            const account = configured() && !accountChanging ? accountKey() : null;
+            const account = claim && configured() && !accountChanging ? accountKey() || null : null;
             rec = { id: newLocalId(), hash, at: new Date().toISOString(), account };
             localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify([...list, rec]));
         }
@@ -351,7 +404,13 @@ let openingImport = false;
 // waiting. `why`: 'arrived' (just tapped) and 'asked' (Review) say why not;
 // the automatic tries after a sign-in or a pull keep quiet.
 async function openPendingImport({ id = null, why = 'auto' } = {}) {
-    const list = pendingImports().filter(pendingImportVisible);
+    const held = copyImportIds();
+    if (id && held.includes(id)) {
+        // Tapped again before the push that carries it got through.
+        if (why !== 'auto') showToast('This link is in your notes already — ⬆️ Push to put it on the server.');
+        return false;
+    }
+    const list = pendingImports().filter(p => pendingImportVisible(p) && !held.includes(p.id));
     const rec = id ? list.find(p => p.id === id) : list[0];
     if (!rec || openingImport) return false;
     const wait = (msg) => {
@@ -442,7 +501,7 @@ async function openImportReview(rec) {
         state.importBatch = link.kind === 'notes'
             ? { kind: 'notes', items: link.items, importId: rec.id }
             : { kind: 'reorder', order: link.order, importId: rec.id };
-        pinPendingImport(rec.id);
+        claimPendingImport(rec.id);
         // The review block lives in the Notes library.
         if (state.view === 'notes' && !state.nv.editing) openNotes({ pane: 'library' });
         else renderView();
@@ -464,7 +523,7 @@ async function openImportReview(rec) {
         else if (res) pendingNotebookName = link.notebook.trim();
     }
     if (!(await startNewNote({ parentId, content: link.content, pendingNotebookName, importId: rec.id }))) return false;
-    pinPendingImport(rec.id);
+    claimPendingImport(rec.id);
     showToast('Review the note, then press ✓ Done.');
     return true;
 }
@@ -1488,12 +1547,17 @@ function isDesktop() {
 }
 
 // Who the page is showing, for its history entries and pending import links:
-// the server and the account id (ids start at 1 on every server), or the name
-// for a session from before ids. Empty when nobody is.
+// the server and the account's name, compared the way the server compares
+// names (NFKC, any case). A server never renames an account or hands a name
+// out twice, deleted accounts' included, so the name is as sure as the id —
+// and unlike the id it is there from the first moment of every session, one
+// from before ids too: the key is the same before and after the server has
+// said who the session is. Empty when nobody is. "name:" keeps it apart from
+// the keys earlier builds kept links under (see pendingImportVisible): a
+// username never has a colon.
 function accountKey() {
-    const id = currentUserId();
-    const who = id !== null ? String(id) : (localStorage.getItem(LS.username) || '');
-    return who ? `${(state.config.url || '').replace(/\/$/, '')}|${who}` : '';
+    const who = (localStorage.getItem(LS.username) || '').normalize('NFKC').toLowerCase();
+    return who ? `${(state.config.url || '').replace(/\/$/, '')}|name:${who}` : '';
 }
 
 // Each entry says whose notes it shows, so one left in the stack by an
@@ -1541,6 +1605,12 @@ function editorDirty() {
     return nv.draft !== (nv.loaded == null ? '' : nv.loaded);
 }
 
+// A note open in the editor, changed or not: what it saves is its own text,
+// loaded before anything a pull brings in under it.
+function editorOpen() {
+    return state.view === 'notes' && Boolean(state.nv.editing);
+}
+
 // The guard on every way out of an edit: back, the bottom nav, wikilinks, the
 // wordmark, another note.
 function confirmDiscardEdit() {
@@ -1548,9 +1618,10 @@ function confirmDiscardEdit() {
 }
 
 // Every way out of an edit comes through here, saved (✓ Done) or discarded
-// (✕, or a confirmed back or switch). For an import link's note either way
-// ends the link: it is in the copy now, or was thrown away on purpose. An
-// account change sets the editor aside without coming through here.
+// (✕, or a confirmed back or switch). An import link's note that is thrown
+// away on purpose ends its link here; a saved one has handed its link to the
+// copy first (saveNoteEdit), to be kept until the copy is pushed. An account
+// change sets the editor aside without coming through here.
 function stopEditing() {
     if (state.nv.importId) dropPendingImport(state.nv.importId);
     Object.assign(state.nv, {
@@ -2134,6 +2205,11 @@ async function saveNoteEdit() {
         assignIds(note);
         parent.children = parent.children || [];
         parent.children.push(note);
+        // An import link's note is in the copy now, not on the server: the
+        // link stays on the phone until the push below (or a later one) gets
+        // it there.
+        holdImportInCopy(nv.importId);
+        nv.importId = null;
         stopEditing();
         nv.noteId = note._pwaId;
         history.replaceState(nvHistoryState(), '', location.pathname);
@@ -2793,10 +2869,12 @@ function renderProposalsBlock() {
 
 // The server makes an approved note or order on its own tree, and the phone
 // pulls that tree down — which replaces this copy. So a copy with unpushed
-// edits, or a note being written, approves nothing: push (or finish the note)
+// edits, or a note open in the editor (changed or not: it holds the text from
+// before the pull, and saving it would write that back over an approval that
+// rewrote the note), approves nothing: push (or save or close the note)
 // first, and the proposal keeps waiting. A clean copy approves, then pulls.
 async function resolveProposal(p, approve) {
-    if (approve && (state.dirty || editorDirty())) {
+    if (approve && (state.dirty || editorOpen())) {
         askToPushBeforeApproving();
         return;
     }
@@ -2815,9 +2893,12 @@ async function resolveProposal(p, approve) {
             if (accountKey() !== account) {
                 // Signed out or switched while it was on its way: this copy is
                 // not the one it went into.
-            } else if (state.dirty || editorDirty()) {
+            } else if (state.dirty) {
                 // Edited while it was on its way: no pull over that.
                 showToast(`${done} on the server — not pulled here, over the changes made meanwhile.`);
+            } else if (editorOpen()) {
+                // A note opened while it was on its way: no pull under that.
+                showToast(`${done} on the server — not pulled here under your open note. ⬇️ Pull once it is saved or closed.`);
             } else {
                 showToast(`${done}.`);
                 await pullSnapshot(); // server applied the change — pull it down
@@ -2834,18 +2915,19 @@ async function resolveProposal(p, approve) {
 }
 
 function askToPushBeforeApproving() {
-    const writing = editorDirty();
+    const writing = editorOpen();
     if (!state.dirty) {
-        alert('Save your note first, then approve.\n\n'
-            + 'You are still writing a note, and approving pulls the server’s tree under it. '
-            + '✓ Done saves and pushes it; ✕ discards it.\n\nThe proposal keeps waiting.');
+        alert('Save or close your note first, then approve.\n\n'
+            + 'You have a note open in the editor, and approving pulls the server’s tree under it: '
+            + 'the editor would keep the text from before, and saving it could undo what you approved. '
+            + '✓ Done saves and pushes it; ✕ closes it.\n\nThe proposal keeps waiting.');
         return;
     }
     const n = state.editCount || 1;
-    const what = `${n} unpushed edit${n === 1 ? '' : 's'}${writing ? ' and a note you are still writing' : ''}`;
+    const what = `${n} unpushed edit${n === 1 ? '' : 's'}${writing ? ' and a note open in the editor' : ''}`;
     if (confirm('Push your changes first, then approve.\n\n'
         + `This phone has ${what}. Approving pulls the server’s tree, which would replace ${n === 1 && !writing ? 'it' : 'them'}.\n\n`
-        + `OK = ⬆️ Push now, then tap Approve again${writing ? ' (save the note with ✓ Done first)' : ''}\n`
+        + `OK = ⬆️ Push now, then tap Approve again${writing ? ' (save or close the note first)' : ''}\n`
         + 'Cancel = not now — the proposal keeps waiting')) {
         pushNow();
     }
@@ -2920,9 +3002,10 @@ async function applyImportBatch() {
         }
     }
 
-    // In the copy now: an unpushed edit like any other if the push fails.
+    // In the copy now: an unpushed edit like any other if the push fails,
+    // and the link stays on the phone until a push gets it to the server.
     state.importBatch = null;
-    dropPendingImport(batch.importId);
+    holdImportInCopy(batch.importId);
     markDirty();
     try {
         setStatus('Saving…');
@@ -3175,6 +3258,12 @@ async function pushSnapshot({ force = false } = {}) {
     }
     const baseUserId = state.snapshotUserId ?? null;
     const baseServerId = state.snapshotServerId || null;
+    // What goes up with this push: the import links in the copy as it is
+    // now, and the edits counted so far. Anything added while the push is on
+    // its way goes up with the next one.
+    const copy = state.snapshot;
+    const carried = copyImportIds().slice();
+    const edits = state.editCount;
     try {
         const data = await api('/api/tree', {
             method: 'PUT',
@@ -3187,8 +3276,13 @@ async function pushSnapshot({ force = false } = {}) {
         state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
         if (data.userId !== undefined) state.snapshotUserId = data.userId;
         if (data.serverId) state.snapshotServerId = data.serverId;
-        state.dirty = false;
-        state.editCount = 0;
+        state.editCount = Math.max(0, state.editCount - edits);
+        state.dirty = state.editCount > 0;
+        // On the server now: the links those imports came from are done.
+        if (carried.length) {
+            dropPendingImports(carried);
+            copy._importIds = (copy._importIds || []).filter(id => !carried.includes(id));
+        }
     } catch (e) {
         // This copy belongs to another account. Forcing would write it into
         // this one, so there is no offer to — sign in as its account to push.
@@ -3963,7 +4057,9 @@ function discardPreviousEdits() {
     const account = (btn && btn.dataset.account) || '';
     const typed = prompt(`Discard ${account}'s unpushed edits on this phone? They cannot be recovered.\n\nType ${account} to confirm.`);
     if (typed === null || typed.trim() !== account) return;
-    // An import link opened as one of those unsaved notes goes with it.
+    // An import link opened as one of those unsaved notes goes with it. One
+    // whose import was already in the copy waits again for its account: the
+    // copy goes, the links it held were never on the server.
     for (const nv of [state.keptDraft, state.nv]) {
         if (nv && nv.editing && nv.importId) dropPendingImport(nv.importId);
     }

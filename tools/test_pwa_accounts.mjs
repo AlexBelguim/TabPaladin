@@ -29,7 +29,7 @@
 //      that says what it kept, and closing the app asks first while a note
 //      is set aside.
 //   8. An LLM proposal (a note or an order) is never approved over unpushed
-//      edits or a note being written, since the approval's pull would
+//      edits or a note open in the editor, since the approval's pull would
 //      replace them: the app says to push (or save) first, offers ⬆️ Push,
 //      and the proposal keeps waiting. With the copy clean it approves and
 //      pulls as before.
@@ -46,6 +46,18 @@
 //      scan and the Unfiled links sheet).
 //  11. Back and forward never reopen another account's notes: the entries an
 //      account change leaves in the stack read as Home.
+//  12. A link that opens the app is nobody's until the server has confirmed
+//      the session it found, and an account's key is the same before and
+//      after the server says its id: from a session older than ids it opens
+//      for that account, on that start or a later one; with a session that
+//      expired while the app was closed it goes to whoever signs in next.
+//  13. A link is kept on the phone until the push that carries what it
+//      imported succeeds: through a failed push and the app being closed, out
+//      of the waiting block and not opened twice meanwhile, and back for
+//      review when a pull throws the copy holding it away.
+//  14. A note open in the editor, changed or not, holds back an approval: a
+//      clean editor would otherwise save its old text over the approved one.
+//      One opened while the approval is on its way holds back its pull.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -235,12 +247,20 @@ const realFetch = globalThis.fetch;
 let inFlight = 0;
 let lastActivity = Date.now();
 let failNext = null; // e.g. 'PUT /api/tree'
+// One request held on its way until the test lets it go: { match, until }.
+let holdNext = null;
 globalThis.fetch = async (url, opts = {}) => {
     const line = `${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`;
     requests.push(line);
     if (failNext && line.startsWith(failNext)) {
         failNext = null;
         throw new TypeError('Failed to fetch');
+    }
+    // Not counted as in flight until let go, so the test can settle meanwhile.
+    if (holdNext && line.startsWith(holdNext.match)) {
+        const { until } = holdNext;
+        holdNext = null;
+        await until;
     }
     inFlight++;
     try { return await realFetch(url, opts); } finally { inFlight--; lastActivity = Date.now(); }
@@ -348,6 +368,24 @@ const pendingHolds = (text) => pendingLinks().some(p => decodeURIComponent(p.has
 const waitingRow = (title) => [...created].reverse()
     .find(e => e.className === 'proposal pending-import' && e.innerHTML.includes(title));
 const noteLink = (title, body) => '#note=' + encodeURIComponent(`# ${title}\n\n${body}`);
+// The note editor's text as drawn since a mark (a count of `created`).
+const editorSince = (mark) => [...created.slice(mark)].reverse().find(e => e.tagName === 'TEXTAREA')?.value ?? null;
+
+// The app started afresh at a URL, as after the phone's OS closed it: a new
+// page with nothing in memory, only what the phone kept in localStorage. The
+// last page is gone with its listeners, and its elements are no longer the
+// document's.
+let starts = 0;
+async function coldStart(url) {
+    elements.clear();
+    for (const k of Object.keys(windowListeners)) delete windowListeners[k];
+    for (const k of Object.keys(documentListeners)) delete documentListeners[k];
+    H.entries = [{ state: null, url }];
+    H.index = 0;
+    await import(pathToFileURL(path.join(REPO, 'pwa', 'app.js')).href + '?start=' + (++starts));
+    for (const fn of windowListeners.DOMContentLoaded || []) await fn();
+    await settle();
+}
 
 try {
     for (let i = 0; i < 100; i++) {
@@ -671,7 +709,7 @@ try {
     await findProposal('While writing').querySelector('.proposal-approve').fire('click');
     await settle();
     check('approving while a note is being written approves nothing, and says to save it first',
-        /^Save your note first, then approve\./.test(dialogs.alert[alerted8] || '') && approvals() === approvals8b
+        /^Save or close your note first, then approve\./.test(dialogs.alert[alerted8] || '') && approvals() === approvals8b
         && bodyHas('nv-editing'), dialogs.alert.slice(alerted8).join(' | '));
     check('  and the proposal still waits', (await serverProposals()).includes('While writing'));
     await clickNv('done'); // the text typed above is what gets saved: nothing was lost
@@ -932,6 +970,199 @@ try {
     historyShim.go(1);
     await settle();
     check('  while sam\'s own Notes entry still opens as Notes', bodyHas('view-notes'));
+
+    console.log('\n12. A link that opens the app is nobody\'s until the server confirms the session');
+    const loginAlex = async () => (await api('/api/login', { method: 'POST', body: { username: 'alex', password: alexPw } })).json.token;
+    // A session from before ids: the phone knows alex's name and token, not his id.
+    const preIdsSession = async () => {
+        for (const k of ['tp_pwa_userid', 'tp_pwa_role', 'tp_pwa_owner']) localStorageShim.removeItem(k);
+        localStorageShim.setItem('tp_pwa_url', BASE);
+        localStorageShim.setItem('tp_pwa_user', 'alex');
+        localStorageShim.setItem('tp_pwa_token', await loginAlex());
+    };
+    check('no link is waiting to begin with', pendingLinks().length === 0, JSON.stringify(pendingLinks()));
+    await preIdsSession();
+    let mark12 = created.length;
+    await coldStart(BASE + '/' + noteLink('Cold start', 'COLD START BODY'));
+    check('a link that starts a session from before ids opens for alex once the server says who he is',
+        localStorageShim.getItem('tp_pwa_userid') === '1' && bodyHas('nv-editing') && /COLD START BODY/.test(editorSince(mark12) || ''),
+        JSON.stringify({ userId: localStorageShim.getItem('tp_pwa_userid'), editor: editorSince(mark12), pending: pendingLinks() }));
+    check('  kept for alex under the key his session has with or without its id',
+        pendingLinks().length === 1 && pendingLinks()[0].account === `${BASE}|name:alex`, JSON.stringify(pendingLinks()));
+    await clickNv('done');
+    check('  ✓ Done files it for alex, and it is kept no longer', (await treeTitles(alexTok)).includes('COLD START BODY') && pendingLinks().length === 0);
+
+    // alex's session ends while the app is closed (his password changed on
+    // another device); a link starts the app; sam signs in.
+    localStorageShim.setItem('tp_pwa_token', await loginAlex());
+    alexTok = (await api('/api/auth/password', { method: 'POST', token: alexTok, body: { currentPassword: alexPw, newPassword: 'seventh horse battery' } })).json.token;
+    alexPw = 'seventh horse battery';
+    const toasts12 = toastCount();
+    mark12 = created.length;
+    await coldStart(BASE + '/' + noteLink('Stale start', 'STALE START BODY'));
+    check('a link that starts the app on a session that ended meanwhile is kept for nobody in particular',
+        !localStorageShim.getItem('tp_pwa_token') && pendingLinks().length === 1 && pendingLinks()[0].account === null
+        && toastsSince(toasts12).some(t => /Sign in to import this link/.test(t)) && !bodyHas('nv-editing'),
+        JSON.stringify({ pending: pendingLinks(), toasts: toastsSince(toasts12) }));
+    await signIn('sam', 'sam-password-1');
+    check('  so sam, signing in next, gets it to review', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && bodyHas('nv-editing') && /STALE START BODY/.test(editorSince(mark12) || ''), editorSince(mark12));
+    await clickNv('done');
+    check('  and ✓ Done files it for sam alone', (await treeTitles(samNow)).includes('STALE START BODY')
+        && !(await treeTitles(alexTok)).includes('STALE START BODY') && pendingLinks().length === 0);
+
+    // A session from before ids starts while the server cannot say who it is.
+    await byId('auth-signout').fire('click');
+    await settle();
+    await preIdsSession();
+    failNext = 'GET /api/auth/me';
+    await coldStart(BASE + '/#notes=' + encodeURIComponent(JSON.stringify([{ content: '# Pre-ids batch\n\nPREIDS BATCH BODY' }])));
+    mark12 = created.length;
+    await byId('notesBtn').fire('click');
+    check('a batch opened for review while the server cannot say who alex is',
+        localStorageShim.getItem('tp_pwa_userid') === null && created.slice(mark12).some(e => e.className === 'import-list' && /Pre-ids batch/.test(e.innerHTML))
+        && pendingLinks().length === 1 && pendingLinks()[0].account === `${BASE}|name:alex`, JSON.stringify(pendingLinks()));
+    await coldStart(BASE + '/'); // closed unimported; the next start reaches the server
+    mark12 = created.length;
+    await byId('notesBtn').fire('click');
+    const import12 = [...created.slice(mark12)].reverse().find(e => e.tagName === 'BUTTON' && e.textContent === 'Import');
+    check('  is still alex\'s on a later start that learns his id', localStorageShim.getItem('tp_pwa_userid') === '1'
+        && Boolean(import12) && created.slice(mark12).some(e => e.className === 'import-list' && /Pre-ids batch/.test(e.innerHTML)),
+        JSON.stringify(pendingLinks()));
+    if (import12) await import12.fire('click');
+    await settle();
+    check('  and Import files it for him', (await treeTitles(alexTok)).includes('PREIDS BATCH BODY') && pendingLinks().length === 0);
+
+    // Links an earlier build kept for alex: under his id, and under his name
+    // from a session before ids (the ones that could never be seen again).
+    const at12 = new Date().toISOString();
+    localStorageShim.setItem('tp_pending_import', JSON.stringify([
+        { id: 'legacy-by-id', hash: noteLink('Legacy by id', 'LEGACY ID BODY'), at: at12, account: `${BASE}|1` },
+        { id: 'legacy-by-name', hash: noteLink('Legacy by name', 'LEGACY NAME BODY'), at: at12, account: `${BASE}|alex` }
+    ]));
+    await byId('auth-signout').fire('click');
+    await settle();
+    mark12 = created.length;
+    await signIn('sam', 'sam-password-1');
+    await byId('notesBtn').fire('click');
+    check('links an earlier build kept for alex are not sam\'s', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && !bodyHas('nv-editing') && !['Legacy by', 'LEGACY'].some(t => drawnSince(mark12, t)) && pendingLinks().length === 2);
+    await byId('auth-signout').fire('click');
+    await settle();
+    mark12 = created.length;
+    await signIn('alex', alexPw);
+    check('  but alex\'s: the one kept under his id opens when he signs in', bodyHas('nv-editing') && /LEGACY ID BODY/.test(editorSince(mark12) || ''),
+        editorSince(mark12));
+    await clickNv('done');
+    mark12 = created.length;
+    await byId('notesBtn').fire('click');
+    const legacyRow = created.slice(mark12).find(e => e.className === 'proposal pending-import' && e.innerHTML.includes('Legacy by name'));
+    check('  and the one kept under his name waits in Notes', Boolean(legacyRow));
+    if (legacyRow) await legacyRow.querySelector('.pending-import-review').fire('click');
+    await settle();
+    await clickNv('done');
+    const legacyTree = await treeTitles(alexTok);
+    check('  both file into his tree, and are kept no longer', legacyTree.includes('LEGACY ID BODY') && legacyTree.includes('LEGACY NAME BODY')
+        && pendingLinks().length === 0, JSON.stringify(pendingLinks()));
+
+    console.log('\n13. A link stays on the phone until the push that carries it succeeds');
+    await tapLink(noteLink('Offline done', 'OFFLINE DONE BODY'));
+    check('a link tapped opens for review', bodyHas('nv-editing') && /OFFLINE DONE BODY/.test(lastEditorText() || ''), lastEditorText());
+    failNext = 'PUT /api/tree'; // offline for this push
+    let toasts13 = toastCount();
+    await clickNv('done');
+    check('✓ Done whose push fails keeps the link on the phone, its note in the unpushed copy',
+        pendingHolds('OFFLINE DONE BODY') && dirtyShown() && toastsSince(toasts13).some(t => /Push failed/.test(t))
+        && !(await treeTitles(alexTok)).includes('OFFLINE DONE BODY'), JSON.stringify(pendingLinks()));
+    let mark13 = created.length;
+    await byId('notesBtn').fire('click');
+    await byId('brand-home').fire('click');
+    await settle();
+    check('  not waiting in Notes or counted on Home meanwhile: its note is in the copy',
+        !created.slice(mark13).some(e => e.className === 'proposal pending-import') && !drawnSince(mark13, 'waiting to be imported'));
+    toasts13 = toastCount();
+    await tapLink(noteLink('Offline done', 'OFFLINE DONE BODY'));
+    check('  and tapped again it is not opened a second time', !bodyHas('nv-editing') && pendingLinks().length === 1
+        && toastsSince(toasts13).some(t => /in your notes already/.test(t)), toastsSince(toasts13).join(' | '));
+    mark13 = created.length;
+    await coldStart(BASE + '/'); // the phone closes the app before any push
+    check('the app closed before a push got through: the next start opens the link again',
+        bodyHas('nv-editing') && /OFFLINE DONE BODY/.test(editorSince(mark13) || ''), editorSince(mark13));
+    await clickNv('done');
+    const filed13 = notesOf(JSON.parse(await treeTitles(alexTok))).filter(n => /OFFLINE DONE BODY/.test(n.content || ''));
+    check('  ✓ Done with the server reachable files it once, and then it goes', filed13.length === 1 && pendingLinks().length === 0,
+        JSON.stringify({ filed13, pending: pendingLinks() }));
+
+    await tapLink('#notes=' + encodeURIComponent(JSON.stringify([{ content: '# Held batch\n\nHELD BATCH BODY' }])));
+    await byId('notesBtn').fire('click');
+    const import13 = [...created].reverse().find(e => e.tagName === 'BUTTON' && e.textContent === 'Import');
+    failNext = 'PUT /api/tree';
+    const alerts13 = dialogs.alert.length;
+    if (import13) await import13.fire('click');
+    await settle();
+    check('a batch whose Import cannot be pushed keeps its link as well', Boolean(import13) && pendingHolds('HELD BATCH BODY') && dirtyShown()
+        && dialogs.alert.slice(alerts13).some(m => /Import failed/.test(m)), dialogs.alert.slice(alerts13).join(' | '));
+    await byId('pushBtn').fire('click');
+    await settle();
+    check('  until ⬆️ Push gets it to the server', (await treeTitles(alexTok)).includes('HELD BATCH BODY') && pendingLinks().length === 0 && !dirtyShown());
+
+    await tapLink(noteLink('Pulled away', 'PULLED AWAY BODY'));
+    failNext = 'PUT /api/tree';
+    await clickNv('done');
+    answers.confirm.push(true); // "Pull anyway?" — the unpushed copy is thrown away
+    mark13 = created.length;
+    await byId('pullBtn').fire('click');
+    await settle();
+    check('a pull that throws away the copy holding an imported note gives its link back, for review',
+        bodyHas('nv-editing') && /PULLED AWAY BODY/.test(editorSince(mark13) || '') && pendingHolds('PULLED AWAY BODY'), editorSince(mark13));
+    answers.confirm.push(true); // "Discard unsaved changes?"
+    await clickNv('cancel-edit');
+    check('  where ✕ dismisses it', pendingLinks().length === 0 && !(await treeTitles(alexTok)).includes('PULLED AWAY BODY'));
+
+    console.log('\n14. A note open in the editor holds back an approval, changed or not');
+    await propose(alexTok, { title: 'Diary', content: '# Diary\n\nLLM REWRITE OF DIARY' });
+    await signIn('alex', alexPw); // the same account, clean: it pulls, and the proposal arrives
+    await byId('notesBtn').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    const alerts14 = dialogs.alert.length;
+    const approvals14 = approvals();
+    await findProposal('Diary').querySelector('.proposal-approve').fire('click');
+    await settle();
+    check('approving with a note open, unchanged, approves nothing and says to save or close it first',
+        /^Save or close your note first, then approve\./.test(dialogs.alert[alerts14] || '') && approvals() === approvals14
+        && bodyHas('nv-editing') && (await serverProposals()).includes('Diary'), dialogs.alert.slice(alerts14).join(' | '));
+    const asked14 = dialogs.confirm.length;
+    await clickNv('cancel-edit');
+    await findProposal('Diary').querySelector('.proposal-approve').fire('click');
+    await settle();
+    check('  closed (nothing asked), Approve goes through', dialogs.confirm.length === asked14 && approvals() === approvals14 + 1
+        && /LLM REWRITE OF DIARY/.test(await treeTitles(alexTok)));
+    await clickNv('edit');
+    check('  and the editor opens on the approved text', /LLM REWRITE OF DIARY/.test(lastEditorText() || ''), lastEditorText());
+    await typeNote((lastEditorText() || '') + '\nadded after the approval');
+    await clickNv('done');
+    const diary14 = notesOf(JSON.parse(await treeTitles(alexTok))).find(n => n.title === 'Diary');
+    check('  so saving it keeps what was approved', Boolean(diary14) && /LLM REWRITE OF DIARY/.test(diary14.content || '')
+        && /added after the approval/.test(diary14.content || ''), JSON.stringify(diary14));
+
+    await propose(alexTok, { title: 'Late approval', content: '# Late approval\n\nLATE APPROVAL BODY' });
+    await signIn('alex', alexPw);
+    await byId('notesBtn').fire('click');
+    let letGo = null;
+    holdNext = { match: 'POST /api/proposals/', until: new Promise(r => { letGo = r; }) };
+    const pulls14 = pulls();
+    const toasts14 = toastCount();
+    const approving = findProposal('Late approval').querySelector('.proposal-approve').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    letGo();
+    await approving;
+    await settle();
+    check('a note opened while an approval is on its way holds back the pull, and says so',
+        (await treeTitles(alexTok)).includes('LATE APPROVAL BODY') && pulls() === pulls14 && bodyHas('nv-editing')
+        && toastsSince(toasts14).some(t => /not pulled here under your open note/.test(t)), toastsSince(toasts14).join(' | '));
+    await clickNv('cancel-edit');
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);
