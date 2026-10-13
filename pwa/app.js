@@ -167,6 +167,17 @@ function showToast(message) {
 // --- Config ---
 function configured() { return state.config.url && state.config.token; }
 
+// Nobody signed in, nothing written. A copy kept over a sign-out, or still
+// shown after a session expired, belongs to its account: whatever went into
+// it now would go up with that account's next push. The same goes for the
+// per-account lists on the phone, which signed out have no account to be
+// kept under. Every way of changing either asks this first.
+function signedOutRefuses(message = 'Sign in first — changes go into your account.') {
+    if (configured()) return false;
+    showToast(message);
+    return true;
+}
+
 async function api(path, opts = {}) {
     if (!configured()) throw new Error('Server not configured. Open Settings.');
     const res = await fetch(state.config.url.replace(/\/$/, '') + path, {
@@ -209,15 +220,15 @@ async function bootstrap() {
     // the app.
     mirrorConfigToSW();
 
+    // An import link that opened the app is kept on the phone before anything
+    // else can fail; it opens at the end, or waits for a sign-in or a pull.
+    const arrived = stashImportHash();
+
     await processShareTargetIfAny();
 
     if (!configured()) {
         setStatus('Open Settings (⚙) to configure your sync server.');
-        // An import link stays in the URL for the reload after setup. Tag its
-        // entry, so coming back to it later reads as Home, not as a new link.
-        if (IMPORT_HASH_RE.test(location.hash) && !history.state) {
-            history.replaceState({ tp: 'import-pending' }, '', location.href);
-        }
+        if (arrived) showToast(SIGN_IN_TO_IMPORT);
         return;
     }
     await refreshWhoAmI();
@@ -233,75 +244,172 @@ async function bootstrap() {
     await refreshInbox();
     await refreshProposals();
     await checkUnfiledLinks();
-    await processImportHashIfAny();
+    await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
 }
 
 // Universal import link: /#note=<percent-encoded markdown>[&notebook=<name>]
 // Used by LLM chats that cannot POST. The fragment never reaches the server;
 // the note opens in the editor for review and is only stored when the user
 // presses ✓ Done. A first-line "# " heading becomes the title, as usual.
+// #notes= and #reorder= open a review block in the Notes library instead.
 const IMPORT_HASH_RE = /^#(note|notes|reorder)=/;
 
-async function processImportHashIfAny() {
-    const raw = location.hash.slice(1);
+// Every import link is kept on the phone the moment it arrives, before its
+// fragment leaves the URL, and stays until it is imported or dismissed: when
+// it cannot be opened right away (signed out, no copy pulled yet, offline, an
+// account changing, another review or edit open) it waits for the next
+// sign-in or pull. One tapped while an account is signed in is that
+// account's (`account`), as is one opened for review under an account; it
+// waits for that account alone, through a sign-out. One tapped while nobody
+// is signed in goes to whoever signs in next: it came from a tap on this
+// phone. [{ id, hash, at, account }], oldest first.
+const PENDING_IMPORT_KEY = 'tp_pending_import';
+const SIGN_IN_TO_IMPORT = 'Sign in to import this link — it is kept on this phone until then.';
 
-    // Drop the fragment so a reload cannot import twice. A link tapped while
-    // the app is open arrived as a history entry of its own; it takes over
-    // whatever is on screen, so back still behaves.
-    const consumeHash = () => {
-        if (state.view === 'notes') {
-            navDepth++;
-            history.replaceState(nvHistoryState(), '', location.pathname);
-        } else {
-            history.replaceState(null, '', location.pathname);
+function pendingImports() {
+    try {
+        const list = JSON.parse(localStorage.getItem(PENDING_IMPORT_KEY) || '[]');
+        return Array.isArray(list) ? list.filter(p => p && p.id && typeof p.hash === 'string') : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function savePendingImports(list) {
+    try {
+        if (list.length) localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(list));
+        else localStorage.removeItem(PENDING_IMPORT_KEY);
+    } catch (e) {
+        console.warn('Could not update the pending import links', e);
+    }
+}
+
+// Imported, or dismissed on purpose.
+function dropPendingImport(id) {
+    if (id) savePendingImports(pendingImports().filter(p => p.id !== id));
+}
+
+function pinPendingImport(id) {
+    savePendingImports(pendingImports().map(p => (p.id === id ? { ...p, account: accountKey() } : p)));
+}
+
+function pendingImportVisible(p) {
+    return !p.account || p.account === accountKey();
+}
+
+// Pending links for whoever is here, other than the one under review.
+function waitingImports() {
+    const open = new Set([
+        state.importBatch && state.importBatch.importId,
+        state.nv.editing && state.nv.importId,
+        state.keptDraft && state.keptDraft.importId
+    ].filter(Boolean));
+    return pendingImports().filter(p => pendingImportVisible(p) && !open.has(p.id));
+}
+
+// Keep the URL's import link on the phone, then drop the fragment, so neither
+// a reload nor back brings it round again. A link tapped while the app is open
+// arrived as a history entry of its own; it takes over whatever is on screen,
+// so back still behaves. Returns the kept link, or null when there was none —
+// or nowhere to keep it, in which case the fragment stays where it is.
+function stashImportHash() {
+    const hash = location.hash;
+    if (!IMPORT_HASH_RE.test(hash)) return null;
+    let rec = null;
+    try {
+        const list = pendingImports();
+        rec = list.find(p => p.hash === hash && pendingImportVisible(p)) || null;
+        if (!rec) {
+            const account = configured() && !accountChanging ? accountKey() : null;
+            rec = { id: newLocalId(), hash, at: new Date().toISOString(), account };
+            localStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify([...list, rec]));
         }
-    };
-    // The review block lives in the Notes library.
-    const showReview = () => {
-        if (state.view === 'notes' && !state.nv.editing) openNotes({ pane: 'library' });
-        else renderView();
-    };
+    } catch (e) {
+        showToast('This link could not be kept on the phone — it stays in the address bar for now.');
+        return null;
+    }
+    if (state.view === 'notes') {
+        navDepth++;
+        history.replaceState(nvHistoryState(), '', location.pathname);
+    } else {
+        history.replaceState(null, '', location.pathname);
+    }
+    return rec;
+}
 
+// A link tapped while the app is open.
+async function processImportHashIfAny() {
+    const rec = stashImportHash();
+    if (rec) await openPendingImport({ id: rec.id, why: 'arrived' });
+}
+
+let openingImport = false;
+
+// Open a pending link (the oldest, or `id`) for review, if there is somewhere
+// to put it now: signed in, this account's copy pulled, no account change on
+// its way and nothing else under review or being written. Otherwise it keeps
+// waiting. `why`: 'arrived' (just tapped) and 'asked' (Review) say why not;
+// the automatic tries after a sign-in or a pull keep quiet.
+async function openPendingImport({ id = null, why = 'auto' } = {}) {
+    const list = pendingImports().filter(pendingImportVisible);
+    const rec = id ? list.find(p => p.id === id) : list[0];
+    if (!rec || openingImport) return false;
+    const wait = (msg) => {
+        if (why !== 'auto') {
+            showToast(msg);
+            if (state.view === 'notes') renderView(); // the waiting block
+        }
+        return false;
+    };
+    if (!configured()) return wait(SIGN_IN_TO_IMPORT);
+    if (accountChanging || (unwindingAccount && why !== 'asked')) return false;
+    if (!state.snapshot || !copyIsMine()) return wait('This link is kept on this phone — it opens after the next ⬇️ Pull.');
+    // A note is reviewed in the editor, a batch or an order in the library's
+    // review block: each waits only for its own place to be free.
+    const busy = parseImportHash(rec.hash).kind === 'note'
+        ? editorDirty() || Boolean(state.nv.editing && state.nv.importId)
+        : Boolean(state.importBatch);
+    if (busy) return wait('This link is kept on this phone — finish what is open, then review it in Notes.');
+    openingImport = true;
+    try {
+        return await openImportReview(rec);
+    } finally {
+        openingImport = false;
+    }
+}
+
+// The copy on screen is the signed-in account's. Always so while signed in;
+// checked anyway before an import link is put into it.
+function copyIsMine() {
+    return state.snapshotUserId == null || currentUserId() == null
+        || Number(state.snapshotUserId) === Number(currentUserId());
+}
+
+// What a link holds: { kind: 'note', content, notebook } | { kind: 'notes',
+// items } | { kind: 'reorder', order }, or { error } when there is nothing in
+// it to import.
+function parseImportHash(hash) {
+    const raw = String(hash || '').replace(/^#/, '');
     // Multi-note batch: #notes=<percent-encoded JSON array of {"content","notebook"?}>
     if (raw.startsWith('notes=')) {
-        consumeHash();
         let items = null;
         try { items = JSON.parse(decodeURIComponent(raw.slice(6))); } catch (e) { /* invalid */ }
-        if (!Array.isArray(items) || items.length === 0) {
-            showToast('Import link could not be decoded.');
-            return;
-        }
+        if (!Array.isArray(items) || items.length === 0) return { error: 'Import link could not be decoded.' };
         const notes = items
             .filter(it => it && typeof it.content === 'string' && it.content.trim())
             .map(it => ({ content: it.content, notebook: typeof it.notebook === 'string' && it.notebook.trim() ? it.notebook.trim() : null }));
-        if (notes.length === 0) {
-            showToast('Import link contained no notes.');
-            return;
-        }
-        state.importBatch = { kind: 'notes', items: notes };
-        showReview();
-        showToast('Review the import, then press Import.');
-        return;
+        if (notes.length === 0) return { error: 'Import link contained no notes.' };
+        return { kind: 'notes', items: notes };
     }
-
     // Reorder: #reorder=<percent-encoded JSON array of note titles>
     if (raw.startsWith('reorder=')) {
-        consumeHash();
         let order = null;
         try { order = JSON.parse(decodeURIComponent(raw.slice(8))); } catch (e) { /* invalid */ }
-        if (!Array.isArray(order) || order.length === 0) {
-            showToast('Reorder link could not be decoded.');
-            return;
-        }
-        state.importBatch = { kind: 'reorder', order: order.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim()) };
-        showReview();
-        showToast('Review the new order, then press Apply.');
-        return;
+        order = Array.isArray(order) ? order.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim()) : [];
+        if (order.length === 0) return { error: 'Reorder link could not be decoded.' };
+        return { kind: 'reorder', order };
     }
-
-    if (!raw.startsWith('note=')) return;
-    consumeHash();
-
+    if (!raw.startsWith('note=')) return { error: 'Import link could not be decoded.' };
     let payload = raw.slice(5);
     let notebook = null;
     const nbIdx = payload.indexOf('&notebook=');
@@ -309,7 +417,6 @@ async function processImportHashIfAny() {
         try { notebook = decodeURIComponent(payload.slice(nbIdx + 10)); } catch (e) { /* ignore */ }
         payload = payload.slice(0, nbIdx);
     }
-
     let content;
     try {
         content = decodeURIComponent(payload);
@@ -318,27 +425,95 @@ async function processImportHashIfAny() {
         // can still review/fix it instead of losing the note.
         content = payload;
     }
-    if (!content.trim()) return;
+    if (!content.trim()) return { error: 'Import link contained no note.' };
+    return { kind: 'note', content, notebook };
+}
+
+// The usual review: the editor for a note, the review block for a batch or an
+// order. A link with nothing in it is dropped, with a word why.
+async function openImportReview(rec) {
+    const link = parseImportHash(rec.hash);
+    if (link.error) {
+        dropPendingImport(rec.id);
+        showToast(link.error);
+        return false;
+    }
+    if (link.kind === 'notes' || link.kind === 'reorder') {
+        state.importBatch = link.kind === 'notes'
+            ? { kind: 'notes', items: link.items, importId: rec.id }
+            : { kind: 'reorder', order: link.order, importId: rec.id };
+        pinPendingImport(rec.id);
+        // The review block lives in the Notes library.
+        if (state.view === 'notes' && !state.nv.editing) openNotes({ pane: 'library' });
+        else renderView();
+        showToast(link.kind === 'notes' ? 'Review the import, then press Import.' : 'Review the new order, then press Apply.');
+        return true;
+    }
 
     const found = await ensureNotesFolder();
-    if (!found) return;
-
+    if (!found) return false;
     // The notebook is resolved the same way the server and the extension do
     // (an exact top-level name, 'Parent / Child', a unique nested name), and
     // a missing one is only created on ✓ Done — nothing is saved or pushed
     // before the note has been reviewed.
     let parentId = null;
     let pendingNotebookName = null;
-    if (notebook && notebook.trim()) {
-        const res = NM.resolveNotebookByName(notesLibrary(), notebook);
+    if (link.notebook && link.notebook.trim()) {
+        const res = NM.resolveNotebookByName(notesLibrary(), link.notebook);
         if (res && res.id) parentId = res.id;
-        else if (res) pendingNotebookName = notebook.trim();
+        else if (res) pendingNotebookName = link.notebook.trim();
     }
-    if (await startNewNote({ parentId, content, pendingNotebookName })) {
-        showToast('Review the note, then press ✓ Done.');
-    } else if (editorDirty()) {
-        showToast('Import skipped — your unsaved edit is still open.');
+    if (!(await startNewNote({ parentId, content: link.content, pendingNotebookName, importId: rec.id }))) return false;
+    pinPendingImport(rec.id);
+    showToast('Review the note, then press ✓ Done.');
+    return true;
+}
+
+// A line for the waiting block: what the link holds.
+function describePendingImport(p) {
+    const link = parseImportHash(p.hash);
+    if (link.kind === 'notes') return `📥 ${link.items.length} note${link.items.length === 1 ? '' : 's'}`;
+    if (link.kind === 'reorder') return `🔀 New order for ${link.order.length} note${link.order.length === 1 ? '' : 's'}`;
+    if (link.kind === 'note') return `📝 ${NM.leadingTitle(link.content) || 'Untitled'}`;
+    return '🔗 Import link';
+}
+
+function renderPendingImportsBlock(list) {
+    const block = document.createElement('div');
+    block.className = 'proposals pending-imports';
+    const heading = document.createElement('div');
+    heading.className = 'proposals-title';
+    heading.textContent = `🔗 Links waiting to be imported (${list.length})`;
+    block.appendChild(heading);
+    const now = Date.now();
+    for (const p of list) {
+        const when = NM.relativeTime(p.at, now);
+        const arrived = when === 'now' ? 'just now'
+            : /^\d+[mh]$/.test(when) ? `${when} ago`
+                : when === 'Yesterday' ? 'yesterday' : when;
+        const item = document.createElement('div');
+        item.className = 'proposal pending-import';
+        item.innerHTML = `
+            <div class="proposal-text">
+                <span class="title">${escapeHtml(describePendingImport(p))}</span>
+                ${arrived ? `<span class="snippet">Arrived ${escapeHtml(arrived)}</span>` : ''}
+            </div>
+            <div class="proposal-actions">
+                <button class="primary pending-import-review">Review</button>
+                <button class="pending-import-dismiss">Dismiss</button>
+            </div>
+        `;
+        item.querySelector('.pending-import-review').addEventListener('click', () => openPendingImport({ id: p.id, why: 'asked' }));
+        item.querySelector('.pending-import-dismiss').addEventListener('click', () => dismissPendingImport(p));
+        block.appendChild(item);
     }
+    return block;
+}
+
+function dismissPendingImport(p) {
+    if (!confirm(`Dismiss this link (${describePendingImport(p)})? It is not imported, and cannot be opened again.`)) return;
+    dropPendingImport(p.id);
+    renderView();
 }
 
 // --- Wire format <-> local shape ---
@@ -938,6 +1113,8 @@ function renderHome(root) {
         pending.push(`${state.proposals.length} note${state.proposals.length === 1 ? '' : 's'} waiting for approval`);
     }
     if (state.importBatch) pending.push('an import waiting for review');
+    const waiting = waitingImports().length;
+    if (waiting) pending.push(`${waiting} link${waiting === 1 ? '' : 's'} waiting to be imported`);
     if (pending.length) {
         const banner = document.createElement('button');
         banner.type = 'button';
@@ -1065,6 +1242,7 @@ function renderWorkflowsSection(root) {
         });
         row.querySelector('.wf-del').addEventListener('click', async (e) => {
             e.stopPropagation();
+            if (signedOutRefuses()) return;
             if (!confirm(`Delete workflow "${wf.title}" (${tabs.length} tabs)?`)) return;
             wfRoot.children = (wfRoot.children || []).filter(c => c !== wf);
             markDirty();
@@ -1293,7 +1471,8 @@ function freshNv() {
         query: '',
         from: 'Notes',            // label of where back goes
         draft: null,              // the editor's text, kept across re-renders
-        loaded: null              // what the editor started from
+        loaded: null,             // what the editor started from
+        importId: null            // the pending import link a new note is the review of
     };
 }
 
@@ -1301,14 +1480,27 @@ function freshNv() {
 // a popstate knows where it landed.
 let navDepth = 0;
 let skipNavGuardOnce = false;
+let unwindingAccount = false; // resetAccountUi's history.go, already drawn
+let accountChanging = false;  // a sign-out on its way to the server
 
 function isDesktop() {
     return window.matchMedia('(min-width: 900px)').matches;
 }
 
+// Who the page is showing, for its history entries and pending import links:
+// the server and the account id (ids start at 1 on every server), or the name
+// for a session from before ids. Empty when nobody is.
+function accountKey() {
+    const id = currentUserId();
+    const who = id !== null ? String(id) : (localStorage.getItem(LS.username) || '');
+    return who ? `${(state.config.url || '').replace(/\/$/, '')}|${who}` : '';
+}
+
+// Each entry says whose notes it shows, so one left in the stack by an
+// account change is never reopened for the next account.
 function nvHistoryState() {
     const nv = state.nv;
-    return { tp: 'nv', depth: navDepth, pane: nv.pane, scope: nv.scope, noteId: nv.noteId, from: nv.from, query: nv.query };
+    return { tp: 'nv', account: accountKey(), depth: navDepth, pane: nv.pane, scope: nv.scope, noteId: nv.noteId, from: nv.from, query: nv.query };
 }
 
 function placeLabel(lib) {
@@ -1355,14 +1547,20 @@ function confirmDiscardEdit() {
     return !editorDirty() || confirm('Discard unsaved changes?');
 }
 
+// Every way out of an edit comes through here, saved (✓ Done) or discarded
+// (✕, or a confirmed back or switch). For an import link's note either way
+// ends the link: it is in the copy now, or was thrown away on purpose. An
+// account change sets the editor aside without coming through here.
 function stopEditing() {
+    if (state.nv.importId) dropPendingImport(state.nv.importId);
     Object.assign(state.nv, {
         editing: false,
         isNew: false,
         draft: null,
         loaded: null,
         newParentId: null,
-        pendingNotebookName: null
+        pendingNotebookName: null,
+        importId: null
     });
 }
 
@@ -1446,9 +1644,23 @@ function onNotesPopState(e) {
     // An import link opened while the app runs is a fragment navigation: the
     // browser pops a fresh, state-less entry just before hashchange. That is
     // no way back to Home (and no reason to ask about an edit) — the
-    // hashchange handler takes the entry over in consumeHash.
+    // hashchange handler takes the entry over in stashImportHash.
     if (!e.state && IMPORT_HASH_RE.test(location.hash)) return;
-    const st = e.state && e.state.tp === 'nv' ? e.state : null;
+    // An entry of another account's notes, left in the stack by an account
+    // change, reads as Home: its pane, label and search are not this one's.
+    const st = e.state && e.state.tp === 'nv' && e.state.account === accountKey() ? e.state : null;
+    // The unwind a sign-out or an account change started lands on Home,
+    // which it drew already. Anything else (a stray unwind that never
+    // landed, then a real back) is handled as usual. A link that waited for
+    // the unwind to land opens now, if it can.
+    if (unwindingAccount) {
+        unwindingAccount = false;
+        if (!st && state.view === 'home' && !state.nv.editing) {
+            navDepth = 0;
+            openPendingImport();
+            return;
+        }
+    }
     if (!skipNavGuardOnce && editorDirty() && !confirm('Discard unsaved changes?')) {
         // Stay: put back the entry back just took away.
         history.pushState(nvHistoryState(), '', location.pathname);
@@ -1484,7 +1696,7 @@ function openNoteById(id, { from } = {}) {
 }
 
 // Resolves true once the editor is open.
-async function startNewNote({ parentId = null, content = '', from, pendingNotebookName = null } = {}) {
+async function startNewNote({ parentId = null, content = '', from, pendingNotebookName = null, importId = null } = {}) {
     if (!confirmDiscardEdit()) return false;
     const found = await ensureNotesFolder();
     if (!found) return false;
@@ -1492,7 +1704,7 @@ async function startNewNote({ parentId = null, content = '', from, pendingNotebo
     const patch = {
         pane: 'note', noteId: null, isNew: true, editing: true,
         newParentId: parentId, pendingNotebookName,
-        draft: content, loaded: content
+        draft: content, loaded: content, importId
     };
     if (from) patch.from = from;
     openNotes(patch, { history: 'push' });
@@ -1586,8 +1798,10 @@ function renderNvSide(lib) {
     search.dataset.nv = 'search';
     pane.appendChild(search);
 
-    // Proposals and import review wait here, unchanged.
+    // Proposals, import review and import links still waiting wait here.
     if (state.importBatch) pane.appendChild(renderImportBlock());
+    const waiting = waitingImports();
+    if (waiting.length) pane.appendChild(renderPendingImportsBlock(waiting));
     if (state.proposals.length > 0) pane.appendChild(renderProposalsBlock());
 
     const scopes = nvEl('div', 'nv-card nv-scopes');
@@ -1950,7 +2164,7 @@ async function saveNoteEdit() {
 
 async function toggleNoteTask(line) {
     const hit = findNotesNode(state.nv.noteId);
-    if (!hit || state.nv.editing) return;
+    if (!hit || state.nv.editing || signedOutRefuses()) return;
     const meta = decodeNote(hit.node);
     const updated = NM.toggleTaskAtLine(meta.content, line);
     if (updated === meta.content) return;
@@ -1963,7 +2177,7 @@ async function toggleNoteTask(line) {
 
 async function renameNote(id) {
     const hit = findNotesNode(id);
-    if (!hit) return;
+    if (!hit || signedOutRefuses()) return;
     const note = hit.node;
     const meta = decodeNote(note);
     const name = prompt('Rename note:', note.title || '');
@@ -1984,7 +2198,7 @@ async function renameNote(id) {
 
 async function deleteNote(id) {
     const hit = findNotesNode(id);
-    if (!hit) return;
+    if (!hit || signedOutRefuses()) return;
     if (!confirm(`Delete note “${hit.node.title || 'Untitled'}”?`)) return;
     hit.parent.children = (hit.parent.children || []).filter(c => c !== hit.node);
     if (state.nv.noteId === id) {
@@ -2051,7 +2265,7 @@ async function createNotebookIn(parentId = null, { andThen } = {}) {
 
 async function renameNotebook(id) {
     const hit = findNotesNode(id);
-    if (!hit || !isFolderNode(hit.node)) return;
+    if (!hit || !isFolderNode(hit.node) || signedOutRefuses()) return;
     const name = prompt('Rename notebook:', hit.node.title || '');
     if (name === null || name.trim() === hit.node.title) return;
     const problem = NM.notebookNameProblem(name, folderTitles(hit.parent, id));
@@ -2071,7 +2285,7 @@ function folderContains(folder, id) {
 async function moveNotebookTo(id, targetId) {
     const hit = findNotesNode(id);
     const found = findNotesFolderWithPath();
-    if (!hit || !found || !isFolderNode(hit.node)) return;
+    if (!hit || !found || !isFolderNode(hit.node) || signedOutRefuses()) return;
     const target = targetId ? findNotesNode(targetId)?.node : found.node;
     if (!isFolderNode(target)) { showToast('That notebook is gone.'); return; }
     if (folderContains(hit.node, target._pwaId)) { showToast('A notebook cannot move into itself.'); return; }
@@ -2091,7 +2305,7 @@ async function moveNotebookTo(id, targetId) {
 async function moveNoteTo(id, targetId) {
     const hit = findNotesNode(id);
     const found = findNotesFolderWithPath();
-    if (!hit || !found) return;
+    if (!hit || !found || signedOutRefuses()) return;
     const target = targetId ? findNotesNode(targetId)?.node : found.node;
     if (!isFolderNode(target)) { showToast('That notebook is gone.'); return; }
     if (target === hit.parent) return;
@@ -2114,7 +2328,7 @@ function movedToLabel(targetId, rootLabel) {
 // parent, in order and with their ids. Deleting a notebook never deletes notes.
 async function deleteNotebook(id) {
     const hit = findNotesNode(id);
-    if (!hit || !isFolderNode(hit.node)) return;
+    if (!hit || !isFolderNode(hit.node) || signedOutRefuses()) return;
     const lib = notesLibrary();
     const nb = lib.notebooks.get(id);
     const parentNb = nb && nb.parentId ? lib.notebooks.get(nb.parentId) : null;
@@ -2537,6 +2751,18 @@ function renderProposalsBlock() {
     heading.textContent = `⏳ Pending approval (${state.proposals.length})`;
     block.appendChild(heading);
 
+    // Approving waits for a clean copy (see resolveProposal); say so up front.
+    if (state.dirty) {
+        const hint = document.createElement('div');
+        hint.className = 'proposal proposals-push-hint';
+        hint.innerHTML = `
+            <div class="proposal-text"><span class="snippet">Push your changes first, then approve.</span></div>
+            <div class="proposal-actions"><button class="primary proposals-push">⬆️ Push</button></div>
+        `;
+        hint.querySelector('.proposals-push').addEventListener('click', () => pushNow());
+        block.appendChild(hint);
+    }
+
     for (const p of state.proposals) {
         let title = p.title;
         let snippet = (p.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -2565,10 +2791,19 @@ function renderProposalsBlock() {
     return block;
 }
 
+// The server makes an approved note or order on its own tree, and the phone
+// pulls that tree down — which replaces this copy. So a copy with unpushed
+// edits, or a note being written, approves nothing: push (or finish the note)
+// first, and the proposal keeps waiting. A clean copy approves, then pulls.
 async function resolveProposal(p, approve) {
+    if (approve && (state.dirty || editorDirty())) {
+        askToPushBeforeApproving();
+        return;
+    }
+    const account = accountKey();
     try {
         setStatus(approve ? 'Approving…' : 'Rejecting…');
-        const res = await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
         setStatus('');
         if (approve) {
             if (p.kind === 'reorder') {
@@ -2577,11 +2812,12 @@ async function resolveProposal(p, approve) {
                 saveNotesPrefs();
             }
             const done = p.kind === 'reorder' ? 'New order applied (Manual order)' : `Note “${p.title}” added`;
-            if (state.dirty && state.snapshot) {
-                // A pull would replace this copy and its unpushed edits, so
-                // the server's change is made here as well and the edits stay.
-                await applyApprovedProposal(p, res && res.version);
-                showToast(`${done} — your unpushed edits are kept, ⬆️ to push them.`);
+            if (accountKey() !== account) {
+                // Signed out or switched while it was on its way: this copy is
+                // not the one it went into.
+            } else if (state.dirty || editorDirty()) {
+                // Edited while it was on its way: no pull over that.
+                showToast(`${done} on the server — not pulled here, over the changes made meanwhile.`);
             } else {
                 showToast(`${done}.`);
                 await pullSnapshot(); // server applied the change — pull it down
@@ -2597,49 +2833,22 @@ async function resolveProposal(p, approve) {
     }
 }
 
-// An approved proposal, made on this copy the way the server just made it on
-// its tree (upsertNote and reorderNotes in server/items.js): the note with
-// this exact title is replaced, preferring one in the named notebook, or a new
-// one is filed there. `version` is the server's tree version after the
-// approval. When it is exactly one past this copy's base, nothing else reached
-// the server in between, so the copy is now that version plus its own edits
-// and the next push needs no overwrite. Otherwise the base stays: the push
-// meets the usual conflict question, and this copy has the note either way.
-async function applyApprovedProposal(p, version) {
-    const mine = state.snapshotUserId == null || currentUserId() == null
-        || Number(state.snapshotUserId) === Number(currentUserId());
-    if (!mine) return; // never write one account's note into another's copy
-    const found = await ensureNotesFolder({ create: p.kind !== 'reorder' });
-    if (found && found.node) {
-        if (p.kind === 'reorder') {
-            let order = null;
-            try { order = JSON.parse(p.content); } catch (e) { /* corrupt */ }
-            if (Array.isArray(order)) applyNoteOrder(found.node, order);
-        } else {
-            const target = p.notebook ? (ensureNotebookByName(p.notebook) || found.node) : found.node;
-            const same = [];
-            const walk = (folder) => {
-                for (const c of folder.children || []) {
-                    if (isNoteBookmark(c) && c.title === p.title) same.push({ node: c, parent: folder });
-                    else if (isFolderNode(c)) walk(c);
-                }
-            };
-            walk(found.node);
-            const hit = same.find(h => h.parent === target) || same[0];
-            const now = new Date().toISOString();
-            if (hit) {
-                const meta = decodeNote(hit.node);
-                hit.node.url = encodeNoteUrl({ content: p.content || '', createdAt: meta.createdAt || now, updatedAt: now });
-            } else {
-                const note = { type: 'bookmark', title: p.title, url: encodeNoteUrl({ content: p.content || '', createdAt: now, updatedAt: now }) };
-                assignIds(note);
-                target.children = target.children || [];
-                target.children.push(note);
-            }
-        }
+function askToPushBeforeApproving() {
+    const writing = editorDirty();
+    if (!state.dirty) {
+        alert('Save your note first, then approve.\n\n'
+            + 'You are still writing a note, and approving pulls the server’s tree under it. '
+            + '✓ Done saves and pushes it; ✕ discards it.\n\nThe proposal keeps waiting.');
+        return;
     }
-    const v = Number(version);
-    if (Number.isFinite(v) && v === (state.treeVersion || 0) + 1) state.treeVersion = v;
+    const n = state.editCount || 1;
+    const what = `${n} unpushed edit${n === 1 ? '' : 's'}${writing ? ' and a note you are still writing' : ''}`;
+    if (confirm('Push your changes first, then approve.\n\n'
+        + `This phone has ${what}. Approving pulls the server’s tree, which would replace ${n === 1 && !writing ? 'it' : 'them'}.\n\n`
+        + `OK = ⬆️ Push now, then tap Approve again${writing ? ' (save the note with ✓ Done first)' : ''}\n`
+        + 'Cancel = not now — the proposal keeps waiting')) {
+        pushNow();
+    }
 }
 
 // --- Import links (#notes / #reorder): review block in the notes section ---
@@ -2676,7 +2885,11 @@ function renderImportBlock() {
     okBtn.addEventListener('click', applyImportBatch);
     const cancelBtn = document.createElement('button');
     cancelBtn.textContent = 'Discard';
-    cancelBtn.addEventListener('click', () => { state.importBatch = null; renderView(); });
+    cancelBtn.addEventListener('click', () => {
+        state.importBatch = null;
+        dropPendingImport(batch.importId); // dismissed on purpose
+        renderView();
+    });
     actions.appendChild(okBtn);
     actions.appendChild(cancelBtn);
     block.appendChild(actions);
@@ -2687,7 +2900,7 @@ async function applyImportBatch() {
     const batch = state.importBatch;
     if (!batch) return;
     const found = await ensureNotesFolder({ create: true });
-    if (!found) return;
+    if (!found || state.importBatch !== batch) return;
     const now = new Date().toISOString();
 
     if (batch.kind === 'reorder') {
@@ -2707,7 +2920,9 @@ async function applyImportBatch() {
         }
     }
 
+    // In the copy now: an unpushed edit like any other if the push fails.
     state.importBatch = null;
+    dropPendingImport(batch.importId);
     markDirty();
     try {
         setStatus('Saving…');
@@ -2894,6 +3109,7 @@ function openInbox() {
 }
 
 async function dropHere() {
+    if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
     const folder = findNodeByPath(state.pathIds);
     if (!folder) { alert('Pick a folder first.'); return; }
     if (blockedByImports('drop links')) return;
@@ -2920,6 +3136,31 @@ async function dropHere() {
     } catch (e) {
         alert('Push failed: ' + e.message + '\nLocal changes preserved; will retry next time you press Drop.');
         setStatus('');
+    }
+}
+
+// ⬆️ Push: the topbar button, Home's quick action, and the way past a
+// proposal waiting for a clean copy.
+async function pushNow() {
+    if (!configured()) {
+        showToast('Please open settings (⚙) first.');
+        return false;
+    }
+    if (!state.snapshot) {
+        showToast('No snapshot loaded to push.');
+        return false;
+    }
+    try {
+        setStatus('Pushing…');
+        await pushSnapshot();
+        setStatus('');
+        showToast('Pushed.');
+        renderView();
+        return true;
+    } catch (err) {
+        setStatus('Push failed: ' + err.message);
+        showToast('Push failed: ' + err.message);
+        return false;
     }
 }
 
@@ -3042,8 +3283,11 @@ function isUrlInSnapshot(url, node) {
 let activeQuickFileItems = [];
 let _lastClipboardScanTime = 0;
 
+// Signed in only: the suggestions are filed into, and remembered for, the
+// signed-in account. Signed out there is none — a copy kept on the phone is
+// its account's, not the place for whatever is on the clipboard now.
 async function checkUnfiledLinks(skipClipboardScan = false) {
-    if (!state.snapshot) return;
+    if (!state.snapshot || !configured()) return;
     const dismissed = getDismissedUrls();
     const dismissedSet = new Set(dismissed.map(normalizeUrl));
     const unfiled = [];
@@ -3180,6 +3424,7 @@ function renderQuickFileSheet() {
 
             row.querySelector('.place-btn').addEventListener('click', async (e) => {
                 e.stopPropagation();
+                if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
                 const folder = findNodeByPath(state.pathIds);
                 if (!folder) {
                     alert('Please navigate to a folder in the background first.');
@@ -3214,6 +3459,7 @@ function renderQuickFileSheet() {
 
             row.querySelector('.skip-btn').addEventListener('click', async (e) => {
                 e.stopPropagation();
+                if (signedOutRefuses('Sign in first — skipped links are remembered for your account.')) return;
                 try {
                     if (item.inboxId) {
                         await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
@@ -3717,6 +3963,10 @@ function discardPreviousEdits() {
     const account = (btn && btn.dataset.account) || '';
     const typed = prompt(`Discard ${account}'s unpushed edits on this phone? They cannot be recovered.\n\nType ${account} to confirm.`);
     if (typed === null || typed.trim() !== account) return;
+    // An import link opened as one of those unsaved notes goes with it.
+    for (const nv of [state.keptDraft, state.nv]) {
+        if (nv && nv.editing && nv.importId) dropPendingImport(nv.importId);
+    }
     state.snapshot = null;
     state.snapshotUserId = null;
     state.snapshotUsername = null;
@@ -3754,13 +4004,17 @@ async function signOut() {
         state.snapshotUsername = state.snapshotUsername || localStorage.getItem(LS.username);
     }
     // Best effort — the local token is cleared either way, so a server that is
-    // unreachable can't leave you stuck signed in on the device.
+    // unreachable can't leave you stuck signed in on the device. An import
+    // link tapped meanwhile waits for whoever signs in next.
+    accountChanging = true;
     try {
         await fetch(base + '/api/logout', {
             method: 'POST',
             headers: { Authorization: 'Bearer ' + state.config.token }
         });
-    } catch (e) { /* ignore */ }
+    } catch (e) { /* ignore */ } finally {
+        accountChanging = false;
+    }
     state.config.token = '';
     forgetUser();
     mirrorConfigToSW();
@@ -3786,7 +4040,8 @@ async function signOut() {
 // open in it. Dropped whenever the account changes or signs out, back to
 // Home, so none of it shows up — or can be saved — under whoever signs in
 // next. The working copy follows its own rules above; an unsaved note is set
-// aside by signOut before this runs.
+// aside by signOut before this runs. An import link under review stays kept
+// on the phone (pendingImports), for the account it was opened for.
 function resetAccountUi() {
     closeNotesSheets();
     hide($('inbox-sheet'));
@@ -3802,9 +4057,16 @@ function resetAccountUi() {
     state.view = 'home';
     if (state.snapshot) state.pathIds = [state.snapshot._pwaId];
     // Back to the Home entry, as goHome does, so back from here leaves the
-    // app instead of reopening the last account's notes.
-    if (navDepth > 0) history.go(-navDepth);
-    else if (history.state) history.replaceState(null, '', location.pathname);
+    // app instead of reopening the last account's notes. Home is drawn here
+    // already, so the popstate that follows has nothing to draw: drawing it
+    // again would wipe the status saying what a sign-out kept. Entries the
+    // unwind leaves above Home are the last account's, and read as Home.
+    if (navDepth > 0) {
+        unwindingAccount = true;
+        history.go(-navDepth);
+    } else if (history.state && history.state.tp === 'nv') {
+        history.replaceState(null, '', location.pathname);
+    }
     navDepth = 0;
     renderView();
 }
@@ -4005,6 +4267,11 @@ window.addEventListener('DOMContentLoaded', () => {
         e.stopPropagation();
         e.preventDefault();
 
+        // Unfiled links are filed into the signed-in account: signed out,
+        // neither the clipboard is read nor the sheet opened. (Synchronous,
+        // so the clipboard read below is still the gesture's first await.)
+        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
+
         // 1. Instantly read the clipboard before ANY microtask boundary or async call!
         // This satisfies WebKit's strict security engine in standalone mobile PWAs.
         if (!navigator.clipboard || !navigator.clipboard.readText) {
@@ -4033,10 +4300,7 @@ window.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        if (!configured()) {
-            showToast('Please open settings (⚙) first.');
-            return;
-        }
+        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
 
         if (!state.snapshot) {
             showToast('Loading snapshot first…');
@@ -4098,30 +4362,16 @@ window.addEventListener('DOMContentLoaded', () => {
             showToast('Pulled the latest tree.');
         } catch (err) {
             showToast('Pull failed: ' + err.message);
+            return;
         }
+        // An import link that was waiting for a copy to go into.
+        await openPendingImport();
     });
 
     safeAddListener('pushBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
-        if (!configured()) {
-            showToast('Please open settings (⚙) first.');
-            return;
-        }
-        if (!state.snapshot) {
-            showToast('No snapshot loaded to push.');
-            return;
-        }
-        try {
-            setStatus('Pushing…');
-            await pushSnapshot();
-            setStatus('');
-            showToast('Pushed.');
-            renderView();
-        } catch (err) {
-            setStatus('Push failed: ' + err.message);
-            showToast('Push failed: ' + err.message);
-        }
+        await pushNow();
     });
 
     safeAddListener('settingsBtn', 'click', (e) => {
@@ -4267,9 +4517,11 @@ window.addEventListener('DOMContentLoaded', () => {
         const b = e.target.closest('[data-nb-act]');
         if (b) notebookSheetAction(b.dataset.nbAct);
     });
-    // Leaving with an unsaved note (closing the tab, reloading) asks first.
+    // Leaving (closing the tab, reloading) asks first while this page holds
+    // work nothing else does: an unsaved note, open or set aside by a
+    // sign-out, or unpushed edits, kept for their account or not.
     window.addEventListener('beforeunload', (e) => {
-        if (!editorDirty()) return;
+        if (!editorDirty() && !state.keptDraft && !(state.dirty && state.snapshot)) return;
         e.preventDefault();
         e.returnValue = '';
     });
@@ -4289,11 +4541,17 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('cfg-save', 'click', saveSettings);
 
     // Import a browser's exported bookmarks file — the no-extension way in.
-    safeAddListener('bm-import-btn', 'click', () => $('bm-import-file').click());
+    // Signed in only: a copy kept over a sign-out belongs to its account, and
+    // an import into it would go up with that account's next push.
+    const importNeedsSignIn = () => signedOutRefuses('Sign in first — the bookmarks go into your account.');
+    safeAddListener('bm-import-btn', 'click', () => {
+        if (!importNeedsSignIn()) $('bm-import-file').click();
+    });
     safeAddListener('bm-import-file', 'change', async (e) => {
         const file = e.target.files[0];
         e.target.value = '';
         if (!file) return;
+        if (importNeedsSignIn()) return;
         if (!state.snapshot) {
             try { await pullSnapshot(); } catch (err) { showToast('Pull the tree first: ' + err.message); return; }
         }
@@ -4310,6 +4568,7 @@ window.addEventListener('DOMContentLoaded', () => {
         }
         const n = countNodes(folder) - 1;
         if (!confirm(`Import ${n} item(s) into a new "${folder.title}" folder and push?`)) return;
+        if (importNeedsSignIn() || !state.snapshot) return; // signed out while the file was read
         assignIds(folder);
         state.snapshot.children = state.snapshot.children || [];
         state.snapshot.children.push(folder);
@@ -4373,10 +4632,8 @@ window.addEventListener('DOMContentLoaded', () => {
         }
         
         if (/^https?:\/\/\S+$/.test(trimmed)) {
-            if (!configured()) {
-                showToast('Please open settings (⚙) first.');
-                return false;
-            }
+            // null: a link, refused — kept in the box for after signing in.
+            if (signedOutRefuses('Sign in first — links are filed into your account.')) return null;
             if (!state.snapshot) {
                 showToast('Pulling snapshot first…');
                 pullSnapshot().then(() => {
@@ -4394,6 +4651,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }
 
     function handleScannedLink(url) {
+        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
         const norm = normalizeUrl(url);
         if (isUrlInSnapshot(url, state.snapshot)) {
             showToast('Link is already filed in your bookmarks.');
@@ -4433,22 +4691,25 @@ window.addEventListener('DOMContentLoaded', () => {
         pasteInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
                 const text = pasteInput.value;
-                if (processPastedLink(text)) {
+                const taken = processPastedLink(text);
+                if (taken) {
                     pasteInput.value = '';
-                } else if (text.trim()) {
+                } else if (taken === false && text.trim()) {
                     showToast('Please enter a valid URL.');
                 }
             }
         });
     }
 
-    // Global click listener to trigger clipboard scan using a valid user gesture context
+    // Global click listener to trigger clipboard scan using a valid user gesture context.
+    // Signed in only: signed out, a copy kept on the phone is its account's,
+    // and the clipboard is whoever holds the phone now.
     document.addEventListener('click', (e) => {
         if (e.target.closest('.sheet')) return;
         if (!$('settings-sheet').classList.contains('hidden')) return;
         if (!$('inbox-sheet').classList.contains('hidden')) return;
-        
-        if (state.snapshot && $('quick-file-sheet').classList.contains('hidden')) {
+
+        if (configured() && state.snapshot && $('quick-file-sheet').classList.contains('hidden')) {
             checkUnfiledLinks().catch(() => {});
         }
     });

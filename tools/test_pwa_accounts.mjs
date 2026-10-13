@@ -15,17 +15,37 @@
 //      kept on the phone, the app says why, and it is delivered once there is
 //      room.
 //   6. Signing out with unpushed edits asks first and keeps them: nobody else
-//      can sign in over them, and the same account gets them back.
+//      can sign in over them, the same account gets them back, and nothing
+//      (a bookmarks file import) adds to them meanwhile. Closing the app
+//      while they are kept asks first.
 //   7. Nothing of the notes screen crosses accounts. An unsaved note counts
 //      as unpushed work: signing out asks, it reopens only for its account,
 //      and nobody else signs in over it, even after an expired session. A
 //      clean sign-out or account switch closes any open note, the import
 //      review and the server's lists, so the next account can neither see
 //      the last one's text nor save it into its own tree. Opening a new
-//      notebook or note and cancelling leaves nothing to push.
-//   8. Approving an LLM proposal with unpushed edits keeps them: no pull over
-//      them, the note goes into this copy too, and the next push takes both
-//      without a conflict.
+//      notebook or note and cancelling leaves nothing to push. The sign-out
+//      unwinds the notes screen's history entries without wiping the status
+//      that says what it kept, and closing the app asks first while a note
+//      is set aside.
+//   8. An LLM proposal (a note or an order) is never approved over unpushed
+//      edits or a note being written, since the approval's pull would
+//      replace them: the app says to push (or save) first, offers ⬆️ Push,
+//      and the proposal keeps waiting. With the copy clean it approves and
+//      pulls as before.
+//   9. An import link is kept on the phone the moment it arrives, never in
+//      the URL or a history entry, until it is imported or dismissed: tapped
+//      while signed out (with Notes opened before the sign-in), on a start
+//      that cannot pull, after a session expired and someone else signs in,
+//      while another note is being written, or two at once. One tapped (or
+//      opened) while an account is signed in waits for that account through
+//      a sign-out, not for whoever signs in next.
+//  10. Nothing writes into a copy while nobody is signed in: neither after a
+//      session expired (Place, a task, rename, delete, move, paste, Drop
+//      here, a workflow) nor over edits kept by a sign-out (the clipboard
+//      scan and the Unfiled links sheet).
+//  11. Back and forward never reopen another account's notes: the entries an
+//      account change leaves in the stack read as Home.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -131,9 +151,42 @@ const localStorageShim = {
 };
 
 const windowListeners = {};
-let currentUrl = new URL(BASE + '/?share=1&url=' + encodeURIComponent('https://example.com/shared-while-out') + '&title=Shared');
+const fireWindow = (ev, e = {}) => { for (const fn of windowListeners[ev] || []) fn(e); return e; };
+// The document's own listeners: a tap anywhere is the app's cue to scan the
+// clipboard for unfiled links.
+const documentListeners = {};
+const fireDocument = (ev, e = {}) => { for (const fn of documentListeners[ev] || []) fn(e); return e; };
 const dialogs = { confirm: [], prompt: [], alert: [] };
 const answers = { confirm: [], prompt: [] };
+
+// A browser's session history: entries with a state and a URL, where go()
+// lands a moment later and fires popstate. A sign-out that unwinds the notes
+// screen's entries runs the same popstate here as on a phone.
+const H = { entries: [{ state: null, url: BASE + '/?share=1&url=' + encodeURIComponent('https://example.com/shared-while-out') + '&title=Shared' }], index: 0 };
+const entry = () => H.entries[H.index];
+const currentUrl = () => new URL(entry().url);
+const historyShim = {
+    get state() { return entry().state; },
+    get length() { return H.entries.length; },
+    pushState(s, t, url) {
+        H.entries = H.entries.slice(0, H.index + 1);
+        H.entries.push({ state: s == null ? null : structuredClone(s), url: new URL(url ?? entry().url, entry().url).href });
+        H.index++;
+    },
+    replaceState(s, t, url) {
+        H.entries[H.index] = { state: s == null ? null : structuredClone(s), url: new URL(url ?? entry().url, entry().url).href };
+    },
+    back() { historyShim.go(-1); },
+    go(n) {
+        const to = H.index + n;
+        if (!n || to < 0 || to >= H.entries.length) return;
+        H.index = to;
+        const st = entry().state;
+        setTimeout(() => fireWindow('popstate', { state: st }), 0);
+    }
+};
+// The app (re)opened at this URL, in the entry it is on.
+const openAt = (url, state = null) => { H.entries[H.index] = { state, url }; };
 
 Object.assign(globalThis, {
     window: globalThis,
@@ -143,20 +196,20 @@ Object.assign(globalThis, {
         createTextNode: (t) => ({ textContent: t }),
         body: makeElement('body'),
         documentElement: makeElement('html'),
-        addEventListener() {},
+        addEventListener(ev, fn) { (documentListeners[ev] = documentListeners[ev] || []).push(fn); },
         querySelector: () => null,
         querySelectorAll: () => []
     },
     localStorage: localStorageShim,
     location: {
-        get search() { return currentUrl.search; },
-        get pathname() { return currentUrl.pathname; },
-        get hash() { return currentUrl.hash; },
-        get origin() { return currentUrl.origin; },
-        get protocol() { return currentUrl.protocol; },
-        get href() { return currentUrl.href; }
+        get search() { return currentUrl().search; },
+        get pathname() { return currentUrl().pathname; },
+        get hash() { return currentUrl().hash; },
+        get origin() { return currentUrl().origin; },
+        get protocol() { return currentUrl().protocol; },
+        get href() { return currentUrl().href; }
     },
-    history: { replaceState: (a, b, url) => { currentUrl = new URL(url, currentUrl); } },
+    history: historyShim,
     confirm: (msg) => { dialogs.confirm.push(msg); return answers.confirm.length ? answers.confirm.shift() : false; },
     prompt: (msg) => { dialogs.prompt.push(msg); return answers.prompt.length ? answers.prompt.shift() : null; },
     alert: (msg) => { dialogs.alert.push(msg); },
@@ -165,13 +218,9 @@ Object.assign(globalThis, {
     open() {}
 });
 globalThis.addEventListener = (ev, fn) => { (windowListeners[ev] = windowListeners[ev] || []).push(fn); };
-// The notes screen watches sheets to sync the bottom bar and keeps its own
-// history entries; neither matters to the account flows tested here.
+// The notes screen watches sheets to sync the bottom bar, which does not
+// matter to the account flows tested here.
 globalThis.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
-globalThis.history.pushState = (a, b, url) => { if (url) currentUrl = new URL(url, currentUrl); };
-globalThis.history.back = () => {};
-globalThis.history.go = () => {};
-globalThis.history.state = null;
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
 globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
 globalThis.cancelAnimationFrame = globalThis.cancelAnimationFrame || ((id) => clearTimeout(id));
@@ -256,12 +305,49 @@ async function typeNote(text) {
 }
 const bodyHas = (c) => document.body.classList.contains(c);
 const badgeShown = () => !byId('bottom-nav').querySelector('.bn-badge').classList.contains('hidden');
+const lastToast = () => [...document.body.children].reverse().find(c => c.id === 'tp-toast')?.textContent || '';
+// Every toast shown since a mark (a count of document.body's toasts).
+const toastCount = () => document.body.children.filter(c => c.id === 'tp-toast').length;
+const toastsSince = (mark) => document.body.children.filter(c => c.id === 'tp-toast').slice(mark).map(c => c.textContent);
+// Unpushed edits on the phone, as the ⬆️ button shows them.
+const dirtyShown = () => byId('pushBtn').classList.contains('dirty');
+// Whether closing or reloading the app now would ask first.
+const unloadAsks = () => fireWindow('beforeunload', { prevented: false, preventDefault() { this.prevented = true; } }).prevented;
+// A link tapped while the app is open: the browser adds an entry for it,
+// lands on it and fires hashchange.
+async function tapLink(hash) {
+    historyShim.pushState(null, '', '/' + hash);
+    fireWindow('popstate', { state: null });
+    fireWindow('hashchange');
+    await settle();
+}
+// Every note of a tree from the server: { parent (its folder's title), title, content }.
+function notesOf(roots) {
+    const out = [];
+    const walk = (list, parent) => list.forEach(n => {
+        if (n.kind === 'note') out.push({ parent, title: n.title, content: n.payload && n.payload.content });
+        else walk(n.children || [], n.title);
+    });
+    walk(roots, null);
+    return out;
+}
 
 async function propose(token, body) {
     const share = (await api('/api/share', { method: 'POST', token })).json;
     const res = await api(new URL(share.url).pathname + '/propose', { method: 'POST', body });
     if (res.status !== 200) throw new Error('could not propose: ' + JSON.stringify(res.json));
 }
+// A proposal as last drawn in Notes, by its title.
+const findProposal = (title) => [...created].reverse()
+    .find(e => e.className === 'proposal' && e.innerHTML.includes(`class="title">${title}`));
+const approvals = () => requests.filter(r => /^POST \/api\/proposals\/\d+\/approve$/.test(r)).length;
+const pulls = () => requests.filter(r => r === 'GET /api/tree').length;
+// Import links kept on the phone, and one as last drawn in Notes' waiting block.
+const pendingLinks = () => JSON.parse(localStorageShim.getItem('tp_pending_import') || '[]');
+const pendingHolds = (text) => pendingLinks().some(p => decodeURIComponent(p.hash).includes(text));
+const waitingRow = (title) => [...created].reverse()
+    .find(e => e.className === 'proposal pending-import' && e.innerHTML.includes(title));
+const noteLink = (title, body) => '#note=' + encodeURIComponent(`# ${title}\n\n${body}`);
 
 try {
     for (let i = 0; i < 100; i++) {
@@ -285,7 +371,7 @@ try {
     const queued = JSON.parse(localStorageShim.getItem('tp_pending_shares') || '[]');
     check('is queued on the phone', queued.length === 1 && queued[0].url === 'https://example.com/shared-while-out' && queued[0].userId === null,
         JSON.stringify(queued));
-    check('and the URL is cleaned afterwards', currentUrl.search === '');
+    check('and the URL is cleaned afterwards', currentUrl().search === '');
 
     answers.confirm.push(true); // "add them to alex's inbox?"
     await signIn('alex', PASSWORD);
@@ -357,7 +443,7 @@ try {
     // alex's inbox holds the link from section 1; one more fills it.
     await api('/api/shared', { method: 'POST', token: alexNew, body: { url: 'https://example.com/filler' } });
     const ARTICLE = 'https://blog.example/an-article-i-want-to-keep';
-    currentUrl = new URL(BASE + '/?share=1&url=' + encodeURIComponent(ARTICLE) + '&title=Article');
+    openAt(BASE + '/?share=1&url=' + encodeURIComponent(ARTICLE) + '&title=Article');
     await signIn('alex', 'new horse battery'); // any start runs the share through
     const keptFull = JSON.parse(localStorageShim.getItem('tp_pending_shares') || '[]');
     check('a link the full inbox refuses is kept on the phone, as alex\'s', keptFull.some(s => s.url === ARTICLE && s.userId === 1),
@@ -391,6 +477,19 @@ try {
     await settle();
     check('OK signs out and says the edits stay on the phone',
         !localStorageShim.getItem('tp_pwa_token') && /stays? on this phone until alex signs in/.test(byId('status').textContent), byId('status').textContent);
+    check('  and closing the app now asks first', unloadAsks());
+    // Settings stays open over the sign-out; a bookmarks file imported from
+    // it must not land in the copy kept for alex, to go up with his push.
+    const BOOKMARKS_FILE = '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<DL><p>\n<DT><H3>Stranger</H3>\n<DL><p>\n'
+        + '<DT><A HREF="https://stranger.example/">Stranger link</A>\n</DL><p>\n</DL><p>\n';
+    const askedImport = dialogs.confirm.length;
+    answers.confirm.push(true); // "Import 1 item(s)…?", were it asked
+    await byId('bm-import-file').fire('change', { target: { files: [{ text: async () => BOOKMARKS_FILE }], value: 'bookmarks.html' } });
+    await settle();
+    const importAsked = dialogs.confirm.length > askedImport;
+    if (!importAsked) answers.confirm.pop();
+    check('a bookmarks file imported while signed out is refused, not added to the kept copy',
+        !importAsked && /Sign in first/.test(lastToast()), lastToast());
     const pullsAtSignOut = requests.filter(r => r === 'GET /api/tree').length;
     await signIn('sam', 'sam-password-1');
     check('sam cannot sign in over alex\'s unpushed edits',
@@ -409,6 +508,8 @@ try {
     answers.confirm.push(true); // the laptop's push from section 6: overwrite it
     await byId('pushBtn').fire('click');
     await settle();
+    check('alex\'s push carries his edits and nothing imported while he was out',
+        (await treeTitles(alexNew)).includes('Unpushed at sign-out') && !(await treeTitles(alexNew)).includes('stranger.example'));
     // alex keeps a diary, and an LLM has a note waiting for his approval.
     const t7 = (await api('/api/tree', { token: alexNew })).json;
     await api('/api/tree', { method: 'PUT', token: alexNew, body: { baseVersion: t7.version, deviceId: 'laptop', roots: [...t7.roots,
@@ -435,6 +536,9 @@ try {
     check('OK signs out, closes the note and says it is kept',
         !localStorageShim.getItem('tp_pwa_token') && !bodyHas('view-notes') && !bodyHas('nv-editing')
         && /unsaved note stays on this phone until alex signs in/.test(byId('status').textContent), byId('status').textContent);
+    check('  back on the Home entry, so back leaves the app', H.index === 0 && !(entry().state && entry().state.tp === 'nv'),
+        JSON.stringify({ index: H.index, state: entry().state }));
+    check('  and closing the app now asks first: the note set aside lives only in this page', unloadAsks());
     check('  and nothing of alex\'s is on screen: no copy, proposals or inbox',
         /Signed out/.test(byId('content').innerHTML) && !badgeShown() && byId('inbox-fab').classList.contains('hidden'),
         byId('content').innerHTML);
@@ -446,6 +550,7 @@ try {
         bodyHas('nv-editing') && /half-written thought/.test(lastEditorText() || ''), lastEditorText());
     await clickNv('done');
     check('  and ✓ Done saves it to alex\'s tree', (await treeTitles(alexNew)).includes('half-written thought'));
+    check('  after which closing the app asks nothing', !unloadAsks());
 
     // A clean sign-out with the note open in the editor, then sam.
     await clickNv('edit');
@@ -498,31 +603,335 @@ try {
     await clickNv('done');
     check('  or saved into sam\'s tree', !/ALEX PRIVATE|mid-session/.test(await treeTitles(samNow)));
 
-    console.log('\n8. Approving a proposal over unpushed edits');
-    await signIn('alex', 'third horse battery');
+    // alex's password and session from here on: several sections let his
+    // session expire on purpose.
+    let alexPw = 'third horse battery';
+    let alexTok = alex3;
+    const expireAlex = async (newPassword) => {
+        alexTok = (await api('/api/auth/password', { method: 'POST', token: alexTok, body: { currentPassword: alexPw, newPassword } })).json.token;
+        alexPw = newPassword;
+        await byId('pullBtn').fire('click'); // the phone's next request meets the 401
+        await settle();
+    };
+    const serverProposals = async () => ((await api('/api/proposals', { token: alexTok })).json.proposals || []).map(p => p.title);
+
+    console.log('\n8. Approving a proposal waits for a clean copy');
+    await propose(alexTok, { action: 'reorder', order: ['From the LLM', 'Diary'] });
+    await signIn('alex', alexPw);
     failNext = 'PUT /api/tree'; // the phone is offline for this push
     answers.prompt.push('Offline folder');
     await byId('newFolderBtn').fire('click');
     await settle();
-    check('an edit that could not be pushed stays on the phone', !(await treeTitles(alex3)).includes('Offline folder')
-        && dialogs.alert.some(m => /Failed to save folder/.test(m)));
+    check('an edit that could not be pushed stays on the phone', !(await treeTitles(alexTok)).includes('Offline folder')
+        && dirtyShown() && dialogs.alert.some(m => /Failed to save folder/.test(m)));
     await byId('notesBtn').fire('click');
-    const proposal = [...created].reverse().find(e => e.className === 'proposal');
-    check('alex\'s proposal waits in Notes', Boolean(proposal));
-    const asked8 = dialogs.confirm.length;
-    const pullsBeforeApprove = requests.filter(r => r === 'GET /api/tree').length;
-    await proposal.querySelector('.proposal-approve').fire('click');
+    check('alex\'s note and order proposals wait in Notes, under a word to push first, with a ⬆️ Push',
+        Boolean(findProposal('From the LLM')) && Boolean(findProposal('🔀 Reorder notes'))
+        && created.some(e => e.className === 'proposal proposals-push-hint' && /Push your changes first, then approve/.test(e.innerHTML)
+            && /⬆️ Push</.test(e.innerHTML)));
+    let asked8 = dialogs.confirm.length;
+    const approvals8 = approvals();
+    const pulls8 = pulls();
+    for (const title of ['From the LLM', '🔀 Reorder notes']) {
+        answers.confirm.push(false); // "Push your changes first, then approve." Cancel.
+        await findProposal(title).querySelector('.proposal-approve').fire('click');
+        await settle();
+    }
+    const asks8 = dialogs.confirm.slice(asked8);
+    check('approving a note or an order over an unpushed edit asks to push first, and Cancel approves nothing',
+        asks8.length === 2 && asks8.every(m => /^Push your changes first, then approve\./.test(m) && /1 unpushed edit\b/.test(m) && /OK = ⬆️ Push now/.test(m))
+        && approvals() === approvals8 && pulls() === pulls8, asks8.join(' | '));
+    const waiting8 = await serverProposals();
+    check('  both proposals still wait, on the server and on the phone',
+        waiting8.includes('From the LLM') && waiting8.includes('Reorder notes') && Boolean(findProposal('From the LLM')), JSON.stringify(waiting8));
+    check('  and the unpushed edit is untouched', dirtyShown() && !(await treeTitles(alexTok)).includes('Offline folder'));
+    answers.confirm.push(true); // OK = ⬆️ Push now
+    await findProposal('From the LLM').querySelector('.proposal-approve').fire('click');
     await settle();
-    const afterApprove = await treeTitles(alex3);
-    check('approving it does not pull over the unpushed edit', requests.filter(r => r === 'GET /api/tree').length === pullsBeforeApprove
-        && dialogs.confirm.length === asked8 && afterApprove.includes('From the LLM') && !afterApprove.includes('Offline folder'));
+    check('OK pushes the edit, and still approves nothing', (await treeTitles(alexTok)).includes('Offline folder') && !dirtyShown()
+        && approvals() === approvals8 && (await serverProposals()).length === 2);
+    asked8 = dialogs.confirm.length;
+    await findProposal('From the LLM').querySelector('.proposal-approve').fire('click');
+    await settle();
+    await findProposal('🔀 Reorder notes').querySelector('.proposal-approve').fire('click');
+    await settle();
+    const approved8 = await treeTitles(alexTok);
+    check('with the copy clean, Approve approves and pulls, asking nothing', dialogs.confirm.length === asked8
+        && approvals() === approvals8 + 2 && pulls() === pulls8 + 2 && (await serverProposals()).length === 0
+        && approved8.includes('From the LLM') && approved8.includes('Offline folder'), dialogs.confirm.slice(asked8).join(' | '));
+
+    await propose(alexTok, { title: 'While writing', content: '# While writing\n\nLLM WHILE WRITING' });
+    await signIn('alex', alexPw); // the same account, clean: it pulls, and the proposal arrives
+    await byId('notesBtn').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    await typeNote('# Diary\n\nALEX PRIVATE TEXT\nwritten while a proposal waits');
+    const alerted8 = dialogs.alert.length;
+    const approvals8b = approvals();
+    await findProposal('While writing').querySelector('.proposal-approve').fire('click');
+    await settle();
+    check('approving while a note is being written approves nothing, and says to save it first',
+        /^Save your note first, then approve\./.test(dialogs.alert[alerted8] || '') && approvals() === approvals8b
+        && bodyHas('nv-editing'), dialogs.alert.slice(alerted8).join(' | '));
+    check('  and the proposal still waits', (await serverProposals()).includes('While writing'));
+    await clickNv('done'); // the text typed above is what gets saved: nothing was lost
+    await findProposal('While writing').querySelector('.proposal-approve').fire('click');
+    await settle();
+    const approved8b = await treeTitles(alexTok);
+    check('once the note is saved, Approve goes through and the note keeps its text',
+        approvals() === approvals8b + 1 && approved8b.includes('LLM WHILE WRITING') && approved8b.includes('written while a proposal waits'));
+
+    console.log('\n9. Import links wait on the phone until imported or dismissed');
+    const historyHoldsNoLink = () => H.entries.every(e => !new URL(e.url).hash && !(e.state && e.state.tp === 'import-pending'));
+    await byId('auth-signout').fire('click'); // a clean copy: nothing to ask
+    await settle();
+    let toasts9 = toastCount();
+    await tapLink(noteLink('Tapped while out', 'TAPPED LINK BODY'));
+    check('a link tapped while signed out is kept on the phone, with when it came, and says so',
+        pendingLinks().length === 1 && pendingHolds('TAPPED LINK BODY') && !Number.isNaN(Date.parse(pendingLinks()[0].at))
+        && toastsSince(toasts9).some(t => /Sign in to import this link/.test(t)), JSON.stringify(pendingLinks()));
+    check('  and neither the URL nor any history entry holds it any more', !location.hash && historyHoldsNoLink());
+    let mark9 = created.length;
+    await byId('notesBtn').fire('click');
+    check('Notes, opened before anyone signs in, shows it waiting, with Review and Dismiss',
+        Boolean(waitingRow('Tapped while out')) && created.slice(mark9).includes(waitingRow('Tapped while out')));
+    await signIn('kim', 'kim-password-1');
+    check('  the next sign-in opens it for review', bodyHas('nv-editing') && /TAPPED LINK BODY/.test(lastEditorText() || ''), lastEditorText());
+    check('  and it is still kept while under review', pendingHolds('TAPPED LINK BODY'));
+    await clickNv('done');
+    const kim = (await api('/api/login', { method: 'POST', body: { username: 'kim', password: 'kim-password-1' } })).json.token;
+    check('  ✓ Done files it for that account, and it is kept no longer',
+        (await treeTitles(kim)).includes('TAPPED LINK BODY') && pendingLinks().length === 0, JSON.stringify(pendingLinks()));
+
+    // A start with no copy yet and no way to pull one.
+    await byId('auth-signout').fire('click');
+    await settle();
+    failNext = 'GET /api/tree';
+    await signIn('alex', alexPw);
+    await byId('brand-home').fire('click');
+    check('alex signs in while the tree cannot be pulled', localStorageShim.getItem('tp_pwa_userid') === '1'
+        && /Nothing loaded yet/.test(byId('content').innerHTML), byId('content').innerHTML);
+    openAt(BASE + '/' + noteLink('Offline link', 'OFFLINE LINK BODY'));
+    failNext = 'GET /api/tree';
+    toasts9 = toastCount();
+    await byId('cfg-save').fire('click'); // the app starts again, from the link
+    await settle();
+    check('a link that opens the app while the tree cannot be pulled is kept, and says so',
+        pendingHolds('OFFLINE LINK BODY') && !location.hash && !bodyHas('nv-editing')
+        && toastsSince(toasts9).some(t => /opens after the next ⬇️ Pull/.test(t)), toastsSince(toasts9).join(' | '));
+    await byId('pullBtn').fire('click');
+    await settle();
+    check('  the next pull opens it for review', bodyHas('nv-editing') && /OFFLINE LINK BODY/.test(lastEditorText() || ''), lastEditorText());
+    await clickNv('done');
+    check('  and ✓ Done files it for alex', (await treeTitles(alexTok)).includes('OFFLINE LINK BODY') && pendingLinks().length === 0);
+
+    // alex's session expires deep in his notes; a link is tapped; sam signs in.
+    const stamp9 = new Date().toISOString();
+    const t9 = (await api('/api/tree', { token: alexTok })).json;
+    t9.roots.find(r => r.role === 'notes').children.push({ id: 'nb-work', kind: 'folder', title: 'Workzz', children: [
+        { id: 'plan-z', kind: 'note', title: 'Planzz', payload: { content: '# Planzz\n\nALEX PLAN TEXT\n- [ ] alex task', createdAt: stamp9, updatedAt: stamp9 } }] });
+    t9.roots.push({ id: 'wf-root', kind: 'folder', role: 'workflows', title: 'TabPaladin Workflows', children: [
+        { id: 'wf-morning', kind: 'folder', title: 'Morning', children: [{ id: 'wf-tab', kind: 'bookmark', title: 'News', url: 'https://news.example/' }] }] });
+    await api('/api/tree', { method: 'PUT', token: alexTok, body: { roots: t9.roots, baseVersion: t9.version, deviceId: 'laptop' } });
+    await byId('pullBtn').fire('click');
+    await settle();
+    const deepIntoWork = async () => {
+        await byId('notesBtn').fire('click');
+        await clickNv('open-nb', 'nb-work');
+        await clickNv('open-note', 'plan-z');
+    };
+    await deepIntoWork();
+    await expireAlex('fourth horse battery');
+    check('alex\'s session expires three screens deep in his notes', !localStorageShim.getItem('tp_pwa_token') && bodyHas('view-notes'));
+    toasts9 = toastCount();
+    await tapLink(noteLink('After expiry', 'EXPIRY LINK BODY'));
+    check('a link tapped then is kept for whoever signs in', pendingHolds('EXPIRY LINK BODY')
+        && toastsSince(toasts9).some(t => /Sign in to import this link/.test(t)) && historyHoldsNoLink());
+    mark9 = created.length;
+    await signIn('sam', 'sam-password-1');
+    check('sam signs in over the clean copy, and the link opens for him to review', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && bodyHas('nv-editing') && /EXPIRY LINK BODY/.test(lastEditorText() || ''), lastEditorText());
+    check('  with nothing of alex\'s drawn, not even a back label', !['Workzz', 'Planzz', 'ALEX PLAN', 'ALEX PRIVATE'].some(t => drawnSince(mark9, t)),
+        ['Workzz', 'Planzz', 'ALEX PLAN', 'ALEX PRIVATE'].filter(t => drawnSince(mark9, t)).join(', '));
+    await clickNv('done');
+    check('  ✓ Done files it for sam', (await treeTitles(samNow)).includes('EXPIRY LINK BODY') && pendingLinks().length === 0);
+
+    // A link while another note is being written.
+    await clickNv('new-note');
+    await typeNote('# Sam writing\n\nSAM HALF NOTE');
+    const asked9 = dialogs.confirm.length;
+    toasts9 = toastCount();
+    await tapLink(noteLink('Waiting link', 'WAITING LINK BODY'));
+    check('a link tapped while a note is being written waits, and the note is not asked about',
+        dialogs.confirm.length === asked9 && bodyHas('nv-editing') && /SAM HALF NOTE/.test(lastEditorText() || '')
+        && pendingHolds('WAITING LINK BODY') && toastsSince(toasts9).some(t => /finish what is open/.test(t)), toastsSince(toasts9).join(' | '));
+    mark9 = created.length;
+    await clickNv('done');
+    check('  once the note is saved, it waits in Notes', (await treeTitles(samNow)).includes('SAM HALF NOTE')
+        && created.slice(mark9).includes(waitingRow('Waiting link')));
+    answers.confirm.push(false); // "Dismiss this link?" Cancel.
+    await waitingRow('Waiting link').querySelector('.pending-import-dismiss').fire('click');
+    check('Dismiss asks first, and Cancel keeps it', /^Dismiss this link/.test(dialogs.confirm[dialogs.confirm.length - 1]) && pendingHolds('WAITING LINK BODY'));
+    answers.confirm.push(true);
+    await waitingRow('Waiting link').querySelector('.pending-import-dismiss').fire('click');
+    await settle();
+    check('  OK dismisses it for good', pendingLinks().length === 0 && !(await treeTitles(samNow)).includes('WAITING LINK BODY'));
+
+    // Two links while signed out; the second is reviewed from Notes, then discarded.
+    await byId('auth-signout').fire('click');
+    await settle();
+    await tapLink(noteLink('First of two', 'FIRST LINK BODY'));
+    await tapLink(noteLink('Second of two', 'SECOND LINK BODY'));
+    check('two links tapped while signed out are both kept', pendingLinks().length === 2);
+    await signIn('kim', 'kim-password-1');
+    check('  the next sign-in opens the first', bodyHas('nv-editing') && /FIRST LINK BODY/.test(lastEditorText() || ''), lastEditorText());
+    mark9 = created.length;
+    await clickNv('done');
+    check('  ✓ Done files it, and the second waits in Notes', (await treeTitles(kim)).includes('FIRST LINK BODY')
+        && pendingLinks().length === 1 && created.slice(mark9).includes(waitingRow('Second of two')));
+    await waitingRow('Second of two').querySelector('.pending-import-review').fire('click');
+    await settle();
+    check('Review opens the second', bodyHas('nv-editing') && /SECOND LINK BODY/.test(lastEditorText() || ''), lastEditorText());
+    answers.confirm.push(true); // "Discard unsaved changes?"
+    await clickNv('cancel-edit');
+    check('  and discarding it in the editor dismisses it', pendingLinks().length === 0 && !bodyHas('nv-editing')
+        && !(await treeTitles(kim)).includes('SECOND LINK BODY'));
+
+    // Links tapped while alex is signed in are his, opened or still waiting,
+    // through a sign-out.
+    await byId('auth-signout').fire('click');
+    await settle();
+    await signIn('alex', alexPw);
+    await byId('notesBtn').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    await typeNote('# Diary\n\nALEX PRIVATE TEXT\nwritten while links arrive');
+    await tapLink('#notes=' + encodeURIComponent(JSON.stringify([{ content: '# Batch one\n\nALEX BATCH BODY' }])));
+    check('a #notes= link tapped while alex writes a note opens its review beside the note',
+        created.some(e => e.className === 'import-list' && /Batch one/.test(e.innerHTML)) && bodyHas('nv-editing'));
+    toasts9 = toastCount();
+    await tapLink('#reorder=' + encodeURIComponent(JSON.stringify(['From the LLM', 'Diary'])));
+    check('  a #reorder= link tapped then waits, the review block being taken', pendingLinks().length === 2
+        && toastsSince(toasts9).some(t => /finish what is open/.test(t)));
+    await clickNv('done');
+    await byId('auth-signout').fire('click'); // a clean copy: the review is no unsaved edit
+    await settle();
+    mark9 = created.length;
+    await signIn('sam', 'sam-password-1');
+    await byId('notesBtn').fire('click');
+    check('sam, signing in next, sees neither, under review or waiting in Notes', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && !['Batch one', 'ALEX BATCH', 'New order for'].some(t => drawnSince(mark9, t)) && pendingLinks().length === 2);
+    await byId('auth-signout').fire('click');
+    await settle();
+    await signIn('alex', alexPw);
+    await byId('notesBtn').fire('click');
+    const importBtn = [...created].reverse().find(e => e.tagName === 'BUTTON' && e.textContent === 'Import');
+    check('alex signs back in to his review, the order waiting below it', Boolean(importBtn)
+        && created.some(e => e.className === 'import-list' && /Batch one/.test(e.innerHTML)) && Boolean(waitingRow('New order for 2 notes')));
+    if (importBtn) await importBtn.fire('click');
+    await settle();
+    check('  Import files it for alex alone, and it is kept no longer', (await treeTitles(alexTok)).includes('ALEX BATCH BODY')
+        && !(await treeTitles(samNow)).includes('ALEX BATCH BODY') && pendingLinks().length === 1);
+    await waitingRow('New order for 2 notes').querySelector('.pending-import-review').fire('click');
+    await settle();
+    const discardBtn = [...created].reverse().find(e => e.tagName === 'BUTTON' && e.textContent === 'Discard');
+    check('  Review opens the order', created.some(e => e.className === 'import-list' && /From the LLM/.test(e.innerHTML)) && Boolean(discardBtn));
+    if (discardBtn) await discardBtn.fire('click');
+    check('  and Discard dismisses it', pendingLinks().length === 0);
+
+    console.log('\n10. Nothing writes into a copy while nobody is signed in');
+    let clip = '';
+    navigator.clipboard = { readText: async () => clip, writeText: async () => {} };
+    clip = 'https://stranger.example/expired';
+    await byId('clipBtn').fire('click');
+    await settle();
+    const placeRow = [...byId('quick-file-list').children].reverse().find(r => r.innerHTML.includes('stranger.example/expired'));
+    check('alex has a copied link waiting to be placed', Boolean(placeRow) && !byId('quick-file-sheet').classList.contains('hidden'));
+    await deepIntoWork();
+    await expireAlex('fifth horse battery');
+    check('his session expires with the sheet and a note open', !localStorageShim.getItem('tp_pwa_token') && bodyHas('view-notes'));
+    const prompts10 = dialogs.prompt.length;
+    const confirms10 = dialogs.confirm.length;
+    const toasts10 = toastCount();
+    await placeRow.querySelector('.place-btn').fire('click');
+    await byId('content').fire('click', { target: { closest: (sel) => (sel === '.note-task-box' ? { dataset: { line: '3' } } : null) } });
+    await clickNv('rename-note');
+    await clickNv('delete-note');
+    await clickNv('move-note');
+    await byId('move-list').fire('click', { target: { closest: () => ({ disabled: false, dataset: { target: '' } }) } });
+    await settle();
+    byId('quick-file-paste-input').value = 'https://stranger.example/pasted';
+    await byId('quick-file-paste-input').fire('keydown', { key: 'Enter' });
+    await byId('dropHereBtn').fire('click');
+    await byId('brand-home').fire('click');
+    await settle();
+    const wfRow = [...created].reverse().find(e => e.className === 'row workflow-row');
+    if (wfRow) await wfRow.querySelector('.wf-del').fire('click');
+    await settle();
+    const refusals10 = toastsSince(toasts10).filter(t => /^Sign in first/.test(t));
+    check('signed out, nothing is placed, ticked, renamed, deleted, moved, pasted, dropped or deleted from workflows',
+        Boolean(wfRow) && refusals10.length === 8 && !dirtyShown() && dialogs.prompt.length === prompts10 && dialogs.confirm.length === confirms10,
+        `${refusals10.length}: ${toastsSince(toasts10).join(' | ')}`);
+    const pasteKept = byId('quick-file-paste-input').value === 'https://stranger.example/pasted';
+    check('  a refused paste stays in the box, without a word about it not being a URL', pasteKept
+        && !toastsSince(toasts10).some(t => /valid URL/.test(t)));
+    await signIn('alex', alexPw);
+    const after10 = await treeTitles(alexTok);
+    check('  and alex signs back in to his tree as he left it', !after10.includes('stranger.example') && after10.includes('- [ ] alex task')
+        && after10.includes('"title":"Planzz"') && after10.includes('"title":"Morning"'));
+
+    // Signed out on purpose, with an unpushed edit kept for alex.
+    failNext = 'PUT /api/tree';
+    answers.prompt.push('Kept folder');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    answers.confirm.push(true); // "Sign out anyway?"
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('alex signs out with his edit kept', !localStorageShim.getItem('tp_pwa_token') && /stays on this phone until alex signs in/.test(byId('status').textContent),
+        byId('status').textContent);
+    byId('settings-sheet').classList.add('hidden'); // closed after signing out
+    const listsBefore = JSON.stringify([...storage.entries()].filter(([k]) => /scanned|dismissed/.test(k)));
+    clip = 'https://stranger.example/kept';
+    await new Promise(r => setTimeout(r, 3100)); // past the clipboard scan's once-in-3s throttle
+    fireDocument('click', { target: { closest: () => null } });
+    await settle();
+    const toasts10b = toastCount();
+    clip = 'not a url';
+    await byId('clipBtn').fire('click');
+    await settle();
+    check('a tap scans no clipboard into anyone\'s lists, and Unfiled links will not open',
+        JSON.stringify([...storage.entries()].filter(([k]) => /scanned|dismissed/.test(k))) === listsBefore
+        && ![...storage.values()].some(v => v.includes('stranger.example/kept'))
+        && byId('quick-file-sheet').classList.contains('hidden') && toastsSince(toasts10b).some(t => /^Sign in first/.test(t)),
+        toastsSince(toasts10b).join(' | '));
+    await signIn('alex', alexPw);
     await byId('pushBtn').fire('click');
     await settle();
-    const pushed = await treeTitles(alex3);
-    const count = (s) => pushed.split(s).length - 1;
-    check('Push then lands both, with no conflict question and no duplicate',
-        dialogs.confirm.length === asked8 && pushed.includes('Offline folder')
-        && count('"title":"From the LLM"') === 1 && count('"title":"LLM inbox"') === 1, pushed);
+    const pushed10 = await treeTitles(alexTok);
+    check('alex signs back in and pushes his own edit, and nothing else', pushed10.includes('Kept folder') && !pushed10.includes('stranger.example'));
+
+    console.log('\n11. Back and forward never reopen another account\'s notes');
+    const home11 = H.index;
+    await deepIntoWork();
+    await expireAlex('sixth horse battery');
+    await signIn('sam', 'sam-password-1');
+    check('sam signs in over alex\'s clean copy, back on the Home entry', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && !bodyHas('view-notes') && H.index === home11, JSON.stringify({ index: H.index, home11 }));
+    const mark11 = created.length;
+    for (let i = 0; i < 3; i++) { historyShim.go(1); await settle(); }
+    check('forward into the screens alex left reads as Home: none of his notes, notebooks or labels',
+        H.index === home11 + 3 && !bodyHas('view-notes') && !['Workzz', 'Planzz', 'ALEX PLAN'].some(t => drawnSince(mark11, t)),
+        ['Workzz', 'Planzz', 'ALEX PLAN'].filter(t => drawnSince(mark11, t)).join(', '));
+    historyShim.go(-1);
+    await settle();
+    check('  and so does back', !bodyHas('view-notes') && !drawnSince(mark11, 'Workzz'));
+    await byId('notesBtn').fire('click');
+    historyShim.go(-1);
+    await settle();
+    historyShim.go(1);
+    await settle();
+    check('  while sam\'s own Notes entry still opens as Notes', bodyHas('view-notes'));
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);
