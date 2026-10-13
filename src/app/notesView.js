@@ -1301,15 +1301,17 @@ export function initNotesView() {
         }
     });
 
-    // Push and Pull ask first when the open note has unsaved edits. OK saves
-    // it to the working copy so it goes up with the push (or is not silently
-    // dropped by the pull); Cancel carries on and leaves the draft as it is.
+    // Push asks first when the open note has unsaved edits: OK saves it to the
+    // working copy so it goes up with the push; Cancel carries on and leaves
+    // the draft as it is. Pull never saves it — the pull replaces the working
+    // copy, so a save would be thrown away with it. The draft simply stays in
+    // the editor, dirty, and refresh() leaves a dirty editor alone.
     window.addEventListener('tabpaladin:before-sync', (e) => {
-        if (!isDirty()) return;
+        if (!isDirty() || !e.detail || e.detail.kind !== 'push') return;
         const p = (async () => {
-            if (window.confirm('Save the open note before syncing?')) await saveNote();
+            if (window.confirm('Save the open note before pushing?')) await saveNote();
         })();
-        if (e.detail && typeof e.detail.waitUntil === 'function') e.detail.waitUntil(p);
+        if (typeof e.detail.waitUntil === 'function') e.detail.waitUntil(p);
     });
 
     window.addEventListener('beforeunload', (e) => {

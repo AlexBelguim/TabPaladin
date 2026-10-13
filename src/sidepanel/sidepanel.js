@@ -3670,7 +3670,8 @@ async function doPull({ skipConfirm = false } = {}) {
 }
 
 // Give open editors a say before a sync. The notes view offers to save a
-// dirty note first, so a push carries it and a pull does not drop it unasked.
+// dirty note before a push, so the push carries it; before a pull it saves
+// nothing, since the pull would replace that save, and keeps the draft open.
 // Listeners call event.detail.waitUntil(promise); the sync waits for all of
 // them, and a listener that fails never blocks it.
 async function beforeSync(kind) {
