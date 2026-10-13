@@ -73,6 +73,16 @@ that pre-upgrade and predelete copies **contain deleted accounts' data**; they
 stay on the server's disk. To restore, stop the container and copy one over
 `sync.db` (deleting `sync.db-wal` and `sync.db-shm`).
 
+**The identity key.** On its first start the server also makes
+`identity.jwk` in the data directory: the ECDSA P-256 key it proves itself
+with at `/api/identity`. Keep it with your backups of `sync.db`. A server
+restored without it makes a new key, and every client that pinned this server
+(the browser helper, once it ships) then refuses it until someone pins it
+again by hand. The file is private: whoever holds it can pass as your server.
+An unreadable key file is moved aside (`identity.jwk.unreadable-<timestamp>`),
+never deleted, and a new key made; the log says so, and prints the key's id
+(`identity key <id>`) on every start.
+
 ### Upgrading an existing server
 
 Existing data, the existing account, its password and every signed-in device
@@ -280,11 +290,12 @@ can only be changed through the explicit import verbs below.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health`, the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead) and the Reddit OAuth callback and confirm pages. Everything acts on the caller's own account.
+All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health`, `/api/identity`, the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead) and the Reddit OAuth callback and confirm pages. Everything acts on the caller's own account.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/health` | server status |
+| GET | `/api/health` | **no auth** — `{ ok, version, configured, app: 'tabpaladin', serverId }` |
+| GET | `/api/identity?nonce=<hex>` | **no auth** — `{ app, serverId, alg: 'ES256', publicKeyJwk, keyId, nonce, sig }`: `sig` is ECDSA P-256 over `tp-identity\|1\|<nonce>\|<serverId>` (raw r‖s, base64url, as WebCrypto verifies it); the nonce is 32–128 lowercase hex characters; 503 when the server has no key |
 | GET | `/api/auth/status` | **no auth** — `{ hasAccount, legacyTokenEnabled }` |
 | GET | `/api/auth/me` | `{ user: { id, username, role, tenancyOwner }, serverId }` |
 | POST | `/api/login` | **no auth** — `{ username, password }` → session token, `user` and `serverId`; rate-limited per IP and username |
@@ -299,7 +310,8 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/tree` | the tree (+ virtual imports subtree), `userId` and `serverId` |
 | PUT | `/api/tree` | replace the tree `{ roots, baseVersion, baseUserId?, baseServerId?, deviceId?, force? }`; 409 on a stale baseVersion, 412 for another account's or server's copy |
 | GET | `/api/tree/version` | cheap freshness probe |
-| GET | `/api/tree/ops?since=N` | what a copy based on N missed, when that was only filed links: `{ version, floor, complete, ops, userId, serverId }` |
+| GET | `/api/tree/ops?since=N` | what a copy based on N missed, when that was only filed links or saved workflows: `{ version, floor, complete, ops, userId, serverId }` |
+| POST | `/api/workflows` | save one workflow without pushing the copy: `{ workflow: { id, title, createdAt, tabs: [{ id, title, url }] }, rootId, expectUserId?, expectServerId? }` → `{ baseVersion, version, created, already, userId, serverId }`, appended under the account's workflows root as one logged append (the folder with payload `{ createdAt }`). Client ids; a retry is a no-op. 409 `no-root` (no such workflows root; nothing written, no root made), 409 `conflict` (an id is something else here), 412 for another account. Tab URLs: http, https and local `file:` only (no `javascript:`, `data:`, browser or extension pages, no UNC paths); at most 500 tabs and 8 KB per URL |
 | GET | `/api/history` | list of past tree versions |
 | GET | `/api/history/:id` | fetch a specific past version |
 | POST | `/api/push`, GET `/api/pull` | **410 Gone** — the legacy snapshot sync, kept only to tell old clients to update |
@@ -510,7 +522,10 @@ node tools/test_share_sw.mjs   # PWA service worker: shares kept before the netw
 node tools/test_share_core.mjs # the share core: what a share holds, cleaning, apps, suggestions, outbox, folding appends
 node tools/test_share_pwa.mjs  # the share sheet in the PWA against a real server: one-tap filing, undo, offline, rebase, kept copy
 node tools/test_pwa_release.mjs # the PWA's version numbers agree, and the shell holds what it loads
-node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
+node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping, identity key; a live server's headers, health and identity (--port)
+node tools/test_workflows_append.mjs # POST /api/workflows: URL allowlist, append, retries, conflicts, no-root, folding (starts a server: --port)
+node tools/test_render_safety.mjs # notes, bookmarks and links render as text, never markup; the PWA's innerHTML audit
+node tools/test_shared_sync.mjs   # the files the extension and the PWA share are byte-identical (tools/sync_shared.mjs copies them)
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
 node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
 node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, legacy routes, forced-push safety net, and an upgrade rehearsal on a database the schema-3 server wrote (starts servers: --port, --old-port)
@@ -561,5 +576,31 @@ avoiding.
 ## TLS
 
 Mobile browsers refuse to install a PWA or fire share-target intents over plain
-HTTP. Put a reverse proxy in front (Traefik, Caddy, NPM) and terminate TLS there.
-Local desktop testing over HTTP works fine.
+HTTP. Put a reverse proxy in front (Traefik, Caddy, NPM, a Cloudflare Tunnel,
+`tailscale serve`) and terminate TLS there. Use https for every device, not
+only phones: the coming browser helper hands tab access to the page at your
+server's address, and over plain http anyone on the network path can be that
+page. A plain-http LAN address will only be allowed after an explicit
+warning. Local desktop testing over HTTP works fine.
+
+## Response headers
+
+Every response carries `X-Content-Type-Options: nosniff` and
+`Referrer-Policy: no-referrer`.
+
+The web app (every file under the PWA directory) carries its
+Content-Security-Policy. This release enforces `script-src 'self';
+object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors
+'none'` and only reports the rest of the policy (`default-src 'self'`,
+`connect-src 'self'`, `img-src 'self' data: https://www.google.com
+https://*.gstatic.com`, …) in `Content-Security-Policy-Report-Only`: a
+phone still set to a server address other than the one it opened the app
+from would otherwise stop syncing. Settings now says when that is the case
+and offers the app's own server. The app's HTML also gets
+`Cross-Origin-Opener-Policy: same-origin` and `X-Frame-Options: DENY`.
+
+Every other HTML response — the Reddit connect pages, Express's 404, error
+and redirect pages — carries a script-free policy (`default-src 'none';
+style-src 'unsafe-inline'; base-uri 'none'; form-action 'self';
+frame-ancestors 'none'`). A reverse proxy in front should pass these
+headers through unchanged.
