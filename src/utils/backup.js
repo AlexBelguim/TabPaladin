@@ -68,7 +68,12 @@ export function buildBackup({ storage = {}, local = {}, extension = {}, now = ne
     const tree = storage.tpTree || {};
     const stashKeys = Object.keys(storage).filter(k => k.startsWith('tpTreeStash:'));
     const parkedList = Array.isArray(localValues.tp_notes_parked_v1) ? localValues.tp_notes_parked_v1 : [];
-    const mirror = storage.tpParkedMirror && Array.isArray(storage.tpParkedMirror.drafts) ? storage.tpParkedMirror.drafts : [];
+    const mirrored = storage.tpParkedMirror && typeof storage.tpParkedMirror === 'object' ? storage.tpParkedMirror : {};
+    const mirror = Array.isArray(mirrored.drafts) ? mirrored.drafts : [];
+    // Drafts pages kept only in memory (localStorage refused them), by page:
+    // in no list, so counted on top of it.
+    const heldByPages = mirrored.pages && typeof mirrored.pages === 'object'
+        ? Object.values(mirrored.pages).reduce((n, d) => n + (Array.isArray(d) ? d.length : 0), 0) : 0;
     const live = storage.tpLiveDraft && typeof storage.tpLiveDraft === 'object' ? Object.keys(storage.tpLiveDraft) : [];
     return {
         format: BACKUP_FORMAT,
@@ -86,7 +91,7 @@ export function buildBackup({ storage = {}, local = {}, extension = {}, now = ne
                 baseVersion: Number(tree.baseVersion) || 0
             },
             setAsideCopies: stashKeys.length,
-            parkedDrafts: Math.max(parkedList.length, mirror.length),
+            parkedDrafts: Math.max(parkedList.length, mirror.length) + heldByPages,
             liveDrafts: live.length,
             queuedRemovals: Array.isArray(storage.tpPendingRemovals) ? storage.tpPendingRemovals.length : 0
         },

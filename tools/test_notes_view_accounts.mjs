@@ -57,6 +57,12 @@
 //      back into the editor only for their own copy; one that says what its
 //      note now says is let go. Drafts only the mirror still holds come back
 //      into the list; a mirror older than the list brings back nothing.
+//  15. A draft localStorage refused is mirrored under its own page's entry
+//      (tpParkedMirror.pages), before the live draft lets it go; a page that
+//      starts while that page lives takes nothing of it.
+//  16. Another page changing the parked list (parking, discarding) never
+//      drops what this page holds; once this page is gone (its lock free),
+//      the next page to start takes it back into the list, once.
 //
 // Run: node tools/test_notes_view_accounts.mjs
 
@@ -1155,28 +1161,80 @@ console.log('\n14. A page that is gone: its live draft comes back, for its copy 
     ls.delete('tp_notes_parked_v1');
 }
 
-console.log('\n15. A draft localStorage refused is kept by the mirror for the next page');
+console.log('\n15. A draft localStorage refused is mirrored under the page that holds it');
 {
     if (NV.isDirty()) await discardDraft();
     ls.delete('tp_notes_parked_v1');
     await otherPageLoads(ALICE, aliceRoots());
     await settle();
+    const X = '# Diary\nLOCALSTORAGE IS FULL';
+    const mirrorHolds = () => JSON.stringify(storageData.get('tpParkedMirror') || {}).includes('LOCALSTORAGE IS FULL');
     await NV.openNotes({ noteId: 'a-note1' });
-    await type('noteContentInput', '# Diary\nLOCALSTORAGE IS FULL');
+    await type('noteContentInput', X);
+    await sleep(700);
+    check('(its live draft is written)', Object.values(storageData.get('tpLiveDraft') || {}).some(d => d.content === X));
+    // When the live draft lets the text go, the mirror must have it already.
+    const realSet = chrome.storage.local.set;
+    const realRemove = chrome.storage.local.remove;
+    const drops = [];
+    const seen = (entries) => { if (!entries.some(d => d && d.content === X)) drops.push(mirrorHolds()); };
+    chrome.storage.local.set = async (obj) => { if (obj.tpLiveDraft) seen(Object.values(obj.tpLiveDraft)); return realSet(obj); };
+    chrome.storage.local.remove = async (k) => { if ([].concat(k).includes('tpLiveDraft')) seen([]); return realRemove(k); };
     const setItem = localStorage.setItem;
     localStorage.setItem = (k, v) => { if (k === 'tp_notes_parked_v1') throw new Error('QuotaExceededError'); return setItem(k, v); };
     await otherPageLoads(BOB, bobRoots());
     await settle();
     localStorage.setItem = setItem;
-    const mirror = storageData.get('tpParkedMirror') || { drafts: [] };
-    check('localStorage refused it: the list does not have it, the mirror does',
-        parked().length === 0 && mirror.drafts.length === 1 && mirror.drafts[0].content === '# Diary\nLOCALSTORAGE IS FULL'
-        && Number(mirror.at) > Number(ls.get('tp_notes_parked_at_v1') || 0), JSON.stringify(mirror));
-    // The next page to start (a fresh copy of the module: nothing in memory).
+    chrome.storage.local.set = realSet;
+    chrome.storage.local.remove = realRemove;
+    const mirror = storageData.get('tpParkedMirror') || {};
+    const pages = Object.entries(mirror.pages || {});
+    check('localStorage refused it: not in the list, nor in the mirror\'s copy of the list, but under this page\'s own entry',
+        parked().length === 0 && !JSON.stringify(mirror.drafts || []).includes('LOCALSTORAGE IS FULL')
+        && pages.length === 1 && pages[0][1].length === 1 && pages[0][1][0].content === X && pages[0][1][0].owner.userId === 1,
+        JSON.stringify(mirror));
+    check('the live draft let the text go only once the mirror held it', drops.length === 1 && drops[0] === true, JSON.stringify(drops));
+    // Another page starting (a fresh copy of the module: nothing in memory)
+    // while this one lives leaves it to this page.
     const NextPage = await import('../src/app/notesView.js?next-page');
-    await NextPage.restoreParkedFromMirror();
-    check('the next page takes it back from the mirror into the list', parked().length === 1
-        && parked()[0].content === '# Diary\nLOCALSTORAGE IS FULL' && parked()[0].owner.userId === 1, JSON.stringify(parked()));
+    check('a page that starts while this one lives takes nothing of it', (await NextPage.restoreParkedFromMirror()) === 0
+        && parked().length === 0 && JSON.stringify(storageData.get('tpParkedMirror').pages) === JSON.stringify(mirror.pages),
+        JSON.stringify(storageData.get('tpParkedMirror')));
+}
+
+console.log('\n16. Another page changing the parked list keeps it; once this page is gone, the next one takes it back');
+{
+    const X = '# Diary\nLOCALSTORAGE IS FULL';
+    const held = () => Object.values((storageData.get('tpParkedMirror') || {}).pages || {}).flat();
+    // Another page, with its own memory.
+    const PageB = await import('../src/app/notesView.js?page-b');
+    await chrome.storage.local.set({ tpLiveDraft: { 'gone-y': { owner: BOB, origin: null, noteId: 'b-note1', notebookId: 'b-nb', title: 'Bob todo',
+        content: '# Bob todo\nY FROM A CLOSED PAGE', loaded: { title: 'Bob todo', content: '# Bob todo\n- [ ] ship' }, at: '2026-10-13T11:00:00.000Z' } } });
+    check('another page parks a draft into the list', (await PageB.recoverLiveDrafts()) === 1
+        && parked().length === 1 && parked()[0].content === '# Bob todo\nY FROM A CLOSED PAGE', JSON.stringify(parked()));
+    check('…and the mirror has the list as it is now, with this page\'s draft still under this page',
+        JSON.stringify(storageData.get('tpParkedMirror').drafts) === JSON.stringify(parked()) && held().length === 1 && held()[0].content === X,
+        JSON.stringify(storageData.get('tpParkedMirror')));
+    // That page lets the draft go again (Settings › Discard on its copy).
+    PageB.dropParkedDrafts(parked());
+    await sleep(20);
+    check('another page emptying the list leaves this page\'s draft in the mirror',
+        parked().length === 0 && held().length === 1 && held()[0].content === X, JSON.stringify(storageData.get('tpParkedMirror')));
+    check('(this page\'s editor is clean: closing it writes nothing more)', !NV.isDirty());
+
+    // This page goes (the tab closes, an update reloads it): its lock is free.
+    const locks = (await navigator.locks.query()).held.map(l => l.name).filter(n => n.startsWith('tp-notes-page:'));
+    check('(this page holds the lock its mirror entry is named after)', locks.length === 1
+        && JSON.stringify(Object.keys(storageData.get('tpParkedMirror').pages)) === JSON.stringify([locks[0].slice('tp-notes-page:'.length)]),
+        JSON.stringify(locks));
+    await navigator.locks.request(locks[0], { steal: true }, async () => {});
+    const PageC = await import('../src/app/notesView.js?page-c');
+    check('the next page to start takes it back into the list', (await PageC.restoreParkedFromMirror()) === 1
+        && parked().length === 1 && parked()[0].content === X && parked()[0].owner.userId === 1, JSON.stringify(parked()));
+    check('…and the gone page\'s entry with it: the mirror has the list, and nothing under any page',
+        held().length === 0 && JSON.stringify(storageData.get('tpParkedMirror').drafts) === JSON.stringify(parked()),
+        JSON.stringify(storageData.get('tpParkedMirror')));
+    check('a page starting after that finds nothing more to take', (await PageB.restoreParkedFromMirror()) === 0 && parked().length === 1);
     ls.delete('tp_notes_parked_v1');
 }
 

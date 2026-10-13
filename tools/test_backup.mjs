@@ -10,7 +10,8 @@
 //      API key are null in the file and listed under `redacted`; the
 //      server address and user name stay. Words the user chose (a keyword
 //      category called "Token") are kept.
-//   3. A summary says what is in it; the file is named by date.
+//   3. A summary says what is in it (parked drafts mirrored only under the
+//      page that held them counted too); the file is named by date.
 //   4. Downloading writes what the page holds first, then hands the browser
 //      a JSON file with no token in it.
 //   5. Settings has the button; the app page shows the moving notice, with
@@ -99,6 +100,15 @@ check('a summary of what it holds', JSON.stringify(backup.summary) === JSON.stri
     workingCopy: { owner: { url: 'https://tp.example', userId: 1, username: 'alex' }, origin: null, items: 3, unpushedEdits: 3, baseVersion: 12 },
     setAsideCopies: 1, parkedDrafts: 1, liveDrafts: 1, queuedRemovals: 2
 }), JSON.stringify(backup.summary));
+{
+    const pages = {
+        pageA: [{ owner: null, origin: 'local', title: 'Q', content: 'ONLY IN PAGE A' }],
+        pageB: [{ owner: null, origin: 'local', title: 'R', content: 'ONLY IN PAGE B' }, { owner: null, origin: 'local', title: 'S', content: 'AND THIS' }]
+    };
+    const held = buildBackup({ storage: { ...storage, tpParkedMirror: { ...storage.tpParkedMirror, pages } }, local });
+    check('drafts pages could keep only in memory (mirrored by page) are in it, counted on top of the list',
+        held.summary.parkedDrafts === 4 && JSON.stringify(held.storage.tpParkedMirror.pages) === JSON.stringify(pages), JSON.stringify(held.summary));
+}
 check('the file is named by date and time', backupFileName(new Date('2026-10-13T12:34:56Z')) === 'tabpaladin-backup-2026-10-13-12-34-56.json');
 
 console.log('\n4. Collecting and downloading');

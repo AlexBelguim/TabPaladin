@@ -230,10 +230,23 @@ function draftFromEditor(from) {
     };
 }
 
-// Add drafts to the parked list (here, when it cannot be written).
-function addParked(drafts) {
+// Write the parked list, with the time it was written beside it. False when
+// localStorage refused it.
+function writeParked(list) {
+    if (!writeJson(PARKED_KEY, list)) return false;
+    writeJson(PARKED_AT_KEY, Date.now());
+    return true;
+}
+
+// Put drafts on the parked list (here, when it cannot be written).
+function putParked(drafts) {
     const list = readJson(PARKED_KEY, []);
-    if (!writeJson(PARKED_KEY, [...(Array.isArray(list) ? list : []), ...drafts])) parkedHere.push(...drafts);
+    if (!writeParked([...(Array.isArray(list) ? list : []), ...drafts])) parkedHere.push(...drafts);
+}
+
+// The same, mirrored.
+function addParked(drafts) {
+    putParked(drafts);
     return parkedChanged();
 }
 
@@ -251,7 +264,7 @@ function takeParkedDraft(st) {
         const i = list.findIndex(mine);
         if (i !== -1) {
             const [draft] = list.splice(i, 1);
-            if (writeJson(PARKED_KEY, list)) {
+            if (writeParked(list)) {
                 parkedChanged();
                 return draft;
             }
@@ -268,10 +281,14 @@ function takeParkedDraft(st) {
 //
 // Parked drafts live in this origin's localStorage, which only pages can
 // read. Every change to them is mirrored into extension storage as well
-// (tpParkedMirror {at, drafts}), with the same `at` noted beside the list
-// (tp_notes_parked_at_v1): drafts that could only be kept in memory because
-// localStorage refused them, or a localStorage that was cleared, come back
-// from the mirror when it is newer than the list.
+// (tpParkedMirror {at, drafts, pages}): the list as it was last written, with
+// the time it was written (`at`, noted beside the list too, as
+// tp_notes_parked_at_v1), and, by page, the drafts each page could only keep
+// in memory because localStorage refused them. A page writes its own entry in
+// `pages` and nobody else's, so a change to the list made in one page never
+// drops what another holds. The next page to start takes back into the list
+// what the list lost — all of the mirror's list when it is newer than the
+// list (localStorage was cleared), and the entries of pages that are gone.
 //
 // The open note's unsaved text is kept in extension storage too, as it is
 // typed (half a second after the last key) and whenever the page is hidden or
@@ -283,6 +300,7 @@ function takeParkedDraft(st) {
 // it comes back the way any parked draft does — into the editor, unsaved,
 // only for that copy, once the editor is free.
 const PARKED_MIRROR_KEY = 'tpParkedMirror';
+const PARKED_MIRROR_LOCK = 'tp-parked-mirror';
 const PARKED_AT_KEY = 'tp_notes_parked_at_v1';
 const LIVE_DRAFT_KEY = 'tpLiveDraft';
 const LIVE_DRAFT_LOCK = 'tp-live-drafts';
@@ -305,38 +323,78 @@ function webLocks() {
         ? navigator.locks : null;
 }
 
-function parkedChanged() {
-    const at = Date.now();
-    // The list's stamp says the list holds every draft. While some are held
-    // only here (localStorage refused them), it does not: left older, it
-    // makes the next page take them back from the mirror.
-    if (!parkedHere.length) writeJson(PARKED_AT_KEY, at);
-    const drafts = allParked();
+// Read, change and write the mirror, one page at a time. `fn(stored, pages)`
+// may change `pages` (the entries by page); then the list as localStorage
+// holds it now, and this page's own entry, are written with them. Resolves
+// once written (or given up on: it never rejects).
+function updateMirror(fn) {
+    const run = async () => {
+        const data = await api.storage.local.get(PARKED_MIRROR_KEY);
+        const raw = data && data[PARKED_MIRROR_KEY];
+        const stored = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+        const pages = stored && stored.pages && typeof stored.pages === 'object' && !Array.isArray(stored.pages)
+            ? { ...stored.pages } : {};
+        await fn(stored, pages);
+        if (parkedHere.length) pages[pageId] = [...parkedHere];
+        else delete pages[pageId];
+        const list = readJson(PARKED_KEY, []);
+        const drafts = (Array.isArray(list) ? list : []).filter(d => d && typeof d.content === 'string');
+        if (!drafts.length && !Object.keys(pages).length) {
+            if (raw !== undefined) await api.storage.local.remove(PARKED_MIRROR_KEY);
+            return;
+        }
+        // An unstamped list (its stamp refused) is mirrored as older than any
+        // stamped one, but newer than a list that is gone.
+        const at = Number(readJson(PARKED_AT_KEY, 0)) || 1;
+        await api.storage.local.set({ [PARKED_MIRROR_KEY]: { at, drafts, pages } });
+    };
+    const locks = webLocks();
     mirrorChain = mirrorChain
-        .then(() => api.storage.local.set({ [PARKED_MIRROR_KEY]: { at, drafts } }))
+        .then(() => (locks ? locks.request(PARKED_MIRROR_LOCK, run) : run()))
         .catch((e) => console.warn('[TabPaladin] Could not mirror parked drafts', e));
     return mirrorChain;
 }
 
-// Drafts the mirror holds that the list lost, back into it.
+// The parked drafts changed here: bring the mirror up to date.
+function parkedChanged() {
+    return updateMirror(() => {});
+}
+
+// Back into the list: what it lost that the mirror holds (all of the
+// mirror's list, when that is newer than the list), and what pages that are
+// gone kept only in memory. They are in the list before the mirror lets them
+// go: stopped in between, a draft is found again and not taken twice.
+// Resolves with how many came back.
 export async function restoreParkedFromMirror() {
-    let mirror = null;
-    try {
-        mirror = ((await api.storage.local.get(PARKED_MIRROR_KEY)) || {})[PARKED_MIRROR_KEY] || null;
-    } catch (e) {
-        return;
-    }
-    const listAt = Number(readJson(PARKED_AT_KEY, 0)) || 0;
-    if (mirror && Array.isArray(mirror.drafts) && Number(mirror.at) > listAt) {
+    const alive = await livePages();
+    let back = 0;
+    await updateMirror((stored, pages) => {
         const have = new Set(allParked().map(d => JSON.stringify(d)));
-        const missing = mirror.drafts.filter(d => d && typeof d.content === 'string' && !have.has(JSON.stringify(d)));
-        if (missing.length) {
-            await addParked(missing);
-            return;
+        const missing = [];
+        const take = (drafts) => {
+            for (const d of Array.isArray(drafts) ? drafts : []) {
+                if (!d || typeof d.content !== 'string') continue;
+                const key = JSON.stringify(d);
+                if (have.has(key)) continue;
+                have.add(key);
+                missing.push(d);
+            }
+        };
+        const listAt = Number(readJson(PARKED_AT_KEY, 0)) || 0;
+        if (stored && Number(stored.at) > listAt) take(stored.drafts);
+        for (const [id, drafts] of Object.entries(pages)) {
+            if (id === pageId || (alive && alive.has(id))) continue;
+            delete pages[id];
+            take(drafts);
         }
+        if (missing.length) putParked(missing);
+        back = missing.length;
+    });
+    if (back) {
+        view.checkParked = true;
+        if (view.opened) await refresh();
     }
-    // Drafts parked by an earlier version were never mirrored.
-    if (allParked().length || mirror) await parkedChanged();
+    return back;
 }
 
 // Read, change and write the shared live-draft map, one page at a time.
@@ -507,7 +565,7 @@ export function dropParkedDrafts(drafts) {
     const gone = new Set((drafts || []).map(d => JSON.stringify(d)));
     if (!gone.size) return;
     const list = readJson(PARKED_KEY, []);
-    if (Array.isArray(list)) writeJson(PARKED_KEY, list.filter(d => !gone.has(JSON.stringify(d))));
+    if (Array.isArray(list)) writeParked(list.filter(d => !gone.has(JSON.stringify(d))));
     for (let i = parkedHere.length - 1; i >= 0; i--) {
         if (gone.has(JSON.stringify(parkedHere[i]))) parkedHere.splice(i, 1);
     }
