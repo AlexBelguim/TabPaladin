@@ -4518,7 +4518,7 @@ async function doPull({ skipConfirm = false } = {}) {
         // Folders deleted on another device drop out of the open/closed
         // state — but never against an empty pull, where all would look gone.
         if (items > 0) await pruneStaleExpandState({ afterPull: true });
-        const aside = setAside ? ' The other account's working copy is set aside (Settings).' : '';
+        const aside = setAside ? ' The other account’s working copy is set aside (Settings).' : '';
         return (items === 0
             ? `Pulled (v${version}) — but the server's tree is EMPTY.`
             : `Pulled ${items} item(s) (v${version}).`) + aside;
