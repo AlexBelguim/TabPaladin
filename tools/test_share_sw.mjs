@@ -1,29 +1,37 @@
-// Headless test for the service worker's share handler.
+// Headless test for the service worker: shares, and the app shell.
 //
-// Sharing a post must not launch the app, so the worker answers the share-target
-// POST itself and replies 204. That path cannot be exercised in a normal page —
-// it needs a real installed PWA and an Android share intent — so the handler is
-// loaded here with stubbed worker globals and driven directly.
+// A share arrives at the worker as the share target's POST. It must be kept
+// on the phone before anything touches the network, and the app must open on
+// it — by its id, never with the link in a URL — whatever the network does.
+// That path needs a real installed PWA and an Android share intent to run for
+// real, so sw.js is loaded here with stubbed worker globals (Cache Storage,
+// fetch, clients) and importScripts evaluating the real shareCore.js.
 //
 // What this locks down:
-//   1. A recognised link is captured and answered 204, so nothing opens.
-//   2. Every way the job can fail redirects into the app instead of dropping
-//      the link. Losing what you shared is the one unacceptable outcome.
-//   3. The URL is found wherever the sharing app puts it — X uses `text`.
-//   4. Where the worker hands a share to the app and the app cannot deliver
-//      it either (signed out, a revoked session, a full inbox), the app
-//      queues it on the phone, knowing why; after sign-in the same account's
-//      queued shares are delivered and anyone else's wait for a yes.
+//   1. The outbox entry is written before any fetch, and the answer is a 303
+//      to /?share=<sid> with no link in the Location header.
+//   2. Offline, signed out, a 401, a 500, and a fetch that never answers
+//      (given up on after the upload timeout) all keep the entry and still
+//      answer the same 303. A share with no link is kept for the app too.
+//   3. When the outbox cannot be written, the old redirect carries url, title
+//      and text, so the app can keep the share instead.
+//   4. Two flushes at once send a share once; a share captured as one
+//      account is never uploaded as another.
+//   5. The shell: a navigation is cached under '/' only, never under its
+//      query; a share navigation is served from cache first; install survives
+//      one shell file failing; activate removes only older shells.
 //
 // Run: node tools/test_share_sw.mjs
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makePendingShares, PENDING_SHARES_KEY } from '../pwa/pendingShares.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SW_SRC = fs.readFileSync(path.join(__dirname, '..', 'pwa', 'sw.js'), 'utf8');
+const PWA = path.join(__dirname, '..', 'pwa');
+const SW_SRC = fs.readFileSync(path.join(PWA, 'sw.js'), 'utf8');
+const CORE_SRC = fs.readFileSync(path.join(PWA, 'shareCore.js'), 'utf8');
+const ORIGIN = 'https://tab.example';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -31,254 +39,293 @@ function check(name, cond, detail) {
     else { failures++; console.error(`FAIL  ${name}${detail ? ` — ${detail}` : ''}`); }
 }
 
-// --- Worker globals ------------------------------------------------------
+// --- Worker globals -----------------------------------------------------------
 
-function makeCaches(config) {
-    const store = new Map();
-    if (config) {
-        store.set('/__tp_config', new Response(JSON.stringify(config), {
-            headers: { 'Content-Type': 'application/json' }
-        }));
-    }
-    return {
-        open: async () => ({
-            match: async (k) => store.get(k),
-            put: async (k, v) => store.set(k, v),
-            delete: async (k) => store.delete(k),
-            addAll: async () => {}
-        }),
-        keys: async () => ['tp-config'],
-        delete: async () => true,
-        match: async () => undefined
+function makeCaches({ failPut = null } = {}) {
+    const stores = new Map();
+    const key = (k) => {
+        const s = typeof k === 'string' ? k : k.url;
+        return s.startsWith('/') ? s : new URL(s).pathname + new URL(s).search;
     };
+    const api = {
+        stores,
+        failPut,
+        async open(name) {
+            if (!stores.has(name)) stores.set(name, new Map());
+            const m = stores.get(name);
+            return {
+                match: async (k) => { const r = m.get(key(k)); return r ? r.clone() : undefined; },
+                put: async (k, v) => {
+                    if (api.failPut && api.failPut(name, key(k))) throw new Error('QuotaExceededError');
+                    m.set(key(k), v);
+                },
+                add: async (k) => {
+                    const res = await api.fetchForAdd(k);
+                    if (!res.ok) throw new TypeError('add failed: ' + k);
+                    m.set(key(k), res);
+                },
+                delete: async (k) => m.delete(key(k)),
+                keys: async () => [...m.keys()]
+            };
+        },
+        keys: async () => [...stores.keys()],
+        delete: async (name) => stores.delete(name),
+        match: async (k) => {
+            for (const m of stores.values()) { const r = m.get(key(k)); if (r) return r.clone(); }
+            return undefined;
+        },
+        fetchForAdd: async () => new Response('shell', { status: 200 })
+    };
+    return api;
 }
 
-// Loads sw.js with worker globals injected and hands back its handleShare.
-function loadHandleShare({ config, fetchImpl }) {
+async function putConfig(caches, cfg) {
+    const c = await caches.open('tp-config');
+    await c.put('/__tp_config', new Response(JSON.stringify(cfg), { headers: { 'Content-Type': 'application/json' } }));
+}
+
+// Loads sw.js as a worker would, with importScripts evaluating shareCore.js
+// into the same `self`. `timeoutMs` replaces the upload timeout.
+function loadWorker({ caches, fetchImpl, timeoutMs = null }) {
+    const listeners = {};
+    const posted = [];
     const self = {
-        addEventListener: () => {},
+        addEventListener: (type, fn) => { listeners[type] = fn; },
         skipWaiting: () => {},
-        clients: { claim: () => {} },
-        location: { origin: 'https://tab.example' }
+        clients: { claim: () => {}, matchAll: async () => [{ postMessage: (m) => posted.push(m) }] },
+        location: { origin: ORIGIN },
+        crypto: globalThis.crypto
     };
-    const factory = new Function(
-        'self', 'caches', 'fetch', 'Response', 'URL', 'URLSearchParams', 'console',
-        SW_SRC + '\n;return handleShare;'
-    );
-    return factory(self, makeCaches(config), fetchImpl, Response, URL, URLSearchParams, console);
+    const importScripts = (url) => {
+        if (!/^shareCore\.js\?v=\d+$/.test(url)) throw new Error('unexpected importScripts ' + url);
+        new Function('self', CORE_SRC)(self);
+    };
+    const src = timeoutMs === null ? SW_SRC : SW_SRC.replace(/const UPLOAD_TIMEOUT_MS = \d+;/, `const UPLOAD_TIMEOUT_MS = ${timeoutMs};`);
+    new Function('self', 'caches', 'fetch', 'importScripts', 'Response', 'URL', 'URLSearchParams', 'console', src)(
+        self, caches, fetchImpl, importScripts, Response, URL, URLSearchParams, console);
+    return { self, listeners, posted };
 }
 
-// A share arrives as a urlencoded POST, exactly as the manifest declares.
+// A fetch event as the browser dispatches one; resolves to the response and
+// waits for everything the worker kept alive with waitUntil.
+async function dispatchFetch(worker, request, { mode = 'no-cors' } = {}) {
+    const extended = [];
+    let responded = null;
+    // A Request's mode is set by the browser; a plain stand-in carries it.
+    const req = { url: request.url, method: request.method, headers: request.headers, mode, formData: () => request.formData() };
+    const event = {
+        request: req,
+        respondWith: (p) => { responded = Promise.resolve(p); },
+        waitUntil: (p) => { extended.push(Promise.resolve(p)); }
+    };
+    worker.listeners.fetch(event);
+    const res = responded ? await responded : null;
+    // waitUntil may be called from inside the respondWith promise: settle twice.
+    await Promise.allSettled(extended);
+    await Promise.allSettled(extended);
+    return { res, extended };
+}
+
 function shareRequest(fields) {
-    return new Request('https://tab.example/share', {
+    return new Request(ORIGIN + '/share', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams(fields).toString()
     });
 }
 
-const CONFIG = { url: 'https://tab.example', token: 'tok' };
-
 function recordingFetch(responder) {
     const calls = [];
     const fn = async (url, opts = {}) => {
-        calls.push({ url: String(url), body: opts.body ? JSON.parse(opts.body) : null, opts });
-        return responder(String(url), calls.length);
+        calls.push({ url: String(url).replace(ORIGIN, ''), body: opts.body ? JSON.parse(opts.body) : null, auth: (opts.headers || {}).Authorization });
+        return responder(String(url).replace(ORIGIN, ''), opts, calls.length);
     };
     fn.calls = calls;
     return fn;
 }
 
-const ok = (body) => new Response(JSON.stringify(body), {
-    status: 200, headers: { 'Content-Type': 'application/json' }
-});
+const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+const intakeOk = (p, o) => json({ ok: true, created: true, share: { sid: JSON.parse(o.body).sid, status: 'pending', filings: [] }, archived: null });
+const ALEX = { url: ORIGIN, token: 'tok', userId: 1, username: 'alex', serverId: 'srv' };
 
-// --- Tests ---------------------------------------------------------------
+async function outboxEntries(caches) {
+    const m = caches.stores.get('tp-outbox');
+    if (!m) return [];
+    return Promise.all([...m.values()].map(r => r.clone().json()));
+}
+
+const sidOf = (res) => new URL(res.headers.get('location')).searchParams.get('share');
+
+// --- Tests -----------------------------------------------------------------------
 
 async function main() {
-    console.log('\n1. A recognised link is captured, and nothing opens');
+    console.log('\n1. A share is kept, then the app opens on its id');
     {
-        const fetchImpl = recordingFetch(() => ok({ ok: true, captured: true, provider: 'x', items: 7 }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/nasa/status/1', title: 'Hi' }));
-        check('answered 204 — the app never launches', res.status === 204, `status=${res.status}`);
-        check('called the capture endpoint',
-            fetchImpl.calls[0].url === 'https://tab.example/api/imports/capture', fetchImpl.calls[0].url);
-        check('sent the shared url', fetchImpl.calls[0].body.url === 'https://x.com/nasa/status/1');
-        check('sent the auth token',
-            fetchImpl.calls[0].opts.headers.Authorization === 'Bearer tok');
-        check('made exactly one request', fetchImpl.calls.length === 1, `${fetchImpl.calls.length}`);
-    }
-
-    console.log('\n2. An unrecognised link still lands, in the inbox');
-    {
-        const fetchImpl = recordingFetch((url) => url.includes('/capture')
-            ? ok({ ok: true, captured: false })
-            : ok({ ok: true }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://example.com/post' }));
-        check('still 204', res.status === 204, `status=${res.status}`);
-        check('fell through to the inbox',
-            fetchImpl.calls[1] && fetchImpl.calls[1].url.endsWith('/api/shared'),
-            fetchImpl.calls.map(c => c.url).join(', '));
-    }
-
-    console.log('\n3. X puts the link in `text` — it is still found');
-    {
-        const fetchImpl = recordingFetch(() => ok({ ok: true, captured: true, provider: 'x', items: 1 }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        await handleShare(shareRequest({ text: 'Look at this https://x.com/nasa/status/2', title: 'NASA' }));
-        check('url extracted from text',
-            fetchImpl.calls[0].body.url === 'https://x.com/nasa/status/2', fetchImpl.calls[0].body.url);
-    }
-
-    console.log('\n4. Every failure opens the app rather than dropping the link');
-    const redirected = (res) => res.status >= 300 && res.status < 400;
-
-    {
-        // Not signed in yet, so the worker has no server to talk to.
-        const fetchImpl = recordingFetch(() => ok({}));
-        const handleShare = loadHandleShare({ config: null, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/a/status/3' }));
-        check('no mirrored config -> redirect', redirected(res), `status=${res.status}`);
-        check('and the link is carried into the app',
-            res.headers.get('location').includes(encodeURIComponent('https://x.com/a/status/3')),
-            res.headers.get('location'));
-        check('nothing was requested', fetchImpl.calls.length === 0);
-    }
-    {
-        // Server unreachable.
-        const fetchImpl = recordingFetch(() => { throw new Error('offline'); });
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/a/status/4' }));
-        check('network failure -> redirect', redirected(res), `status=${res.status}`);
-    }
-    {
-        // Session expired.
-        const fetchImpl = recordingFetch(() => new Response('nope', { status: 401 }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/a/status/5' }));
-        check('401 -> redirect', redirected(res), `status=${res.status}`);
-    }
-    {
-        // A share with no link at all.
-        const fetchImpl = recordingFetch(() => ok({}));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ title: 'just text' }));
-        check('no url -> redirect', redirected(res), `status=${res.status}`);
-    }
-    {
-        // A link the archive does not take, and an inbox that is full: the
-        // worker must not answer 204 over a refused inbox POST.
-        const fetchImpl = recordingFetch((url) => url.includes('/capture')
-            ? ok({ ok: true, captured: false })
-            : new Response(JSON.stringify({ error: 'Your inbox already holds 2 links, the most it keeps. File or clear some first.' }),
-                { status: 429, headers: { 'Content-Type': 'application/json' } }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://blog.example/an-article-i-want-to-keep' }));
-        check('full inbox (429) -> redirect, not a silent 204', redirected(res), `status=${res.status}`);
-        check('  after trying the inbox', fetchImpl.calls.length === 2 && fetchImpl.calls[1].url.endsWith('/api/shared'));
-        check('  and the link is carried into the app',
-            (res.headers.get('location') || '').includes(encodeURIComponent('https://blog.example/an-article-i-want-to-keep')),
-            res.headers.get('location'));
-    }
-    {
-        // An older server that predates the capture route.
-        const fetchImpl = recordingFetch((url) => url.includes('/capture')
-            ? new Response('not found', { status: 404 })
-            : ok({ ok: true }));
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/a/status/6' }));
-        check('old server -> inbox, still 204', res.status === 204, `status=${res.status}`);
-        check('used the inbox route',
-            fetchImpl.calls[1] && fetchImpl.calls[1].url.endsWith('/api/shared'),
-            fetchImpl.calls.map(c => c.url).join(', '));
-    }
-
-    console.log('\n5. The redirect target is absolute');
-    {
-        const fetchImpl = recordingFetch(() => { throw new Error('offline'); });
-        const handleShare = loadHandleShare({ config: CONFIG, fetchImpl });
-        const res = await handleShare(shareRequest({ url: 'https://x.com/a/status/7' }));
+        const caches = makeCaches();
+        await putConfig(caches, ALEX);
+        let atFirstFetch = null;
+        const fetchImpl = recordingFetch(async (p, o) => {
+            if (atFirstFetch === null) atFirstFetch = await outboxEntries(caches);
+            return intakeOk(p, o);
+        });
+        const w = loadWorker({ caches, fetchImpl });
+        const { res } = await dispatchFetch(w, shareRequest({ title: '', text: 'Look at this https://x.com/nasa/status/42?s=20', url: '' }));
         const loc = res.headers.get('location');
-        check('absolute url, not a bare path', /^https?:\/\//.test(loc), loc);
-        check('lands on the app root with share=1', loc.includes('/?share=1'), loc);
+        check('answered 303 to /?share=<sid>', res.status === 303 && /^https:\/\/tab\.example\/\?share=[A-Za-z0-9_-]{16,64}$/.test(loc), `${res.status} ${loc}`);
+        check('  with no link in the Location header', !/x\.com|nasa|status/.test(loc));
+        check('the outbox entry was written before any fetch', atFirstFetch && atFirstFetch.length === 1 && atFirstFetch[0].sid === sidOf(res)
+            && atFirstFetch[0].url === 'https://x.com/nasa/status/42');
+        check('then uploaded with its sid, the cleaned link and the session token', fetchImpl.calls.length === 1 && fetchImpl.calls[0].url === '/api/shares'
+            && fetchImpl.calls[0].body.sid === sidOf(res) && fetchImpl.calls[0].body.url === 'https://x.com/nasa/status/42'
+            && fetchImpl.calls[0].body.app === 'x' && fetchImpl.calls[0].auth === 'Bearer tok');
+        const [entry] = await outboxEntries(caches);
+        check('and the entry stays, uploaded, for the app to read', entry && entry.uploaded === true && entry.phase === 'uploaded'
+            && entry.account.userId === 1 && entry.fields.text.includes('nasa'));
+        check('open windows are told', w.posted.some(m => m.type === 'tp-outbox' && m.result.uploaded.includes(entry.sid)));
     }
 
-    await pendingShareTests();
+    console.log('\n2. Whatever the network does, the share is kept and the app opens on it');
+    const failing = [
+        ['offline', () => { throw new TypeError('Failed to fetch'); }, ALEX],
+        ['not signed in (no config mirrored)', () => json({}), null],
+        ['a 401', () => new Response('{}', { status: 401 }), ALEX],
+        ['an inbox 500', () => json({ error: 'boom' }, 500), ALEX],
+        ['a fetch that never answers', () => new Promise(() => {}), ALEX]
+    ];
+    for (const [what, responder, cfg] of failing) {
+        const caches = makeCaches();
+        if (cfg) await putConfig(caches, cfg);
+        const fetchImpl = recordingFetch(responder);
+        const w = loadWorker({ caches, fetchImpl, timeoutMs: 40 });
+        const t0 = Date.now();
+        const { res } = await dispatchFetch(w, shareRequest({ url: 'https://example.com/keep-me', title: 'Keep me' }));
+        const entries = await outboxEntries(caches);
+        check(`${what}: still a 303 to the share's id, the entry kept and not uploaded`,
+            res.status === 303 && entries.length === 1 && entries[0].sid === sidOf(res) && entries[0].uploaded === false
+            && entries[0].url === 'https://example.com/keep-me' && Date.now() - t0 < 3000, `${res.status} ${JSON.stringify(entries)}`);
+    }
+    {
+        const caches = makeCaches();
+        await putConfig(caches, ALEX);
+        const fetchImpl = recordingFetch(intakeOk);
+        const w = loadWorker({ caches, fetchImpl });
+        const { res } = await dispatchFetch(w, shareRequest({ text: 'Just a thought, no link' }));
+        const [entry] = await outboxEntries(caches);
+        check('a share with no link is kept for the app (Save as note / Discard) and not uploaded',
+            res.status === 303 && entry && entry.url === null && entry.text === 'Just a thought, no link' && fetchImpl.calls.length === 0);
+    }
+
+    console.log('\n3. When the outbox cannot be written');
+    {
+        const caches = makeCaches({ failPut: (name) => name === 'tp-outbox' });
+        await putConfig(caches, ALEX);
+        const fetchImpl = recordingFetch(intakeOk);
+        const w = loadWorker({ caches, fetchImpl });
+        const { res } = await dispatchFetch(w, shareRequest({ url: '', title: 'A title', text: 'Look https://x.com/a/status/9' }));
+        const loc = new URL(res.headers.get('location'));
+        check('the old redirect carries url, title and text into the app', res.status === 303 && loc.pathname === '/'
+            && loc.searchParams.get('share') === '1' && loc.searchParams.get('title') === 'A title'
+            && loc.searchParams.get('text') === 'Look https://x.com/a/status/9' && loc.searchParams.has('url'), loc.href);
+        check('  and nothing was sent', fetchImpl.calls.length === 0);
+    }
+
+    console.log('\n4. Flushing');
+    {
+        const caches = makeCaches();
+        await putConfig(caches, ALEX);
+        let release = null;
+        const gate = new Promise(r => { release = r; });
+        const fetchImpl = recordingFetch(async (p, o) => { await gate; return intakeOk(p, o); });
+        const w = loadWorker({ caches, fetchImpl });
+        const shared = dispatchFetch(w, shareRequest({ url: 'https://example.com/once' }));
+        await new Promise(r => setTimeout(r, 20));
+        const ext = [];
+        w.listeners.message({ data: { type: 'flush' }, waitUntil: (p) => ext.push(p) });
+        w.listeners.sync({ tag: 'tp-outbox', waitUntil: (p) => ext.push(p) });
+        await new Promise(r => setTimeout(r, 20));
+        release();
+        await shared;
+        await Promise.all(ext);
+        check('the share upload, a flush message and a background sync at once send the share once',
+            fetchImpl.calls.filter(c => c.url === '/api/shares').length === 1, String(fetchImpl.calls.length));
+    }
+    {
+        const caches = makeCaches();
+        await putConfig(caches, ALEX);
+        const w0 = loadWorker({ caches, fetchImpl: recordingFetch(() => { throw new TypeError('offline'); }) });
+        await dispatchFetch(w0, shareRequest({ url: 'https://example.com/alex-only' }));
+        await putConfig(caches, { ...ALEX, token: 'sam-tok', userId: 2, username: 'sam' });
+        const fetchImpl = recordingFetch(intakeOk);
+        const w = loadWorker({ caches, fetchImpl });
+        const ext = [];
+        w.listeners.sync({ tag: 'tp-outbox', waitUntil: (p) => ext.push(p) });
+        await Promise.all(ext);
+        const [entry] = await outboxEntries(caches);
+        check('a share captured as alex is not uploaded once sam is signed in', fetchImpl.calls.length === 0 && entry && !entry.uploaded
+            && entry.account.username === 'alex');
+        await putConfig(caches, ALEX);
+        const w2 = loadWorker({ caches, fetchImpl });
+        const ext2 = [];
+        w2.listeners.message({ data: { type: 'flush' }, waitUntil: (p) => ext2.push(p) });
+        await Promise.all(ext2);
+        check('  and goes up once alex is again', fetchImpl.calls.length === 1 && fetchImpl.calls[0].body.url === 'https://example.com/alex-only');
+    }
+
+    console.log('\n5. The shell');
+    {
+        const caches = makeCaches();
+        const served = [];
+        const fetchImpl = async (req) => {
+            const u = typeof req === 'string' ? req : req.url;
+            served.push(u.replace(ORIGIN, ''));
+            return new Response('<html>shell ' + served.length + '</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+        };
+        const w = loadWorker({ caches, fetchImpl });
+        await dispatchFetch(w, new Request(ORIGIN + '/?share=1&url=https%3A%2F%2Fsecret.example%2Fx&title=t'), { mode: 'navigate' });
+        await dispatchFetch(w, new Request(ORIGIN + '/?ref=home'), { mode: 'navigate' });
+        const shellKeys = [...(caches.stores.get('tp-shell-v29') || new Map()).keys()];
+        check('navigations are cached under / only, never under their query', JSON.stringify(shellKeys) === '["/"]', JSON.stringify(shellKeys));
+        check('  so no shared link sits in Cache Storage', ![...caches.stores.values()].some(m => [...m.keys()].some(k => k.includes('secret'))));
+        const before = served.length;
+        const { res } = await dispatchFetch(w, new Request(ORIGIN + '/?share=AbCdEfGhIjKlMnOpQrStUv'), { mode: 'navigate' });
+        check('a share navigation is served from the cached shell first', (await res.text()) === '<html>shell 2</html>');
+        check('  and the shell is refreshed in the background, under /', served.length === before + 1 && served[served.length - 1] === '/'
+            && (await (await (await caches.open('tp-shell-v29')).match('/')).text()) === '<html>shell 3</html>');
+        const slow = loadWorker({ caches, fetchImpl: () => new Promise(() => {}) });
+        const t0 = Date.now();
+        const { res: offline } = await dispatchFetch(slow, new Request(ORIGIN + '/'), { mode: 'navigate' });
+        check('a navigation the network does not answer falls back to the cached shell', offline && (await offline.text()).startsWith('<html>shell')
+            && Date.now() - t0 < 5000);
+    }
+    {
+        const caches = makeCaches();
+        caches.fetchForAdd = async (u) => new Response('x', { status: u === '/notesModel.js' ? 404 : 200 });
+        const w = loadWorker({ caches, fetchImpl: async () => new Response('x') });
+        const ext = [];
+        w.listeners.install({ waitUntil: (p) => ext.push(p) });
+        await Promise.all(ext);
+        const keys = [...caches.stores.get('tp-shell-v29').keys()];
+        check('install caches every other shell file when one fails', keys.length >= 8 && !keys.includes('/notesModel.js')
+            && keys.includes('/app.js?v=29') && keys.includes('/shareCore.js?v=29'), JSON.stringify(keys));
+        for (const name of ['tp-shell-v28', 'tp-shell-v27', 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) await caches.open(name);
+        const ext2 = [];
+        w.listeners.activate({ waitUntil: (p) => ext2.push(p) });
+        await Promise.all(ext2);
+        check('activate removes older shells only, keeping tp-config, tp-outbox and tp-data',
+            JSON.stringify([...caches.stores.keys()].sort()) === JSON.stringify(['other-app-cache', 'tp-config', 'tp-data', 'tp-outbox', 'tp-shell-v29']),
+            JSON.stringify([...caches.stores.keys()]));
+    }
+    {
+        const caches = makeCaches();
+        const fetchImpl = recordingFetch(() => json({}));
+        const w = loadWorker({ caches, fetchImpl });
+        const api = await dispatchFetch(w, new Request(ORIGIN + '/api/tree'));
+        const llm = await dispatchFetch(w, new Request(ORIGIN + '/llm/token'));
+        check('API calls and LLM links are left to the network', api.res === null && llm.res === null);
+    }
 
     console.log(failures === 0 ? '\nAll share-worker tests passed.\n' : `\n${failures} test(s) failed.\n`);
-    process.exit(failures === 0 ? 0 : 1);
-}
-
-// --- The app's side: a share it cannot deliver is queued, never dropped ----
-
-function fakeStorage() {
-    const m = new Map();
-    return {
-        getItem: (k) => (m.has(k) ? m.get(k) : null),
-        setItem: (k, v) => m.set(k, String(v)),
-        removeItem: (k) => m.delete(k),
-        raw: m
-    };
-}
-
-async function pendingShareTests() {
-    console.log('\n6. The app queues what it cannot deliver');
-    const storage = fakeStorage();
-    const pending = makePendingShares({ storage });
-    const unauthorized = async () => { const e = new Error('Signed out'); e.status = 401; throw e; };
-
-    const after401 = await pending.take({ url: 'https://x.com/a/status/8', title: 't', userId: 1 }, { canDeliver: true, deliver: unauthorized });
-    check('a share whose delivery gets 401 is queued', after401.queued && !after401.delivered);
-    check('  in tp_pending_shares, with the account it was shared under',
-        JSON.parse(storage.getItem(PENDING_SHARES_KEY)).some(s => s.url === 'https://x.com/a/status/8' && s.userId === 1));
-    await pending.take({ url: 'https://example.com/signed-out', userId: null }, { canDeliver: false, deliver: unauthorized });
-    check('a share made while signed out is queued without trying', pending.list().length === 2);
-    const delivered = [];
-    const ok = await pending.take({ url: 'https://example.com/fine', userId: 1 }, { canDeliver: true, deliver: async (s) => { delivered.push(s.url); return { captured: null }; } });
-    check('a share that can be delivered is not queued as well', ok.delivered && !ok.queued && pending.list().length === 2);
-
-    console.log('\n7. Draining after sign-in');
-    await pending.take({ url: 'https://example.com/sams', userId: 2 }, { canDeliver: false });
-    let asked = null;
-    const sent = [];
-    const held = await pending.drain({
-        userId: 1,
-        deliver: async (s) => { sent.push(s.url); },
-        ask: async (shares) => { asked = shares.map(s => s.url); return 'keep'; }
-    });
-    check('the same account\'s shares are delivered without asking', sent.join() === 'https://x.com/a/status/8' && held.added === 1);
-    check('everyone else\'s are asked about, not delivered',
-        JSON.stringify(asked) === JSON.stringify(['https://example.com/signed-out', 'https://example.com/sams']));
-    check('kept ones stay queued', pending.list().map(s => s.url).join() === 'https://example.com/signed-out,https://example.com/sams');
-
-    const failing = await pending.drain({ userId: 2, deliver: unauthorized, ask: async () => 'add' });
-    check('a delivery that fails again keeps the share', failing.added === 0 && pending.list().length === 2);
-
-    const sent2 = [];
-    const added = await pending.drain({ userId: 2, deliver: async (s) => { sent2.push(s.url); }, ask: async () => 'add' });
-    check('sam\'s own share goes in, and the signed-out one when he says add',
-        added.added === 2 && sent2.includes('https://example.com/sams') && sent2.includes('https://example.com/signed-out'));
-    check('the queue is empty afterwards', pending.list().length === 0 && storage.getItem(PENDING_SHARES_KEY) === null);
-
-    await pending.take({ url: 'https://example.com/unwanted', userId: null }, { canDeliver: false });
-    const dropped = await pending.drain({ userId: 1, deliver: async () => {}, ask: async () => 'discard' });
-    check('discarding is an explicit answer', dropped.discarded === 1 && pending.list().length === 0);
-
-    console.log('\n8. A share the server refuses');
-    const full = async () => {
-        const e = new Error('429 Too Many Requests');
-        e.status = 429;
-        e.body = { error: 'Your inbox already holds 5000 links, the most it keeps. File or clear some first.' };
-        throw e;
-    };
-    const refused = await pending.take({ url: 'https://blog.example/kept', userId: 1 }, { canDeliver: true, deliver: full });
-    check('a share the server refuses while signed in is queued', refused.queued && !refused.delivered
-        && pending.list().some(s => s.url === 'https://blog.example/kept'));
-    check('  and the caller learns why, to say so', refused.error && refused.error.status === 429 && /inbox already holds/.test(refused.error.body.error));
-    const retried = await pending.drain({ userId: 1, deliver: full, ask: async () => 'add' });
-    check('a drain while the inbox is still full keeps it', retried.added === 0 && pending.list().length === 1);
+    process.exitCode = failures === 0 ? 0 : 1;
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

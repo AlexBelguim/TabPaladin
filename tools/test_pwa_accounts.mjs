@@ -3,8 +3,10 @@
 // in and out.
 //
 // What this locks down:
-//   1. A share made while signed out is queued on the phone, not lost, and
-//      delivered after sign-in once the account says yes.
+//   1. A share made while signed out is kept on the phone (the outbox), not
+//      lost, and the share sheet opens on it; after sign-in it goes to that
+//      account only once the account says yes — in the sheet, or asked at
+//      sign-in for one an earlier build queued.
 //   2. Unpushed edits survive a revoked session: signing in as someone else
 //      is refused (nothing of theirs is pulled over the edits), signing back
 //      in as the same account does not pull, and Push then keeps the edits.
@@ -12,8 +14,8 @@
 //      before accounts are adopted by the server's owner only.
 //   4. Admins see the Users block; plain users do not.
 //   5. A share the server refuses while you are signed in (a full inbox) is
-//      kept on the phone, the app says why, and it is delivered once there is
-//      room.
+//      kept on the phone, the share sheet says why, and it goes up once there
+//      is room.
 //   6. Signing out with unpushed edits asks first and keeps them: nobody else
 //      can sign in over them, the same account gets them back, and nothing
 //      (a bookmarks file import) adds to them meanwhile. Closing the app
@@ -41,9 +43,9 @@
 //      opened) while an account is signed in waits for that account through
 //      a sign-out, not for whoever signs in next.
 //  10. Nothing writes into a copy while nobody is signed in: neither after a
-//      session expired (Place, a task, rename, delete, move, paste, Drop
-//      here, a workflow) nor over edits kept by a sign-out (the clipboard
-//      scan and the Unfiled links sheet).
+//      session expired (a copied link in the Inbox, a task, rename, delete,
+//      move, paste, a workflow) nor over edits kept by a sign-out (the
+//      clipboard scan and the Inbox).
 //  11. Back and forward never reopen another account's notes: the entries an
 //      account change leaves in the stack read as Home.
 //  12. A link that opens the app is nobody's until the server has confirmed
@@ -239,6 +241,8 @@ globalThis.cancelAnimationFrame = globalThis.cancelAnimationFrame || ((id) => cl
 globalThis.innerWidth = 375;
 globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
 Object.defineProperty(globalThis, 'navigator', { value: { clipboard: null }, configurable: true });
+// The share core, as index.html loads it: a classic script before app.js.
+new Function('self', fs.readFileSync(path.join(REPO, 'pwa', 'shareCore.js'), 'utf8'))(globalThis);
 
 // Every request the app makes, so the test can tell a pull from no pull. One
 // can be made to fail as if the phone were offline.
@@ -312,6 +316,16 @@ async function signIn(username, password, url = BASE) {
 }
 
 const treeTitles = async (token) => JSON.stringify((await api('/api/tree', { token })).json.roots);
+
+// The share outbox as kept on the phone (localStorage: no Cache Storage
+// here), the share sheet, and what it and the Inbox drew.
+const outboxEntries = () => Object.values(JSON.parse(localStorageShim.getItem('tp_outbox') || '{}'));
+const sheetOpen = () => !byId('share-sheet').classList.contains('hidden');
+const lastButton = (text) => [...created].reverse().find(e => e.tagName === 'BUTTON' && e.textContent === text);
+const textOf = (el) => [el.textContent || '', ...(el.children || []).map(textOf)].join(' ');
+const inboxRowWith = (text) => [...byId('inbox-list').children].reverse().find(r => r.className === 'inbox-row' && textOf(r).includes(text));
+const inboxPaste = () => [...byId('inbox-list').children].reverse().find(r => r.className === 'inbox-paste')?.children[0];
+const waitingLinks = async (token) => (await api('/api/shared', { token })).json.links.map(l => l.url);
 
 // A tap on something the notes screen drew, by its data-nv action.
 async function clickNv(nv, id = null) {
@@ -398,25 +412,41 @@ try {
     const madeKim = await api('/api/users', { method: 'POST', token: alexAdmin, body: { username: 'kim', password: 'kim-password-1', role: 'user', currentPassword: PASSWORD } });
     if (madeKim.status !== 200) throw new Error('could not create kim: ' + JSON.stringify(madeKim.json));
 
-    // The per-device lists from before accounts.
+    // The per-device lists from before accounts, and a share an earlier build
+    // queued on the phone while nobody was signed in.
     localStorageShim.setItem('tp_dismissed_urls', JSON.stringify(['https://legacy-dismissed.example']));
+    const OLD_QUEUED = 'https://example.com/queued-by-an-earlier-build';
+    localStorageShim.setItem('tp_pending_shares', JSON.stringify([{ url: OLD_QUEUED, title: 'Old queue', at: '2026-10-01T10:00:00.000Z', userId: null }]));
 
     await import(pathToFileURL(path.join(REPO, 'pwa', 'app.js')).href);
     for (const fn of windowListeners.DOMContentLoaded || []) await fn();
     await settle();
 
     console.log('\n1. A share made while signed out');
-    const queued = JSON.parse(localStorageShim.getItem('tp_pending_shares') || '[]');
-    check('is queued on the phone', queued.length === 1 && queued[0].url === 'https://example.com/shared-while-out' && queued[0].userId === null,
-        JSON.stringify(queued));
-    check('and the URL is cleaned afterwards', currentUrl().search === '');
+    const SHARED = 'https://example.com/shared-while-out';
+    const kept1 = outboxEntries();
+    check('is kept on the phone, as nobody\'s, and the URL is cleaned afterwards',
+        kept1.some(e => e.url === SHARED && e.account === null && e.title === 'Shared') && currentUrl().search === '', JSON.stringify(kept1));
+    check('a share an earlier build queued is moved into the outbox, the old queue gone',
+        !localStorageShim.getItem('tp_pending_shares') && kept1.some(e => e.url === OLD_QUEUED && e.account === null));
+    check('the share sheet opens on it, saying to sign in', sheetOpen() && created.some(e => e.textContent === 'Kept on this phone: sign in to file it.'));
 
-    answers.confirm.push(true); // "add them to alex's inbox?"
+    answers.confirm.push(true); // "add it to alex's inbox?" — the earlier build's share
     await signIn('alex', PASSWORD);
-    check('after alex signs in he is asked about it', dialogs.confirm.some(m => /shared while signed out/.test(m) && /alex/.test(m)), dialogs.confirm.join(' | '));
-    const inbox = (await api('/api/shared', { token: alexAdmin })).json.links;
-    check('and it lands in his inbox', inbox.some(l => l.url === 'https://example.com/shared-while-out'));
-    check('the queue is empty', !localStorageShim.getItem('tp_pending_shares'));
+    const asked1 = dialogs.confirm.filter(m => /shared while signed out/.test(m));
+    check('after alex signs in he is asked about the queued one', asked1.length === 1 && /alex/.test(asked1[0]) && /^1 link was/.test(asked1[0]),
+        dialogs.confirm.join(' | '));
+    check('  and it lands in his inbox', (await waitingLinks(alexAdmin)).includes(OLD_QUEUED));
+    check('the open sheet asks for its own share instead, and nothing of it was sent', sheetOpen() && Boolean(lastButton('Upload to alex'))
+        && !(await waitingLinks(alexAdmin)).includes(SHARED));
+    await lastButton('Upload to alex').fire('click');
+    await settle();
+    check('Upload to alex sends it to his inbox', (await waitingLinks(alexAdmin)).includes(SHARED));
+    await lastButton('Later').fire('click');
+    await settle();
+    check('Later closes the sheet; the share waits in his inbox and is off the phone', !sheetOpen()
+        && (await waitingLinks(alexAdmin)).includes(SHARED) && !outboxEntries().some(e => e.url === SHARED || e.url === OLD_QUEUED),
+        JSON.stringify(outboxEntries()));
     check('the session knows who it is', localStorageShim.getItem('tp_pwa_userid') === '1' && localStorageShim.getItem('tp_pwa_owner') === '1');
     check('the owner adopts the per-device dismissed list',
         localStorageShim.getItem('tp_dismissed_urls:1') !== null && localStorageShim.getItem('tp_dismissed_urls') === null);
@@ -478,21 +508,27 @@ try {
     check('labelled as admin and owner', byId('auth-role-label').textContent === ' (admin, owner)', byId('auth-role-label').textContent);
 
     console.log('\n5. A share the inbox has no room for');
-    // alex's inbox holds the link from section 1; one more fills it.
+    // alex's inbox holds the links from section 1, which fill it (2).
     await api('/api/shared', { method: 'POST', token: alexNew, body: { url: 'https://example.com/filler' } });
+    check('alex\'s inbox is full', (await waitingLinks(alexNew)).length === 2);
     const ARTICLE = 'https://blog.example/an-article-i-want-to-keep';
     openAt(BASE + '/?share=1&url=' + encodeURIComponent(ARTICLE) + '&title=Article');
+    const mark5 = created.length;
     await signIn('alex', 'new horse battery'); // any start runs the share through
-    const keptFull = JSON.parse(localStorageShim.getItem('tp_pending_shares') || '[]');
-    check('a link the full inbox refuses is kept on the phone, as alex\'s', keptFull.some(s => s.url === ARTICLE && s.userId === 1),
-        JSON.stringify(keptFull));
-    check('  and the app says why, in the server\'s words', dialogs.alert.some(m => /inbox already holds 2 links/.test(m)),
-        dialogs.alert.join(' | '));
-    const filler = (await api('/api/shared', { token: alexNew })).json.links.find(l => l.url === 'https://example.com/filler');
-    await api(`/api/shared/${filler.id}`, { method: 'DELETE', token: alexNew });
+    const keptFull = outboxEntries().find(e => e.url === ARTICLE);
+    check('a link the full inbox refuses is kept on the phone, as alex\'s', keptFull && keptFull.account && keptFull.account.userId === 1
+        && !keptFull.uploaded && keptFull.lastError && keptFull.lastError.status === 429, JSON.stringify(keptFull));
+    check('  and the share sheet says why, in the server\'s words', sheetOpen() && drawnSince(mark5, 'inbox already holds 2 links'),
+        created.slice(mark5).map(e => e.textContent).filter(Boolean).join(' | ').slice(0, 400));
+    const full = (await api('/api/shared', { token: alexNew })).json.links;
+    await api(`/api/shared/${full.find(l => l.url === SHARED).id}`, { method: 'DELETE', token: alexNew });
     await signIn('alex', 'new horse battery');
-    check('once there is room, the next start delivers it',
-        (await api('/api/shared', { token: alexNew })).json.links.some(l => l.url === ARTICLE) && !localStorageShim.getItem('tp_pending_shares'));
+    check('once there is room, the next start sends it', (await waitingLinks(alexNew)).includes(ARTICLE)
+        && outboxEntries().find(e => e.url === ARTICLE)?.uploaded === true);
+    await lastButton('Later').fire('click');
+    await settle();
+    check('  and Later leaves it in the inbox, off the phone', !sheetOpen() && !outboxEntries().some(e => e.url === ARTICLE)
+        && (await waitingLinks(alexNew)).includes(ARTICLE));
 
     console.log('\n6. Signing out with unpushed edits');
     // Another device pushes, so the phone's next push meets a 409 and the
@@ -883,36 +919,38 @@ try {
     clip = 'https://stranger.example/expired';
     await byId('clipBtn').fire('click');
     await settle();
-    const placeRow = [...byId('quick-file-list').children].reverse().find(r => r.innerHTML.includes('stranger.example/expired'));
-    check('alex has a copied link waiting to be placed', Boolean(placeRow) && !byId('quick-file-sheet').classList.contains('hidden'));
+    const clipRow = inboxRowWith('stranger.example/expired');
+    check('alex has a copied link waiting in the Inbox', Boolean(clipRow) && !byId('inbox-sheet').classList.contains('hidden'));
     await deepIntoWork();
     await expireAlex('fifth horse battery');
     check('his session expires with the sheet and a note open', !localStorageShim.getItem('tp_pwa_token') && bodyHas('view-notes'));
     const prompts10 = dialogs.prompt.length;
     const confirms10 = dialogs.confirm.length;
     const toasts10 = toastCount();
-    await placeRow.querySelector('.place-btn').fire('click');
+    const outbox10 = JSON.stringify(outboxEntries());
+    await clipRow.children[0].fire('click');
     await byId('content').fire('click', { target: { closest: (sel) => (sel === '.note-task-box' ? { dataset: { line: '3' } } : null) } });
     await clickNv('rename-note');
     await clickNv('delete-note');
     await clickNv('move-note');
     await byId('move-list').fire('click', { target: { closest: () => ({ disabled: false, dataset: { target: '' } }) } });
     await settle();
-    byId('quick-file-paste-input').value = 'https://stranger.example/pasted';
-    await byId('quick-file-paste-input').fire('keydown', { key: 'Enter' });
-    await byId('dropHereBtn').fire('click');
+    const paste10 = inboxPaste();
+    paste10.value = 'https://stranger.example/pasted';
+    await paste10.fire('keydown', { key: 'Enter' });
     await byId('brand-home').fire('click');
     await settle();
     const wfRow = [...created].reverse().find(e => e.className === 'row workflow-row');
     if (wfRow) await wfRow.querySelector('.wf-del').fire('click');
     await settle();
     const refusals10 = toastsSince(toasts10).filter(t => /^Sign in first/.test(t));
-    check('signed out, nothing is placed, ticked, renamed, deleted, moved, pasted, dropped or deleted from workflows',
-        Boolean(wfRow) && refusals10.length === 8 && !dirtyShown() && dialogs.prompt.length === prompts10 && dialogs.confirm.length === confirms10,
+    check('signed out, nothing is filed from the Inbox, ticked, renamed, deleted, moved, pasted or deleted from workflows',
+        Boolean(wfRow) && refusals10.length === 7 && !dirtyShown() && dialogs.prompt.length === prompts10 && dialogs.confirm.length === confirms10
+        && JSON.stringify(outboxEntries()) === outbox10 && !sheetOpen(),
         `${refusals10.length}: ${toastsSince(toasts10).join(' | ')}`);
-    const pasteKept = byId('quick-file-paste-input').value === 'https://stranger.example/pasted';
-    check('  a refused paste stays in the box, without a word about it not being a URL', pasteKept
-        && !toastsSince(toasts10).some(t => /valid URL/.test(t)));
+    const pasteKept = paste10.value === 'https://stranger.example/pasted';
+    check('  a refused paste stays in the box, without a word about it not being a link', pasteKept
+        && !toastsSince(toasts10).some(t => /not a link|valid URL/.test(t)));
     await signIn('alex', alexPw);
     const after10 = await treeTitles(alexTok);
     check('  and alex signs back in to his tree as he left it', !after10.includes('stranger.example') && after10.includes('- [ ] alex task')
@@ -938,10 +976,10 @@ try {
     clip = 'not a url';
     await byId('clipBtn').fire('click');
     await settle();
-    check('a tap scans no clipboard into anyone\'s lists, and Unfiled links will not open',
+    check('a tap scans no clipboard into anyone\'s lists, and the Inbox will not open',
         JSON.stringify([...storage.entries()].filter(([k]) => /scanned|dismissed/.test(k))) === listsBefore
         && ![...storage.values()].some(v => v.includes('stranger.example/kept'))
-        && byId('quick-file-sheet').classList.contains('hidden') && toastsSince(toasts10b).some(t => /^Sign in first/.test(t)),
+        && byId('inbox-sheet').classList.contains('hidden') && toastsSince(toasts10b).some(t => /^Sign in first/.test(t)),
         toastsSince(toasts10b).join(' | '));
     await signIn('alex', alexPw);
     await byId('pushBtn').fire('click');

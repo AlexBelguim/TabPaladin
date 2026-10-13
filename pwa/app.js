@@ -1,45 +1,77 @@
 // Minimal vanilla PWA for TabPaladin. Browses the server's canonical tree
-// (GET /api/tree) as an in-memory working copy, edits it locally, and pushes it
-// back (PUT /api/tree) git-style — a push against a tree another device changed
-// since the last pull is refused until you pull or force.
-// "Drop here" filing: navigate to a folder, tap the button — every link in the
-// Recent-links modal is appended to the current folder, then pushed.
+// (GET /api/tree) as a working copy, edits it locally, and pushes it back
+// (PUT /api/tree) git-style — a push against a tree another device changed
+// since the last pull is refused until you pull or force, unless all that
+// changed is links filed from a share sheet, which are folded in and the push
+// goes again. The copy is kept in Cache Storage (tp-data) while the app is in
+// the background, so a share that reloads the window loses nothing.
+//
+// Sharing: a link shared to the app is kept in the outbox (tp-outbox, by the
+// service worker or here), and the share sheet (shareSheet.js) files it with
+// one tap on a suggested folder — straight into the server's tree, as a small
+// append (POST /api/shares/:sid/file) rather than a push of this whole copy.
 
 import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
-import { makePendingShares, PENDING_SHARES_KEY } from './pendingShares.js';
 import * as NM from './notesModel.js';
+import { createShareSheet } from './shareSheet.js';
+
+// The share core, loaded by a classic <script> before this module.
+const Share = window.TPShare;
 
 const LS = {
     url: 'tp_pwa_url',
     token: 'tp_pwa_token',   // now a session token from /api/login, not a shared secret
     username: 'tp_pwa_user',
     // Who that session is, as the server said at sign-in (and /api/auth/me
-    // since): the account id, its role, and whether it holds the data from
-    // before accounts were separated ('1').
+    // since): the account id, its role, whether it holds the data from
+    // before accounts were separated ('1'), and the server's own id.
     userId: 'tp_pwa_userid',
     role: 'tp_pwa_role',
     owner: 'tp_pwa_owner',
-    pendingShares: PENDING_SHARES_KEY
+    serverId: 'tp_pwa_serverid',
+    // Shares an earlier build queued here; moved into the outbox at start.
+    legacyShares: 'tp_pending_shares'
 };
-
-const pendingShares = makePendingShares({ storage: localStorage, key: LS.pendingShares });
 
 function currentUserId() {
     const v = localStorage.getItem(LS.userId);
     return v === null || v === '' ? null : Number(v);
 }
 
-function rememberUser(user, username) {
+function rememberUser(user, username, serverId = null) {
     if (!user || user.id === undefined || user.id === null) return;
     localStorage.setItem(LS.userId, String(user.id));
     localStorage.setItem(LS.role, user.role || '');
     localStorage.setItem(LS.owner, user.tenancyOwner ? '1' : '0');
     if (username || user.username) localStorage.setItem(LS.username, username || user.username);
+    if (serverId) localStorage.setItem(LS.serverId, serverId);
 }
 
 function forgetUser() {
-    for (const k of [LS.token, LS.username, LS.userId, LS.role, LS.owner]) localStorage.removeItem(k);
+    for (const k of [LS.token, LS.username, LS.userId, LS.role, LS.owner, LS.serverId]) localStorage.removeItem(k);
 }
+
+// The account signed in now, as an outbox entry records it, or null.
+function shareAccount() {
+    if (!configured() || accountChanging) return null;
+    return {
+        url: state.config.url.replace(/\/+$/, ''),
+        userId: currentUserId(),
+        username: localStorage.getItem(LS.username) || null,
+        serverId: localStorage.getItem(LS.serverId) || null
+    };
+}
+
+// The config as the worker and flushOutbox take it.
+function shareConfig() {
+    const a = shareAccount();
+    return a ? { ...a, token: state.config.token } : null;
+}
+
+// Shares wait in Cache Storage, shared with the worker; a page without it
+// (an http origin, where no worker runs either) keeps them in localStorage.
+const outbox = (typeof caches !== 'undefined' && caches && typeof caches.open === 'function')
+    ? Share.cacheOutbox(caches) : Share.localOutbox(localStorage);
 
 const state = {
     config: {
@@ -56,8 +88,9 @@ const state = {
     snapshotUrl: '',          // the server it came from, and that server's id: ids
     snapshotServerId: null,   // start at 1 on every server, so the id alone is not enough
     treeVersion: 0,           // server tree version this working copy is based on
+    serverIds: new Set(),     // ids of this copy's nodes the server has (last pull, push or filing)
+    treeRev: 0,               // bumped on every change to the copy, for the share sheet's folder index
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
-    inbox: [],                // [{id, url, title}]
     dirty: false,             // unsaved local edits to the snapshot
     editCount: 0,             // how many, for "N unpushed edits"
     view: 'home',             // 'home' (search, pins, bookmark folders) | 'notes'
@@ -73,6 +106,7 @@ const $ = (id) => document.getElementById(id);
 function markDirty() {
     state.dirty = true;
     state.editCount++;
+    state.treeRev++;
 }
 
 function show(el) { if (el) el.classList.remove('hidden'); }
@@ -95,11 +129,12 @@ function setStatus(text) {
 }
 
 // Premium glassmorphic toast notification
-// Mirror the server URL and session token into Cache Storage so the service
-// worker can reach the server on its own. That is what lets a shared link be
-// captured without launching the app: workers cannot read localStorage, where
-// the config actually lives. Called on every change, including sign-out, which
-// clears it — a stale token in here would keep working after you signed out.
+// Mirror the server URL, session token and account into Cache Storage so the
+// service worker can upload a share on its own the moment it arrives, and
+// knows whose it is: workers cannot read localStorage, where the config
+// actually lives. Called on every change, including sign-out and an expired
+// session, which clear it — a stale token in here would keep working after
+// you signed out.
 const SW_CONFIG_CACHE = 'tp-config';
 const SW_CONFIG_KEY = '/__tp_config';
 
@@ -107,16 +142,14 @@ async function mirrorConfigToSW() {
     if (!('caches' in window)) return;
     try {
         const cache = await caches.open(SW_CONFIG_CACHE);
-        if (!state.config.url || !state.config.token) {
+        const cfg = shareConfig();
+        if (!cfg) {
             await cache.delete(SW_CONFIG_KEY);
             return;
         }
-        await cache.put(SW_CONFIG_KEY, new Response(
-            JSON.stringify({ url: state.config.url, token: state.config.token }),
-            { headers: { 'Content-Type': 'application/json' } }
-        ));
+        await cache.put(SW_CONFIG_KEY, new Response(JSON.stringify(cfg), { headers: { 'Content-Type': 'application/json' } }));
     } catch (e) {
-        // Not fatal: the worker falls back to opening the app for a share.
+        // Not fatal: shares wait in the outbox until the app uploads them.
         console.warn('Could not mirror config to the service worker', e);
     }
 }
@@ -213,11 +246,12 @@ async function api(path, opts = {}) {
 }
 
 // --- Initial load ---
+let booted = false;
+
 async function bootstrap() {
     // Existing installs already hold a token in localStorage and will never
     // sign in again, so mirror on every start rather than only on change —
-    // otherwise the worker has no config and every share falls back to opening
-    // the app.
+    // otherwise the worker has no config and every share waits for the app.
     mirrorConfigToSW();
 
     // An import link that opened the app is kept on the phone before anything
@@ -227,11 +261,28 @@ async function bootstrap() {
     // and then the link waits for whoever signs in next.
     const arrived = stashImportHash({ claim: false });
 
-    await processShareTargetIfAny();
+    // A share that opened the app is in the outbox (or, from the old
+    // redirect, in the URL, and goes in there now) before anything else.
+    await migrateLegacyShares();
+    const shared = await handleShareEntry();
+
+    // On the first start of this page: the working copy kept when the app
+    // last went to the background, so a share that reloaded the window, or
+    // the phone closing the app, loses no unpushed edit or half-written note.
+    const restored = booted ? null : await restoreTreeCache();
+    booted = true;
+
+    // The sheet's pins and statistics as kept on the phone, before it draws:
+    // its chips are drawn once and never reordered.
+    await loadKeptShareData();
+    if (shared) shareSheet.open(shared, { fromShare: true });
 
     if (!configured()) {
-        setStatus('Open Settings (⚙) to configure your sync server.');
+        setStatus(restored && restored.dirty
+            ? `Restored unpushed changes from ${restored.at} — sign in as ${state.snapshotUsername || 'their account'} to push them.`
+            : 'Open Settings (⚙) to configure your sync server.');
         if (arrived) showToast(SIGN_IN_TO_IMPORT);
+        shareSheet.refreshInbox();
         return;
     }
     await refreshWhoAmI();
@@ -246,19 +297,43 @@ async function bootstrap() {
     // says otherwise. Only a rejected session (handled above) leaves the link
     // to whoever signs in next.
     if (arrived) claimPendingImport(arrived.id);
+    // Shares waiting on the phone go up now (and those chosen offline are
+    // filed), before the pull, so the pull brings them in. Those made while
+    // nobody, or someone else, was signed in are asked about, never sent on
+    // their own.
+    await flushShares();
+    await offerUnclaimedShares();
     // A pull replaces the working copy, so it never runs over unpushed edits
-    // — after a sign-out and back in they are still here, waiting.
+    // — after a sign-out and back in, or a reload, they are still here.
     if (state.dirty && state.snapshot) {
         renderView();
-        setStatus('You have unpushed edits from before you were signed out — Push to keep them, or Pull to discard.');
+        setStatus(restored && restored.dirty
+            ? `Restored unpushed changes from ${restored.at} — ⬆️ Push to keep them, or Pull to discard.`
+            : 'You have unpushed edits from before you were signed out — Push to keep them, or Pull to discard.');
+    } else if (restored && state.snapshot && copyIsMine()) {
+        // A clean copy from the last time: on screen already; pulled only
+        // when the server has moved on.
+        renderView();
+        try {
+            const v = await api('/api/tree/version');
+            const copy = state.snapshot;
+            if (Number(v.version) !== state.treeVersion && state.snapshot === copy && !state.dirty) await pullSnapshot();
+        } catch (e) { /* offline: the kept copy stands */ }
     } else {
         try { await pullSnapshot(); } catch (e) { /* status already set */ }
     }
-    await drainPendingShares();
+    loadShareStats();
+    loadSharePrefs();
     await refreshInbox();
+    if (!shareSheet.isOpen()) await afterShareSheet();
+    await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
+}
+
+// What waits while the share sheet is up: the proposals (which would redraw
+// what is behind it) and the clipboard scan (Android shows a toast for it).
+async function afterShareSheet() {
     await refreshProposals();
     await checkUnfiledLinks();
-    await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
 }
 
 // Universal import link: /#note=<percent-encoded markdown>[&notebook=<name>]
@@ -653,21 +728,31 @@ async function pullSnapshot() {
         state.pathIds = [getRootId(state.snapshot)];
         state.dirty = false;
         state.editCount = 0;
+        state.serverIds = idsOf(data.roots || []);
+        state.treeRev++;
         renderView();
+        saveTreeCache();
+        if (shareSheet) shareSheet.refresh();
     } catch (e) {
         setStatus('Pull failed: ' + e.message);
         throw e;
     }
 }
 
+// Every id in a wire-format tree, the virtual archive's excepted.
+function idsOf(roots) {
+    const ids = new Set();
+    const walk = (n) => {
+        if (!n || n.virtual || n.readOnly) return;
+        if (n.id) ids.add(String(n.id));
+        (n.children || []).forEach(walk);
+    };
+    (roots || []).forEach(walk);
+    return ids;
+}
+
 async function refreshInbox() {
-    try {
-        const data = await api('/api/shared');
-        state.inbox = data.links || [];
-        updateInboxFab();
-    } catch (e) {
-        console.warn('Inbox fetch failed', e);
-    }
+    if (shareSheet) await shareSheet.refreshInbox();
 }
 
 async function refreshProposals() {
@@ -750,9 +835,6 @@ function renderView() {
     renderBreadcrumb();
     renderContent();
     updateInboxFab();
-    if (document.getElementById('quick-file-sheet') && !document.getElementById('quick-file-sheet').classList.contains('hidden')) {
-        renderQuickFileSheet();
-    }
     updatePushBtnState();
     syncBottomNav();
 
@@ -1155,7 +1237,7 @@ function renderHome(root) {
     actions.className = 'home-actions';
     const ACTIONS = [
         { label: '+ New note', cls: 'a-notes', run: () => startNewNote({ parentId: null, from: 'Home' }) },
-        { label: '📋 Unfiled links', cls: 'a-clip', delegate: 'clipBtn' },
+        { label: '📥 Inbox', cls: 'a-clip', delegate: 'clipBtn' },
         { label: '⬇️ Pull', cls: 'a-pull', delegate: 'pullBtn' },
         { label: '⬆️ Push', cls: 'a-push', delegate: 'pushBtn' }
     ];
@@ -3148,13 +3230,14 @@ function renderNotePreviewHtml(content, skipTitle = '') {
 // The highlight follows what is on screen rather than the last tap: Notes
 // while Notes shows, Inbox or Settings only while their sheet is open, Home
 // otherwise — including a note opened straight from Home, whose back goes
-// to Home. The Notes tab carries the pending-proposal count.
+// to Home. The Notes tab carries the pending-proposal count, the Inbox tab
+// what waits to be filed.
 function syncBottomNav() {
     const nav = $('bottom-nav');
     const open = (id) => { const el = $(id); return Boolean(el) && !el.classList.contains('hidden'); };
     const fromHome = state.nv.pane === 'note' && state.nv.from === 'Home';
     const active = open('settings-sheet') ? 'settings'
-        : open('inbox-sheet') ? 'inbox'
+        : open('inbox-sheet') || open('share-sheet') ? 'inbox'
             : state.view === 'notes' && !fromHome ? 'notes' : 'home';
     if (nav) {
         for (const b of nav.querySelectorAll('button[data-nav]')) b.classList.toggle('on', b.dataset.nav === active);
@@ -3164,89 +3247,46 @@ function syncBottomNav() {
             badge.textContent = n > 99 ? '99+' : String(n);
             badge.classList.toggle('hidden', n === 0);
         }
+        const inboxBadge = nav.querySelector('.inbox-badge');
+        if (inboxBadge) {
+            const n = configured() ? inboxCount : 0;
+            inboxBadge.textContent = n > 99 ? '99+' : String(n);
+            inboxBadge.classList.toggle('hidden', n === 0);
+        }
     }
     const notesBtn = $('notesBtn');
     if (notesBtn) notesBtn.classList.toggle('on', state.view === 'notes');
 }
 
-// --- Inbox modal ---
+// --- Inbox ---
+// One list (shareSheet.js) for everything waiting to be filed: shares not
+// uploaded yet, the server's inbox, copied links, and what was filed lately.
+// The tab bar has it on a phone; on a desktop, where there is no tab bar, the
+// floating button does, with the same count.
+let shareSheet = null;
+let inboxBase = 0;   // what the inbox itself counts
+let inboxCount = 0;  // ... plus copied links waiting
+
+function setInboxCount(n = inboxBase) {
+    inboxBase = n;
+    inboxCount = inboxBase + clipboardSuggestions().length;
+    updateInboxFab();
+    syncBottomNav();
+}
+
 function updateInboxFab() {
     const fab = $('inbox-fab');
     const count = $('inbox-count');
     if (!fab || !count) return;
-    if (state.inbox.length === 0) { hide(fab); return; }
-    count.textContent = state.inbox.length;
+    if (!inboxCount || !configured()) { hide(fab); return; }
+    count.textContent = inboxCount > 99 ? '99+' : String(inboxCount);
     show(fab);
 }
 
 function openInbox() {
-    const list = $('inbox-list');
-    if (!list) return;
-    list.innerHTML = '';
-    if (state.inbox.length === 0) {
-        list.innerHTML = '<div class="empty">No pending links. Share something from your phone to TabPaladin to add one.</div>';
-    } else {
-        state.inbox.forEach(link => {
-            const row = document.createElement('div');
-            row.className = 'row bookmark';
-            let domain = '';
-            try { domain = new URL(link.url).hostname.replace(/^www\./, ''); } catch (e) {}
-            const favicon = domain
-                ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32">`
-                : '<span class="icon">🔖</span>';
-            row.innerHTML = `
-                ${favicon}
-                <a href="${escapeAttr(link.url)}" target="_blank" rel="noopener">${escapeHtml(link.title || link.url)}</a>
-                <button class="remove" data-id="${link.id}" title="Remove">✕</button>
-            `;
-            row.querySelector('.remove').addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const id = e.currentTarget.dataset.id;
-                try {
-                    await api('/api/shared/' + id, { method: 'DELETE' });
-                    state.inbox = state.inbox.filter(l => String(l.id) !== String(id));
-                    openInbox();
-                    updateInboxFab();
-                } catch (err) { alert('Remove failed: ' + err.message); }
-            });
-            list.appendChild(row);
-        });
-    }
-    const currentFolder = findNodeByPath(state.pathIds);
-    const hint = $('dropHereHint');
-    if (hint) hint.textContent = currentFolder ? `Will add to "${currentFolder.title || 'Bookmarks'}"` : '';
-    show($('inbox-sheet'));
-}
-
-async function dropHere() {
-    if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
-    const folder = findNodeByPath(state.pathIds);
-    if (!folder) { alert('Pick a folder first.'); return; }
-    if (blockedByImports('drop links')) return;
-    if (state.inbox.length === 0) { alert('Nothing in the inbox.'); return; }
-
-    // Append each link as a bookmark to the current folder, locally.
-    folder.children = folder.children || [];
-    for (const link of state.inbox) {
-        folder.children.push({ type: 'bookmark', url: link.url, title: link.title || link.url });
-    }
-    markDirty();
-    renderView();
-
-    // Push the updated snapshot back to the server (clean of helper fields).
-    try {
-        setStatus('Saving…');
-        await pushSnapshot();
-        // Clear the server inbox.
-        await api('/api/shared', { method: 'DELETE' });
-        state.inbox = [];
-        updateInboxFab();
-        hide($('inbox-sheet'));
-        setStatus('');
-    } catch (e) {
-        alert('Push failed: ' + e.message + '\nLocal changes preserved; will retry next time you press Drop.');
-        setStatus('');
-    }
+    if (!shareSheet) return;
+    shareSheet.openInbox();
+    syncBottomNav();
 }
 
 // ⬆️ Push: the topbar button, Home's quick action, and the way past a
@@ -3262,9 +3302,11 @@ async function pushNow() {
     }
     try {
         setStatus('Pushing…');
+        lastFold = null;
         await pushSnapshot();
         setStatus('');
-        showToast('Pushed.');
+        const n = lastFold ? lastFold.applied : 0;
+        showToast(n ? `Pushed — included ${n} filed link${n === 1 ? '' : 's'} from another device.` : 'Pushed.');
         renderView();
         return true;
     } catch (err) {
@@ -3274,7 +3316,10 @@ async function pushNow() {
     }
 }
 
-async function pushSnapshot({ force = false } = {}) {
+// What the last push folded in from links filed elsewhere, for its message.
+let lastFold = null;
+
+async function pushSnapshot({ force = false, attempt = 0 } = {}) {
     const roots = (state.snapshot.children || []).map(toWire).filter(Boolean);
     // Pushing an empty tree erases everything server-side for every device —
     // never do that without a very explicit yes.
@@ -3291,11 +3336,12 @@ async function pushSnapshot({ force = false } = {}) {
     const copy = state.snapshot;
     const carried = copyImportIds().slice();
     const edits = state.editCount;
+    const base = state.treeVersion || 0;
     try {
         const data = await api('/api/tree', {
             method: 'PUT',
             body: JSON.stringify({
-                roots, baseVersion: state.treeVersion || 0, deviceId: 'pwa', force,
+                roots, baseVersion: base, deviceId: 'pwa', force,
                 ...(baseUserId !== null ? { baseUserId } : {}),
                 ...(baseServerId ? { baseServerId } : {})
             })
@@ -3308,16 +3354,18 @@ async function pushSnapshot({ force = false } = {}) {
             if (carried.length) dropPendingImports(carried);
             return;
         }
-        state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
+        state.treeVersion = Number(data.version) || base + 1;
         if (data.userId !== undefined) state.snapshotUserId = data.userId;
         if (data.serverId) state.snapshotServerId = data.serverId;
         state.editCount = Math.max(0, state.editCount - edits);
         state.dirty = state.editCount > 0;
+        state.serverIds = idsOf(roots);
         // On the server now: the links those imports came from are done.
         if (carried.length) {
             dropPendingImports(carried);
             copy._importIds = (copy._importIds || []).filter(id => !carried.includes(id));
         }
+        saveTreeCache();
     } catch (e) {
         // This copy belongs to another account. Forcing would write it into
         // this one, so there is no offer to — sign in as its account to push.
@@ -3327,6 +3375,18 @@ async function pushSnapshot({ force = false } = {}) {
         // A stale baseVersion means another device pushed since our last pull.
         // Never overwrite that silently — ask.
         if (/^409[\s:]/.test(e.message) || /changed on the server/i.test(e.message)) {
+            if (state.snapshot !== copy) {
+                throw new Error('The working copy changed while pushing — nothing was overwritten. Push again.');
+            }
+            // Unless all that changed is links filed from a share sheet: those
+            // are folded into this copy, and the push goes again.
+            if (!force && attempt < 3) {
+                const folded = await rebaseOntoServer(copy, base);
+                if (folded) {
+                    lastFold = { applied: (lastFold ? lastFold.applied : 0) + folded.applied, relocated: (lastFold ? lastFold.relocated : 0) + folded.relocated };
+                    return pushSnapshot({ force, attempt: attempt + 1 });
+                }
+            }
             if (state.snapshot !== copy) {
                 throw new Error('The working copy changed while pushing — nothing was overwritten. Push again.');
             }
@@ -3342,11 +3402,113 @@ async function pushSnapshot({ force = false } = {}) {
     }
 }
 
-// --- Quick-File Modal (proactive clipboard & inbox filing) ---
+// --- Links filed from a share sheet, folded into the copy ----------------------
+//
+// Filing is an append on the server, not a push of this copy, so the copy
+// learns of it one of two ways: from the filing's own answer (applyFiled,
+// when this app filed it), or from the server's ops log when a push meets a
+// 409 (rebaseOntoServer). Either way only nodes that are not here yet are
+// added, so the two never double up.
+
+// The copy's nodes by id, for shareCore's applyOps.
+function localAdapter(wrapper) {
+    const nodes = new Map();
+    const parents = new Map();
+    const walk = (node) => {
+        for (const c of node.children || []) {
+            if (c._pwaId) { nodes.set(String(c._pwaId), c); parents.set(String(c._pwaId), node); }
+            if (c.children) walk(c);
+        }
+    };
+    walk(wrapper);
+    const isFolder = (n) => n.type === 'folder' || n.type === 'root';
+    return {
+        find: (id) => nodes.get(String(id)) || null,
+        kindOf: (n) => (isFolder(n) ? 'folder' : typeof n.url === 'string' && n.url.startsWith(NOTE_DATA_PREFIX) ? 'note' : 'bookmark'),
+        urlOf: (n) => n.url,
+        childCount: (n) => (n.children || []).length,
+        insert(parent, spec) {
+            const node = spec.kind === 'folder'
+                ? { type: 'folder', title: spec.title, _pwaId: spec.id, children: [] }
+                : { type: 'bookmark', title: spec.title, url: spec.url, _pwaId: spec.id };
+            const into = parent || wrapper;
+            (into.children = into.children || []).push(node);
+            nodes.set(String(spec.id), node);
+            parents.set(String(spec.id), into);
+            return node;
+        },
+        remove(node) {
+            const p = parents.get(String(node._pwaId));
+            if (!p) return;
+            const i = (p.children || []).indexOf(node);
+            if (i >= 0) p.children.splice(i, 1);
+            nodes.delete(String(node._pwaId));
+        },
+        fallbackParent: () => [...nodes.values()].find(n => isFolder(n) && n._role === 'bookmarks') || null
+    };
+}
+
+// After a 409 at `base`: when everything the server gained since is links
+// filed (or taken back) from a share sheet, fold them into the copy that was
+// refused and say how many; otherwise null, and the push asks as before. Only
+// into that copy as it was, and only with what the server says of this copy's
+// own account.
+async function rebaseOntoServer(copy, base) {
+    let ops;
+    try {
+        ops = await api('/api/tree/ops?since=' + encodeURIComponent(base));
+    } catch (e) {
+        return null;
+    }
+    if (state.snapshot !== copy || (state.treeVersion || 0) !== base || !ops || !ops.complete) return null;
+    if (ops.userId !== undefined && state.snapshotUserId != null && Number(ops.userId) !== Number(state.snapshotUserId)) return null;
+    if (ops.serverId && state.snapshotServerId && ops.serverId !== state.snapshotServerId) return null;
+    const result = Share.applyOps(ops.ops || [], localAdapter(copy));
+    state.treeVersion = Number(ops.version) || base;
+    for (const op of ops.ops || []) {
+        for (const n of (op.payload && op.payload.nodes) || []) state.serverIds.add(String(n.id));
+    }
+    state.treeRev++;
+    saveTreeCache();
+    if (!editorOpen()) renderView();
+    return result;
+}
+
+// A filing this app made (or the worker made and told it of): its new
+// folders and bookmarks go into the copy, and when the copy was based on the
+// version the filing started from, it is based on the filing's version now —
+// with its own unpushed edits, if any, still on top.
+function applyFiled(res) {
+    applyFiling(res, 'append', (res && res.created) || []);
+}
+
+function applyUnfiled(res) {
+    applyFiling(res, 'unappend', (res && res.removed) || []);
+}
+
+function applyFiling(res, kind, list) {
+    if (!res || !state.snapshot || !configured() || !copyIsMine()) return;
+    const copy = state.snapshot;
+    Share.applyOps([{ kind, payload: kind === 'append' ? { nodes: list } : { items: list } }], localAdapter(copy));
+    for (const n of list) {
+        if (kind === 'append') state.serverIds.add(String(n.id));
+        else state.serverIds.delete(String(n.id));
+    }
+    if (Number(res.baseVersion) === (state.treeVersion || 0) && Number(res.version) > Number(res.baseVersion)) {
+        state.treeVersion = Number(res.version);
+    }
+    state.treeRev++;
+    saveTreeCache();
+    if (!editorOpen()) renderView();
+}
+
+// --- Copied links ---
 //
 // Both lists are per account (<key>:<userId>): one person's skipped links are
 // not another's. The per-device lists from before accounts are adopted once,
-// by the server's owner only — whose phone they were.
+// by the server's owner only — whose phone they were. Copied links show in
+// the Inbox under From clipboard until filed (through the share sheet) or
+// skipped.
 const DISMISSED_KEY = 'tp_dismissed_urls';
 const SCANNED_CLIPBOARD_KEY = 'tp_scanned_clipboard_links';
 
@@ -3416,42 +3578,28 @@ function isUrlInSnapshot(url, node) {
     return false;
 }
 
-let activeQuickFileItems = [];
+// Copied links still worth offering: signed in, not skipped, not filed.
+function clipboardSuggestions() {
+    if (!configured() || accountChanging) return [];
+    const dismissed = new Set(getDismissedUrls().map(normalizeUrl));
+    return getScannedClipboardLinks().filter(item => !dismissed.has(normalizeUrl(item.url))
+        && !(state.snapshot && isUrlInSnapshot(item.url, state.snapshot)));
+}
+
 let _lastClipboardScanTime = 0;
 
 // Signed in only: the suggestions are filed into, and remembered for, the
 // signed-in account. Signed out there is none — a copy kept on the phone is
-// its account's, not the place for whatever is on the clipboard now.
+// its account's, not the place for whatever is on the clipboard now. Never
+// while the share sheet is up: Android announces every clipboard read.
 async function checkUnfiledLinks(skipClipboardScan = false) {
     if (!state.snapshot || !configured()) return;
-    const dismissed = getDismissedUrls();
-    const dismissedSet = new Set(dismissed.map(normalizeUrl));
-    const unfiled = [];
-
-    // 1. Process shared inbox items
-    for (const link of state.inbox) {
-        const norm = normalizeUrl(link.url);
-        if (!isUrlInSnapshot(link.url, state.snapshot) && !dismissedSet.has(norm)) {
-            if (!unfiled.some(item => normalizeUrl(item.url) === norm)) {
-                unfiled.push({ url: link.url, title: link.title || link.url, inboxId: link.id });
-            }
-        }
+    if (shareSheet && shareSheet.isOpen()) return;
+    const dismissedSet = new Set(getDismissedUrls().map(normalizeUrl));
+    for (const item of getScannedClipboardLinks()) {
+        if (isUrlInSnapshot(item.url, state.snapshot)) removeScannedClipboardLink(item.url);
     }
-
-    // 2. Process historically scanned clipboard items
-    const clipboardLinks = getScannedClipboardLinks();
-    for (const item of clipboardLinks) {
-        const norm = normalizeUrl(item.url);
-        if (!isUrlInSnapshot(item.url, state.snapshot) && !dismissedSet.has(norm)) {
-            if (!unfiled.some(u => normalizeUrl(u.url) === norm)) {
-                unfiled.push({ url: item.url, title: item.title, fromClipboard: true });
-            }
-        } else {
-            removeScannedClipboardLink(item.url);
-        }
-    }
-
-    // 3. Process clipboard if permission is available and throttled (max once per 3s)
+    // At most once every 3s.
     if (!skipClipboardScan) {
         const now = Date.now();
         if (now - _lastClipboardScanTime > 3000) {
@@ -3460,14 +3608,9 @@ async function checkUnfiledLinks(skipClipboardScan = false) {
                 try {
                     const text = await navigator.clipboard.readText();
                     const trimmed = (text || '').trim();
-                    if (/^https?:\/\/\S+$/.test(trimmed)) {
-                        const normTrimmed = normalizeUrl(trimmed);
-                        if (!isUrlInSnapshot(trimmed, state.snapshot) && !dismissedSet.has(normTrimmed)) {
-                            addScannedClipboardLink(trimmed, trimmed);
-                            if (!unfiled.some(item => normalizeUrl(item.url) === normTrimmed)) {
-                                unfiled.push({ url: trimmed, title: trimmed, fromClipboard: true });
-                            }
-                        }
+                    if (/^https?:\/\/\S+$/.test(trimmed) && configured() && !isUrlInSnapshot(trimmed, state.snapshot)
+                        && !dismissedSet.has(normalizeUrl(trimmed))) {
+                        addScannedClipboardLink(trimmed, trimmed);
                     }
                 } catch (e) {
                     // Silently swallow clipboard permission errors
@@ -3475,232 +3618,489 @@ async function checkUnfiledLinks(skipClipboardScan = false) {
             }
         }
     }
-
-    activeQuickFileItems = unfiled;
-    updateClipBtnBadge();
-    // Never auto-open the sheet — the 📋 button badge shows the count instead.
-    const sheet = $('quick-file-sheet');
-    const isOpen = sheet && !sheet.classList.contains('hidden');
-    if (isOpen) {
-        renderQuickFileSheet();
-    }
+    setInboxCount();
 }
 
-function updateClipBtnBadge() {
-    const btn = $('clipBtn');
-    if (!btn) return;
-    const n = activeQuickFileItems.length;
-    btn.classList.toggle('has-items', n > 0);
-    btn.textContent = n > 0 ? `📋 Unfiled links (${n})` : '📋 Unfiled links';
-    btn.title = n > 0
-        ? `${n} unfiled link${n > 1 ? 's' : ''} — tap to review`
-        : 'Scan clipboard for unfiled links';
-}
-
-function openQuickFileSheet() {
-    renderQuickFileSheet();
-    show($('quick-file-sheet'));
-}
-
-function renderQuickFileSheet() {
-    updateClipBtnBadge();
-    const sheet = $('quick-file-sheet');
-    const list = $('quick-file-list');
-    const hint = $('quick-file-hint');
-    if (!sheet || !list || !hint) return;
-    
-    const currentFolder = findNodeByPath(state.pathIds);
-    hint.textContent = currentFolder 
-        ? `Will add to folder: "${currentFolder.title || 'Bookmarks'}"` 
-        : 'Select a folder in the background to file these links.';
-
-    list.innerHTML = '';
-    
-    if (activeQuickFileItems.length === 0) {
-        list.innerHTML = `
-            <div class="empty" style="padding: 32px 16px; color: var(--muted); text-align: center; font-style: italic; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
-                <span style="font-size: 2rem;">📥</span>
-                <span>No unfiled links queued.</span>
-                <span style="font-size: 0.8rem; font-style: normal; color: var(--primary); font-weight: 500;">
-                    Paste a link in the box above to add it!
-                </span>
-            </div>
-        `;
-    } else {
-        activeQuickFileItems.forEach((item, index) => {
-            const row = document.createElement('div');
-            row.className = 'row bookmark';
-            row.style.display = 'flex';
-            row.style.alignItems = 'center';
-            row.style.justifyContent = 'space-between';
-            row.style.gap = '10px';
-            row.style.background = 'rgba(255, 255, 255, 0.04)';
-            row.style.marginBottom = '6px';
-            row.style.padding = '10px 14px';
-
-            let domain = '';
-            try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch (e) {}
-            const favicon = domain
-                ? `<img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32" style="width:16px; height:16px; border-radius:3px; flex-shrink:0;">`
-                : '<span class="icon">🔖</span>';
-
-            row.innerHTML = `
-                <div style="display:flex; align-items:center; gap:10px; overflow:hidden; flex:1;">
-                    ${favicon}
-                    <div style="display:flex; flex-direction:column; overflow:hidden; text-align:left;">
-                        <strong style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.88rem; color:var(--text);">${escapeHtml(item.title)}</strong>
-                        <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.75rem; color:var(--muted);">${escapeHtml(item.url)}</span>
-                    </div>
-                </div>
-                <div style="display:flex; gap:6px; flex-shrink:0;">
-                    <button class="place-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--success); color:white; border-radius:6px;">Place</button>
-                    <button class="skip-btn" style="padding:6px 10px; font-size:0.8rem; font-weight:600; background:var(--surface-2); color:var(--text); border-radius:6px;">Skip</button>
-                </div>
-            `;
-
-            row.querySelector('.place-btn').addEventListener('click', async (e) => {
-                e.stopPropagation();
-                if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
-                const folder = findNodeByPath(state.pathIds);
-                if (!folder) {
-                    alert('Please navigate to a folder in the background first.');
-                    return;
-                }
-                if (blockedByImports('file links')) return;
-                // File locally
-                folder.children = folder.children || [];
-                folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
-                markDirty();
-                renderView();
-
-                try {
-                    setStatus('Saving…');
-                    await pushSnapshot();
-                    // Clear server shared link if it came from inbox
-                    if (item.inboxId) {
-                        await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
-                        state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
-                    }
-                    dismissUrl(item.url);
-                    removeScannedClipboardLink(item.url);
-                    activeQuickFileItems.splice(index, 1);
-                    renderQuickFileSheet();
-                    updateInboxFab();
-                    setStatus('');
-                } catch (err) {
-                    alert('Place failed: ' + err.message);
-                    setStatus('');
-                }
-            });
-
-            row.querySelector('.skip-btn').addEventListener('click', async (e) => {
-                e.stopPropagation();
-                if (signedOutRefuses('Sign in first — skipped links are remembered for your account.')) return;
-                try {
-                    if (item.inboxId) {
-                        await api('/api/shared/' + item.inboxId, { method: 'DELETE' });
-                        state.inbox = state.inbox.filter(l => String(l.id) !== String(item.inboxId));
-                    }
-                    dismissUrl(item.url);
-                    removeScannedClipboardLink(item.url);
-                    activeQuickFileItems.splice(index, 1);
-                    renderQuickFileSheet();
-                    updateInboxFab();
-                } catch (err) {
-                    alert('Skip failed: ' + err.message);
-                }
-            });
-
-            list.appendChild(row);
-        });
-    }
-}
-
-// --- Share Target API ---
-// When the user shares a URL from another mobile app, the browser navigates to
-// /?share=1&title=...&text=...&url=... (configured in manifest). We capture and
-// POST to /api/shared so it lands in the inbox.
+// --- Shares ---------------------------------------------------------------------
 //
-// Whatever stops that — signed out, a revoked session, offline, a full inbox —
-// the share is queued on the phone before the URL is cleaned, and delivered
-// after the next sign-in or start (see pendingShares.js). Losing what you
-// shared is the one unacceptable outcome.
-async function processShareTargetIfAny() {
-    const params = new URLSearchParams(location.search);
-    // Browsers vary in where they put the URL when share_target action is `/`.
-    let url = params.get('url') || '';
-    const title = params.get('title') || '';
-    const text = params.get('text') || '';
-    if (!url && /^https?:\/\//.test(text)) url = text;
-    if (!url) return;
-    const shareTitle = title || text;
-    try {
-        const taken = await pendingShares.take(
-            { url, title: shareTitle, at: new Date().toISOString(), userId: currentUserId() },
-            { canDeliver: configured(), deliver: deliverShare }
-        );
-        const captured = taken.result && taken.result.captured;
-        if (captured) {
-            const name = captured.provider === 'x' ? 'X' : 'Instagram';
-            showToast(captured.duplicate
-                ? `Already in your ${name} archive.`
-                : `Saved to ${name} — ${captured.items} archived.`);
-        } else if (taken.queued && configured() && taken.error && taken.error.status && taken.error.status !== 401) {
-            // Signed in, and the server said no — a full inbox (429), say.
-            // Show its reason: "sign in" would not help here.
-            const why = (taken.error.body && taken.error.body.error) || taken.error.message;
-            alert(`The server did not take this link:\n\n${why}\n\nIt is kept on this phone and tried again the next time the app starts.`);
-        } else if (taken.queued && configured()) {
-            showToast('Kept on this phone — the server could not be reached.');
-        } else if (taken.queued) {
-            showToast('Kept on this phone — it is added after you sign in.');
+// A share is kept in the outbox before anything touches the network — by the
+// worker, or here when it arrives the old way, in the URL — and stays there
+// until the server has taken it in and the user has filed it, left it for
+// later or discarded it. Each records the account signed in when it was
+// shared; it is only ever uploaded as that account, and one shared while
+// nobody (or someone else) was signed in waits for a yes.
+
+// Shares an earlier build queued in localStorage, moved into the outbox.
+async function migrateLegacyShares() {
+    let list = [];
+    try { list = JSON.parse(localStorage.getItem(LS.legacyShares) || '[]'); } catch (e) { list = []; }
+    if (!Array.isArray(list)) list = [];
+    if (!list.length) {
+        if (localStorage.getItem(LS.legacyShares) !== null) localStorage.removeItem(LS.legacyShares);
+        return 0;
+    }
+    let existing = [];
+    try { existing = await outbox.list(); } catch (e) { return 0; }
+    const base = (state.config.url || '').replace(/\/+$/, '');
+    let moved = 0;
+    for (const old of list) {
+        if (!old || typeof old.url !== 'string' || !old.url) continue;
+        // Moved already, by a start that stopped halfway.
+        if (existing.some(e => e.fields && e.fields.url === old.url && e.createdAt === old.at)) continue;
+        const mine = old.userId !== null && old.userId !== undefined && Number(old.userId) === currentUserId();
+        const account = old.userId === null || old.userId === undefined ? null : {
+            url: base, userId: Number(old.userId),
+            username: mine ? localStorage.getItem(LS.username) : null,
+            serverId: mine ? localStorage.getItem(LS.serverId) : null
+        };
+        const at = old.at && !Number.isNaN(Date.parse(old.at)) ? new Date(old.at) : new Date();
+        try {
+            // Bound for the inbox, as the old queue delivered them: once
+            // uploaded they leave the phone.
+            await outbox.put({ ...Share.makeEntry({ fields: { url: old.url, title: old.title || '', text: '' }, account, source: 'share', now: at }), later: true });
+            moved++;
+        } catch (e) {
+            return moved; // still in the old queue; moved on the next start
         }
-    } catch (e) {
-        console.warn('Share-target handling failed', e);
-    } finally {
-        // Clean the URL so reload doesn't double-add. The share is delivered
-        // or queued by now.
-        history.replaceState({}, '', location.pathname);
     }
+    localStorage.removeItem(LS.legacyShares);
+    return moved;
 }
 
-// One share into the account signed in now. Posts shared from X or Instagram
-// go straight into their own archive rather than the generic inbox — neither
-// can be swept, so sharing is the only way those archives are ever filled.
-// Anything else lands in the inbox. Throws when it could not be delivered.
-async function deliverShare(share) {
-    let captured = null;
+// The share that opened the app, if one did: /?share=<sid> (kept by the
+// worker) or /?share=1&url&title&text (the server's fallback, or the worker's
+// when it could not keep it), which goes into the outbox now. The address is
+// cleaned once the share is kept, so neither a reload nor back brings it
+// round again and no history entry holds the link.
+async function handleShareEntry() {
+    const params = new URLSearchParams(location.search);
+    const id = params.get('share');
+    if (!id) return null;
+    let entry = null;
+    if (id === '1') {
+        const fields = { url: params.get('url') || '', title: params.get('title') || '', text: params.get('text') || '' };
+        entry = Share.makeEntry({ fields, account: shareAccount(), source: 'share' });
+        try {
+            await outbox.put(entry);
+        } catch (e) {
+            showToast('This share could not be kept on the phone — it stays in the address bar for now.');
+            return entry;
+        }
+    } else {
+        entry = await outbox.get(id).catch(() => null);
+        if (!entry && configured()) {
+            try {
+                entry = shareSheet.entryFromShare((await api('/api/shares/' + encodeURIComponent(id))).share);
+            } catch (e) {
+                entry = null;
+            }
+        }
+        if (!entry) showToast('That share is no longer on this phone — look in the Inbox.');
+    }
+    history.replaceState(null, '', location.pathname);
+    return entry;
+}
+
+// Upload what waits (and file what was chosen offline), for the account
+// signed in now. Filed links go into the copy; a dead session is found out
+// the usual way; offline, the browser is asked to try again when it can.
+async function flushShares(sids = null) {
+    const cfg = shareConfig();
+    if (!cfg) return null;
+    let res;
     try {
-        captured = await api('/api/imports/capture', {
-            method: 'POST',
-            body: JSON.stringify({ url: share.url, title: share.title })
-        });
+        res = await Share.flushOutbox({ outbox, cfg, fetch: (u, o) => fetch(u, o), sids });
     } catch (e) {
-        if (e.status === 401) throw e;
-        // An older server has no capture route; the inbox still works.
-        console.warn('Capture unavailable, falling back to inbox', e);
+        return null;
     }
-    if (captured && captured.captured) return { captured };
-    await api('/api/shared', { method: 'POST', body: JSON.stringify({ url: share.url, title: share.title }) });
-    return { captured: null };
+    for (const f of res.filed) applyFiled(f.result);
+    if (res.filed.length) loadShareStats();
+    if (res.stopped === 'auth') {
+        try { await api('/api/auth/me'); } catch (e) { /* api() has said so */ }
+    }
+    if (res.stopped === 'network') registerShareSync();
+    return res;
 }
 
-// After a sign-in (and on every start): shares queued while they could not be
-// delivered. This account's go in on their own; others are asked about.
-async function drainPendingShares() {
-    if (!configured() || !pendingShares.list().length) return;
+function registerShareSync() {
+    try {
+        if (!('serviceWorker' in navigator) || !navigator.serviceWorker || !navigator.serviceWorker.ready) return;
+        navigator.serviceWorker.ready.then(reg => reg.sync && reg.sync.register('tp-outbox')).catch(() => {});
+    } catch (e) { /* no Background Sync: the next start or 'online' sends it */ }
+}
+
+// Shares made while nobody, or another account, was signed in: offered to
+// the account signing in now, never sent on its own. (The share sheet asks
+// for the one it shows.)
+async function offerUnclaimedShares() {
+    const me = shareConfig();
+    if (!me) return;
+    let list = [];
+    try { list = await outbox.list(); } catch (e) { return; }
+    const others = list.filter(e => e.url && !Share.sameAccount(e.account, me) && !(shareSheet && shareSheet.current() === e.sid));
+    if (!others.length) return;
+    const n = others.length;
     const who = localStorage.getItem(LS.username) || 'this account';
-    const result = await pendingShares.drain({
-        userId: currentUserId(),
-        deliver: deliverShare,
-        ask: async (shares) => {
-            const n = shares.length;
-            if (confirm(`${n} link${n === 1 ? ' was' : 's were'} shared while signed out — add ${n === 1 ? 'it' : 'them'} to ${who}'s inbox?`)) return 'add';
-            return confirm(`Discard ${n === 1 ? 'that link' : `those ${n} links`}? Cancel keeps ${n === 1 ? 'it' : 'them'} on this phone for later.`)
-                ? 'discard' : 'keep';
+    if (confirm(`${n} link${n === 1 ? ' was' : 's were'} shared while signed out — add ${n === 1 ? 'it' : 'them'} to ${who}'s inbox?`)) {
+        const account = shareAccount();
+        // Into the inbox: once uploaded they leave the phone.
+        for (const e of others) await outbox.update(e.sid, (c) => ({ ...c, account, later: true })).catch(() => {});
+        const res = await flushShares(others.map(e => e.sid));
+        if (res && res.uploaded.length) showToast(`${res.uploaded.length} shared link${res.uploaded.length === 1 ? '' : 's'} added`);
+        return;
+    }
+    if (confirm(`Discard ${n === 1 ? 'that link' : `those ${n} links`}? Cancel keeps ${n === 1 ? 'it' : 'them'} on this phone for later (in the Inbox).`)) {
+        for (const e of others) await outbox.remove(e.sid).catch(() => {});
+    }
+}
+
+// --- The working copy, kept for the next start --------------------------------
+//
+// Written to Cache Storage after every pull, push and filing, and whenever
+// the app goes to the background — so a share that reloads the window, or
+// the phone closing the app, loses neither unpushed edits nor a half-written
+// note. It says whose it is, and comes back only under the same rules as a
+// copy kept in memory: for its own account, or signed out (for its account
+// to come back to) when it holds work.
+const DATA_CACHE = 'tp-data';
+const TREE_KEY = '/__tp_tree';
+const PREFS_KEY = '/__tp_prefs';
+const STATS_KEY = '/__tp_stats';
+
+async function dataCache() {
+    if (typeof caches === 'undefined' || !caches || typeof caches.open !== 'function') return null;
+    try { return await caches.open(DATA_CACHE); } catch (e) { return null; }
+}
+
+async function readData(key) {
+    try {
+        const c = await dataCache();
+        const hit = c && await c.match(key);
+        return hit ? await hit.json() : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function writeData(key, value) {
+    try {
+        const c = await dataCache();
+        if (!c) return false;
+        if (value === null) await c.delete(key);
+        else await c.put(key, new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } }));
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Is a kept record's account the one signed in now?
+function sameKeptAccount(acct) {
+    if (!acct || !configured()) return false;
+    const url = state.config.url.replace(/\/+$/, '');
+    if ((acct.url || '').replace(/\/+$/, '') !== url) return false;
+    const serverId = localStorage.getItem(LS.serverId);
+    if (acct.serverId && serverId && acct.serverId !== serverId) return false;
+    const id = currentUserId();
+    if (acct.userId !== null && acct.userId !== undefined && id !== null) return Number(acct.userId) === id;
+    const name = (localStorage.getItem(LS.username) || '').normalize('NFKC').toLowerCase();
+    return Boolean(name) && String(acct.username || '').normalize('NFKC').toLowerCase() === name;
+}
+
+// A copy with work in it kept for another account than the one signed in:
+// never written over until that account has it back.
+let foreignKeptCopy = null;
+let treeCacheWrite = Promise.resolve();
+
+function saveTreeCache() {
+    const snap = state.snapshot;
+    if (!snap || accountChanging) return treeCacheWrite;
+    const account = {
+        url: (state.snapshotUrl || state.config.url || '').replace(/\/+$/, ''),
+        userId: state.snapshotUserId ?? null,
+        username: state.snapshotUsername || localStorage.getItem(LS.username) || null,
+        serverId: state.snapshotServerId || null
+    };
+    if (foreignKeptCopy) {
+        const kept = foreignKeptCopy.account || {};
+        if (kept.url !== account.url || Number(kept.userId) !== Number(account.userId)) return treeCacheWrite;
+        foreignKeptCopy = null;
+    }
+    const record = {
+        v: 1,
+        savedAt: new Date().toISOString(),
+        account,
+        roots: (snap.children || []).map(toWire).filter(Boolean),
+        version: state.treeVersion || 0,
+        dirty: Boolean(state.dirty),
+        editCount: state.editCount || 0,
+        importIds: copyImportIds().slice(),
+        serverIds: [...state.serverIds],
+        nv: editorOpen() ? { ...state.nv } : null,
+        keptDraft: state.keptDraft ? { ...state.keptDraft } : null,
+        pathIds: state.pathIds.slice(1)
+    };
+    treeCacheWrite = treeCacheWrite.then(() => writeData(TREE_KEY, record));
+    return treeCacheWrite;
+}
+
+function clearTreeCache() {
+    foreignKeptCopy = null;
+    treeCacheWrite = treeCacheWrite.then(() => writeData(TREE_KEY, null));
+    return treeCacheWrite;
+}
+
+// Put the kept copy back. Returns {dirty, at} when it did, else null.
+async function restoreTreeCache() {
+    const rec = await readData(TREE_KEY);
+    if (!rec || rec.v !== 1 || !Array.isArray(rec.roots) || state.snapshot) return null;
+    const signedIn = configured();
+    const holdsWork = Boolean(rec.dirty || rec.nv || rec.keptDraft);
+    if (signedIn && !sameKeptAccount(rec.account)) {
+        if (holdsWork) {
+            foreignKeptCopy = rec;
+            showToast(`This phone keeps unpushed changes for ${(rec.account && rec.account.username) || 'another account'} — sign in as them to push them.`);
+        }
+        return null;
+    }
+    // A clean copy waits for nobody: signed out, there is nothing to keep it for.
+    if (!signedIn && !holdsWork) return null;
+    const acct = rec.account || {};
+    state.snapshot = { type: 'root', title: '', children: rec.roots.map(fromWire) };
+    const rootId = getRootId(state.snapshot);
+    state.snapshotUserId = acct.userId ?? null;
+    state.snapshotUsername = acct.username || null;
+    state.snapshotUrl = acct.url || '';
+    state.snapshotServerId = acct.serverId || null;
+    state.treeVersion = Number(rec.version) || 0;
+    state.dirty = Boolean(rec.dirty);
+    state.editCount = state.dirty ? Math.max(1, Number(rec.editCount) || 0) : 0;
+    state.serverIds = new Set(rec.serverIds || []);
+    state.treeRev++;
+    if (Array.isArray(rec.importIds) && rec.importIds.length) state.snapshot._importIds = rec.importIds.slice();
+    const path = [rootId, ...(Array.isArray(rec.pathIds) ? rec.pathIds : [])];
+    state.pathIds = findNodeByPath(path) ? path : [rootId];
+    if (rec.keptDraft) state.keptDraft = rec.keptDraft;
+    if (rec.nv && rec.nv.editing) {
+        if (signedIn) {
+            state.view = 'notes';
+            state.nv = { ...freshNv(), ...rec.nv };
+            navDepth++;
+            history.pushState(nvHistoryState(), '', location.pathname);
+        } else if (!state.keptDraft) {
+            // Set aside for its account, as a sign-out would have.
+            state.keptDraft = { ...freshNv(), ...rec.nv };
+        }
+    }
+    renderView();
+    const d = new Date(rec.savedAt);
+    const at = Number.isNaN(d.getTime()) ? 'earlier' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return { dirty: holdsWork, at };
+}
+
+// --- The share sheet's prefs and statistics --------------------------------------
+//
+// Prefs ('share': pins, hidden folders and slots per app) are kept on the
+// phone and in /api/prefs/share; a change saves here at once and then on the
+// server, merged per app with whatever another device saved meanwhile.
+// Statistics (where each app's links were filed) come from the server with
+// each start and filing, and are kept for offline.
+let shareStats = null;
+let sharePrefs = { value: null, updatedAt: null, dirty: [] };
+
+// What the phone kept of both for the account signed in now.
+async function loadKeptShareData() {
+    if (!configured()) return;
+    if (!shareStats) {
+        const kept = await readData(STATS_KEY);
+        if (kept && sameKeptAccount(kept.account)) shareStats = kept.stats;
+    }
+    if (!sharePrefs.value && !sharePrefs.dirty.length) {
+        const kept = await readData(PREFS_KEY);
+        if (kept && sameKeptAccount(kept.account)) {
+            sharePrefs = { value: kept.value || null, updatedAt: kept.updatedAt || null, dirty: kept.dirty || [] };
+        }
+    }
+}
+
+async function loadShareStats() {
+    await loadKeptShareData();
+    if (!configured()) return;
+    try {
+        const r = await api('/api/shares/stats');
+        shareStats = { apps: r.apps || {} };
+        writeData(STATS_KEY, { account: shareAccount(), stats: shareStats, fetchedAt: new Date().toISOString() });
+        if (shareSheet) shareSheet.refresh();
+    } catch (e) { /* the kept ones stand */ }
+}
+
+function mergeSharePrefs(server, local, dirtyApps) {
+    const out = server && typeof server === 'object' ? JSON.parse(JSON.stringify(server)) : { v: 1, slots: 4, apps: {} };
+    out.v = 1;
+    out.apps = out.apps || {};
+    for (const app of dirtyApps) {
+        if (app === '__slots') { if (local && local.slots) out.slots = local.slots; continue; }
+        if (local && local.apps && local.apps[app]) out.apps[app] = local.apps[app];
+    }
+    return out;
+}
+
+function keepSharePrefs() {
+    writeData(PREFS_KEY, { account: shareAccount(), ...sharePrefs });
+}
+
+async function loadSharePrefs() {
+    await loadKeptShareData();
+    if (!configured()) return;
+    try {
+        const r = await api('/api/prefs/share');
+        sharePrefs.value = mergeSharePrefs(r.value, sharePrefs.value, sharePrefs.dirty);
+        sharePrefs.updatedAt = r.updatedAt || null;
+    } catch (e) {
+        if (e.status !== 404) return; // offline: what is kept stands
+    }
+    if (sharePrefs.dirty.length) await pushSharePrefs();
+    keepSharePrefs();
+    if (shareSheet) shareSheet.refresh();
+}
+
+// Folder ids no longer in the tree are dropped on the way out.
+function pruneSharePrefs(value) {
+    const c = shareCopy();
+    if (!c.ready || !value || !value.apps) return value;
+    const out = JSON.parse(JSON.stringify(value));
+    for (const a of Object.values(out.apps)) {
+        if (Array.isArray(a.pinned)) a.pinned = a.pinned.filter(id => c.index.folders.has(id));
+        if (Array.isArray(a.hidden)) a.hidden = a.hidden.filter(id => c.index.folders.has(id));
+    }
+    return out;
+}
+
+async function pushSharePrefs() {
+    if (!configured()) return;
+    for (let i = 0; i < 3; i++) {
+        try {
+            const r = await api('/api/prefs/share', {
+                method: 'PUT',
+                body: JSON.stringify({ value: pruneSharePrefs(sharePrefs.value), baseUpdatedAt: sharePrefs.updatedAt })
+            });
+            sharePrefs.updatedAt = r.updatedAt;
+            sharePrefs.dirty = [];
+            keepSharePrefs();
+            return;
+        } catch (e) {
+            if (e.status === 409 && e.body) {
+                const cur = e.body.current || null;
+                sharePrefs.value = mergeSharePrefs(cur && cur.value, sharePrefs.value, sharePrefs.dirty);
+                sharePrefs.updatedAt = cur ? cur.updatedAt : null;
+                continue;
+            }
+            // Offline, or a server without prefs: kept on the phone, sent next time.
+            return;
+        }
+    }
+}
+
+async function updateSharePrefs(fn, app) {
+    sharePrefs.value = fn(sharePrefs.value);
+    for (const k of [app, '__slots']) if (!sharePrefs.dirty.includes(k)) sharePrefs.dirty.push(k);
+    keepSharePrefs();
+    await pushSharePrefs();
+}
+
+// The copy's folders for the share sheet: only this account's copy, from
+// this server.
+let copyIndex = { rev: -1, snapshot: null, index: null };
+
+function shareCopy() {
+    if (!state.snapshot || !configured() || accountChanging || !copyIsMine()) return { ready: false };
+    if (state.snapshotUrl && state.snapshotUrl !== state.config.url.replace(/\/$/, '')) return { ready: false };
+    if (copyIndex.snapshot !== state.snapshot || copyIndex.rev !== state.treeRev) {
+        assignIds(state.snapshot);
+        copyIndex = {
+            rev: state.treeRev,
+            snapshot: state.snapshot,
+            index: Share.indexFolders((state.snapshot.children || []).map(toWire).filter(Boolean))
+        };
+    }
+    return { ready: true, index: copyIndex.index, serverIds: state.serverIds };
+}
+
+// The folder's place in the copy, for 'Open folder'.
+function openFolderById(id) {
+    if (!state.snapshot) return;
+    const path = [];
+    const walk = (node) => {
+        for (const c of node.children || []) {
+            if (c.type !== 'folder') continue;
+            path.push(c._pwaId);
+            if (c._pwaId === id || walk(c)) return true;
+            path.pop();
+        }
+        return false;
+    };
+    if (!walk(state.snapshot)) return;
+    if (state.view === 'notes' && !confirmDiscardEdit()) return;
+    if (state.view === 'notes') stopEditing();
+    state.view = 'home';
+    state.pathIds = [state.snapshot._pwaId, ...path];
+    renderView();
+}
+
+// A toast with an Undo, for a soft delete.
+function showUndoToast(message, undo) {
+    showToast(message);
+    const toast = document.getElementById('tp-toast');
+    if (!toast) return;
+    toast.style.pointerEvents = 'auto';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast-undo';
+    btn.textContent = 'Undo';
+    btn.addEventListener('click', () => { toast.remove(); undo(); });
+    toast.appendChild(btn);
+}
+
+function makeShareSheet() {
+    return createShareSheet({
+        outbox,
+        signedIn: () => configured() && !accountChanging,
+        account: shareAccount,
+        username: () => localStorage.getItem(LS.username) || 'this account',
+        copy: shareCopy,
+        flush: (sids) => flushShares(sids),
+        api,
+        applyUnfiled,
+        prefs: { get: () => sharePrefs.value, update: updateSharePrefs },
+        stats: () => shareStats,
+        clipboardLinks: clipboardSuggestions,
+        forgetClipboardLink: (url) => { removeScannedClipboardLink(url); setInboxCount(); },
+        dismissClipboardLink: (url) => { dismissUrl(url); removeScannedClipboardLink(url); setInboxCount(); },
+        toast: showToast,
+        toastUndo: showUndoToast,
+        openSettings: () => openSettings(),
+        saveAsNote: async (text) => {
+            if (!(await startNewNote({ parentId: null, content: text, from: 'Home' }))) showToast('Pull your notes first, then save it as a note.');
+        },
+        openFolder: openFolderById,
+        registerSync: registerShareSync,
+        newId: newLocalId,
+        isDesktop,
+        onInboxCount: (n) => setInboxCount(n),
+        onClose: () => {
+            syncBottomNav();
+            afterShareSheet().catch(() => {});
+            refreshInbox();
+        },
+        done: ({ label, fromShare }) => {
+            // A window the share opened goes back to the app it came from.
+            if (fromShare && history.length === 1) {
+                try { window.close(); } catch (e) { /* not ours to close */ }
+            }
+            if (state.view !== 'notes') renderView();
+            if (label) showToast(`Saved to ${label}`);
         }
     });
-    if (result.added) showToast(`${result.added} shared link${result.added === 1 ? '' : 's'} added`);
 }
 
 // --- Settings / sign in ---
@@ -3727,7 +4127,9 @@ async function refreshWhoAmI() {
     if (!configured()) return null;
     try {
         const data = await api('/api/auth/me');
-        rememberUser(data.user);
+        rememberUser(data.user, undefined, data.serverId);
+        // The worker records shares under this account: tell it who it is.
+        mirrorConfigToSW();
         return data.user;
     } catch (e) {
         return null;
@@ -4068,16 +4470,22 @@ async function submitAuth() {
         localStorage.setItem(LS.url, base);
         localStorage.setItem(LS.token, data.token);
         localStorage.setItem(LS.username, name);
-        rememberUser(user, name);
+        if (!sameAccount) localStorage.removeItem(LS.serverId);
+        rememberUser(user, name, data.serverId);
         mirrorConfigToSW();
         if (!sameAccount) {
             // A clean copy of someone else's: nothing of theirs is lost, and
-            // none of it may show up under this account — the copy, the
-            // lists, an open note or an import waiting for review.
+            // none of it may show up under this account — the copy (on the
+            // phone too), the lists, an open note or an import waiting for
+            // review, and the share sheet's folders and choices.
             state.snapshot = null;
             state.snapshotUserId = null;
             state.snapshotUsername = null;
             state.keptDraft = null;
+            state.serverIds = new Set();
+            shareStats = null;
+            sharePrefs = { value: null, updatedAt: null, dirty: [] };
+            clearTreeCache();
             resetAccountUi();
         } else {
             reopenKeptDraft();
@@ -4086,7 +4494,7 @@ async function submitAuth() {
         hide($('auth-discard'));
         refreshAuthUi();
         hide($('settings-sheet'));
-        bootstrap();
+        await bootstrap();
     } catch (e) {
         setErr('Sign in failed: ' + e.message);
     }
@@ -4111,6 +4519,8 @@ function discardPreviousEdits() {
     state.dirty = false;
     state.editCount = 0;
     state.keptDraft = null;
+    state.serverIds = new Set();
+    clearTreeCache();
     resetAccountUi();
     hide(btn);
     const err = $('auth-error');
@@ -4153,6 +4563,12 @@ async function signOut() {
     } catch (e) { /* ignore */ } finally {
         accountChanging = false;
     }
+    // Shares not uploaded yet stay on the phone, kept for this account.
+    const me = shareConfig();
+    let waiting = 0;
+    try {
+        waiting = (await outbox.list()).filter(e => e.url && !e.uploaded && me && Share.sameAccount(e.account, me)).length;
+    } catch (e) { waiting = 0; }
     state.config.token = '';
     forgetUser();
     mirrorConfigToSW();
@@ -4163,18 +4579,26 @@ async function signOut() {
         state.snapshotUsername = null;
         state.dirty = false;
         state.editCount = 0;
+        state.serverIds = new Set();
     }
+    // The copy kept on the phone goes with it — unless it holds the work
+    // just kept for this account, which a reload must not lose either.
+    if (kept) saveTreeCache();
+    else clearTreeCache();
+    shareStats = null;
+    sharePrefs = { value: null, updatedAt: null, dirty: [] };
     resetAccountUi();
     refreshAuthUi();
     const plural = (keepEdits && keepDraft) || (keepEdits && n !== 1);
-    setStatus(!kept ? 'Signed out.'
+    const shares = waiting ? ` ${waiting} shared link${waiting === 1 ? '' : 's'} not uploaded yet ${waiting === 1 ? 'waits' : 'wait'} on this phone for ${who}.` : '';
+    setStatus((!kept ? 'Signed out.'
         : keepEdits ? `Signed out. ${kept} for ${who} ${plural ? 'stay' : 'stays'} on this phone until ${who} signs in and pushes.`
-            : `Signed out. ${who}’s unsaved note stays on this phone until ${who} signs in again.`);
+            : `Signed out. ${who}’s unsaved note stays on this phone until ${who} signs in again.`) + shares);
 }
 
 // What the screen holds for the signed-in account besides the working copy:
 // the server's lists (inbox, proposals, importers), an import waiting for
-// review, unfiled-link suggestions, and the notes screen with whatever note is
+// review, the share sheet's folders, and the notes screen with whatever note is
 // open in it. Dropped whenever the account changes or signs out, back to
 // Home, so none of it shows up — or can be saved — under whoever signs in
 // next. The working copy follows its own rules above; an unsaved note is set
@@ -4183,14 +4607,14 @@ async function signOut() {
 function resetAccountUi() {
     closeNotesSheets();
     hide($('inbox-sheet'));
-    hide($('quick-file-sheet'));
-    state.inbox = [];
     state.proposals = [];
     state.importers = [];
     renderImporters(); // Settings stays open over a sign-out
     state.importBatch = null;
-    activeQuickFileItems = [];
-    updateClipBtnBadge();
+    setInboxCount(0);
+    // An open share sheet stays (the share is not the account's), but draws
+    // its folders again from whoever is signed in now, or none.
+    if (shareSheet) shareSheet.refresh({ reset: true });
     state.nv = freshNv();
     state.view = 'home';
     if (state.snapshot) state.pathIds = [state.snapshot._pwaId];
@@ -4401,88 +4825,35 @@ function saveSettings() {
 
 // --- Wire up ---
 window.addEventListener('DOMContentLoaded', () => {
+    shareSheet = makeShareSheet();
+
+    // ⋯ › Inbox. The tap is also the gesture that lets the clipboard be
+    // read: a copied link shows in the Inbox under From clipboard.
     safeAddListener('clipBtn', 'click', async (e) => {
         e.stopPropagation();
         e.preventDefault();
 
-        // Unfiled links are filed into the signed-in account: signed out,
-        // neither the clipboard is read nor the sheet opened. (Synchronous,
-        // so the clipboard read below is still the gesture's first await.)
+        // Links are filed into the signed-in account: signed out, neither
+        // the clipboard is read nor the inbox opened. (Synchronous, so the
+        // clipboard read below is still the gesture's first await.)
         if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
 
-        // 1. Instantly read the clipboard before ANY microtask boundary or async call!
-        // This satisfies WebKit's strict security engine in standalone mobile PWAs.
-        if (!navigator.clipboard || !navigator.clipboard.readText) {
-            showToast('Clipboard API not supported. Paste manually below.');
-            openQuickFileSheet();
-            $('quick-file-paste-input').focus();
-            return;
-        }
-
-        let text = '';
-        try {
-            text = await navigator.clipboard.readText();
-        } catch (e) {
-            showToast('Clipboard access denied. Paste manually below.');
-            openQuickFileSheet();
-            $('quick-file-paste-input').focus();
-            console.warn(e);
-            return;
-        }
-
-        const trimmed = (text || '').trim();
-        if (!trimmed || !/^https?:\/\/\S+$/.test(trimmed)) {
-            showToast('No URL in clipboard. Paste manually below.');
-            openQuickFileSheet();
-            $('quick-file-paste-input').focus();
-            return;
-        }
-
-        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
-
-        if (!state.snapshot) {
-            showToast('Loading snapshot first…');
-            try {
-                await pullSnapshot();
-            } catch (err) {
-                showToast('Failed to pull snapshot: ' + err.message);
-                return;
+        // Read the clipboard before any other await: WebKit allows it only
+        // as the gesture's first.
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            let text = '';
+            try { text = await navigator.clipboard.readText(); } catch (err) { text = ''; }
+            const trimmed = (text || '').trim();
+            if (/^https?:\/\/\S+$/.test(trimmed)) {
+                if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
+                if (state.snapshot && isUrlInSnapshot(trimmed, state.snapshot)) showToast('The copied link is filed already.');
+                else if (getDismissedUrls().map(normalizeUrl).includes(normalizeUrl(trimmed))) showToast('You skipped the copied link before — paste it to file it.');
+                else addScannedClipboardLink(trimmed, trimmed);
+                setInboxCount();
             }
         }
-
-        // 2. Process the scanned URL
-        const normTrimmed = normalizeUrl(trimmed);
-        if (isUrlInSnapshot(trimmed, state.snapshot)) {
-            showToast('Link is already filed in your bookmarks.');
-            openQuickFileSheet();
-            $('quick-file-paste-input').focus();
-            return;
-        }
-
-        const dismissed = getDismissedUrls();
-        const dismissedSet = new Set(dismissed.map(normalizeUrl));
-
-        if (dismissedSet.has(normTrimmed)) {
-            showToast('Previously skipped clipboard link. Paste manually if desired.');
-            openQuickFileSheet();
-            $('quick-file-paste-input').focus();
-            return;
-        }
-
-        // Add to persistent clipboard scan storage
-        addScannedClipboardLink(trimmed, trimmed);
-        
-        // Re-run the full checklist combining everything (skipping duplicate scan)
-        await checkUnfiledLinks(true);
-
-        // Check if our specific scanned item is now active in the sheet
-        if (activeQuickFileItems.some(item => normalizeUrl(item.url) === normTrimmed)) {
-            showToast('Unfiled link added from clipboard!');
-        } else {
-            showToast('Showing unfiled links bottom sheet.');
-        }
-        openQuickFileSheet();
-        $('quick-file-paste-input').focus();
+        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
+        openInbox();
     });
 
     safeAddListener('pullBtn', 'click', async (e) => {
@@ -4752,92 +5123,12 @@ window.addEventListener('DOMContentLoaded', () => {
         openInbox();
     });
     safeAddListener('inbox-close', 'click', () => hide($('inbox-sheet')));
-    safeAddListener('dropHereBtn', 'click', dropHere);
 
-    safeAddListener('quick-file-close', 'click', () => hide($('quick-file-sheet')));
-
-    const pasteInput = $('quick-file-paste-input');
-    
-    function processPastedLink(text) {
-        let trimmed = (text || '').trim();
-        if (!trimmed) return false;
-        
-        // Auto-prepend https:// if it looks like a domain without scheme
-        if (!/^https?:\/\//i.test(trimmed)) {
-            if (/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/.test(trimmed)) {
-                trimmed = 'https://' + trimmed;
-            }
-        }
-        
-        if (/^https?:\/\/\S+$/.test(trimmed)) {
-            // null: a link, refused — kept in the box for after signing in.
-            if (signedOutRefuses('Sign in first — links are filed into your account.')) return null;
-            if (!state.snapshot) {
-                showToast('Pulling snapshot first…');
-                pullSnapshot().then(() => {
-                    handleScannedLink(trimmed);
-                }).catch(err => {
-                    showToast('Failed to pull snapshot: ' + err.message);
-                });
-                return true;
-            }
-            
-            handleScannedLink(trimmed);
-            return true;
-        }
-        return false;
-    }
-
-    function handleScannedLink(url) {
-        if (signedOutRefuses('Sign in first — links are filed into your account.')) return;
-        const norm = normalizeUrl(url);
-        if (isUrlInSnapshot(url, state.snapshot)) {
-            showToast('Link is already filed in your bookmarks.');
-            return;
-        }
-        
-        const dismissed = getDismissedUrls();
-        const dismissedSet = new Set(dismissed.map(normalizeUrl));
-        
-        // If it was previously dismissed/skipped, allow un-dismissing it on manual entry!
-        if (dismissedSet.has(norm)) {
-            const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== norm);
-            localStorage.setItem(userKey(DISMISSED_KEY), JSON.stringify(updatedDismissed));
-        }
-        
-        addScannedClipboardLink(url, url);
-        checkUnfiledLinks(true);
-        showToast('Unfiled link added!');
-    }
-
-    if (pasteInput) {
-        pasteInput.addEventListener('paste', (e) => {
-            const text = (e.clipboardData || window.clipboardData).getData('text');
-            if (processPastedLink(text)) {
-                e.preventDefault();
-                pasteInput.value = '';
-            }
-        });
-
-        pasteInput.addEventListener('input', () => {
-            const text = pasteInput.value;
-            if (processPastedLink(text)) {
-                pasteInput.value = '';
-            }
-        });
-
-        pasteInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                const text = pasteInput.value;
-                const taken = processPastedLink(text);
-                if (taken) {
-                    pasteInput.value = '';
-                } else if (taken === false && text.trim()) {
-                    showToast('Please enter a valid URL.');
-                }
-            }
-        });
-    }
+    // The share sheet's keys on a desktop: 1-4 save to that chip, typing
+    // searches, Esc steps back or means Later.
+    document.addEventListener('keydown', (e) => {
+        if (shareSheet && shareSheet.onKey(e) && e.stopImmediatePropagation) e.stopImmediatePropagation();
+    }, true);
 
     // Global click listener to trigger clipboard scan using a valid user gesture context.
     // Signed in only: signed out, a copy kept on the phone is its account's,
@@ -4846,17 +5137,46 @@ window.addEventListener('DOMContentLoaded', () => {
         if (e.target.closest('.sheet')) return;
         if (!$('settings-sheet').classList.contains('hidden')) return;
         if (!$('inbox-sheet').classList.contains('hidden')) return;
+        if (shareSheet && shareSheet.isOpen()) return;
 
-        if (configured() && state.snapshot && $('quick-file-sheet').classList.contains('hidden')) {
+        if (configured() && state.snapshot) {
             checkUnfiledLinks().catch(() => {});
         }
     });
+
+    // Going to the background keeps the copy (and a note being written) on
+    // the phone: a share reloads this window, and Android may close it.
+    // Coming back, and coming online, sends what waits.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') saveTreeCache();
+        else if (document.visibilityState === 'visible' && configured()) {
+            flushShares().then(res => { if (res && (res.uploaded.length || res.filed.length)) refreshInbox(); }).catch(() => {});
+        }
+    });
+    window.addEventListener('pagehide', () => { saveTreeCache(); });
+    window.addEventListener('online', () => {
+        if (!configured()) return;
+        flushShares().then(() => refreshInbox()).catch(() => {});
+    });
+    // The worker uploaded or filed something: links it filed go into the copy.
+    if (navigator.serviceWorker && typeof navigator.serviceWorker.addEventListener === 'function') {
+        navigator.serviceWorker.addEventListener('message', (e) => {
+            const data = e.data || {};
+            if (data.type !== 'tp-outbox' || !data.result) return;
+            for (const f of data.result.filed || []) applyFiled(f.result);
+            refreshInbox();
+        });
+    }
 
     // Notes always opens fresh at start-up; an entry left over from before a
     // reload would otherwise claim a pane this page is not showing.
     loadNotesPrefs();
     if (history.state && history.state.tp === 'nv') history.replaceState(null, '', location.pathname);
     syncBottomNav();
+
+    // The copy kept on the phone survives, but the browser may evict Cache
+    // Storage under pressure unless the site's storage is persistent.
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* not offered */ }
 
     bootstrap();
 

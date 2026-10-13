@@ -1,18 +1,17 @@
-// Minimal service worker — network-first for the app shell so updates roll
-// out immediately; the cache is only an offline fallback. API/LLM calls
-// always go to the network.
+// Service worker: the app shell, and shares.
+//
 // Release ritual: bump the version here AND the ?v= queries in index.html
-// together — all four numbers below included. Miss one and the phone keeps
-// serving the old bundle from cache while the desktop looks fixed.
+// together — SHELL_CACHE, the SHELL entries and the importScripts below
+// included. Miss one and the phone keeps serving the old bundle from cache
+// while the desktop looks fixed. tools/test_pwa_release.mjs checks they agree.
+importScripts('shareCore.js?v=29');
+
 const SHELL_CACHE = 'tp-shell-v29';
 
-// Server URL + session token, mirrored here by the app.
-//
-// A share is handled entirely in this worker so that sharing a post does not
-// launch the app — see the fetch handler below. Workers cannot read
-// localStorage, where the config actually lives, so the app copies it into this
-// cache on every save. Cache Storage rather than IndexedDB purely because both
-// sides can use it in a few lines.
+// Server URL, session token and who it is, mirrored here by the app: workers
+// cannot read localStorage, where the config actually lives. Cache Storage
+// rather than IndexedDB because both sides use it in a few lines, as they do
+// for the outbox (tp-outbox) and the app's working copy (tp-data).
 const CONFIG_CACHE = 'tp-config';
 const CONFIG_KEY = '/__tp_config';
 const SHELL = [
@@ -20,24 +19,36 @@ const SHELL = [
     '/index.html',
     '/app.css?v=29',
     '/app.js?v=29',
+    '/shareCore.js?v=29',
+    '/shareSheet.js',
     '/bookmarksHtml.js',
-    '/pendingShares.js',
     '/notesModel.js',
     '/manifest.webmanifest',
     '/icons/icon192.png'
 ];
 
+// How long a share's upload may take before the worker gives up on it; it
+// stays in the outbox and goes with the next flush.
+const UPLOAD_TIMEOUT_MS = 6000;
+// How long a navigation waits on the network before the cached shell.
+const NAVIGATION_TIMEOUT_MS = 3000;
+
+const Share = self.TPShare;
+const outbox = () => Share.cacheOutbox(caches);
+
+// One SHELL file failing (a 404 mid-deploy) must not leave nothing cached.
 self.addEventListener('install', (event) => {
-    event.waitUntil(caches.open(SHELL_CACHE).then(c => c.addAll(SHELL)).catch(() => {}));
+    event.waitUntil(caches.open(SHELL_CACHE).then(c => Promise.allSettled(SHELL.map(u => c.add(u)))));
     self.skipWaiting();
 });
 
+// Only older shells go. tp-config, tp-outbox and tp-data are not versions:
+// dropping one would sign the share handler out, lose shares not yet
+// uploaded, or the working copy kept for a reload.
 self.addEventListener('activate', (event) => {
     event.waitUntil(
         caches.keys().then(keys => Promise.all(
-            // CONFIG_CACHE is not a shell version — dropping it would log the
-            // share handler out on every release.
-            keys.filter(k => k !== SHELL_CACHE && k !== CONFIG_CACHE).map(k => caches.delete(k))
+            keys.filter(k => k.startsWith('tp-shell-') && k !== SHELL_CACHE).map(k => caches.delete(k))
         ))
     );
     self.clients.claim();
@@ -55,101 +66,135 @@ async function readConfig() {
     }
 }
 
-// Handle a shared link without launching the app.
-//
-// The Web Share Target spec always navigates to the target, so the only way to
-// avoid the app booting is to answer that navigation here. A 204 tells the
-// browser there is nothing to display, so the share completes and you stay in
-// X or Instagram.
-//
-// Anything that stops this worker from finishing the job — no config mirrored
-// yet, server unreachable, the inbox refusing the link — redirects into the
-// app instead, which handles the same share the long way. Losing the link
-// would be far worse than opening a window.
-async function handleShare(request) {
-    // Absolute on purpose: Response.redirect resolves a relative URL against
-    // the worker's base in a browser, but that is a subtlety worth not relying
-    // on when the cost of being explicit is one URL constructor.
-    const fallback = (url, title) => Response.redirect(
-        new URL('/?' + new URLSearchParams({ share: '1', url: url || '', title: title || '' }),
-            self.location.origin).href,
-        303
-    );
-
-    let url = '';
-    let title = '';
-    try {
-        const form = await request.formData();
-        url = String(form.get('url') || '');
-        title = String(form.get('title') || '');
-        const text = String(form.get('text') || '');
-        // Android apps vary in which field carries the link; X puts it in text.
-        if (!url && /https?:\/\//.test(text)) {
-            const m = text.match(/https?:\/\/\S+/);
-            if (m) url = m[0];
-        }
-        if (!url && text) title = title || text;
-    } catch (e) {
-        return fallback('', '');
-    }
-
-    if (!url) return fallback(url, title);
-
+// Upload what waits in the outbox, for the account signed in now, and tell
+// any open window what happened (it folds filed links into its copy).
+async function flush(opts = {}) {
     const cfg = await readConfig();
-    if (!cfg) return fallback(url, title);
-
-    const post = (path, body) => fetch(cfg.url.replace(/\/$/, '') + path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.token },
-        body: JSON.stringify(body)
-    });
-
+    if (!cfg) return null;
+    const result = await Share.flushOutbox({ outbox: outbox(), cfg, fetch: (u, o) => fetch(u, o), timeoutMs: UPLOAD_TIMEOUT_MS, ...opts });
     try {
-        const res = await post('/api/imports/capture', { url, title });
-        if (res.ok) {
-            const data = await res.json();
-            if (data.captured) return new Response(null, { status: 204 });
-            // Not X or Instagram — still worth keeping, just in the inbox. A
-            // full inbox (429) or any other refusal goes to the app, which
-            // keeps the link on the phone and says why.
-            const inbox = await post('/api/shared', { url, title });
-            if (inbox.ok) return new Response(null, { status: 204 });
-            return fallback(url, title);
-        }
-        // An older server has no capture route; the inbox still works.
-        if (res.status === 404) {
-            const inbox = await post('/api/shared', { url, title });
-            if (inbox.ok) return new Response(null, { status: 204 });
-        }
+        const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        for (const w of wins) w.postMessage({ type: 'tp-outbox', result });
+    } catch (e) { /* no window to tell */ }
+    return result;
+}
+
+// The app's old way in, carrying all three fields: used only when the share
+// could not be kept here, so the app can keep it instead.
+function legacyRedirect(fields) {
+    const params = new URLSearchParams({ share: '1', url: fields.url || '', title: fields.title || '', text: fields.text || '' });
+    return Response.redirect(new URL('/?' + params, self.location.origin).href, 303);
+}
+
+// A share arrives here, from the manifest's share_target. It is written to
+// the outbox before anything touches the network, then uploaded in the
+// background, and the app opens on it with only its id in the address — the
+// link itself never goes into a URL. Whatever the upload does (offline,
+// signed out, refused, never answering) the share stays in the outbox, and
+// the app shows it at once from there.
+async function handleShare(event) {
+    let fields = { title: '', text: '', url: '' };
+    try {
+        const form = await event.request.formData();
+        fields = {
+            title: String(form.get('title') || ''),
+            text: String(form.get('text') || ''),
+            url: String(form.get('url') || '')
+        };
     } catch (e) {
-        // Offline or the server is down — fall through.
+        return legacyRedirect(fields);
     }
-    return fallback(url, title);
+    const cfg = await readConfig();
+    let entry;
+    try {
+        entry = Share.makeEntry({ fields, account: Share.accountOf(cfg), source: 'share' });
+        await outbox().put(entry);
+    } catch (e) {
+        return legacyRedirect(fields);
+    }
+    if (cfg && entry.url) event.waitUntil(flush({ sids: [entry.sid] }).catch(() => {}));
+    return Response.redirect(new URL('/?share=' + encodeURIComponent(entry.sid), self.location.origin).href, 303);
+}
+
+async function cachedShell() {
+    const cache = await caches.open(SHELL_CACHE);
+    return (await cache.match('/')) || (await cache.match('/index.html')) || null;
+}
+
+// The shell is cached under '/' only, never under a navigation's query
+// string: /?share=… must not leave a copy per share behind.
+async function keepShell(res) {
+    if (!res || !res.ok) return;
+    try { await (await caches.open(SHELL_CACHE)).put('/', res); } catch (e) { /* cache full: not fatal */ }
+}
+
+async function navigation(event, url) {
+    const share = url.searchParams.get('share');
+    if (share && share !== '1') {
+        // A share opening the app: paint from cache at once, and refresh the
+        // cached shell in the background for next time.
+        const hit = await cachedShell();
+        const fresh = fetch('/').then(res => keepShell(res.clone()).then(() => res));
+        if (hit) {
+            event.waitUntil(fresh.catch(() => {}));
+            return hit;
+        }
+        return fresh;
+    }
+    let timer = null;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), NAVIGATION_TIMEOUT_MS); });
+    const net = fetch(event.request);
+    try {
+        const res = await Promise.race([net, timeout]);
+        if (res.ok && (url.pathname === '/' || url.pathname === '/index.html')) await keepShell(res.clone());
+        return res;
+    } catch (e) {
+        const hit = await cachedShell();
+        if (hit) return hit;
+        return net;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 self.addEventListener('fetch', (event) => {
     const req = event.request;
-    const shareUrl = new URL(req.url);
-    // The share target posts here. Answering it in the worker is what keeps the
-    // app from launching.
-    if (req.method === 'POST' && shareUrl.pathname === '/share') {
-        event.respondWith(handleShare(req));
+    const url = new URL(req.url);
+    if (url.origin !== self.location.origin) return;
+    if (req.method === 'POST' && url.pathname === '/share') {
+        event.respondWith(handleShare(event));
         return;
     }
     if (req.method !== 'GET') return;
-    const url = new URL(req.url);
-    // Never cache API calls or LLM share links — always go to network.
+    // API calls and LLM share links always go to the network.
     if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/llm/')) return;
-    // Network-first: fresh files when online, cached copy when offline.
+    if (req.mode === 'navigate') {
+        event.respondWith(navigation(event, url));
+        return;
+    }
+    // Everything else, network-first: fresh files when online, cached when
+    // not.
     event.respondWith(
         fetch(req)
             .then(res => {
-                if (res.ok && url.origin === self.location.origin) {
+                if (res.ok) {
                     const copy = res.clone();
-                    caches.open(SHELL_CACHE).then(c => c.put(req, copy));
+                    event.waitUntil(caches.open(SHELL_CACHE).then(c => c.put(req, copy)).catch(() => {}));
                 }
                 return res;
             })
-            .catch(() => caches.match(req).then(hit => hit || caches.match('/index.html')))
+            .catch(() => caches.match(req).then(hit => hit || Response.error()))
     );
+});
+
+// Background Sync (Chromium): the app registers 'tp-outbox' when a share
+// could not go up; the browser wakes this when the network is back.
+self.addEventListener('sync', (event) => {
+    if (event.tag === 'tp-outbox') event.waitUntil(flush());
+});
+
+// The app asks for a flush on start, on 'online' and after a sign-in.
+self.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type === 'flush') event.waitUntil(flush(Array.isArray(data.sids) ? { sids: data.sids } : {}));
 });

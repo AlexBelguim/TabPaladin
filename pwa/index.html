@@ -22,7 +22,7 @@
     <div id="menu-wrap">
       <button id="menuBtn" class="ghost" title="Menu">⋯</button>
       <div id="menu" class="hidden">
-        <button id="clipBtn" class="menu-item" title="Scan clipboard for unfiled links">📋 Unfiled links</button>
+        <button id="clipBtn" class="menu-item" title="Links waiting to be filed, and a copied link">📥 Inbox</button>
         <button id="newFolderBtn" class="menu-item" title="Create new folder here">📁+ New folder</button>
         <button id="pullBtn" class="menu-item" title="Pull latest from sync server">⬇️ Pull</button>
         <button id="settingsBtn" class="menu-item" title="Settings">⚙ Settings</button>
@@ -43,41 +43,28 @@
   <nav id="bottom-nav">
     <button type="button" data-nav="home" class="on"><span class="bn-i">🏠</span>Home</button>
     <button type="button" data-nav="notes"><span class="bn-i">📝</span>Notes<span class="bn-badge hidden" aria-label="Notes waiting for approval"></span></button>
-    <button type="button" data-nav="inbox"><span class="bn-i">📥</span>Inbox</button>
+    <button type="button" data-nav="inbox"><span class="bn-i">📥</span>Inbox<span class="bn-badge inbox-badge hidden" aria-label="Links waiting to be filed"></span></button>
     <button type="button" data-nav="settings"><span class="bn-i">⚙</span>Settings</button>
   </nav>
 
-  <div id="inbox-fab" class="hidden" title="Recent shared links">
+  <!-- The Inbox's button where there is no tab bar (900px and wider). -->
+  <div id="inbox-fab" class="hidden" title="Inbox: links waiting to be filed">
     📥 <span id="inbox-count">0</span>
   </div>
 
-  <!-- Bottom modal: recent shared links inbox -->
-  <div id="inbox-sheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <!-- Inbox: every link waiting to be filed — shares not uploaded yet, the
+       server's inbox, copied links — and what was filed lately. Drawn by
+       shareSheet.js. -->
+  <div id="inbox-sheet" class="sheet inbox-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="inbox-title">
     <div class="sheet-header">
-      <strong>Recent links</strong>
-      <button id="inbox-close" class="ghost">✕</button>
+      <strong id="inbox-title">Inbox</strong>
+      <button id="inbox-close" class="ghost" aria-label="Close">✕</button>
     </div>
     <div id="inbox-list" class="sheet-list"></div>
-    <div class="sheet-footer">
-      <button id="dropHereBtn" class="primary">Drop here</button>
-      <small id="dropHereHint" class="hint"></small>
-    </div>
   </div>
 
-  <!-- Bottom modal: quick-file proactive modal for unfiled links -->
-  <div id="quick-file-sheet" class="sheet hidden" role="dialog" aria-modal="true">
-    <div class="sheet-header">
-      <strong>Unfiled Links</strong>
-      <button id="quick-file-close" class="ghost">✕</button>
-    </div>
-    <div style="padding: 10px 16px; border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.1);">
-      <input id="quick-file-paste-input" type="text" placeholder="Paste link here to accumulate..." autocomplete="off" spellcheck="false">
-    </div>
-    <div id="quick-file-list" class="sheet-list"></div>
-    <div class="sheet-footer">
-      <small id="quick-file-hint" class="hint"></small>
-    </div>
-  </div>
+  <!-- Save link: the share sheet (shareSheet.js) -->
+  <div id="share-sheet" class="sheet share-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="share-title"></div>
 
   <!-- Settings modal -->
   <div id="settings-sheet" class="sheet hidden" role="dialog" aria-modal="true">
@@ -231,6 +218,8 @@
     </div>
   </div>
 
+  <!-- The share core is a classic script: the worker loads the same file. -->
+  <script src="shareCore.js?v=29"></script>
   <script src="app.js?v=29" type="module"></script>
 </body>
 </html>

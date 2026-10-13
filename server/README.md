@@ -471,11 +471,13 @@ TabPaladin Imports/X/Saved/<YYYY-MM>/          "@nasa — Look at this nebula"
 TabPaladin Imports/Instagram/Saved/<YYYY-MM>/
 ```
 
-`POST /api/imports/capture` does the routing. It classifies by
-host, creates the source on first use (nothing to set up), and returns
-`captured:false` for anything else so the client falls back to the ordinary
-shared-links inbox. Share-sheet tracking parameters (`?t=`, `?s=`, `?igsh=`) are
-stripped before storing, or the same post shared twice would archive twice.
+A share arriving at `POST /api/shares` is archived through the same routine
+as `POST /api/imports/capture`, which also stays for older clients. It
+classifies by host, creates the source on first use (nothing to set up), and
+returns `captured:false` for anything else. Share-sheet tracking parameters
+(`?t=`, `?s=`, `?igsh=`) are stripped before storing, or the same post shared
+twice would archive twice. Filing such a share into a folder marks its archive
+row filed, so it is not drawn twice; Later leaves it in the archive only.
 
 These sources have no credentials and no sweep, so the clients drop the
 Authorise, Sweep and Pause controls for them. Everything else is identical —
@@ -496,7 +498,10 @@ That would be a separate native app firing the same share intent.
 node tools/test_items.mjs      # canonical tree store: migration, versioning, notes
 node tools/test_treestore.mjs  # extension working copy: managers, facade, sync, import verbs
 node tools/test_imports.mjs    # importers: archive, virtual subtree, tombstones
-node tools/test_share_sw.mjs   # PWA service worker share handling
+node tools/test_share_sw.mjs   # PWA service worker: shares kept before the network, the shell cache
+node tools/test_share_core.mjs # the share core: what a share holds, cleaning, apps, suggestions, outbox, folding appends
+node tools/test_share_pwa.mjs  # the share sheet in the PWA against a real server: one-tap filing, undo, offline, rebase, kept copy
+node tools/test_pwa_release.mjs # the PWA's version numbers agree, and the shell holds what it loads
 node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
 node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
@@ -508,17 +513,39 @@ node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # aga
 
 ### Sharing from a phone
 
-The PWA declares a share target, so a post shared from X or Instagram on Android
-lands in its own archive beside Reddit. The share posts to `/share`, which the
-**service worker answers itself** and replies `204` — that is what stops the app
-launching every time you share something. The worker cannot read `localStorage`,
-so the app mirrors the server URL and session token into a `tp-config` Cache
-Storage entry, cleared on sign-out.
+The PWA declares a share target: **Share → TabPaladin** from any app. The share
+posts to `/share`, which the **service worker** answers:
 
-Anything that stops the worker finishing — not signed in, server unreachable,
-session expired — redirects into the app, which handles the same share the long
-way. `POST /share` on the server does the same when no worker is registered yet.
-Losing the link is the one outcome worth avoiding.
+1. It writes the share to the outbox (`tp-outbox` in Cache Storage) before
+   anything touches the network, with an id of its own and the account
+   signed in, then answers `303` to `/?share=<id>` — the link itself never
+   goes into a URL.
+2. In the background it uploads the share (`POST /api/shares`, a 6 s
+   timeout). X and Instagram posts are archived on arrival, as before.
+3. The app opens on the share, from cache, with the **Save link** sheet: the
+   folders you usually use for that app as chips (pinned ones first, then
+   the last one used, then where most of that app's links are). One tap files
+   it there — straight into the server's tree, not a push of the phone's copy
+   — and another tap files it into a second folder; Undo takes it back. Other
+   folders, new ones and pins are a tap away.
+
+Offline, signed out, a session that expired, a server that refuses or never
+answers: the share stays in the outbox, a folder chosen offline is filed when
+the phone is back online (Background Sync where there is one, otherwise the
+next start), and the Inbox lists what waits. A share captured as one account
+is never uploaded to another without a yes. The worker cannot read
+`localStorage`, so the app mirrors the server URL, session token and account
+into a `tp-config` Cache Storage entry, cleared on sign-out.
+
+The share reloads the app's window, so the app keeps its working copy and a
+half-written note in Cache Storage (`tp-data`) whenever it goes to the
+background, and brings them back — without pulling over unpushed edits.
+
+When the outbox cannot be written, the worker falls back to the old redirect
+`/?share=1&url=…&title=…&text=…` and the app keeps the share instead. `POST
+/share` on the server does the same when no worker is registered yet (the
+first share after installing). Losing the link is the one outcome worth
+avoiding.
 
 ## TLS
 
