@@ -36,6 +36,16 @@
 // from before accounts ('pre-accounts', the server owner's), or one made in
 // this browser while nobody was signed in ('local', claimed by the first
 // account to sign in).
+//
+// A pull never replaces another account's copy either: a tree pulled for an
+// account the copy is not stamped with (or, from before accounts, for anyone
+// but the server's owner) comes into a copy of its own, and this one is set
+// aside first. When the server cannot say whether it is the owner, or another
+// page brings another copy in while the pull waits, the pull stops having
+// changed nothing. And a copy brought back from being set aside remembers the
+// stamps it was set aside under (`restoredFrom`): from before accounts, or at
+// the old address of a server that moved. What was left with it on this
+// device, such as a note draft, can then find its way back to it.
 
 import { ExpandState } from './expandState.js';
 
@@ -86,6 +96,7 @@ const state = {
     origin: null,       // for an unstamped copy: 'pre-accounts' (older version) or 'local' (made while signed out)
     editCount: 0,       // local edits since the last pull or push, for "N unpushed edits"
     copyId: null,       // new each time another copy becomes the working copy (loadCopy)
+    restoredFrom: [],   // stamps of the set-aside copies this one came back from, latest first (see stampOf)
     rev: null           // stamp of the last write, to recognise our own storage events
 };
 
@@ -155,6 +166,7 @@ async function ensureLoaded() {
                 state.origin = originOf(stored);
                 state.editCount = Number(stored.editCount) || (state.dirty ? 1 : 0);
                 state.copyId = stored.copyId || null;
+                state.restoredFrom = stampsIn(stored.restoredFrom);
                 state.rev = stored.rev || null;
             } else {
                 // Nothing here yet: whatever is made before someone signs in
@@ -192,6 +204,7 @@ async function persistNow() {
                 origin: state.owner ? null : state.origin,
                 editCount: state.editCount,
                 copyId: state.copyId,
+                restoredFrom: state.restoredFrom,
                 rev: state.rev
             }
         });
@@ -223,6 +236,7 @@ if (api.storage && api.storage.onChanged) {
         state.origin = originOf(next);
         state.editCount = Number(next.editCount) || 0;
         state.copyId = next.copyId || null;
+        state.restoredFrom = stampsIn(next.restoredFrom);
         state.rev = next.rev || null;
         state.loaded = true;
         reindex();
@@ -459,6 +473,81 @@ function stashMatch(stash, account) {
 
 const stashKeyFor = (owner, url) => STASH_PREFIX + `${trim(owner ? owner.url : url)}|${owner ? owner.userId : 'legacy'}`;
 
+// Where a tree pulled for `owner` goes: 'into' the working copy when the copy
+// is theirs, 'aside' when it is not (the copy is set aside first and the tree
+// comes into a copy of its own), or 'unconfirmed' when only the server could
+// say and it cannot. A stamped copy is theirs when the stamps match, one made
+// here while nobody was signed in is theirs to claim, and one from before
+// accounts only when they are the server's owner, which /api/auth/me says.
+// When it does not answer, nothing is set aside on a guess and nothing is
+// pulled: the caller says so and the user tries again.
+async function pullPlan(config, owner) {
+    if (!owner) return 'into';
+    if (state.owner) return sameAccount(state.owner, owner) ? 'into' : 'aside';
+    if (state.origin === 'local' || !(state.roots.length > 0 || state.dirty)) return 'into';
+    let me = null;
+    try {
+        me = await apiFetch(config, '/api/auth/me');
+    } catch (e) {
+        return 'unconfirmed';
+    }
+    const user = me && me.user;
+    if (!user || user.id === undefined || user.id === null || Number(user.id) !== Number(owner.userId)) return 'unconfirmed';
+    return user.tenancyOwner ? 'into' : 'aside';
+}
+
+// The working copy as a pull found it. Another page can bring another
+// account's copy in (or stamp this one) while the pull waits on the server;
+// the pull then writes nothing, since what it decided was about a copy that
+// is no longer here.
+function currentCopy() {
+    return { copyId: state.copyId, owner: state.owner };
+}
+
+function stillCopy(copy) {
+    if (state.copyId !== copy.copyId) return false;
+    if (!state.owner || !copy.owner) return !state.owner && !copy.owner;
+    return sameAccount(state.owner, copy.owner);
+}
+
+// Why a pull stopped without changing anything. `code` is for callers;
+// the message is for the user.
+function pullStopped(code, setAside = null) {
+    const err = new Error(code === 'account-changed'
+        ? 'Account changed during pull — nothing was replaced.'
+        : 'Couldn’t confirm the account — try again. Nothing was changed.');
+    err.code = code;
+    err.setAside = setAside;
+    return err;
+}
+
+// The stamp a set-aside copy was set aside under: its account, or for an
+// unstamped one its origin (and the address it was set aside from).
+function stampOf(stash) {
+    return stash.owner
+        ? { url: trim(stash.owner.url), userId: Number(stash.owner.userId), serverId: stash.owner.serverId || null, origin: null }
+        : { url: stash.url ? trim(stash.url) : null, userId: null, serverId: null, origin: originOf(stash) };
+}
+
+// Stamps as stored, without repeats (a copy set aside and brought back again
+// and again keeps one of each) and only the latest few.
+const MAX_RESTORED_FROM = 10;
+function stampsIn(list) {
+    const seen = new Set();
+    return (Array.isArray(list) ? list : []).filter((s) => {
+        if (!s || typeof s !== 'object') return false;
+        const key = `${s.url}|${s.userId}|${s.serverId}|${s.origin}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    }).slice(0, MAX_RESTORED_FROM).map(s => ({
+        url: s.url || null,
+        userId: s.userId === null || s.userId === undefined ? null : Number(s.userId),
+        serverId: s.serverId || null,
+        origin: s.origin || null
+    }));
+}
+
 async function readSettings() {
     try {
         const data = await api.storage.local.get(SETTINGS_KEY);
@@ -512,7 +601,8 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
             setAsideAt: new Date().toISOString(),
             focusedFolderIds: settings.focusedFolderIds || [],
             expanded,
-            pendingRemovals
+            pendingRemovals,
+            restoredFrom: state.restoredFrom
         },
         [STASH_INDEX_KEY]: [...keys, key]
     });
@@ -549,9 +639,14 @@ async function takeStashFor(target, { legacy = false } = {}) {
 }
 
 // Make `stash` (or, with none, an empty copy for `owner`) the working copy,
-// and put the per-account state it carries back in place.
+// and put the per-account state it carries back in place. A stash says which
+// stamp it was set aside under, so the copy it becomes still knows it once
+// stamped `owner` — the server's owner adopting a copy from before accounts,
+// or an account restoring its copy from a server's old address. Returns the
+// copy it made (see currentCopy).
 async function loadCopy(stash, owner) {
-    state.copyId = newId();
+    const copy = { copyId: newId(), owner };
+    state.copyId = copy.copyId;
     state.roots = stash ? stash.roots || [] : [];
     state.baseVersion = stash ? Number(stash.baseVersion) || 0 : 0;
     state.dirty = stash ? Boolean(stash.dirty) : false;
@@ -560,6 +655,7 @@ async function loadCopy(stash, owner) {
     state.lastSyncKind = null;
     state.owner = owner;
     state.origin = null;
+    state.restoredFrom = stash ? stampsIn([stampOf(stash), ...stampsIn(stash.restoredFrom)]) : [];
     reindex();
     const settings = await readSettings();
     await api.storage.local.set({ [SETTINGS_KEY]: { ...settings, focusedFolderIds: stash ? stash.focusedFolderIds || [] : [] } });
@@ -572,6 +668,7 @@ async function loadCopy(stash, owner) {
     }
     await persistNow();
     emit('switch');
+    return copy;
 }
 
 function htmlEscape(s) {
@@ -717,6 +814,7 @@ export const TreeStore = {
             owner: state.owner ? { ...state.owner } : null,
             origin: state.owner ? null : state.origin,
             copyId: state.copyId,
+            restoredFrom: state.restoredFrom.map(s => ({ ...s })),
             isEmpty: state.roots.length === 0
         };
     },
@@ -784,7 +882,9 @@ export const TreeStore = {
 
     // With `account`, each copy also says whether that account may restore
     // it: `match` is 'same', 'moved' (its own, apparently on the same server
-    // at a new address — confirm first) or null.
+    // at a new address — confirm first) or null. `stamps` are the stamps it
+    // answers to — its own, then those it was set aside under before — which
+    // is what a note draft parked with it goes by.
     async listStashes(account = null) {
         const keys = await stashIndex();
         if (!keys.length) return [];
@@ -801,6 +901,7 @@ export const TreeStore = {
                 editCount: s.dirty ? Math.max(1, Number(s.editCount) || 0) : 0,
                 items: countItems(s.roots),
                 setAsideAt: s.setAsideAt,
+                stamps: stampsIn([stampOf(s), ...stampsIn(s.restoredFrom)]),
                 match: account ? stashMatch(s, account) : null
             };
         });
@@ -933,20 +1034,47 @@ export const TreeStore = {
 
         // Replace the working copy with the server's tree. Discards local
         // unpushed edits — callers confirm with the user when status().dirty.
+        // But only the account's own: when the tree is another account's than
+        // the copy's (callers set that aside first, but one may not know who
+        // it is signed in as), the copy is set aside here and the tree comes
+        // into a new one — `setAside` is its stash key.
+        //
+        // Two ways it stops having written nothing, rejecting with err.code:
+        // 'account-changed' when another page brought another copy in while
+        // it waited on the server (that copy is never replaced), and
+        // 'account-unconfirmed' when whose copy this is was the server's to
+        // say and it did not answer (the copy is never set aside on a guess).
         async pull(config) {
             await ensureLoaded();
+            const started = currentCopy();
             const body = await apiFetch(config, '/api/tree');
+            if (!stillCopy(started)) throw pullStopped('account-changed');
+            const owner = ownerFrom(config, body.userId, body.serverId);
+            const plan = await pullPlan(config, owner);
+            if (!stillCopy(started)) throw pullStopped('account-changed');
+            if (plan === 'unconfirmed') throw pullStopped('account-unconfirmed');
+            let setAside = null;
+            if (plan === 'aside') {
+                await applyPendingRemovals();
+                if (!stillCopy(started)) throw pullStopped('account-changed');
+                setAside = await stashCurrent({ fallbackUrl: owner.url });
+                // The copy is in its stash now. If another one came in
+                // meanwhile, no fresh copy replaces it.
+                if (!stillCopy(started)) throw pullStopped('account-changed', setAside);
+                const fresh = await loadCopy(null, owner);
+                if (!stillCopy(fresh)) throw pullStopped('account-changed', setAside);
+            }
             state.roots = Array.isArray(body.roots) ? body.roots : [];
             state.baseVersion = Number(body.version) || 0;
             state.dirty = false;
             state.editCount = 0;
-            state.owner = ownerFrom(config, body.userId, body.serverId);
+            state.owner = owner;
             state.lastSyncAt = new Date().toISOString();
             state.lastSyncKind = 'pull';
             reindex();
             await persistNow();
             emit('pull');
-            return { version: state.baseVersion };
+            return { version: state.baseVersion, setAside };
         },
 
         // Replace the server's tree with the working copy. Refused with a

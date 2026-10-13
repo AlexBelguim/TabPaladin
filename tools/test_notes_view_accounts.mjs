@@ -17,6 +17,28 @@
 //      for the same id on a rebuilt server.
 //   4. Fold state, scope and last open note are kept per account; sort stays
 //      per device.
+//   6. A parked draft waits until its account's copy is ready (pulled, or
+//      holding something) and the editor is free, and lands on its note when
+//      the note is there — never as a second copy of it.
+//   7. A draft from a copy with no account of its own — from before accounts,
+//      or at the old address of a server that moved — comes back when that
+//      copy does, for the account allowed to take it, never before.
+//   8. A pull asks the server whose tree it brings (sidepanel.js doPull and
+//      signedInAccount, lifted from the file): a copy from before accounts
+//      is set aside for anyone but the owner, so the draft in it is never
+//      offered to them, and the owner's own pull keeps both.
+//   9. When the server cannot say whose session it is, nothing is set aside
+//      on a guess — not on what Settings last learned either: the pull stops
+//      with "Couldn’t confirm the account — try again" and changes nothing,
+//      and "set aside" is only ever said of a copy that was another
+//      account's and was set aside.
+//  10. Another page switching accounts while doPull waits (on /api/auth/me,
+//      on /api/tree, or before an agreed pull starts) stops it: "Account
+//      changed during pull — nothing was replaced."
+//  11. Settings › Discard on a set-aside copy (handleStashAction, lifted)
+//      names the note drafts parked with it that only it would bring back,
+//      offers them as a Markdown file first, and lets them go only with the
+//      copy, once confirmed — never one another copy would bring back.
 //
 // Run: node tools/test_notes_view_accounts.mjs
 
@@ -123,8 +145,11 @@ globalThis.innerHeight = 900;
 globalThis.scrollY = 0;
 globalThis.localStorage = { getItem: k => (ls.has(k) ? ls.get(k) : null), setItem: (k, v) => ls.set(k, String(v)), removeItem: k => ls.delete(k) };
 globalThis.confirm = (msg) => { const a = answers.length ? answers.shift() : false; confirms.push(msg); return a; };
-globalThis.alert = (msg) => { console.log('ALERT', msg); };
-globalThis.prompt = () => null;
+const alerts = [];
+globalThis.alert = (msg) => { alerts.push(msg); console.log('ALERT', msg); };
+const prompts = [];
+let promptAnswers = [];
+globalThis.prompt = (msg) => { prompts.push(msg); return promptAnswers.length ? promptAnswers.shift() : null; };
 globalThis.addEventListener = (t, fn) => { (winListeners[t] ||= []).push(fn); };
 globalThis.dispatchEvent = (e) => { for (const fn of winListeners[e.type] || []) fn(e); return true; };
 globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
@@ -147,13 +172,32 @@ const aliceRoots = () => [{ id: 'a-notes', kind: 'folder', title: 'TabPaladin No
 const bobRoots = () => [{ id: 'b-notes', kind: 'folder', title: 'TabPaladin Notes', role: 'notes', children: [
     { id: 'b-nb', kind: 'folder', title: 'Bob work', children: [note('b-note1', 'Bob todo', '# Bob todo\n- [ ] ship')] }
 ] }];
-const server = { 'tok-a': { userId: 1, version: 3, roots: aliceRoots }, 'tok-b': { userId: 2, version: 9, roots: bobRoots } };
+// alice is the server's owner: what this browser held before accounts is hers.
+const server = {
+    'tok-a': { userId: 1, username: 'alice', tenancyOwner: true, version: 3, roots: aliceRoots },
+    'tok-b': { userId: 2, username: 'bob', tenancyOwner: false, version: 9, roots: bobRoots }
+};
+const authMeCalls = [];
+let authMeDown = false;
+// Run once while a request to `path` is in flight: another page acting
+// between a pull's awaits.
+let duringFetch = null;
 globalThis.fetch = async (url, opts = {}) => {
     const token = String((opts.headers || {}).Authorization || '').replace('Bearer ', '');
     const acct = server[token];
+    const reply = (body) => ({ ok: true, status: 200, statusText: 'OK', json: async () => body, text: async () => JSON.stringify(body) });
+    if (duringFetch && String(url).endsWith(duringFetch.path)) {
+        const { fn } = duringFetch;
+        duringFetch = null;
+        await fn();
+    }
+    if (acct && String(url).endsWith('/api/auth/me')) {
+        authMeCalls.push(token);
+        if (authMeDown) throw new Error('offline');
+        return reply({ ok: true, user: { id: acct.userId, username: acct.username, role: 'user', tenancyOwner: acct.tenancyOwner }, serverId: 'srv' });
+    }
     if (!acct || !String(url).endsWith('/api/tree')) throw new Error(`unexpected fetch ${url}`);
-    const body = { ok: true, version: acct.version, roots: acct.roots(), userId: acct.userId, serverId: 'srv' };
-    return { ok: true, status: 200, statusText: 'OK', json: async () => body, text: async () => JSON.stringify(body) };
+    return reply({ ok: true, version: acct.version, roots: acct.roots(), userId: acct.userId, serverId: 'srv' });
 };
 
 storageData.set('tpTree', { baseVersion: 3, roots: aliceRoots(), dirty: false, owner: ALICE, editCount: 0, rev: 'seed' });
@@ -169,6 +213,29 @@ const sidepanel = fs.readFileSync(path.join(ROOT, 'src/sidepanel/sidepanel.js'),
 const helperSrc = (sidepanel.match(/async function beforeAccountSwitch\(action\) \{[\s\S]*?\n\}\n/) || [])[0];
 check('sidepanel.js has beforeAccountSwitch', Boolean(helperSrc));
 const beforeAccountSwitch = new Function(`${helperSrc}\nreturn beforeAccountSwitch;`)();
+
+// Another TabPaladin page: its own TreeStore over the same storage, so what it
+// does reaches this page the way it does in the browser.
+const { TreeStore: OtherPage } = await import('../src/utils/treeStore.js?other-page');
+
+// sidepanel.js's doPull and the signedInAccount it asks, lifted the same way,
+// with Settings that has not learned who is signed in (or, with
+// pullSettings changed, that still names someone else).
+const lift = (name) => (sidepanel.match(new RegExp(`async function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}\\n`)) || [])[0];
+const pullSrc = [lift('signedInAccount'), lift('doPull')];
+check('sidepanel.js has signedInAccount and doPull', pullSrc.every(Boolean));
+let pullToken = 'tok-b';
+let pullSettings = { backend: { url: URL_S } };
+const doPull = new Function('TreeStore', 'StorageManager', 'getSyncConfig', 'persistSyncStamp', 'Tree', 'pruneStaleExpandState', 'beforeAccountSwitch',
+    `${pullSrc.join('\n')}\nreturn doPull;`)(
+    TreeStore,
+    { getSettings: async () => clone(pullSettings) },
+    async () => ({ url: URL_S, token: pullToken }),
+    async () => {},
+    TreeStore.bookmarks,
+    async () => {},
+    beforeAccountSwitch
+);
 
 async function type(id, text) {
     $(id).value = text;
@@ -196,14 +263,36 @@ async function stashOf(userId) {
     return '';
 }
 const leaveNotes = () => { $('notes-container').style.display = 'none'; };
+const clearStashes = async () => { for (const st of await TreeStore.listStashes()) await TreeStore.discardStash(st.key); };
+const diaries = async () => (await NotesManager.getLibrary()).notes.filter(n => n.title === 'Diary').map(n => [n.id, n.content]);
 // Another TabPaladin page bringing another copy in, as TreeStore writes it.
 let otherWrites = 0;
-const otherPageLoads = (owner, roots) => chrome.storage.local.set({
-    tpTree: { baseVersion: 5, roots, dirty: false, owner, editCount: 0, copyId: `other-${++otherWrites}`, rev: `other-${otherWrites}` }
+const otherPageLoads = (owner, roots, extra = {}) => chrome.storage.local.set({
+    tpTree: { baseVersion: 5, roots, dirty: false, owner, editCount: 0, copyId: `other-${++otherWrites}`, rev: `other-${otherWrites}`, ...extra }
 });
+
+// Settings › Set-aside copies (sidepanel.js handleStashAction), lifted the
+// same way, with what it downloads caught.
+const stashActionSrc = (sidepanel.match(/\n {4}async function handleStashAction\(st, act, account\) \{[\s\S]*?\n {4}\}\n/) || [])[0];
+check('sidepanel.js has handleStashAction', Boolean(stashActionSrc));
+const downloads = [];
+const blobs = new Map();
+const handleStashAction = new Function('TreeStore', 'document', 'URL', 'Blob', 'parkedDraftsOnlyWith', 'dropParkedDrafts', 'parkedDraftsMarkdown',
+    'renderStashes', 'beforeAccountSwitch', 'pruneStaleFocusedFolders', 'loadWorkflows',
+    `${stashActionSrc}\nreturn handleStashAction;`)(
+    TreeStore,
+    { getElementById: (id) => $(id), createElement: () => ({ click() { downloads.push({ name: this.download, blob: blobs.get(this.href) }); } }) },
+    { createObjectURL: (b) => { const u = `blob:${blobs.size}`; blobs.set(u, b); return u; }, revokeObjectURL() {} },
+    Blob,
+    NV.parkedDraftsOnlyWith, NV.dropParkedDrafts, NV.parkedDraftsMarkdown,
+    async () => {}, beforeAccountSwitch, async () => 0, async () => {}
+);
+// Let an unsaved draft go, as Discard in the switch question does (section 1).
+const discardDraft = async () => { answers = [false, true]; await beforeAccountSwitch('Starting over'); answers = []; };
 
 NV.initNotesView();
 await TreeStore.load();
+await OtherPage.load();
 await sleep(0);
 
 console.log('1. Before a switch made here, an unsaved note is settled first');
@@ -345,6 +434,346 @@ console.log('\n5. Every switch sidepanel.js makes asks first');
     const names = calls.map(c => c.name).sort().join(',');
     check('the call sites are the four known ones', names === 'doPull,doSignIn,handleStashAction,setAsideAndPull', names);
     for (const c of calls) check(`${c.name} asks before ${c.call.slice(10, -1)}`, c.asks);
+}
+
+console.log('\n6. A parked draft waits for its account’s copy, and lands on its note');
+{
+    answers = [true];
+    await $('deleteNoteBtn').fire('click');
+    check('(the new note from 4 is discarded)', !NV.isDirty() && editorText() === '\n');
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nALICE WAITING');
+    await OtherPage.switchAccount({ ...BOB, previousUsername: 'alice' });
+    await settle();
+    check('another page signs bob in: the draft is parked under alice',
+        parked().length === 1 && parked()[0].owner.userId === 1 && editorText() === '\n');
+    // There, Settings › Discard on alice's set-aside copy, then alice signs in
+    // again: her copy starts empty, and her pull is still on its way.
+    const aliceStash = (await OtherPage.listStashes()).filter(s => s.userId === 1).pop();
+    await OtherPage.discardStash(aliceStash.key);
+    await OtherPage.switchAccount({ ...ALICE, previousUsername: 'bob' });
+    await settle();
+    check('alice’s new, empty copy: the draft waits instead of coming back as text whose note is missing',
+        TreeStore.status().owner.userId === 1 && TreeStore.status().isEmpty
+        && editorText() === '\n' && $('nv-removed').hidden === true && parked().length === 1);
+    await $('newNoteBtn').fire('click');
+    await sleep(0);
+    await type('noteTitleInput', 'Started while waiting');
+    await OtherPage.sync.pull({ url: URL_S, token: 'tok-a' });
+    await settle();
+    check('her pull lands while she writes another note: that note stays, the draft keeps waiting',
+        $('noteTitleInput').value === 'Started while waiting' && NV.isDirty() && parked().length === 1);
+    answers = [true];
+    await $('deleteNoteBtn').fire('click');
+    await NV.openNotes();
+    check('with the editor free again, the draft is back on her note, unsaved, nothing removed',
+        $('noteContentInput').value === '# Diary\nALICE WAITING' && NV.isDirty()
+        && $('nv-removed').hidden === true && parked().length === 0);
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    check('Save updates her note: one Diary, holding the draft',
+        JSON.stringify(await diaries()) === JSON.stringify([['a-note1', '# Diary\nALICE WAITING']]), JSON.stringify(await diaries()));
+
+    await TreeStore.flush();
+    await type('noteContentInput', '# Diary\nALICE AGAIN');
+    await OtherPage.switchAccount({ ...BOB, previousUsername: 'alice' });
+    await settle();
+    // Her copy comes back from another page without that note, say deleted
+    // on another device; a later pull brings it back.
+    const withoutDiary = aliceRoots();
+    withoutDiary[0].children[0].children = withoutDiary[0].children[0].children.filter(n => n.id !== 'a-note1');
+    await otherPageLoads(ALICE, withoutDiary);
+    await settle();
+    check('back in a copy without its note, the draft is text to keep',
+        $('noteContentInput').value === '# Diary\nALICE AGAIN' && NV.isDirty() && $('nv-removed').hidden === false);
+    await chrome.storage.local.set({ tpTree: { ...storageData.get('tpTree'), roots: aliceRoots(), rev: 'pulled-back' } });
+    await settle();
+    check('the note comes back: the editor is on it again', $('nv-removed').hidden === true && NV.isDirty()
+        && $('noteContentInput').value === '# Diary\nALICE AGAIN');
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    check('…so Save updates it rather than keeping a second Diary',
+        JSON.stringify(await diaries()) === JSON.stringify([['a-note1', '# Diary\nALICE AGAIN']]), JSON.stringify(await diaries()));
+}
+
+console.log('\n7. A draft from a copy with no account of its own comes back with that copy');
+{
+    await TreeStore.flush();
+    await clearStashes();
+    // What this browser held before accounts. alice is the server's owner.
+    await otherPageLoads(null, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await NV.openNotes({ scope: 'nb:a-sub' });
+    await type('noteContentInput', '# Diary\nOWNER DRAFT FROM BEFORE ACCOUNTS');
+    await OtherPage.switchAccount({ ...BOB, tenancyOwner: false });
+    await settle();
+    check('bob signing in elsewhere parks it as the draft of the copy from before accounts',
+        parked().length === 1 && parked()[0].owner === null && parked()[0].origin === 'pre-accounts', JSON.stringify(parked()));
+    check('bob is not offered it', editorText() === '\n' && !NV.isDirty() && (await pushPrompts()).length === 0);
+    await OtherPage.sync.pull({ url: URL_S, token: 'tok-b' });
+    await settle();
+    await NV.openNotes();
+    check('nor once his tree is in', parked().length === 1 && !editorText().includes('OWNER'));
+    await OtherPage.switchAccount({ ...ALICE, tenancyOwner: true, previousUsername: 'bob' });
+    await settle();
+    check('the owner signing in gets that copy back, and the draft with it, on its note',
+        (TreeStore.status().restoredFrom[0] || {}).origin === 'pre-accounts'
+        && $('noteContentInput').value === '# Diary\nOWNER DRAFT FROM BEFORE ACCOUNTS' && NV.isDirty()
+        && $('nv-removed').hidden === true && parked().length === 0, JSON.stringify(TreeStore.status().restoredFrom));
+    check('…and the notebook it had open', uiPrefs().scope === 'nb:a-sub', JSON.stringify(uiPrefs()));
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    await TreeStore.flush();
+
+    // The same server at a new address: alice's copy at the old one, with a
+    // draft, set aside when she signs in at the new one in another page.
+    const ALICE_MOVED = { ...ALICE, url: 'https://moved.server.test' };
+    await NV.openNotes({ noteId: 'a-note2' });
+    await type('noteContentInput', '# Medical\nDRAFT AT THE OLD ADDRESS');
+    await OtherPage.switchAccount({ ...ALICE_MOVED, previousUsername: 'alice' });
+    await OtherPage.sync.pull({ url: ALICE_MOVED.url, token: 'tok-a' });
+    await settle();
+    await NV.openNotes();
+    check('at the new address the draft stays parked: the same server is never assumed',
+        parked().length === 1 && parked()[0].owner.url === URL_S && !editorText().includes('OLD ADDRESS'));
+    const moved = (await OtherPage.listStashes(ALICE_MOVED)).find(s => s.match === 'moved');
+    await OtherPage.restoreStash(moved.key, ALICE_MOVED, { moved: true });
+    await settle();
+    check('once she restores that copy there, the draft comes back with it',
+        $('noteContentInput').value === '# Medical\nDRAFT AT THE OLD ADDRESS' && NV.isDirty()
+        && $('nv-removed').hidden === true && parked().length === 0);
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    await TreeStore.flush();
+}
+
+console.log('\n8. A pull asks the server whose tree it brings');
+{
+    await clearStashes();
+    await otherPageLoads(null, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nOWNER DRAFT, BOB’S TOKEN');
+    // Settings never learned who is signed in, and the token is bob's.
+    pullToken = 'tok-b';
+    answers = [true];
+    let n = confirms.length;
+    const msg = await doPull();
+    check('the pull learns from the server it is bob’s', authMeCalls.includes('tok-b'));
+    check('…so it asks about the draft first, as any switch does', confirms.length > n && confirms[n].includes('This pull'), confirms[n]);
+    check('…and sets the copy from before accounts aside instead of pulling over it',
+        /set aside/.test(msg) && (await TreeStore.listStashes()).some(s => s.userId === null && s.origin === 'pre-accounts'), msg);
+    const legacyStash = (await TreeStore.listStashes()).find(s => s.userId === null);
+    check('…with the draft saved into it', JSON.stringify(storageData.get(legacyStash.key).roots).includes('OWNER DRAFT, BOB’S TOKEN'));
+    check('bob has his own tree, and nothing of the draft',
+        TreeStore.status().owner.userId === 2 && !(await libraryText()).includes('OWNER')
+        && editorText() === '\n' && !NV.isDirty() && (await pushPrompts()).length === 0);
+
+    // The owner's own session from before accounts, likewise unknown to
+    // Settings: the pull is hers, so the copy and the draft stay.
+    await clearStashes();
+    await otherPageLoads(null, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nOWNER DRAFT, OWNER’S TOKEN');
+    const copyBefore = TreeStore.status().copyId;
+    pullToken = 'tok-a';
+    n = confirms.length;
+    await doPull();
+    await settle();
+    check('the owner pulling her own tree over it keeps the copy',
+        TreeStore.status().copyId === copyBefore && TreeStore.status().owner.userId === 1
+        && (await TreeStore.listStashes()).length === 0 && confirms.length === n);
+    check('…and the draft stays in the editor, on her note', $('noteContentInput').value === '# Diary\nOWNER DRAFT, OWNER’S TOKEN'
+        && NV.isDirty() && $('nv-removed').hidden === true && parked().length === 0);
+    await discardDraft();
+}
+
+console.log('\n9. A pull that cannot confirm the account changes nothing');
+{
+    const cases = [
+        ['the owner’s own token', 'tok-a', { backend: { url: URL_S } }],
+        ['bob’s token, with Settings still naming alice as the owner', 'tok-b', { backend: { url: URL_S, userId: 1, username: 'alice', tenancyOwner: true } }]
+    ];
+    for (const [label, token, settings] of cases) {
+        await clearStashes();
+        // What this browser held before accounts, with unpushed edits.
+        await otherPageLoads(null, aliceRoots(), { dirty: true, editCount: 2 });
+        await settle();
+        await NV.openNotes({ noteId: 'a-note1' });
+        await type('noteContentInput', '# Diary\nOWNER DRAFT, SERVER UNSURE');
+        const copyBefore = TreeStore.status().copyId;
+        const revBefore = storageData.get('tpTree').rev;
+        pullToken = token;
+        pullSettings = settings;
+        authMeDown = true;
+        answers = [true, true];
+        const a = alerts.length;
+        const msg = await doPull();
+        authMeDown = false;
+        answers = [];
+        await settle();
+        check(`/api/auth/me down, ${label}: the pull stops with “Couldn’t confirm the account — try again”`,
+            /^Couldn’t confirm the account — try again/.test(msg) && !/set aside/.test(msg) && alerts.length === a, msg);
+        check('  nothing changed: the copy from before accounts is still the working copy, unpulled, nothing set aside',
+            TreeStore.status().copyId === copyBefore && TreeStore.status().owner === null && TreeStore.status().dirty
+            && storageData.get('tpTree').rev === revBefore && (await TreeStore.listStashes()).length === 0
+            && !(await libraryText()).includes('Bob todo'));
+        check('  the draft stays in the editor, on its note, and nothing is parked',
+            $('noteContentInput').value === '# Diary\nOWNER DRAFT, SERVER UNSURE' && NV.isDirty()
+            && $('nv-removed').hidden === true && parked().length === 0);
+        await discardDraft();
+    }
+
+    // Settings still naming bob, alice's token and alice's own copy: what
+    // Settings says is no reason to set her copy aside.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceRoots(), { dirty: true, editCount: 1 });
+    await settle();
+    const ownCopy = TreeStore.status().copyId;
+    pullToken = 'tok-a';
+    pullSettings = { backend: { url: URL_S, userId: 2, username: 'bob', tenancyOwner: false } };
+    authMeDown = true;
+    answers = [false];
+    const kept = await doPull();
+    authMeDown = false;
+    answers = [];
+    check('Settings naming bob, alice’s token, /api/auth/me down: her own copy is not set aside on Settings’ word',
+        kept === 'Pull cancelled.' && TreeStore.status().copyId === ownCopy && TreeStore.status().owner.userId === 1
+        && TreeStore.status().dirty && (await TreeStore.listStashes()).length === 0, kept);
+    pullSettings = { backend: { url: URL_S } };
+
+    // The copy says whose it is: then the server's tree says the rest, and
+    // "set aside" is said because it was.
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceRoots(), { dirty: true, editCount: 1 });
+    await settle();
+    pullToken = 'tok-b';
+    authMeDown = true;
+    answers = [true];
+    const aside = await doPull();
+    authMeDown = false;
+    answers = [];
+    await settle();
+    check('alice’s copy, bob’s token, /api/auth/me down: her copy is set aside, and the message says so',
+        /The other account’s working copy is set aside/.test(aside) && TreeStore.status().owner.userId === 2
+        && (await TreeStore.listStashes()).some(s => s.userId === 1 && s.dirty) && (await libraryText()).includes('Bob todo'), aside);
+
+    // Nothing to set aside: then nothing is said about it.
+    await clearStashes();
+    await otherPageLoads(ALICE, []);
+    await settle();
+    const nothing = await doPull();
+    check('alice’s empty copy, bob’s token: bob’s tree comes in, and no copy is said to be set aside',
+        /^Pulled \d+ item/.test(nothing) && !/set aside/.test(nothing) && TreeStore.status().owner.userId === 2
+        && (await TreeStore.listStashes()).length === 0, nothing);
+}
+
+console.log('\n10. Another page switching accounts while a pull waits');
+{
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceRoots());
+    await settle();
+    for (const path of ['/api/auth/me', '/api/tree']) {
+        await otherPageLoads(ALICE, aliceRoots());
+        await settle();
+        pullToken = 'tok-a';
+        duringFetch = { path, fn: async () => { await OtherPage.switchAccount({ ...BOB, previousUsername: 'alice' }); } };
+        const a = alerts.length;
+        const msg = await doPull();
+        duringFetch = null;
+        await settle();
+        check(`bob signed in elsewhere during the pull’s ${path}: “Account changed during pull — nothing was replaced.”`,
+            msg === 'Account changed during pull — nothing was replaced.' && alerts.length === a, msg);
+        check('  bob’s copy is the working copy, and none of alice’s tree came into it',
+            TreeStore.status().owner.userId === 2 && TreeStore.status().copyId === OtherPage.status().copyId
+            && !(await libraryText()).includes('Diary') && !JSON.stringify(storageData.get('tpTree').roots).includes('a-note1'));
+    }
+
+    // A push refused as out of date, answered "pull the server's tree": that
+    // answer was about the copy then, not one another page brings in after.
+    await otherPageLoads(ALICE, aliceRoots());
+    await settle();
+    const otherCopy = aliceRoots();
+    otherCopy[0].children.push({ id: 'a-other', kind: 'folder', title: 'ALICE OTHER UNPUSHED', children: [] });
+    duringFetch = { path: '/api/auth/me', fn: () => otherPageLoads(ALICE, otherCopy, { dirty: true, editCount: 1 }) };
+    const theirs = await doPull({ skipConfirm: true });
+    duringFetch = null;
+    check('a pull already agreed to stops when another copy comes in before it starts',
+        theirs === 'Account changed during pull — nothing was replaced.' && TreeStore.status().dirty
+        && JSON.stringify(storageData.get('tpTree').roots).includes('ALICE OTHER UNPUSHED'), theirs);
+}
+
+console.log('\n11. Discarding a set-aside copy offers the drafts parked with it');
+{
+    // A draft from before accounts, parked when another page signed bob in,
+    // and one of alice's own, which that copy would never bring back.
+    await clearStashes();
+    ls.delete('tp_notes_parked_v1');
+    await otherPageLoads(null, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nDRAFT OF A COPY ABOUT TO GO');
+    await OtherPage.switchAccount({ ...BOB, tenancyOwner: false });
+    await settle();
+    const aliceOwn = { owner: { ...ALICE }, origin: null, noteId: 'a-note2', notebookId: 'a-sub', title: 'Medical', content: 'ALICE OWN DRAFT',
+        loaded: { title: 'Medical', content: '# Medical' }, parkedAt: '2026-10-01T00:00:00.000Z' };
+    ls.set('tp_notes_parked_v1', JSON.stringify([...parked(), aliceOwn]));
+    const legacy = (await TreeStore.listStashes()).find(s => s.userId === null);
+    check('the draft is parked with the copy from before accounts, which is set aside',
+        legacy && parked().some(d => d.origin === 'pre-accounts' && d.content.includes('ABOUT TO GO')), JSON.stringify(parked()));
+    check('that copy is the only way back for that draft, not for alice’s',
+        JSON.stringify(NV.parkedDraftsOnlyWith(legacy.stamps).map(d => d.content)) === '["# Diary\\nDRAFT OF A COPY ABOUT TO GO"]');
+    check('  and not the only way when another kept copy would bring it back too',
+        NV.parkedDraftsOnlyWith(legacy.stamps, [legacy.stamps]).length === 0);
+
+    answers = [true];
+    promptAnswers = ['nope'];
+    let n = confirms.length;
+    let p = prompts.length;
+    await handleStashAction(legacy, 'discard', null);
+    check('Discard names the draft and offers it as a file first',
+        confirms.length === n + 1 && confirms[n].includes('1 unsaved note draft (“Diary”)') && confirms[n].includes('comes back only with this copy'),
+        confirms[n]);
+    const file = downloads.length === 1 ? await downloads[0].blob.text() : '';
+    check('  the file holds the draft as it was left', downloads.length === 1 && downloads[0].name.endsWith('-note-drafts.md')
+        && file.includes('# Diary\nDRAFT OF A COPY ABOUT TO GO') && !file.includes('ALICE OWN DRAFT'), file);
+    check('  the typed confirmation says the draft goes with the copy',
+        prompts.length === p + 1 && prompts[p].includes('1 unsaved note draft (“Diary”)') && prompts[p].includes('Type discard'), prompts[p]);
+    check('  a wrong word discards nothing: the copy and both drafts stay',
+        (await TreeStore.listStashes()).some(s => s.key === legacy.key) && parked().length === 2);
+
+    answers = [false];
+    promptAnswers = ['discard'];
+    n = confirms.length;
+    await handleStashAction(legacy, 'discard', null);
+    check('declining the file this time downloads nothing', confirms.length === n + 1 && downloads.length === 1);
+    check('the copy is discarded with the draft only it would bring back',
+        !(await TreeStore.listStashes()).some(s => s.key === legacy.key) && !JSON.stringify(parked()).includes('ABOUT TO GO')
+        && $('stash-status').textContent === 'Discarded, with its note draft.', $('stash-status').textContent);
+    check('alice’s own draft stays parked for her', parked().length === 1 && parked()[0].content === 'ALICE OWN DRAFT');
+
+    // The same for a copy at a server's old address, set aside when alice
+    // signed in at the new one elsewhere.
+    ls.delete('tp_notes_parked_v1');
+    await clearStashes();
+    await otherPageLoads(ALICE, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nDRAFT AT AN OLD ADDRESS');
+    const ALICE_MOVED = { ...ALICE, url: 'https://moved.server.test' };
+    await OtherPage.switchAccount({ ...ALICE_MOVED, previousUsername: 'alice' });
+    await settle();
+    const old = (await TreeStore.listStashes()).find(s => s.url === URL_S && s.userId === 1);
+    check('a draft at the old address is parked under it', old && parked().length === 1 && parked()[0].owner.url === URL_S);
+    answers = [false];
+    promptAnswers = ['alice'];
+    p = prompts.length;
+    await handleStashAction(old, 'discard', null);
+    check('discarding that copy names its draft and lets it go with it',
+        prompts[p].includes('1 unsaved note draft (“Diary”)') && prompts[p].includes('Type alice')
+        && !(await TreeStore.listStashes()).some(s => s.key === old.key) && parked().length === 0, prompts[p]);
 }
 
 console.log(failures === 0 ? '\nAll notes-view account tests passed.\n' : `\n${failures} test(s) failed.\n`);

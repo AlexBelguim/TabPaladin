@@ -57,8 +57,8 @@ const view = {
     pane: 'list',           // the pane narrow layouts show: 'side' | 'list' | 'note'
     cols: 3,
     restoreNoteId: null,    // last open note from a previous visit
-    copy: null,             // { id, owner } of the working copy the view was drawn from
-    checkParked: true,      // look for a parked draft of this account on the next refresh
+    copy: null,             // { id, owner, origin } of the working copy the view was drawn from
+    checkParked: true,      // look for a parked draft of this copy once it is ready and the editor free
     initialized: false,
     opened: false
 };
@@ -104,7 +104,11 @@ function loadPrefs() {
 // draft is saved into the outgoing copy, so it is set aside with it, or
 // discarded. One nobody could ask about — the switch happened in another
 // page — is parked on this device under its account and comes back into the
-// editor when that account's copy does, never for anyone else's.
+// editor when that account's copy does, never for anyone else's. A copy from
+// before accounts, or one at the old address of a server that moved, has no
+// account of its own to wait for: its draft comes back with the copy itself,
+// once the account allowed to take that copy brings it back (TreeStore's
+// restoredFrom).
 
 const ACCOUNT_UI_KEY = 'tp_notes_ui_accounts_v1';
 const PARKED_KEY = 'tp_notes_parked_v1';
@@ -134,7 +138,6 @@ function writeJson(key, value) {
 
 // An account's id at its server's address, however the address was typed.
 function ownerKey(owner) {
-    if (!owner) return 'unstamped';
     let url = String(owner.url || '').replace(/\/+$/, '');
     try {
         const u = new URL(url);
@@ -152,12 +155,47 @@ function sameOwner(a, b) {
     return ownerKey(a) === ownerKey(b);
 }
 
+// A stamp is { owner, origin }: an account, or for an unstamped copy where it
+// came from ('pre-accounts' or 'local'). Drafts parked before origins were
+// recorded match any unstamped copy, as they always did.
+function sameStamp(a, b) {
+    if (a.owner || b.owner) return sameOwner(a.owner, b.owner);
+    return !a.origin || !b.origin || a.origin === b.origin;
+}
+
+// A stamp as TreeStore keeps it ({url, userId, serverId, origin}, in
+// restoredFrom and on a set-aside copy) as one here.
+function stampFrom(s) {
+    return s.userId === null || s.userId === undefined
+        ? { owner: null, origin: s.origin || null }
+        : { owner: { url: s.url, userId: s.userId, serverId: s.serverId || null }, origin: null };
+}
+
+// The stamps the working copy answers to: its own, then those of the
+// set-aside copies it was brought back from, latest first.
+function stampsOf(st) {
+    return [{ owner: st.owner || null, origin: st.owner ? null : st.origin || null },
+        ...(st.restoredFrom || []).map(stampFrom)];
+}
+
+function answersTo(draft, stamps) {
+    const own = { owner: draft.owner || null, origin: draft.origin || null };
+    return stamps.some(s => sameStamp(own, s));
+}
+
+function prefsKey(stamp) {
+    if (stamp.owner) return ownerKey(stamp.owner);
+    return stamp.origin === 'local' ? 'unstamped-local' : 'unstamped';
+}
+
 // Fold state, scope and last open note are per account; sort and mode stay
-// per device. The outgoing account's are kept for when it comes back.
-function swapAccountPrefs(fromOwner, toOwner) {
+// per device. The outgoing copy's are kept for when it comes back. A copy
+// brought back from being set aside under another stamp (from before
+// accounts, at a server's old address) brings back the view it had then.
+function swapAccountPrefs(from, st) {
     const stored = readJson(ACCOUNT_UI_KEY, {});
     const map = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
-    map[ownerKey(fromOwner)] = {
+    map[prefsKey(from)] = {
         expanded: [...view.expanded],
         scope: view.scope,
         noteId: view.noteId || view.restoreNoteId || null,
@@ -166,7 +204,8 @@ function swapAccountPrefs(fromOwner, toOwner) {
     const keys = Object.keys(map).sort((a, b) => (Number(map[b] && map[b].t) || 0) - (Number(map[a] && map[a].t) || 0));
     for (const k of keys.slice(MAX_ACCOUNT_UI)) delete map[k];
     writeJson(ACCOUNT_UI_KEY, map);
-    const entry = map[ownerKey(toOwner)];
+    const [own, ...earlier] = stampsOf(st);
+    const entry = [earlier[0], own, ...earlier.slice(1)].filter(Boolean).map(s => map[prefsKey(s)]).find(Boolean);
     // readNotesUi validates the entry the same way it does the device prefs.
     const p = NM.readNotesUi({ getItem: () => (entry ? JSON.stringify(entry) : null) });
     view.expanded = new Set(p.expanded);
@@ -174,10 +213,12 @@ function swapAccountPrefs(fromOwner, toOwner) {
     view.restoreNoteId = p.noteId;
 }
 
-function parkDraft(owner) {
+function parkDraft(from) {
+    const owner = from.owner;
     const note = view.isNew ? null : currentNote();
     const draft = {
         owner: owner ? { url: owner.url, userId: owner.userId, username: owner.username || null, serverId: owner.serverId || null } : null,
+        origin: owner ? null : from.origin || 'pre-accounts',
         noteId: view.isNew ? null : view.noteId,
         notebookId: view.isNew || view.removed ? view.newParentId : note ? note.notebookId : null,
         title: $('noteTitleInput').value,
@@ -189,17 +230,84 @@ function parkDraft(owner) {
     if (!writeJson(PARKED_KEY, [...(Array.isArray(list) ? list : []), draft])) parkedHere.push(draft);
 }
 
-function takeParkedDraft(owner) {
+// A draft parked from this working copy, under its account or under one of
+// the stamps it was set aside with.
+function takeParkedDraft(st) {
+    const stamps = stampsOf(st);
+    const mine = (d) => d && typeof d.content === 'string' && answersTo(d, stamps);
     const list = readJson(PARKED_KEY, []);
     if (Array.isArray(list)) {
-        const i = list.findIndex(d => d && typeof d.content === 'string' && sameOwner(d.owner, owner));
+        const i = list.findIndex(mine);
         if (i !== -1) {
             const [draft] = list.splice(i, 1);
             if (writeJson(PARKED_KEY, list)) return draft;
         }
     }
-    const j = parkedHere.findIndex(d => sameOwner(d.owner, owner));
+    const j = parkedHere.findIndex(mine);
     return j === -1 ? null : parkedHere.splice(j, 1)[0];
+}
+
+// Ready for a parked draft to come back: the copy holds something, or has
+// been pulled or pushed at least once. A copy just started for an account,
+// whose pull has not landed yet, is not — the draft would come back as text
+// for a note it cannot find, though the pull is about to bring that note.
+function copyReady(st) {
+    return !st.isEmpty || Boolean(st.lastSyncAt);
+}
+
+// A set-aside copy discarded in Settings takes with it the only way back for
+// a draft parked with it — one from before accounts, or at a server's old
+// address, has no account of its own to come back to. So Settings names
+// those drafts first, offers them as a file, and lets them go with the copy
+// (sidepanel.js), rather than leaving them parked, unseen, for good.
+
+function allParked() {
+    const list = readJson(PARKED_KEY, []);
+    return [...(Array.isArray(list) ? list : []), ...parkedHere].filter(d => d && typeof d.content === 'string');
+}
+
+// The parked drafts that the set-aside copy with these `stamps` (as
+// TreeStore.listStashes gives them) would bring back and nothing else kept
+// here would: not the working copy, nor any of the `others` (the stamps of
+// the other set-aside copies).
+export function parkedDraftsOnlyWith(stamps, others = []) {
+    const own = (stamps || []).map(stampFrom);
+    if (!own.length) return [];
+    const kept = [stampsOf(TreeStore.status()), ...others.map(o => (o || []).map(stampFrom))];
+    return allParked().filter(d => answersTo(d, own) && !kept.some(k => answersTo(d, k)));
+}
+
+// Let these drafts go: their copy was discarded, after they were offered.
+export function dropParkedDrafts(drafts) {
+    const gone = new Set((drafts || []).map(d => JSON.stringify(d)));
+    if (!gone.size) return;
+    const list = readJson(PARKED_KEY, []);
+    if (Array.isArray(list)) writeJson(PARKED_KEY, list.filter(d => !gone.has(JSON.stringify(d))));
+    for (let i = parkedHere.length - 1; i >= 0; i--) {
+        if (gone.has(JSON.stringify(parkedHere[i]))) parkedHere.splice(i, 1);
+    }
+}
+
+// The drafts as one Markdown file, each as it was left.
+export function parkedDraftsMarkdown(drafts) {
+    const whose = (d) => (d.owner
+        ? `${d.owner.username || `account #${d.owner.userId}`} @ ${d.owner.url}`
+        : d.origin === 'local' ? 'made while signed out' : 'an older copy, from before accounts');
+    const parts = (drafts || []).map(d => [
+        '---',
+        '',
+        `**${d.title || 'Untitled'}** — unsaved draft (${whose(d)}${d.parkedAt ? `, parked ${String(d.parkedAt).slice(0, 10)}` : ''})`,
+        '',
+        String(d.content || ''),
+        ''
+    ].join('\n'));
+    return [
+        '# Unsaved note drafts',
+        '',
+        `Parked on this device with a set-aside working copy, exported ${new Date().toISOString().slice(0, 10)} before it was discarded.`,
+        '',
+        ...parts
+    ].join('\n');
 }
 
 // Back into the editor, unsaved, as it was left: the note it was editing if
@@ -236,12 +344,13 @@ function noticeCopySwitch() {
     const st = TreeStore.status();
     if (!st.loaded) return false;
     if (!view.copy) {
-        view.copy = { id: st.copyId, owner: st.owner };
+        view.copy = { id: st.copyId, owner: st.owner, origin: st.origin };
         return false;
     }
     const otherOwner = view.copy.owner && st.owner && !sameOwner(view.copy.owner, st.owner);
     if (st.copyId === view.copy.id && !otherOwner) {
         view.copy.owner = st.owner;
+        view.copy.origin = st.origin;
         return false;
     }
     startOverForCopy(st);
@@ -249,10 +358,10 @@ function noticeCopySwitch() {
 }
 
 function startOverForCopy(st) {
-    const from = view.copy ? view.copy.owner : null;
+    const from = view.copy || { owner: null, origin: null };
     if (isDirty()) parkDraft(from);
-    swapAccountPrefs(from, st.owner);
-    view.copy = { id: st.copyId, owner: st.owner };
+    swapAccountPrefs(from, st);
+    view.copy = { id: st.copyId, owner: st.owner, origin: st.origin };
     view.noteId = null;
     view.isNew = false;
     view.removed = false;
@@ -1264,14 +1373,22 @@ async function refresh() {
     const nbId = NM.notebookIdOf(view.scope);
     if (nbId && !view.lib.notebooks.has(nbId)) view.scope = 'all';
 
-    if (view.noteId && !view.isNew && !view.removed) {
+    if (view.noteId && !view.isNew) {
         const note = currentNote();
-        if (!note) {
+        if (note && view.removed) {
+            // Back again: a later pull brought it back, or a parked draft came
+            // back before its account's pull had landed. The editor is on the
+            // note once more, so Save updates it instead of keeping the text
+            // as a second note.
+            view.removed = false;
+            view.newParentId = null;
+        }
+        if (!note && !view.removed) {
             // A pull (or another page) removed the note while it was open.
             // 'Keep my text' files it where it was, if that notebook is left.
             view.removed = true;
             view.newParentId = before ? before.notebookId : null;
-        } else if (!isDirty() && (note.title !== view.loaded.title || note.content !== view.loaded.content)
+        } else if (note && !isDirty() && (note.title !== view.loaded.title || note.content !== view.loaded.content)
             && !$('note-editor').contains(document.activeElement)) {
             // Changed elsewhere while it sat here unedited: show the new text.
             fillEditor(note.title, note.content);
@@ -1282,9 +1399,12 @@ async function refresh() {
     renderList();
     renderNoteChrome();
     renderBacklinks();
-    if (view.checkParked) {
+    // A parked draft waits for its copy to be ready and for the editor to be
+    // free: it never replaces what is open, and is never dropped for it.
+    const st = TreeStore.status();
+    if (view.checkParked && copyReady(st) && !view.noteId && !view.isNew && !view.removed) {
         view.checkParked = false;
-        const draft = !view.noteId && !view.isNew && !view.removed ? takeParkedDraft(TreeStore.status().owner) : null;
+        const draft = takeParkedDraft(st);
         if (draft) restoreParkedDraft(draft);
     }
 }

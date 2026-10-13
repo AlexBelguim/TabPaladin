@@ -13,6 +13,7 @@ import { AIService } from '../utils/aiService.js';
 import { TreeStore } from '../utils/treeStore.js';
 import { ExpandState, OPEN_TABS_KEY, aiGroupKey } from '../utils/expandState.js';
 import { resolveServerUrl } from '../utils/config.js';
+import { parkedDraftsOnlyWith, dropParkedDrafts, parkedDraftsMarkdown } from '../app/notesView.js';
 
 // Every read and write goes against the local working copy of the synced tree
 // (chrome.bookmarks-compatible facade). The browser's own bookmarks are only
@@ -66,7 +67,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         // looks exactly like "all my bookmarks are gone", when in fact the
         // data is on the server and only the fetch failed.
         console.warn('[TabPaladin] Initial pull failed:', e.message);
-        startupSyncError = e.message;
+        // Another page brought a copy in meanwhile: nothing is missing here.
+        if (e.code !== 'account-changed') startupSyncError = e.message;
     }
 
     // Drop focused-folder ids that no longer resolve.
@@ -4255,6 +4257,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         if (!stashes.length) return;
         const restoreAttrs = (st) => !st.match ? 'disabled title="Sign in as this account to restore it"'
             : st.match === 'moved' ? 'title="Made at another address of this server — restoring asks first"' : '';
+        // Note drafts parked on this device that only this copy brings back.
+        const parkedWith = new Map(stashes.map(st => [st.key,
+            parkedDraftsOnlyWith(st.stamps, stashes.filter(x => x.key !== st.key).map(x => x.stamps)).length]));
         list.innerHTML = stashes.map(st => `
             <div data-stash-key="${escapeHtml(st.key)}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
                 <div style="color:#ddd;"><strong>${escapeHtml(st.username || (st.userId === null ? (st.origin === 'local' ? 'Made while signed out' : 'An older copy') : 'account #' + st.userId))}</strong>
@@ -4262,6 +4267,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 <div style="font-size:0.72rem; color:var(--text-muted); margin-top:3px;">
                     ${st.editCount ? `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}` : 'no unpushed edits'} · ${fmtN(st.items)} items
                     · set aside ${escapeHtml(st.setAsideAt ? new Date(st.setAsideAt).toLocaleDateString() : '')}
+                    ${parkedWith.get(st.key) ? `· ${parkedWith.get(st.key)} unsaved note draft${parkedWith.get(st.key) === 1 ? '' : 's'} parked with it` : ''}
                 </div>
                 <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
                     <button class="sm-btn" data-stash-act="restore" style="flex:1;" ${restoreAttrs(st)}>Restore</button>
@@ -4282,21 +4288,37 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
     async function handleStashAction(st, act, account) {
         const status = document.getElementById('stash-status');
-        if (act === 'export') {
-            const html = await TreeStore.exportStashHtml(st.key);
+        const fileStem = `tabpaladin-${(st.username || 'older-copy').replace(/[^\w.-]+/g, '_')}`;
+        const download = (text, type, name) => {
             const a = document.createElement('a');
-            a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-            a.download = `tabpaladin-${(st.username || 'older-copy').replace(/[^\w.-]+/g, '_')}-set-aside.html`;
+            a.href = URL.createObjectURL(new Blob([text], { type }));
+            a.download = name;
             a.click();
             setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        };
+        if (act === 'export') {
+            download(await TreeStore.exportStashHtml(st.key), 'text/html', `${fileStem}-set-aside.html`);
             return;
         }
         if (act === 'discard') {
+            // A note draft parked with this copy comes back only with it. It
+            // is named here and offered as a file first, and goes only with
+            // the copy, once the discard is confirmed.
+            const others = (await TreeStore.listStashes()).filter(x => x.key !== st.key).map(x => x.stamps);
+            const drafts = parkedDraftsOnlyWith(st.stamps, others);
+            const n = drafts.length;
+            const draftsText = `${n} unsaved note draft${n === 1 ? '' : 's'} (${drafts.map(d => `“${d.title || 'Untitled'}”`).join(', ')})`;
+            if (n && confirm(`This copy has ${draftsText} parked with it on this device. ${n === 1 ? 'It comes' : 'They come'} back only with this copy.\n\n`
+                + `OK = Download ${n === 1 ? 'it' : 'them'} first, as a Markdown file.\nCancel = Don’t download.`)) {
+                download(parkedDraftsMarkdown(drafts), 'text/markdown', `${fileStem}-note-drafts.md`);
+            }
             const word = st.username || 'discard';
-            const typed = prompt(`Discard this working copy for good${st.editCount ? `, with its ${st.editCount} unpushed edit(s)` : ''}?\n\nType ${word} to confirm.`);
+            const goes = [st.editCount ? `its ${st.editCount} unpushed edit(s)` : '', n ? `its ${draftsText}` : ''].filter(Boolean).join(' and ');
+            const typed = prompt(`Discard this working copy for good${goes ? `, with ${goes}` : ''}?\n\nType ${word} to confirm.`);
             if (typed !== word) return;
             await TreeStore.discardStash(st.key);
-            status.textContent = 'Discarded.';
+            dropParkedDrafts(drafts);
+            status.textContent = n ? `Discarded, with its ${n === 1 ? 'note draft' : `${n} note drafts`}.` : 'Discarded.';
             await renderStashes();
             return;
         }
@@ -4421,14 +4443,27 @@ async function getSyncConfig() {
     return { url, token: url ? (cfg.token || '') : '' };
 }
 
-// The account this browser is signed in as, as Settings last learned it.
+// The account this browser is signed in as, as the server says for the token
+// in hand — or null when it cannot say (unreachable, or older than accounts).
+// Never what Settings last learned: it may not have learned it yet (a session
+// from before accounts, Settings not opened since) or may still name whoever
+// was signed in before a token was saved by hand, and a copy set aside on
+// that guess, or pulled over, is the wrong one. With null, the pull goes by
+// whose tree the server sends, or stops (see TreeStore.sync.pull).
 async function signedInAccount(cfg) {
-    const backend = (await StorageManager.getSettings()).backend || {};
-    if (!cfg.token || backend.userId === undefined || backend.userId === null) return null;
-    return {
-        url: cfg.url, userId: Number(backend.userId), username: backend.username || null,
-        serverId: backend.serverId || null, tenancyOwner: Boolean(backend.tenancyOwner)
-    };
+    if (!cfg.token) return null;
+    try {
+        const res = await fetch(cfg.url.replace(/\/$/, '') + '/api/auth/me', { headers: { Authorization: 'Bearer ' + cfg.token } });
+        const me = res.ok ? await res.json() : null;
+        const user = me && me.user;
+        if (user && user.id !== undefined && user.id !== null) {
+            return {
+                url: cfg.url, userId: Number(user.id), username: user.username || null,
+                serverId: me.serverId || null, tenancyOwner: Boolean(user.tenancyOwner)
+            };
+        }
+    } catch (e) { /* unreachable, or older than accounts */ }
+    return null;
 }
 
 // The working copy belongs to another account. Pulling over it would discard
@@ -4443,10 +4478,15 @@ async function setAsideAndPull(cfg, err) {
     }
     const me = await signedInAccount(cfg);
     const userId = me ? me.userId : err && err.userId;
-    if (userId === undefined || userId === null) return 'Open Settings once so this browser learns which account it is signed in as, then try again.';
+    if (userId === undefined || userId === null) return 'Couldn’t confirm the account — try again. Nothing was changed.';
     if (!(await beforeAccountSwitch('Pulling this account’s tree'))) return 'Push cancelled — this working copy belongs to another account.';
     await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null });
-    const { version } = await TreeStore.sync.pull(cfg);
+    let version;
+    try {
+        ({ version } = await TreeStore.sync.pull(cfg));
+    } catch (e) {
+        return `Set the other account’s copy aside (Settings), but the pull did not happen: ${e.message}`;
+    }
     await persistSyncStamp('pull');
     return `Set the other account's copy aside and pulled (v${version}).`;
 }
@@ -4501,27 +4541,44 @@ async function doPush() {
 }
 
 async function doPull({ skipConfirm = false } = {}) {
+    // The copy this pull was asked for. Another page can bring another
+    // account's copy in while this one waits on the server or on a question:
+    // then nothing is replaced, and the pull says so.
+    const copyNow = () => {
+        const s = TreeStore.status();
+        return JSON.stringify([s.copyId, s.owner && s.owner.url, s.owner && s.owner.userId]);
+    };
+    const startedOn = copyNow();
+    const accountChanged = 'Account changed during pull — nothing was replaced.';
     const cfg = await getSyncConfig();
     if (!cfg.token) {
         alert('Not signed in to the sync server. Open Settings (⚙️) and sign in.');
         return 'Not signed in.';
     }
-    const status = TreeStore.status();
     // A copy that belongs to another account (or predates accounts, for
-    // anyone but the server owner) is set aside, never pulled over.
+    // anyone but the server owner) is set aside, never pulled over — when the
+    // server says whose session this is. When it cannot, the pull goes by
+    // whose tree the server sends, or stops (TreeStore.sync.pull).
     const me = await signedInAccount(cfg);
+    if (copyNow() !== startedOn) return accountChanged;
+    const status = TreeStore.status();
     let setAside = false;
     if (me && TreeStore.wouldSetAside(me)) {
         if (!(await beforeAccountSwitch('This pull'))) return 'Pull cancelled.';
-        await TreeStore.setAsideAndReset(me);
-        setAside = true;
+        if (copyNow() !== startedOn) return accountChanged;
+        // An empty copy has nothing to set aside, and nothing to say about it.
+        setAside = Boolean((await TreeStore.setAsideAndReset(me)).setAside);
     } else if (!skipConfirm && status.dirty) {
         if (!confirm('You have local edits that were never pushed. Pulling replaces your working copy with the server\'s tree and discards them.\n\nPull anyway?')) {
             return 'Pull cancelled.';
         }
     }
     try {
-        const { version } = await TreeStore.sync.pull(cfg);
+        // The pull sets the copy aside itself when the tree turns out to be
+        // another account's than the copy's (see TreeStore.sync.pull).
+        const pulled = await TreeStore.sync.pull(cfg);
+        const version = pulled.version;
+        if (pulled.setAside) setAside = true;
         await persistSyncStamp('pull');
         // Count what arrived: a successful pull that returns an empty tree is a
         // completely different problem from a pull that failed, and they are
@@ -4538,6 +4595,12 @@ async function doPull({ skipConfirm = false } = {}) {
             ? `Pulled (v${version}) — but the server's tree is EMPTY.`
             : `Pulled ${items} item(s) (v${version}).`) + aside;
     } catch (e) {
+        // Stopped before anything was written: another copy came in, or the
+        // server could not say whose copy this is. Not a failure to alarm
+        // anyone over — pulling again is the answer.
+        if (e.code === 'account-changed' || e.code === 'account-unconfirmed') {
+            return e.message + (setAside || e.setAside ? ' The other account’s working copy is set aside (Settings).' : '');
+        }
         alert('Pull failed: ' + e.message);
         return 'Pull failed: ' + e.message;
     }

@@ -24,6 +24,16 @@
 //      says it is the same server.
 //   7. A copy made in this browser while nobody was signed in goes to the
 //      first account that signs in, never to the server's owner by default.
+//   8. A pull never replaces another account's copy: another account's tree
+//      (or, over a copy from before accounts, anyone's but the owner's, as
+//      /api/auth/me says) comes into a new copy and the old one is set
+//      aside. When /api/auth/me cannot say, the pull stops and changes
+//      nothing — no copy is set aside on a guess. A copy brought back
+//      remembers the stamps it was set aside under (restoredFrom), and
+//      forgets them when another account's tree comes in.
+//   9. Another page bringing another copy in (or stamping this one) while a
+//      pull waits on /api/tree or /api/auth/me stops the pull: that copy is
+//      never replaced, and the one the pull started on is kept.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -50,7 +60,9 @@ globalThis.chrome = {
             get: async (keys) => {
                 const out = {};
                 const list = Array.isArray(keys) ? keys : [keys];
-                for (const k of list) if (storageData.has(k)) out[k] = storageData.get(k);
+                // Copies, as chrome.storage hands out: two pages never share
+                // one object.
+                for (const k of list) if (storageData.has(k)) out[k] = JSON.parse(JSON.stringify(storageData.get(k)));
                 return out;
             },
             set: async (obj) => {
@@ -127,11 +139,23 @@ const serverB = {
     ] }]
 };
 let lastPutBody = null;
+let authMeDown = false;
+// /api/auth/me answering for another user than the token's, as no server
+// should (a session swapped between the two requests).
+let authMeAs = null;
+// Run once while a request to `path` is in flight: another page acting
+// between a pull's awaits.
+let duringFetch = null;
 
 globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
     const method = (opts.method || 'GET').toUpperCase();
     serverLog.push(`${method} ${u}`);
+    if (duringFetch && u.endsWith(duringFetch.path) && method === 'GET') {
+        const { fn } = duringFetch;
+        duringFetch = null;
+        await fn();
+    }
     const json = (body, status = 200) => ({
         ok: status < 400, status, statusText: status === 409 ? 'Conflict' : 'OK',
         json: async () => body, text: async () => JSON.stringify(body)
@@ -141,6 +165,12 @@ globalThis.fetch = async (url, opts = {}) => {
     const srv = serverId === 'srv-other' ? serverC : who === 2 ? serverB : server;
 
     if (u.endsWith('/api/health')) return json({ ok: true, version: 2, configured: true });
+    // alex (#1) owns the main server: what the browser held before accounts is his.
+    if (u.endsWith('/api/auth/me')) {
+        if (authMeDown) throw new Error('offline');
+        const id = authMeAs || who;
+        return json({ ok: true, user: { id, username: id === 2 ? 'sam' : 'alex', role: 'admin', tenancyOwner: id === 1 && serverId === 'srv-main' }, serverId });
+    }
     if (u.endsWith('/api/tree/version')) return json({ ok: true, version: srv.version, userId: who, serverId });
     if (u.endsWith('/api/tree') && method === 'GET') {
         return json({ ok: true, version: srv.version, roots: JSON.parse(JSON.stringify(srv.roots)), userId: who, serverId });
@@ -678,6 +708,9 @@ console.log('\n10. The same id and name on another server is another account');
     await TreeStore.restoreStash(offered.key, movedAlex, { moved: true });
     check('once they do, it comes back stamped with the new address',
         TreeStore.status().owner.url === MOVED && TreeStore.status().owner.serverId === 'srv-main' && TreeStore.status().dirty);
+    const from = TreeStore.status().restoredFrom[0] || {};
+    check('  remembering the address it was set aside from', from.url === MAIN && from.userId === 1 && from.serverId === 'srv-main'
+        && storageData.get('tpTree').restoredFrom[0].url === MAIN, JSON.stringify(TreeStore.status().restoredFrom));
     await TreeStore.sync.push({ url: MOVED, token: 'tok' });
     check('  and pushes there as the same account', server.pushedRoots.some(r => r.title === 'NAS-only edit') && !TreeStore.status().dirty);
 }
@@ -734,6 +767,212 @@ console.log('\n11. A copy made while nobody was signed in');
     const { TreeStore: Upgraded } = await import('../src/utils/treeStore.js?upgraded');
     await Upgraded.load();
     check('an install upgraded from before accounts loads its copy as the owner\'s', Upgraded.status().origin === 'pre-accounts');
+}
+
+console.log('\n12. A pull never replaces another account\'s copy');
+{
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const asAlex = { url: MAIN, token: 'tok' };
+    const asSam = { url: MAIN, token: 'tok-b' };
+    const heard = [];
+    const stopHearing = TreeStore.onChanged((kind) => heard.push(kind));
+
+    // alex's copy with an unpushed edit; the pull is made with sam's token
+    // (one saved by hand, while Settings still names alex).
+    await TreeStore.setAsideAndReset(alex);
+    await clearStashes();
+    await TreeStore.sync.pull(asAlex);
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'alex unpushed' });
+    await TreeStore.flush();
+    const alexCopy = TreeStore.status().copyId;
+    heard.length = 0;
+    const overAlex = await TreeStore.sync.pull(asSam);
+    const aside = overAlex.setAside ? storageData.get(overAlex.setAside) : null;
+    check('sam\'s tree pulled over alex\'s copy comes into a new copy',
+        TreeStore.status().owner.userId === 2 && TreeStore.status().copyId !== alexCopy && heard.includes('switch')
+        && (await TreeStore.getNode('sam-root')) !== null && (await TreeStore.getNode('f1')) === null, JSON.stringify(heard));
+    check('  and alex\'s copy is set aside, unpushed edit and all, not discarded',
+        aside && aside.owner.userId === 1 && aside.dirty && JSON.stringify(aside.roots).includes('alex unpushed'));
+    const samCopy = TreeStore.status().copyId;
+    await TreeStore.sync.pull(asSam);
+    check('sam pulling his own tree again is an ordinary pull', TreeStore.status().copyId === samCopy
+        && (await TreeStore.listStashes()).length === 1);
+
+    // A copy from before accounts is the owner's.
+    const legacyCopy = (rev) => ({ baseVersion: 5, roots: [{ id: 'f1', kind: 'folder', title: 'Stuff', children: [] }], dirty: false, rev });
+    await clearStashes();
+    await chrome.storage.local.set({ tpTree: legacyCopy('legacy-pull-1') });
+    const legacyId = TreeStore.status().copyId;
+    const byOwner = await TreeStore.sync.pull(asAlex);
+    check('the owner pulling over a copy from before accounts pulls into it',
+        !byOwner.setAside && TreeStore.status().copyId === legacyId && TreeStore.status().owner.userId === 1
+        && (await TreeStore.listStashes()).length === 0);
+    await chrome.storage.local.set({ tpTree: legacyCopy('legacy-pull-2') });
+    const bySam = await TreeStore.sync.pull(asSam);
+    const legacyAside = (await TreeStore.listStashes()).find(st => st.key === bySam.setAside);
+    check('anyone else\'s pull sets it aside for the owner first',
+        legacyAside && legacyAside.userId === null && legacyAside.origin === 'pre-accounts' && legacyAside.url === MAIN
+        && TreeStore.status().owner.userId === 2 && (await TreeStore.getNode('sam-root')) !== null, JSON.stringify(legacyAside));
+    // When the server cannot say whose copy it is, nothing is set aside on a
+    // guess, and nothing is pulled: the copy stays exactly as it was.
+    const unconfirmed = async (setup) => {
+        await chrome.storage.local.set({ tpTree: { ...legacyCopy(`legacy-unsure-${Math.random()}`), dirty: true, editCount: 2 } });
+        const legacyTree = JSON.stringify(await TreeStore.bookmarks.getTree());
+        const before ={ copyId: TreeStore.status().copyId, rev: storageData.get('tpTree').rev, stashes: (await TreeStore.listStashes()).length };
+        heard.length = 0;
+        setup(true);
+        let err = null;
+        let result = null;
+        try { result = await TreeStore.sync.pull(asAlex); } catch (e) { err = e; }
+        setup(false);
+        const st = TreeStore.status();
+        return {
+            err, result,
+            unchanged: st.copyId === before.copyId && st.owner === null && st.origin === 'pre-accounts' && st.dirty && st.editCount === 2
+                && st.baseVersion === 5 && JSON.stringify(await TreeStore.bookmarks.getTree()) === legacyTree
+                && storageData.get('tpTree').rev === before.rev
+                && (await TreeStore.listStashes()).length === before.stashes && heard.length === 0
+        };
+    };
+    const meDown = await unconfirmed((on) => { authMeDown = on; });
+    check('a pull over a copy from before accounts while /api/auth/me is down stops: "Couldn’t confirm the account — try again"',
+        meDown.err && meDown.err.code === 'account-unconfirmed' && /^Couldn’t confirm the account — try again/.test(meDown.err.message),
+        meDown.err ? meDown.err.message : JSON.stringify(meDown.result));
+    check('  the copy is neither set aside nor pulled over: nothing written, nothing heard', meDown.unchanged);
+    const meOther = await unconfirmed((on) => { authMeAs = on ? 2 : null; });
+    check('  likewise when /api/auth/me names someone else than the tree does',
+        meOther.err && meOther.err.code === 'account-unconfirmed' && meOther.unchanged, meOther.err && meOther.err.message);
+    await chrome.storage.local.set({ tpTree: { ...legacyCopy('local-pull'), origin: 'local' } });
+    const local = await TreeStore.sync.pull(asSam);
+    check('a copy made while nobody was signed in is pulled over, as the first account\'s to claim',
+        !local.setAside && TreeStore.status().owner.userId === 2);
+
+    // A copy brought back remembers what it was set aside as.
+    await TreeStore.restoreStash(bySam.setAside, alex);
+    const fromLegacy = TreeStore.status().restoredFrom;
+    check('the owner restoring the copy from before accounts: it remembers it was that',
+        fromLegacy.length === 1 && fromLegacy[0].userId === null && fromLegacy[0].origin === 'pre-accounts' && fromLegacy[0].url === MAIN,
+        JSON.stringify(fromLegacy));
+    await TreeStore.switchAccount({ ...sam, previousUsername: 'alex' });
+    check('  sam\'s own copy, back in its place, does not', TreeStore.status().owner.userId === 2
+        && TreeStore.status().restoredFrom.every(s => s.userId === 2), JSON.stringify(TreeStore.status().restoredFrom));
+    for (let i = 0; i < 3; i++) {
+        await TreeStore.switchAccount({ ...alex, previousUsername: 'sam' });
+        await TreeStore.switchAccount({ ...sam, previousUsername: 'alex' });
+    }
+    await TreeStore.switchAccount({ ...alex, previousUsername: 'sam' });
+    const roundTrips = TreeStore.status().restoredFrom;
+    check('  set aside and back again, it still does, once each',
+        roundTrips.length === 2 && roundTrips[0].userId === 1 && roundTrips[1].origin === 'pre-accounts', JSON.stringify(roundTrips));
+    await TreeStore.flush();
+    await chrome.storage.local.set({ tpTree: { ...storageData.get('tpTree'), rev: 'another-page-write' } });
+    check('  and another page writing the copy keeps it', TreeStore.status().restoredFrom.length === 2);
+    const { TreeStore: Reopened } = await import('../src/utils/treeStore.js?reopened');
+    await Reopened.load();
+    check('  as does the next page to open', JSON.stringify(Reopened.status().restoredFrom) === JSON.stringify(roundTrips));
+    await chrome.storage.local.set({ tpTree: {
+        baseVersion: 1, roots: [], dirty: false, owner: { url: MOVED, userId: 1, serverId: 'srv-main' }, copyId: 'restored-elsewhere',
+        restoredFrom: [{ url: MAIN, userId: 1, serverId: 'srv-main', origin: null }], rev: 'another-page-restore'
+    } });
+    check('a copy another page brings back says here, too, what it was set aside as',
+        TreeStore.status().copyId === 'restored-elsewhere' && TreeStore.status().restoredFrom.length === 1
+        && TreeStore.status().restoredFrom[0].url === MAIN, JSON.stringify(TreeStore.status().restoredFrom));
+    await TreeStore.sync.pull(asSam);
+    check('another account\'s tree pulled in starts a copy that remembers nothing',
+        TreeStore.status().owner.userId === 2 && TreeStore.status().restoredFrom.length === 0);
+    stopHearing();
+}
+
+console.log('\n13. Another page switching accounts while a pull waits on the server');
+{
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const asAlex = { url: MAIN, token: 'tok' };
+    const asSam = { url: MAIN, token: 'tok-b' };
+    // Another TabPaladin page: its own TreeStore over the same storage.
+    const { TreeStore: OtherPage } = await import('../src/utils/treeStore.js?race-other-page');
+    await OtherPage.load();
+    // alex's tree on the server, recognisable wherever it lands.
+    server.roots = [{ id: 'alex-server-mark', kind: 'folder', title: 'Alex on the server', children: [] }];
+    const legacy = (rev) => ({ baseVersion: 5, roots: [{ id: 'old-race', kind: 'folder', title: 'Old copy', children: [] }], dirty: true, editCount: 1, rev });
+    // sam's copy, set aside earlier in this browser with an edit he never pushed.
+    const samAside = async () => {
+        const key = `tpTreeStash:${MAIN}|2`;
+        await chrome.storage.local.set({
+            [key]: {
+                roots: [{ id: 'sam-root', kind: 'folder', title: 'Sam stuff', children: [{ id: 'sam-unpushed', kind: 'folder', title: 'SAM UNPUSHED', children: [] }] }],
+                baseVersion: 1000, dirty: true, editCount: 1, owner: { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main' }, origin: null, url: MAIN, username: 'sam',
+                setAsideAt: new Date().toISOString(), focusedFolderIds: [], expanded: {}, pendingRemovals: []
+            },
+            tpTreeStashIndex: [...((await chrome.storage.local.get('tpTreeStashIndex')).tpTreeStashIndex || []), key]
+        });
+    };
+    const everywhere = () => JSON.stringify([...storageData.entries()].filter(([k]) => k.startsWith('tpTree')).map(([, v]) => v));
+    const pullDuring = async (path, cfgFor, act) => {
+        duringFetch = { path, fn: act };
+        let err = null;
+        let result = null;
+        try { result = await TreeStore.sync.pull(cfgFor); } catch (e) { err = e; }
+        duringFetch = null;
+        return { err, result };
+    };
+    const changedDuringPull = (r) => r.err && r.err.code === 'account-changed'
+        && r.err.message === 'Account changed during pull — nothing was replaced.';
+
+    for (const path of ['/api/auth/me', '/api/tree']) {
+        // The owner pulls over the copy from before accounts while another
+        // page signs sam in and brings his set-aside copy back.
+        await clearStashes();
+        await chrome.storage.local.set({ tpTree: legacy(`race-legacy-${path}`) });
+        await samAside();
+        const r = await pullDuring(path, asAlex, () => OtherPage.switchAccount({ ...sam, previousUsername: null }));
+        const wc = storageData.get('tpTree');
+        check(`sam signed in elsewhere during the pull's ${path}: the pull stops, "account changed during pull — nothing was replaced"`,
+            changedDuringPull(r), r.err ? r.err.message : JSON.stringify(r.result));
+        check('  sam\'s copy, with his unpushed edit, is the working copy here and in storage, untouched',
+            TreeStore.status().owner.userId === 2 && TreeStore.status().copyId === OtherPage.status().copyId
+            && wc.owner.userId === 2 && JSON.stringify(wc.roots).includes('SAM UNPUSHED') && !everywhere().includes('alex-server-mark')
+            && (await TreeStore.getNode('sam-unpushed')) !== null && TreeStore.status().dirty, JSON.stringify(wc.owner));
+        check('  and the copy from before accounts is kept, set aside', (await TreeStore.listStashes()).some(s => s.userId === null && s.dirty)
+            && everywhere().includes('old-race'));
+    }
+
+    // alex's own copy, with an unpushed edit, pulled by alex while another
+    // page signs sam in.
+    await clearStashes();
+    await TreeStore.switchAccount({ ...alex });
+    await TreeStore.sync.pull(asAlex);
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'ALEX UNPUSHED' });
+    await TreeStore.flush();
+    await clearStashes();
+    await samAside();
+    server.roots = [{ id: 'alex-server-mark-2', kind: 'folder', title: 'Alex on the server, later', children: [] }];
+    const stamped = await pullDuring('/api/tree', asAlex, () => OtherPage.switchAccount({ ...sam, previousUsername: 'alex' }));
+    check('alex\'s pull over his own copy stops when sam comes in meanwhile', changedDuringPull(stamped),
+        stamped.err ? stamped.err.message : JSON.stringify(stamped.result));
+    check('  sam\'s copy is not replaced by alex\'s tree', TreeStore.status().owner.userId === 2
+        && (await TreeStore.getNode('sam-unpushed')) !== null && !everywhere().includes('alex-server-mark-2')
+        && storageData.get('tpTree').owner.userId === 2);
+    check('  and alex\'s unpushed edit waits in his set-aside copy', (await TreeStore.listStashes()).some(s => s.userId === 1 && s.dirty)
+        && everywhere().includes('ALEX UNPUSHED'));
+
+    // The same copy, stamped meanwhile: the owner signs in on another page and
+    // adopts the copy from before accounts while sam's pull waits.
+    await clearStashes();
+    await chrome.storage.local.set({ tpTree: legacy('race-adopt') });
+    const legacyCopyId = TreeStore.status().copyId;
+    const adopted = await pullDuring('/api/tree', asSam, () => OtherPage.switchAccount({ ...alex }));
+    check('a copy stamped by another page while the pull waits counts as changed too', changedDuringPull(adopted),
+        adopted.err ? adopted.err.message : JSON.stringify(adopted.result));
+    check('  the owner keeps the copy she adopted, unpulled over and not set aside',
+        TreeStore.status().copyId === legacyCopyId && TreeStore.status().owner.userId === 1 && TreeStore.status().dirty
+        && (await TreeStore.getNode('old-race')) !== null && (await TreeStore.listStashes()).length === 0);
+
+    // Nobody switching: the same pulls go through.
+    const plain = await pullDuring('/api/tree', asAlex, async () => {});
+    check('with nothing changing meanwhile, the pull goes through', !plain.err && (await TreeStore.getNode('alex-server-mark-2')) !== null
+        && TreeStore.status().owner.userId === 1, plain.err && plain.err.message);
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
