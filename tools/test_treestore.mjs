@@ -56,6 +56,9 @@
 //  13. A page that sets globalThis.__tpPlatform before loading the store (the
 //      web app, over IndexedDB) has treeStore.js, storageManager.js and
 //      expandState.js use it instead of the browser's storage.
+//  14. A page that is hidden, or going away (pagehide), writes its unwritten
+//      edits at once instead of on the debounce: an extension update reloads
+//      every page, and closing a tab ends it, before the timer fires.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -1458,6 +1461,44 @@ console.log('\n17. A page can install its own platform before the store loads');
     } finally {
         delete globalThis.__tpPlatform;
     }
+}
+
+console.log('\n18. A page that is hidden or going away writes its edits at once');
+{
+    // A page of its own, with a document and a window to hear it hide.
+    const docListeners = {};
+    const winListeners = {};
+    globalThis.document = {
+        visibilityState: 'visible',
+        addEventListener: (t, fn) => { (docListeners[t] ||= []).push(fn); }
+    };
+    globalThis.window = { addEventListener: (t, fn) => { (winListeners[t] ||= []).push(fn); } };
+    const { TreeStore: Page } = await import('../src/utils/treeStore.js?hide-page');
+    delete globalThis.document;
+    delete globalThis.window;
+    await Page.load();
+    const stored = () => JSON.stringify(storageData.get('tpTree') || null);
+    const fire = (list) => { for (const fn of list || []) fn(); };
+
+    await Page.createNode({ parentId: null, kind: 'folder', title: 'WRITTEN ON HIDE' });
+    check('an edit waits for the debounce while the page is visible', !stored().includes('WRITTEN ON HIDE'));
+    // The listener reads document.visibilityState from the global document.
+    globalThis.document = { visibilityState: 'hidden' };
+    fire(docListeners.visibilitychange);
+    await new Promise(r => setTimeout(r, 30));
+    check('hiding the page writes it before the debounce would have', stored().includes('WRITTEN ON HIDE'));
+    delete globalThis.document;
+
+    await Page.createNode({ parentId: null, kind: 'folder', title: 'WRITTEN ON PAGEHIDE' });
+    fire(winListeners.pagehide);
+    await new Promise(r => setTimeout(r, 30));
+    check('pagehide writes it too', stored().includes('WRITTEN ON PAGEHIDE'));
+
+    const rev = storageData.get('tpTree').rev;
+    fire(winListeners.pagehide);
+    await new Promise(r => setTimeout(r, 30));
+    check('with nothing unwritten, hiding writes nothing', storageData.get('tpTree').rev === rev);
+    await TreeStore.flush();
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);

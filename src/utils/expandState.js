@@ -1,19 +1,18 @@
 // Which cards the user left open on this device.
 //
-// Every card on the main page (the Open Tabs column, its AI groups, each
+// Every card on the main page (the Open Tabs column, its keyword groups, each
 // folder column and every nested folder card) is collapsible, and every drop,
 // pull or refresh rebuilds them. This remembers the user's choice per card so
 // a rebuild — or a reload, or a browser restart — comes back the way it was.
 //
 // UI state only, and per device by nature, so it lives under its own
 // storage.local key rather than in `settings`: that object is read in full and
-// written back from several places (toggle writes would race them), and the
-// background re-registers content scripts on every settings change.
+// written back from several places (toggle writes would race them).
 //
 // Stored shape:
 //   { v: 1, cards: { "<key>": { o: 1|0, t: <ms last touched> } } }
 // Keys are tree node ids (stable across push/pull, virtual import ids
-// included), OPEN_TABS_KEY, or aiGroupKey(name) — AI group ids are
+// included), OPEN_TABS_KEY, or tabGroupKey(name) — keyword group ids are
 // regenerated on every regroup, so those go by name. Only explicit choices are
 // stored; a missing key means the card's default.
 //
@@ -28,7 +27,10 @@ const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser
 
 export const EXPAND_KEY = 'tpUiExpanded';
 export const OPEN_TABS_KEY = '__open_tabs__';
-export const aiGroupKey = (name) => `aigroup:${String(name || '').trim().toLowerCase()}`;
+// The Open Tabs column's keyword groups (TabGrouper). The 'aigroup:' prefix
+// is from when they were called AI groups; it stays, so remembered cards do.
+export const tabGroupKey = (name) => `aigroup:${String(name || '').trim().toLowerCase()}`;
+export const aiGroupKey = tabGroupKey;
 
 // Oldest-touched entries go first past this, so the map cannot grow forever
 // with folders opened once years ago.

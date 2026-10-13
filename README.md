@@ -16,7 +16,7 @@
 
 ## ✨ What is TabPaladin?
 
-TabPaladin is a powerful browser extension that helps you **tame tab chaos** and **organize your digital life**. Save your browsing sessions as workflows, organize bookmarks with AI assistance, and never lose track of your research again.
+TabPaladin is a powerful browser extension that helps you **tame tab chaos** and **organize your digital life**. Save your browsing sessions as workflows, sort your bookmarks by your own keywords, and never lose track of your research again.
 
 > *"100 tabs open? No problem."* — Every TabPaladin user
 
@@ -29,10 +29,14 @@ TabPaladin is a powerful browser extension that helps you **tame tab chaos** and
 - **Restore Anytime** — Reopen entire workflows in a new window
 - **Import/Export** — Backup your workflows to JSON files
 
-### 🧠 **AI-Powered Organization** (Optional)
-- **Smart Grouping** — Let AI categorize your tabs and bookmarks
-- **Folder Suggestions** — Get intelligent folder recommendations
-- **Custom Hints** — Guide the AI with your own keywords
+### 🗂️ **Keyword Organization**
+- **Smart Grouping** — open tabs and bookmarks grouped by built-in categories and your own keywords
+- **Folder Suggestions** — Analyze & Sort and Split propose where each bookmark goes; nothing moves until you apply it
+- **Your keywords, your folders** — export and import your keywords and any folder as JSON
+
+There is no built-in AI and no API key to enter: nothing is sent to an AI service.
+An assistant can work with your notes through the sync server's temporary share
+link instead, and what it proposes is applied only once you approve it.
 
 ### 🗄️ **Server-owned bookmarks** (needs the sync server)
 - **One tree, any browser** — your bookmarks live in the sync server's database, not in any browser's own bookmark store, so Chrome, Firefox, Opera and the phone all see the identical tree
@@ -65,6 +69,27 @@ and for any machine without the extension.
 - **Chrome**: `chrome://extensions` → Developer mode → **Load unpacked** → the repository folder
 - **Firefox**: build the package first (below), then `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → `dist/firefox.zip`
 
+#### Updating a sideloaded extension
+
+Update in place, never by removing and adding it again: Chrome derives the
+extension's id from its folder, and a new id starts with empty storage.
+
+- **Chrome / Edge / Opera**: `git pull` in the same folder, then **Reload** on the extensions page.
+- **Firefox**: build the package again and **Reload** it on `about:debugging` (the add-on id, `tabpaladin@extension`, stays the same).
+
+Before you reload, **save or close any note you are editing and Push**. From
+1.0.1 on, the extension keeps the text of a note you are typing (half a second
+after your last key) and writes other edits within a moment, so a reload costs
+at most the last keystrokes, and open workflow windows stay tracked across the
+update. The update *to* 1.0.1 still runs the old code and has none of that. If
+in doubt, **Settings → Backup → Download a backup** first: one file with
+everything this browser holds, minus your sign-in session.
+
+TabPaladin does not run in private (incognito) windows.
+
+TabPaladin is moving into the sync server's web app; the extension will become
+a small helper for the tab features. Push your edits before each update.
+
 #### Packaging for the stores
 
 ```bash
@@ -92,7 +117,7 @@ HTML file in **Settings → Import bookmarks** — works with any browser.
 1. **Click the TabPaladin icon** in your toolbar to open the app
 2. **Create Workflow** — Save all your current tabs (extension)
 3. **View Workflows** — Restore, open, or delete saved sessions (both clients)
-4. **Organize Bookmarks** — Use AI to clean up your bookmark mess
+4. **Organize Bookmarks** — Sort folders by keyword, reviewing every move first
 5. **Push / Pull** — git-style sync; edit offline, push when ready
 
 ---

@@ -13,6 +13,19 @@ import { TreeStore } from './treeStore.js';
 // The browser's API, unless a page installed a platform first (see treeStore.js).
 const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser : chrome);
 
+const VIDEO_SEEK_KEY = 'tpVideoSeek';
+
+// Settings an earlier version kept and this one has no use for: the built-in
+// AI's switch and its Gemini API key.
+export const RETIRED_SETTINGS = ['geminiApiKey', 'useAI'];
+
+function withoutRetired(settings) {
+    if (!settings || typeof settings !== 'object' || !RETIRED_SETTINGS.some(k => k in settings)) return settings;
+    const kept = { ...settings };
+    for (const k of RETIRED_SETTINGS) delete kept[k];
+    return kept;
+}
+
 function hydrateWorkflow(folderNode) {
     const tabs = [];
     for (const c of folderNode.children || []) {
@@ -204,16 +217,44 @@ export const StorageManager = {
 
     /**
      * Settings Management (still in extension storage — these aren't workflows).
+     *
+     * The built-in AI is gone, and with it the Gemini key an earlier version
+     * kept here: it is never read back, never written again, and deleted from
+     * storage (purgeRetiredSettings, and the background on every update).
      */
     saveSettings: async (settings) => {
-        await api.storage.local.set({ settings });
+        await api.storage.local.set({ settings: withoutRetired(settings) });
     },
 
     getSettings: async () => {
         const data = await api.storage.local.get("settings") || {};
-        return (data && data.settings) || {
+        return withoutRetired((data && data.settings) || {
             focusedFolderIds: []
-        };
+        });
+    },
+
+    purgeRetiredSettings: async () => {
+        const data = await api.storage.local.get('settings') || {};
+        const settings = data && data.settings;
+        if (!settings || typeof settings !== 'object' || !RETIRED_SETTINGS.some(k => k in settings)) return false;
+        await api.storage.local.set({ settings: withoutRetired(settings) });
+        return true;
+    },
+
+    /**
+     * Video scroll-seek's switch. Its own key (tpVideoSeek), which the
+     * background registers the content script by; settings.videoSeek, where
+     * it lived before, is still written so an older version finds it set.
+     */
+    getVideoSeek: async () => {
+        const data = await api.storage.local.get([VIDEO_SEEK_KEY, 'settings']) || {};
+        if (typeof data[VIDEO_SEEK_KEY] === 'boolean') return data[VIDEO_SEEK_KEY];
+        return Boolean(data.settings && data.settings.videoSeek);
+    },
+
+    setVideoSeek: async (on) => {
+        const current = await StorageManager.getSettings();
+        await api.storage.local.set({ [VIDEO_SEEK_KEY]: Boolean(on), settings: { ...current, videoSeek: Boolean(on) } });
     },
 
     /**

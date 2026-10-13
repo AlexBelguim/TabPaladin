@@ -9,11 +9,11 @@ const chrome = globalThis.chrome || globalThis.browser;
 import { TabGrouper, CONTEXT_KEYWORDS } from '../utils/tabGrouper.js';
 import { StorageManager } from '../utils/storageManager.js';
 import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
-import { AIService } from '../utils/aiService.js';
 import { TreeStore } from '../utils/treeStore.js';
-import { ExpandState, OPEN_TABS_KEY, aiGroupKey } from '../utils/expandState.js';
+import { ExpandState, OPEN_TABS_KEY, tabGroupKey } from '../utils/expandState.js';
 import { resolveServerUrl } from '../utils/config.js';
-import { parkedDraftsOnlyWith, dropParkedDrafts, parkedDraftsMarkdown } from '../app/notesView.js';
+import { parkedDraftsOnlyWith, dropParkedDrafts, parkedDraftsMarkdown, saveLiveDraft } from '../app/notesView.js';
+import { downloadBackup } from '../utils/backup.js';
 
 // Every read and write goes against the local working copy of the synced tree
 // (chrome.bookmarks-compatible facade). The browser's own bookmarks are only
@@ -45,6 +45,8 @@ function showStartupSyncBanner() {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
+    // A Gemini key an earlier version kept is deleted (the built-in AI is gone).
+    StorageManager.purgeRetiredSettings().catch(() => {});
     // Which cards were open last time is read alongside the tree, so the first
     // render already has it and paints once, in its final state.
     await Promise.all([TreeStore.load(), ExpandState.load()]);
@@ -504,9 +506,9 @@ async function getFolderPath(folderId) {
 // the old path-capture/remap machinery that lived here is gone with the
 // destructive pull it compensated for.
 
-// Module-level state for the main view (AI groups are mutable in-memory; tabs are sourced live).
+// Module-level state for the main view (keyword groups are mutable in-memory; tabs are sourced live).
 let mainViewState = {
-    aiGroups: [],         // [{ id, name, items: [{tabId, url, title, favIconUrl}] }]
+    tabGroups: [],        // [{ id, name, items: [{tabId, url, title, favIconUrl}] }]
     bookmarkUrls: new Set(), // URLs already in bookmarks — filters Open Tabs
 };
 
@@ -542,13 +544,13 @@ async function renderMainView({ regroup = true } = {}) {
     mainViewState.bookmarkUrls = await getAllBookmarkUrls();
     const filteredTabs = saveable.filter(t => !mainViewState.bookmarkUrls.has(t.url));
 
-    // Build / refresh AI Groups. On first render or explicit regroup, ask TabGrouper.
-    // Otherwise preserve existing aiGroups but drop items whose URLs are now bookmarked
+    // Build / refresh the keyword groups. On first render or explicit regroup, ask TabGrouper.
+    // Otherwise preserve existing groups but drop items whose URLs are now bookmarked
     // and drop items whose tabs are closed.
-    if (regroup || mainViewState.aiGroups.length === 0) {
+    if (regroup || mainViewState.tabGroups.length === 0) {
         const s = await StorageManager.getSettings();
         const grouped = TabGrouper.groupSmart(filteredTabs, s.customKeywords || {}, s.categoryOrder || null);
-        mainViewState.aiGroups = Object.entries(grouped).map(([name, items], idx) => ({
+        mainViewState.tabGroups = Object.entries(grouped).map(([name, items], idx) => ({
             id: `g_${idx}_${Date.now()}`,
             name,
             items: items.map(t => ({
@@ -557,7 +559,7 @@ async function renderMainView({ regroup = true } = {}) {
         }));
     } else {
         const tabIdsOpen = new Set(saveable.map(t => t.id));
-        mainViewState.aiGroups = mainViewState.aiGroups
+        mainViewState.tabGroups = mainViewState.tabGroups
             .map(g => ({
                 ...g,
                 items: g.items.filter(it =>
@@ -566,9 +568,9 @@ async function renderMainView({ regroup = true } = {}) {
             .filter(g => g.items.length > 0);
     }
 
-    // Tabs that are currently in some AI group — Open Tabs root excludes them.
+    // Tabs that are currently in some keyword group — Open Tabs root excludes them.
     const claimedTabIds = new Set();
-    mainViewState.aiGroups.forEach(g => g.items.forEach(i => claimedTabIds.add(i.tabId)));
+    mainViewState.tabGroups.forEach(g => g.items.forEach(i => claimedTabIds.add(i.tabId)));
     const unclaimedTabs = filteredTabs.filter(t => !claimedTabIds.has(t.id));
 
     // Real folder roots for the main view: TabPaladin Workflows (if exists) + focused folders.
@@ -606,7 +608,7 @@ async function renderMainView({ regroup = true } = {}) {
     // Columns, side by side: Open Tabs, Workflows, Bookmarks. Each is a
     // section you scan independently, so they sit next to each other rather
     // than stacking and pushing the later ones below the fold.
-    grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
+    grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.tabGroups));
 
     // One budget across all columns: it caps how much the remembered-open
     // folders may build on their own in this pass.
@@ -649,12 +651,12 @@ function swapKeepingColumnScroll(container, ...nodes) {
     }
 }
 
-function renderOpenTabsCard(unclaimedTabs, aiGroups) {
+function renderOpenTabsCard(unclaimedTabs, tabGroups) {
     const card = document.createElement('div');
     card.className = 'source-folder-card open-tabs-card';
     card.dataset.id = OPEN_TABS_KEY;
 
-    const totalTabs = unclaimedTabs.length + aiGroups.reduce((n, g) => n + g.items.length, 0);
+    const totalTabs = unclaimedTabs.length + tabGroups.reduce((n, g) => n + g.items.length, 0);
 
     const header = document.createElement('div');
     header.className = 'source-folder-header';
@@ -684,8 +686,8 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
             appendTabDomainGroups(ungroupedWrap, unclaimedTabs, null);
             body.appendChild(ungroupedWrap);
         }
-        // 2. Each AI group as a nested card inside Open Tabs body.
-        aiGroups.forEach(g => body.appendChild(renderGroupCard(g)));
+        // 2. Each keyword group as a nested card inside Open Tabs body.
+        tabGroups.forEach(g => body.appendChild(renderGroupCard(g)));
     }
 
     // Expand/collapse the whole Open Tabs card
@@ -712,7 +714,7 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
             if (tabsPayload) {
                 const { items = [], sourceGroupId } = JSON.parse(tabsPayload);
                 if (sourceGroupId) {
-                    const src = mainViewState.aiGroups.find(g => g.id === sourceGroupId);
+                    const src = mainViewState.tabGroups.find(g => g.id === sourceGroupId);
                     if (src) {
                         const ids = new Set(items.map(it => it.tabId));
                         src.items = src.items.filter(it => !ids.has(it.tabId));
@@ -722,7 +724,7 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
             } else if (payload) {
                 const { tabId, sourceGroupId } = JSON.parse(payload);
                 if (sourceGroupId) {
-                    const g = mainViewState.aiGroups.find(g => g.id === sourceGroupId);
+                    const g = mainViewState.tabGroups.find(g => g.id === sourceGroupId);
                     if (g) g.items = g.items.filter(it => it.tabId !== tabId);
                 }
                 await renderMainView({ regroup: false });
@@ -735,7 +737,7 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
     return card;
 }
 
-// Open Tabs and the AI groups build their whole body up front (one window's
+// Open Tabs and the keyword groups build their whole body up front (one window's
 // tabs), so collapsing only hides it. Both default to open; an explicit
 // toggle is remembered under `key`.
 function wireRememberedToggle(card, header, body, key) {
@@ -829,7 +831,7 @@ function appendTabDomainGroups(container, tabs, sourceGroupId = null) {
 function renderGroupCard(group) {
     const card = document.createElement('div');
     // Render as a nested card so it inherits the indented styling used by Organize subfolders.
-    card.className = 'source-folder-card ai-group-card nested';
+    card.className = 'source-folder-card tab-group-card nested';
     card.dataset.id = group.id;
     card.dataset.groupId = group.id;
 
@@ -838,7 +840,7 @@ function renderGroupCard(group) {
     header.innerHTML = `
         <span class="folder-drag-handle" title="Drag group to a folder to file it" draggable="true">⋮⋮</span>
         <span class="folder-caret">▼</span>
-        <span class="folder-icon">🧠</span>
+        <span class="folder-icon">🏷️</span>
         <span class="folder-title">${escapeHtml(group.name)}</span>
         <span class="folder-stats">${group.items.length}</span>
     `;
@@ -856,7 +858,7 @@ function renderGroupCard(group) {
 
     // Expand/collapse. Group ids are regenerated on every regroup, so the
     // remembered state goes by the group's name.
-    wireRememberedToggle(card, header, body, aiGroupKey(group.name));
+    wireRememberedToggle(card, header, body, tabGroupKey(group.name));
 
     // Drag the WHOLE group via the handle.
     const handle = header.querySelector('.folder-drag-handle');
@@ -894,7 +896,7 @@ function renderGroupCard(group) {
                 const { items = [], sourceGroupId } = JSON.parse(tabsPayload);
                 if (sourceGroupId === group.id) return;
                 if (sourceGroupId) {
-                    const src = mainViewState.aiGroups.find(g => g.id === sourceGroupId);
+                    const src = mainViewState.tabGroups.find(g => g.id === sourceGroupId);
                     if (src) {
                         const ids = new Set(items.map(it => it.tabId));
                         src.items = src.items.filter(it => !ids.has(it.tabId));
@@ -909,7 +911,7 @@ function renderGroupCard(group) {
                 const { tabId, url, title, sourceGroupId } = JSON.parse(payload);
                 if (sourceGroupId === group.id) return;
                 if (sourceGroupId) {
-                    const src = mainViewState.aiGroups.find(g => g.id === sourceGroupId);
+                    const src = mainViewState.tabGroups.find(g => g.id === sourceGroupId);
                     if (src) src.items = src.items.filter(it => it.tabId !== tabId);
                 }
                 if (!group.items.find(it => it.tabId === tabId)) {
@@ -1426,7 +1428,7 @@ function renderFolderCard(sub, depth = 0) {
         ${isImports ? '' : `<button class="sm-btn new-subfolder-btn" title="Create a folder inside ${escapeHtml(sub.title)}" style="padding:2px 8px;">＋📁</button>`}
         ${deleteBtnHtml}
         ${drillBtnHtml}
-        ${isImports ? '' : '<input type="checkbox" class="source-select-check" title="Select for batch action (Analyze & Sort / Restructure)">'}
+        ${isImports ? '' : '<input type="checkbox" class="source-select-check" title="Select for Analyze & Sort">'}
     `;
     card.appendChild(header);
 
@@ -1540,7 +1542,7 @@ function renderFolderCard(sub, depth = 0) {
         });
     }
 
-    // Split = AI/heuristic on this folder's loose files only.
+    // Split = the keyword organizer on this folder's loose files only.
     // Optional chaining throughout: these controls are omitted inside the
     // import archive, where they would only queue up work the next sweep undoes.
     header.querySelector('.split-btn')?.addEventListener('click', async (e) => {
@@ -1598,7 +1600,7 @@ function renderFolderCard(sub, depth = 0) {
         });
     }
 
-    // Checkbox: select for batch Analyze/Restructure.
+    // Checkbox: select for Analyze & Sort.
     const checkbox = header.querySelector('.source-select-check');
     checkbox?.addEventListener('change', () => {
         if (checkbox.checked) {
@@ -1642,7 +1644,7 @@ function renderFolderCard(sub, depth = 0) {
         if (springTimer) { clearTimeout(springTimer); springTimer = null; }
     };
 
-    // Drop target — accept dragged bookmark, bulk bookmarks, folder, tab, bulk tabs, or AI group.
+    // Drop target — accept dragged bookmark, bulk bookmarks, folder, tab, bulk tabs, or a keyword group.
     card.addEventListener('dragover', (e) => {
         // Nothing may be filed *into* the archive. The next sweep rebuilds this
         // subtree from the server's own records, so anything dropped here is
@@ -1700,7 +1702,7 @@ function renderFolderCard(sub, depth = 0) {
 
         try {
             if (groupPayload) {
-                // AI Group → create subfolder + bookmarks for each item, then close source tabs.
+                // Keyword group → create subfolder + bookmarks for each item, then close source tabs.
                 const g = JSON.parse(groupPayload);
                 if (!g.items || g.items.length === 0) return;
                 // Create subfolder under target with the group name (reuse existing if name matches).
@@ -1712,7 +1714,7 @@ function renderFolderCard(sub, depth = 0) {
                     if (closeTabs && it.tabId != null) closedTabIds.push(it.tabId);
                 }
                 // Remove group from main-view state.
-                mainViewState.aiGroups = mainViewState.aiGroups.filter(x => x.id !== g.groupId);
+                mainViewState.tabGroups = mainViewState.tabGroups.filter(x => x.id !== g.groupId);
             } else if (tabsPayload) {
                 // Bulk tabs (a whole domain group).
                 // Special case: main view + drop on the workflows ROOT → auto-create a
@@ -1741,7 +1743,7 @@ function renderFolderCard(sub, depth = 0) {
                     }
 
                     if (sourceGroupId) {
-                        const src = mainViewState.aiGroups.find(g => g.id === sourceGroupId);
+                        const src = mainViewState.tabGroups.find(g => g.id === sourceGroupId);
                         if (src) {
                             const ids = new Set(items.map(it => it.tabId));
                             src.items = src.items.filter(it => !ids.has(it.tabId));
@@ -1753,9 +1755,9 @@ function renderFolderCard(sub, depth = 0) {
                 const t = JSON.parse(tabPayload);
                 await Tree.create({ parentId: sub.id, title: t.title || t.url, url: t.url });
                 if (closeTabs && t.tabId != null) closedTabIds.push(t.tabId);
-                // Remove tab from its source AI group, if any.
+                // Remove tab from its source keyword group, if any.
                 if (t.sourceGroupId) {
-                    const src = mainViewState.aiGroups.find(g => g.id === t.sourceGroupId);
+                    const src = mainViewState.tabGroups.find(g => g.id === t.sourceGroupId);
                     if (src) src.items = src.items.filter(it => it.tabId !== t.tabId);
                 }
             } else if (bookmarkIdsJson) {
@@ -2234,19 +2236,12 @@ async function refreshFolderBodyIfOpen(folderIds, except = null) {
     for (const card of outermost) await cardControls.get(card)?.refresh(budget);
 }
 
+// Split: the keyword organizer on this folder's loose files only.
 async function runSplitOnFolder(folderId, folderTitle) {
-    const settings = await StorageManager.getSettings();
-    const hintsInput = document.getElementById('aiHintsInput');
-    const userHints = hintsInput ? hintsInput.value.trim() : '';
     const sourceIds = [`loose-${folderId}`];
 
     try {
-        let proposal;
-        if (settings.useAI && settings.geminiApiKey) {
-            proposal = await BookmarkOrganizer.analyzeWithAI(sourceIds, [folderId], settings.geminiApiKey, userHints);
-        } else {
-            proposal = await BookmarkOrganizer.proposeSmartOrganization(sourceIds);
-        }
+        const proposal = await BookmarkOrganizer.proposeSmartOrganization(sourceIds);
         if (!proposal.groups || proposal.groups.length === 0) {
             alert(`Nothing to split in "${folderTitle}".`);
             return;
@@ -2288,96 +2283,6 @@ document.getElementById('groupTabsBtn').addEventListener('click', async () => {
 // switchers here only hide #notes-container, the same way they hide every
 // other section.
 
-// AI Grouping for TABS
-document.getElementById('aiGroupTabsBtn').addEventListener('click', async () => {
-    const btn = document.getElementById('aiGroupTabsBtn');
-    const originalText = btn.textContent;
-    btn.textContent = 'Grouping... 🧠';
-    btn.disabled = true;
-
-    try {
-        const settings = await StorageManager.getSettings();
-        if (!settings.useAI || !settings.geminiApiKey) {
-            alert("AI features disabled. Check Settings.");
-            return;
-        }
-
-        // 1. Get Tabs (Source) — current window only, http/https/file
-        const tabs = await chrome.tabs.query({ currentWindow: true });
-        const looseItems = tabs
-            .filter(t => t.url && /^https?:|^file:|^ftp:/.test(t.url))
-            .map(t => ({
-                id: t.id.toString(),
-                title: t.title,
-                url: t.url,
-                isTab: true
-            }));
-
-        // 2. Get Context (Folders)
-        // We want AI to file tabs into EXISTING folders if possible, or create NEW ones.
-        const allowedIds = settings.focusedFolderIds || [];
-        const allStructure = await BookmarkOrganizer.getFolderMap(allowedIds);
-        const contextFolders = allStructure.map(f => ({ id: f.id, path: f.fullPath }));
-
-        // 3. User Hints
-        const hints = document.getElementById('aiTabsHintsInput').value.trim();
-
-        // 4. Call AIService (Reusing the core AI logic)
-        // We use the same 'organizeWithAI' because the signature is generic (links, folders, key, hints)
-        const mapping = await AIService.organizeWithAI(looseItems, contextFolders, settings.geminiApiKey, hints);
-
-        // 5. Convert Mapping to UI Proposal
-        // (Similar logic to Analyze, but for Tabs)
-        const groups = {};
-
-        // Default for NEW: proposals — first focused folder, then first in scope, finally Other Bookmarks
-        const focusedRoot = allowedIds.length
-            ? allStructure.find(f => f.id === allowedIds[0])
-            : null;
-        const defaultRoot = focusedRoot || allStructure[0] || { id: '2', fullPath: 'Other Bookmarks' };
-
-        looseItems.forEach(item => {
-            const decision = mapping[item.id];
-            if (!decision || decision === 'SKIP') return;
-
-            if (decision.startsWith('NEW:')) {
-                const newCat = decision.replace('NEW:', '').trim();
-                const groupKey = `NEW_${newCat}`;
-                if (!groups[groupKey]) {
-                    groups[groupKey] = {
-                        groupName: newCat, action: 'CREATE', targetId: defaultRoot.id, targetPath: defaultRoot.fullPath,
-                        newSubfolder: newCat, items: []
-                    };
-                }
-                groups[groupKey].items.push(item);
-            } else {
-                const folderId = decision;
-                const folderInfo = allStructure.find(f => f.id === folderId);
-                if (folderInfo) {
-                    if (!groups[folderId]) {
-                        groups[folderId] = {
-                            groupName: folderInfo.title, action: 'MOVE', targetId: folderId,
-                            targetPath: folderInfo.fullPath, newSubfolder: '', items: []
-                        };
-                    }
-                    groups[folderId].items.push(item);
-                }
-            }
-        });
-
-        // 6. Render
-        const proposal = { groups: Object.values(groups) };
-        renderOrganizerProposal(proposal, true); // true = isTabMode
-
-    } catch (e) {
-        console.error("AI Tab Grouping Failed", e);
-        alert("AI Failed: " + e.message);
-    } finally {
-        btn.textContent = originalText;
-        btn.disabled = false;
-    }
-});
-
 document.getElementById('organizeBookmarksBtn').addEventListener('click', async () => {
     try {
         // Always land on the virtual root — Workflows + focused folders side-by-side.
@@ -2408,11 +2313,11 @@ window.addEventListener('tabpaladin:home-refresh', () => {
     if (isMainViewVisible()) renderMainView({ regroup: false });
 });
 
-// Step 2: Analyze & Propose
+// Step 2: Analyze & Propose — the keyword organizer on the selected folders.
 document.getElementById('analyzeBtn').addEventListener('click', async () => {
     // FIX: Include split cards in selection!
     const selected = document.querySelectorAll('.source-folder-card.selected');
-    // Pass raw values (e.g. 'loose-5' or '5'). The backend 'getAllItemsInScope' handles the distinction.
+    // Pass raw values (e.g. 'loose-5' or '5'); proposeSmartOrganization handles the distinction.
     const folderIds = Array.from(selected).map(btn => btn.dataset.value).filter(Boolean);
 
     if (folderIds.length === 0) {
@@ -2422,39 +2327,11 @@ document.getElementById('analyzeBtn').addEventListener('click', async () => {
 
     const btn = document.getElementById('analyzeBtn');
     const originalText = btn.textContent;
-    btn.textContent = 'Analyzing... 🧠';
+    btn.textContent = 'Analyzing…';
     btn.disabled = true;
 
     try {
-        // Validation check for StorageManager
-        if (typeof StorageManager.getSettings !== 'function') {
-            alert("StorageManager.getSettings missing. Reload extension.");
-            return;
-        }
-
-        const settings = await StorageManager.getSettings();
-
-        // Get user hints
-        const hintsInput = document.getElementById('aiHintsInput');
-        const userHints = hintsInput ? hintsInput.value.trim() : '';
-
-        // Call the actual AI or fallback to naive
-        let proposal;
-        if (settings.useAI && settings.geminiApiKey) {
-            // FIXED: Context Scope logic
-            // When explicitly analyzing selected folders (Source View), user intent is usually to organize WITHIN that scope.
-            // If we use 'focusedFolderIds', it might be too broad (e.g. Root) or too narrow (unrelated).
-            // We should prioritize the EXPLICITLY SELECTED source folders as the context.
-            // (If user wants to move items OUT of source to Global, they might need a different mode, but "Analyze" usually implies "Cleanup this folder").
-
-            const cleanSourceIds = folderIds.map(id => id.replace('loose-', ''));
-            // If we have selected sources, USE THEM. Only fallback to Settings if no source selected (rare/impossible here).
-            const contextIds = (cleanSourceIds.length > 0) ? cleanSourceIds : (settings.focusedFolderIds || []);
-
-            proposal = await BookmarkOrganizer.analyzeWithAI(folderIds, contextIds, settings.geminiApiKey, userHints);
-        } else {
-            proposal = await BookmarkOrganizer.proposeSmartOrganization(folderIds);
-        }
+        const proposal = await BookmarkOrganizer.proposeSmartOrganization(folderIds);
         renderOrganizerProposal(proposal);
 
     } catch (error) {
@@ -2463,72 +2340,6 @@ document.getElementById('analyzeBtn').addEventListener('click', async () => {
     } finally {
         btn.textContent = originalText;
         btn.disabled = false;
-    }
-});
-
-document.getElementById('restructureBtn').addEventListener('click', async () => {
-    // Logic similar to analyzeBtn but calls restructureWithAI
-    const selected = document.querySelectorAll('.source-folder-card.selected');
-    const folderIds = Array.from(selected).map(btn => btn.dataset.value).filter(Boolean);
-
-    if (folderIds.length === 0) {
-        alert('Please select at least one folder to RESTRUCTURE.');
-        return;
-    }
-
-    const btn = document.getElementById('restructureBtn');
-    const originalText = btn.textContent;
-    btn.textContent = 'Re-Architecting... 🏗️';
-    btn.disabled = true;
-    document.getElementById('analyzeBtn').disabled = true;
-
-    try {
-        const settings = await StorageManager.getSettings();
-        if (!settings.useAI || !settings.geminiApiKey) {
-            alert("AI features are required for Restructure. Please enable AI and set an API key in Settings.");
-            return;
-        }
-
-        // 1. Get ALL items from selected folders
-        const { looseItems } = await BookmarkOrganizer.getAllItemsInScope(folderIds);
-
-        // Get user hints
-        const hintsInput = document.getElementById('aiHintsInput');
-        const userHints = hintsInput ? hintsInput.value.trim() : '';
-
-        // 2. Call AI Restructure
-        const aiMapping = await AIService.restructureWithAI(looseItems, settings.geminiApiKey, userHints);
-
-        // 3. Build Proposal from AI Mapping
-        // aiMapping: { "bookmarkId": "Category > Subcategory" }
-        const groups = {};
-        looseItems.forEach(item => {
-            const newPath = aiMapping[item.id];
-            if (!newPath) return;
-
-            if (!groups[newPath]) {
-                groups[newPath] = {
-                    groupName: newPath,
-                    action: 'CREATE',
-                    targetId: '2', // Default to Other Bookmarks
-                    targetPath: `Other bookmarks/${newPath.replace(/ > /g, '/')}`,
-                    newSubfolder: newPath.replace(/ > /g, '/'),
-                    items: []
-                };
-            }
-            groups[newPath].items.push(item);
-        });
-
-        const proposal = { groups: Object.values(groups) };
-        renderOrganizerProposal(proposal);
-
-    } catch (error) {
-        console.error(error);
-        alert('Restructure failed: ' + error.message);
-    } finally {
-        btn.textContent = originalText;
-        btn.disabled = false;
-        document.getElementById('analyzeBtn').disabled = false;
     }
 });
 
@@ -2561,12 +2372,8 @@ document.getElementById('applyOrganizerBtn').addEventListener('click', async () 
         return;
     }
 
-    if (window.isTabMode) {
-        await applyTabModeGroups(approvedGroups);
-    } else {
-        await BookmarkOrganizer.applyOrganization(approvedGroups);
-        alert(`Organized ${approvedGroups.length} groups!`);
-    }
+    await BookmarkOrganizer.applyOrganization(approvedGroups);
+    alert(`Organized ${approvedGroups.length} groups!`);
 
     document.getElementById('organizer-container').style.display = 'none';
     document.getElementById('groups-container').style.display = 'block';
@@ -2575,134 +2382,25 @@ document.getElementById('applyOrganizerBtn').addEventListener('click', async () 
     if (isMainViewVisible()) await renderMainView({ regroup: false });
 });
 
-async function applyTabModeGroups(approvedGroups) {
-    // 1. Create bookmarks for each group at the chosen destination
-    for (const group of approvedGroups) {
-        let folderId = group.targetId;
-
-        if (group.newSubfolder && group.newSubfolder.trim() !== '') {
-            try {
-                const siblings = await Tree.getChildren(folderId);
-                const existing = siblings.find(s => !s.url && s.title.toLowerCase() === group.newSubfolder.toLowerCase());
-                if (existing) {
-                    folderId = existing.id;
-                } else {
-                    const created = await Tree.create({
-                        parentId: folderId,
-                        title: group.newSubfolder
-                    });
-                    folderId = created.id;
-                }
-            } catch (e) { console.error("Error creating subfolder", e); }
-        }
-
-        for (const item of group.items) {
-            await Tree.create({
-                parentId: folderId,
-                title: item.title,
-                url: item.url
-            });
-        }
-    }
-
-    // 2. Close source tabs if the toggle is on (default: on)
-    const toggle = document.getElementById('closeAfterApplyToggle');
-    let closed = 0;
-    if (toggle && toggle.checked) {
-        closed = await closeFiledTabs(approvedGroups);
-    }
-
-    const msg = closed > 0
-        ? `Saved ${approvedGroups.length} group(s) to bookmarks. Closed ${closed} filed tab(s).`
-        : `Saved ${approvedGroups.length} group(s) to bookmarks!`;
-    alert(msg);
-
-    await loadWorkflows();
-}
-
-async function closeFiledTabs(approvedGroups) {
-    const api = typeof browser !== 'undefined' ? browser : chrome;
-
-    // Collect tab IDs from approved groups. Items in tab-mode carry the chrome tab id.
-    const tabIds = [];
-    for (const g of approvedGroups) {
-        for (const item of g.items) {
-            const id = Number(item.id);
-            if (Number.isFinite(id)) tabIds.push(id);
-        }
-    }
-    if (tabIds.length === 0) return 0;
-
-    // Resolve which of these tabs still exist and are safe to close.
-    // Skip: pinned tabs, the currently-active tab (don't kill the user's current page).
-    const allTabs = await api.tabs.query({ currentWindow: true });
-    const byId = new Map(allTabs.map(t => [t.id, t]));
-    const safeIds = tabIds.filter(id => {
-        const t = byId.get(id);
-        if (!t) return false;
-        if (t.pinned) return false;
-        if (t.active) return false;
-        return true;
-    });
-
-    if (safeIds.length === 0) return 0;
-
-    // If closing these would empty the window, open a blank tab first.
-    const remaining = allTabs.filter(t => !safeIds.includes(t.id));
-    if (remaining.length === 0) {
-        await api.tabs.create({});
-    }
-
-    try {
-        await api.tabs.remove(safeIds);
-    } catch (e) {
-        console.warn("Some tabs could not be closed:", e);
-    }
-    return safeIds.length;
-}
-
-async function renderOrganizerProposal(proposal, isTabMode = false) {
+// Proposals from the keyword organizer (Analyze & Sort, Split). Group names,
+// folder paths and bookmark titles come from the synced tree, so they are
+// escaped wherever they land in markup.
+async function renderOrganizerProposal(proposal) {
     const list = document.getElementById('proposals-list');
     const applyBtn = document.getElementById('applyOrganizerBtn');
-    const closeWrapper = document.getElementById('closeAfterApplyWrapper');
-    const closeToggle = document.getElementById('closeAfterApplyToggle');
 
     // Switch Views
     document.getElementById('groups-container').style.display = 'none';
     document.getElementById('organizer-container').style.display = 'block';
 
-    // Tab mode shows the close toggle and a reactive button label.
-    closeWrapper.style.display = isTabMode ? 'flex' : 'none';
-
-    const updateApplyLabel = () => {
-        if (!isTabMode) {
-            applyBtn.textContent = 'Apply Changes';
-            return;
-        }
-        // Count tabs in currently-checked groups.
-        const checked = document.querySelectorAll('.proposal-checkbox:checked');
-        let tabCount = 0;
-        checked.forEach(cb => {
-            const idx = parseInt(cb.dataset.index);
-            if (proposal.groups[idx]) tabCount += proposal.groups[idx].items.length;
-        });
-        applyBtn.textContent = closeToggle.checked
-            ? `Apply & Close (${tabCount} tab${tabCount === 1 ? '' : 's'})`
-            : `Apply (${tabCount} tab${tabCount === 1 ? '' : 's'})`;
-    };
-
-    // Re-attach a single change handler (idempotent — replace any prior one).
-    closeToggle.onchange = updateApplyLabel;
-    list.onchange = (e) => {
-        if (e.target && e.target.classList.contains('proposal-checkbox')) updateApplyLabel();
-    };
+    applyBtn.textContent = 'Apply Changes';
+    list.onchange = null;
 
     list.innerHTML = '';
 
     if (proposal.groups.length === 0) {
         list.innerHTML = '<p>No suggestions found.</p>';
         applyBtn.style.display = 'none';
-        closeWrapper.style.display = 'none';
         return;
     }
     applyBtn.style.display = 'block';
@@ -2720,7 +2418,7 @@ async function renderOrganizerProposal(proposal, isTabMode = false) {
         datalist.id = datalistId;
         document.body.appendChild(datalist);
     }
-    datalist.innerHTML = folderMap.map(f => `<option value="${f.fullPath}"></option>`).join('');
+    datalist.innerHTML = folderMap.map(f => `<option value="${escapeHtml(f.fullPath)}"></option>`).join('');
 
     // Default Fallback (usually 'Other Bookmarks' or first available)
     const fallbackRoot = folderMap.find(f => f.id === '2') || folderMap[0];
@@ -2763,12 +2461,13 @@ async function renderOrganizerProposal(proposal, isTabMode = false) {
 
         // Generate Items HTML
         const itemsHtml = group.items.map((i, itemIndex) => {
-            const domain = new URL(i.url).hostname;
-            const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
+            let domain = '';
+            try { domain = new URL(i.url).hostname; } catch (e) { /* no icon */ }
+            const faviconUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=16`;
             return `
                 <div class="draggable-item" draggable="true" data-group-index="${index}" data-item-index="${itemIndex}" style="display:flex; align-items:center; gap:8px; padding:6px; background:rgba(255,255,255,0.03); margin-bottom:2px; border-radius:4px; cursor:grab;">
                     <img src="${faviconUrl}" width="16" height="16" style="flex-shrink:0; border-radius:3px;"/>
-                    <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.85rem; color:var(--text-color); opacity:0.9;">${i.title}</div>
+                    <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.85rem; color:var(--text-color); opacity:0.9;">${escapeHtml(i.title || i.url || '')}</div>
                 </div>
             `;
         }).join('');
@@ -2779,7 +2478,7 @@ async function renderOrganizerProposal(proposal, isTabMode = false) {
              <!-- Label -->
             <label style="display:flex; align-items:center; cursor:pointer; font-weight:bold; font-size:1rem; flex:1;">
                 <input type="checkbox" checked class="proposal-checkbox" data-index="${index}" style="margin-right:10px; transform:scale(1.1); accent-color: var(--primary-color);">
-                ${group.groupName} 
+                ${escapeHtml(group.groupName)}
             </label>
             
             <button class="sm-btn apply-single-btn" data-index="${index}" style="margin-left:8px; background:transparent; border:1px solid #10b981; color:#10b981;">✓ Apply This</button>
@@ -2790,7 +2489,7 @@ async function renderOrganizerProposal(proposal, isTabMode = false) {
              <div style="font-size:0.7rem; color:#888; margin-bottom:4px; font-weight:600;">DESTINATION</div>
              <div style="display:flex; align-items:center; background:#111827; border:1px solid var(--border-color); border-radius:4px; padding:2px 8px;">
                 <span class="status-icon" style="font-size:1.2rem; margin-right:8px; cursor:default;" title="${isNew ? 'New Folder' : 'Existing Folder'}">${initialIcon}</span>
-                <input type="text" class="smart-dest-input" list="${datalistId}" value="${initialValue}" 
+                <input type="text" class="smart-dest-input" list="${datalistId}" value="${escapeHtml(initialValue)}"
                        placeholder="Type folder path or new name..." 
                        style="flex:1; background:transparent; border:none; color:white; padding:8px 0; font-size:0.9rem; outline:none;">
              </div>
@@ -2849,23 +2548,15 @@ async function renderOrganizerProposal(proposal, isTabMode = false) {
         // Single Apply
         div.querySelector('.apply-single-btn').addEventListener('click', async (e) => {
             if (!confirm(`Organize just this group?`)) return;
-            if (isTabMode) {
-                await applyTabModeGroups([group]);
-            } else {
-                await BookmarkOrganizer.applyOrganization([group]);
-            }
+            await BookmarkOrganizer.applyOrganization([group]);
             proposal.groups.splice(index, 1);
-            renderOrganizerProposal(proposal, window.isTabMode);
+            renderOrganizerProposal(proposal);
         });
     });
 
     setupDragAndDrop(proposal);
 
     window.currentRenderedProposal = proposal;
-    window.isTabMode = isTabMode;
-
-    // Initial label sync (counts tabs in checked groups).
-    updateApplyLabel();
 }
 
 function setupDragAndDrop(proposal) {
@@ -2920,7 +2611,7 @@ function setupDragAndDrop(proposal) {
             proposal.groups[targetGroupIndex].items.push(item);
 
             // Re-Render EVERYTHING (easiest way to fix indices)
-            renderOrganizerProposal(proposal, window.isTabMode);
+            renderOrganizerProposal(proposal);
         });
     });
 }
@@ -2942,6 +2633,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     // Fetch Data
     const settings = await StorageManager.getSettings();
     const folders = await BookmarkOrganizer.getStructure();
+    const videoSeekOn = await StorageManager.getVideoSeek();
 
     // -- Render UI --
     container.innerHTML = `
@@ -2969,24 +2661,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 <!-- Inputs injected here -->
             </div>
 
-            <!-- 3. AI Configuration -->
-            <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">AI Brain (Gemini)</h3>
-            <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
-                <label style="display:flex; align-items:center; cursor:pointer; margin-bottom:10px;">
-                    <input type="checkbox" id="use-ai-toggle" ${settings.useAI ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
-                    <span style="font-weight:bold;">Enable AI Organization</span>
-                </label>
-
-                <div id="ai-key-wrapper" style="display:${settings.useAI ? 'block' : 'none'}; margin-top:10px; padding-left:5px;">
-                    <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Gemini API Key</div>
-                    <input type="password" id="gemini-api-key" value="${escapeHtml(settings.geminiApiKey || '')}" placeholder="Paste API Key..." style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px;">
-                    <div style="font-size:0.75rem; color:#666; margin-top:6px;">
-                        Keys are stored locally. <a href="#" style="color:#3b82f6;">Get Free Key</a>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 4. Backend Sync -->
+            <!-- 3. Backend Sync -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backend Sync</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
                 <!-- The token is a session issued by signing in; it stays a
@@ -3035,6 +2710,17 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </button>
             </div>
 
+            <!-- Backup -->
+            <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backup</h3>
+            <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                    Everything this browser's TabPaladin holds as one file: the working copy with its unpushed edits,
+                    set-aside copies, unsaved note drafts and your settings. Your sign-in session is left out.
+                </div>
+                <button id="backup-download-btn" class="sm-btn" style="width:100%;">📦 Download a backup</button>
+                <div id="backup-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
+            </div>
+
             <!-- Working copies of other accounts, kept when you switched -->
             <div id="stash-block" style="display:none;">
                 <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Set-aside working copies</h3>
@@ -3051,7 +2737,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Video</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
                 <label style="display:flex; align-items:center; cursor:pointer;">
-                    <input type="checkbox" id="video-seek-toggle" ${settings.videoSeek ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
+                    <input type="checkbox" id="video-seek-toggle" ${videoSeekOn ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
                     <span style="font-weight:bold;">Scroll to seek in fullscreen videos</span>
                 </label>
                 <div style="font-size:0.75rem; color:#666; margin-top:6px;">
@@ -3059,7 +2745,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </div>
             </div>
 
-            <!-- 5. Imports -->
+            <!-- 4. Imports -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Imports</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
                 <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
@@ -3544,10 +3230,6 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     renderKeywordSection();
 
     // C. Event Listeners
-    document.getElementById('use-ai-toggle').addEventListener('change', (e) => {
-        document.getElementById('ai-key-wrapper').style.display = e.target.checked ? 'block' : 'none';
-    });
-
     // Applied immediately rather than on Save: switching it on has to ask for
     // the all-sites permission, and that prompt only works during the click.
     document.getElementById('video-seek-toggle').addEventListener('change', async (e) => {
@@ -3566,8 +3248,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             alert('Could not enable video seek: ' + err.message);
         }
         box.checked = on;
-        const current = await StorageManager.getSettings();
-        await StorageManager.saveSettings({ ...current, videoSeek: on });
+        await StorageManager.setVideoSeek(on);
     });
 
     // Backend sync buttons
@@ -3814,6 +3495,19 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     document.getElementById('backend-pull-btn').addEventListener('click', async () => {
         await beforeSync('pull');
         writeBackendStatus(await doPull() || '');
+    });
+
+    document.getElementById('backup-download-btn').addEventListener('click', async () => {
+        const status = document.getElementById('backup-status');
+        status.textContent = 'Preparing…';
+        try {
+            const backup = await downloadPageBackup();
+            const s = backup.summary;
+            status.textContent = `Saved: ${s.workingCopy.items} items, ${s.workingCopy.unpushedEdits} unpushed edit(s), `
+                + `${s.setAsideCopies} set-aside cop${s.setAsideCopies === 1 ? 'y' : 'ies'}, ${s.parkedDrafts + s.liveDrafts} note draft(s). No session token.`;
+        } catch (e) {
+            status.textContent = 'Backup failed: ' + e.message;
+        }
     });
 
     document.getElementById('browser-import-btn').addEventListener('click', async () => {
@@ -4391,9 +4085,6 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         Array.from(selectedCards).forEach(c => mutableFocused.add(c.dataset.id));
         const focusedFolderIds = [...mutableFocused];
 
-        const useAI = document.getElementById('use-ai-toggle').checked;
-        const apiKey = document.getElementById('gemini-api-key').value.trim();
-
         // Filter out empty custom keyword arrays so we don't persist empty entries.
         const cleanCustom = {};
         for (const [cat, kws] of Object.entries(mutableState.customKeywords)) {
@@ -4415,8 +4106,6 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             focusedFolderIds,
             customKeywords: cleanCustom,
             categoryOrder: mutableState.categoryOrder || null,
-            useAI,
-            geminiApiKey: apiKey,
             backend: {
                 ...(existing.backend || {}),
                 url: backendUrl,
@@ -4741,4 +4430,13 @@ function closeSettings() {
 
     // Reload tabs in case settings changed context logic
     loadCurrentTabs();
+}
+
+// Settings › Backup: the working copy and the open note's unsaved text are
+// written first, so the file has what is on screen.
+function downloadPageBackup() {
+    return downloadBackup({
+        api: globalThis.browser || chrome,
+        prepare: () => Promise.allSettled([TreeStore.flush(), saveLiveDraft()])
+    });
 }

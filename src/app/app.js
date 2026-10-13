@@ -6,7 +6,54 @@
 // how the side panel already behaved — one section at a time — just with room
 // to breathe.
 import { initHome } from './home.js';
-import { initNotesView, canLeave } from './notesView.js';
+import { initNotesView, canLeave, saveLiveDraft } from './notesView.js';
+import { TreeStore } from '../utils/treeStore.js';
+import { ExpandState } from '../utils/expandState.js';
+import { listenForUpdate } from '../utils/pageMessages.js';
+import { downloadBackup } from '../utils/backup.js';
+
+// An update is about to reload this page: write the working copy, the open
+// cards and the open note's unsaved text first.
+listenForUpdate(() => Promise.allSettled([TreeStore.flush(), ExpandState.flush(), saveLiveDraft()]));
+
+// The extension is moving into the server's web app. Until the move, say so
+// above every view: push before updating, and keep a backup. Dismissed per
+// device; Settings › Backup stays.
+const MOVING_DISMISSED_KEY = 'tp_moving_banner_dismissed_v1';
+
+function initMovingBanner() {
+    const banner = document.getElementById('tp-moving-banner');
+    if (!banner) return;
+    let dismissed = false;
+    try { dismissed = Boolean(window.localStorage.getItem(MOVING_DISMISSED_KEY)); } catch (e) { /* show it */ }
+    if (dismissed) return;
+    banner.hidden = false;
+    const unpushed = document.getElementById('tp-moving-unpushed');
+    const paint = () => {
+        const st = TreeStore.status();
+        if (unpushed) unpushed.textContent = st.dirty ? `You have ${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}.` : '';
+    };
+    TreeStore.load().then(paint).catch(() => {});
+    TreeStore.onChanged(paint);
+    const backupBtn = document.getElementById('tp-moving-backup');
+    backupBtn?.addEventListener('click', async () => {
+        backupBtn.disabled = true;
+        try {
+            await downloadBackup({
+                api: globalThis.browser || globalThis.chrome,
+                prepare: () => Promise.allSettled([TreeStore.flush(), saveLiveDraft()])
+            });
+        } catch (e) {
+            window.alert('Backup failed: ' + e.message);
+        } finally {
+            backupBtn.disabled = false;
+        }
+    });
+    document.getElementById('tp-moving-dismiss')?.addEventListener('click', () => {
+        try { window.localStorage.setItem(MOVING_DISMISSED_KEY, new Date().toISOString()); } catch (e) { /* hidden for now */ }
+        banner.hidden = true;
+    });
+}
 
 const HOME_IDS = ['home-container', 'actions', 'home-recents'];
 // Sections that take over the page when open.
@@ -79,6 +126,11 @@ async function boot() {
     }
     watchViews();
     document.getElementById('tp-home-link')?.addEventListener('click', goHome);
+    try {
+        initMovingBanner();
+    } catch (e) {
+        console.error('[TabPaladin] The moving notice failed to start', e);
+    }
 }
 
 if (document.readyState === 'loading') {

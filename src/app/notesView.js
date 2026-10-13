@@ -12,7 +12,9 @@
 // Saving stays explicit and local: Save or Ctrl+S writes the working copy, and
 // ⬆️ Push stays the only thing that talks to the server. An unsaved draft is
 // guarded on every way out of it, and survives leaving Notes through the gear,
-// but never another account's working copy coming in (see "accounts").
+// but never another account's working copy coming in (see "accounts"). It
+// also survives the page closing or the extension reloading it (see "the live
+// draft").
 //
 // Layout is driven by classes set from here (.nv-cols-*, .nv-pane-*,
 // .nv-can-split, .is-read/.is-edit/.is-split). #notes-container itself is
@@ -213,21 +215,43 @@ function swapAccountPrefs(from, st) {
     view.restoreNoteId = p.noteId;
 }
 
-function parkDraft(from) {
+// The editor as a draft of the copy stamped `from` ({owner, origin}).
+function draftFromEditor(from) {
     const owner = from.owner;
     const note = view.isNew ? null : currentNote();
-    const draft = {
+    return {
         owner: owner ? { url: owner.url, userId: owner.userId, username: owner.username || null, serverId: owner.serverId || null } : null,
         origin: owner ? null : from.origin || 'pre-accounts',
         noteId: view.isNew ? null : view.noteId,
         notebookId: view.isNew || view.removed ? view.newParentId : note ? note.notebookId : null,
         title: $('noteTitleInput').value,
         content: $('noteContentInput').value,
-        loaded: { ...view.loaded },
-        parkedAt: new Date().toISOString()
+        loaded: { ...view.loaded }
     };
+}
+
+// Write the parked list, with the time it was written beside it. False when
+// localStorage refused it.
+function writeParked(list) {
+    if (!writeJson(PARKED_KEY, list)) return false;
+    writeJson(PARKED_AT_KEY, Date.now());
+    return true;
+}
+
+// Put drafts on the parked list (here, when it cannot be written).
+function putParked(drafts) {
     const list = readJson(PARKED_KEY, []);
-    if (!writeJson(PARKED_KEY, [...(Array.isArray(list) ? list : []), draft])) parkedHere.push(draft);
+    if (!writeParked([...(Array.isArray(list) ? list : []), ...drafts])) parkedHere.push(...drafts);
+}
+
+// The same, mirrored.
+function addParked(drafts) {
+    putParked(drafts);
+    return parkedChanged();
+}
+
+function parkDraft(from) {
+    addParked([{ ...draftFromEditor(from), parkedAt: new Date().toISOString() }]);
 }
 
 // A draft parked from this working copy, under its account or under one of
@@ -240,11 +264,270 @@ function takeParkedDraft(st) {
         const i = list.findIndex(mine);
         if (i !== -1) {
             const [draft] = list.splice(i, 1);
-            if (writeJson(PARKED_KEY, list)) return draft;
+            if (writeParked(list)) {
+                parkedChanged();
+                return draft;
+            }
         }
     }
     const j = parkedHere.findIndex(mine);
-    return j === -1 ? null : parkedHere.splice(j, 1)[0];
+    if (j === -1) return null;
+    const [draft] = parkedHere.splice(j, 1);
+    parkedChanged();
+    return draft;
+}
+
+// --- the park mirror and the live draft -------------------------------------------------
+//
+// Parked drafts live in this origin's localStorage, which only pages can
+// read. Every change to them is mirrored into extension storage as well
+// (tpParkedMirror {at, drafts, pages}): the list as it was last written, with
+// the time it was written (`at`, noted beside the list too, as
+// tp_notes_parked_at_v1), and, by page, the drafts each page could only keep
+// in memory because localStorage refused them. A page writes its own entry in
+// `pages` and nobody else's, so a change to the list made in one page never
+// drops what another holds. The next page to start takes back into the list
+// what the list lost — all of the mirror's list when it is newer than the
+// list (localStorage was cleared), and the entries of pages that are gone.
+//
+// The open note's unsaved text is kept in extension storage too, as it is
+// typed (half a second after the last key) and whenever the page is hidden or
+// goes away: an extension update or reload ends every page with no chance to
+// ask anything. Each page keeps its own entry (tpLiveDraft {[pageId]: draft}),
+// so two pages never overwrite each other's, and holds a lock named after it
+// for as long as it lives. An entry whose lock nobody holds is a page that is
+// gone: the next page to start parks it under the copy it was written in, and
+// it comes back the way any parked draft does — into the editor, unsaved,
+// only for that copy, once the editor is free.
+const PARKED_MIRROR_KEY = 'tpParkedMirror';
+const PARKED_MIRROR_LOCK = 'tp-parked-mirror';
+const PARKED_AT_KEY = 'tp_notes_parked_at_v1';
+const LIVE_DRAFT_KEY = 'tpLiveDraft';
+const LIVE_DRAFT_LOCK = 'tp-live-drafts';
+const PAGE_LOCK_PREFIX = 'tp-notes-page:';
+const LIVE_DRAFT_DELAY_MS = 500;
+const pageId = (() => {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+})();
+let mirrorChain = Promise.resolve();
+let liveChain = Promise.resolve();
+let liveTimer = null;
+// What this page last wrote as its live draft (ignoring the time), or null
+// while it has no entry.
+let liveWritten = null;
+
+function webLocks() {
+    return typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
+        ? navigator.locks : null;
+}
+
+// Read, change and write the mirror, one page at a time. `fn(stored, pages)`
+// may change `pages` (the entries by page); then the list as localStorage
+// holds it now, and this page's own entry, are written with them. Resolves
+// once written (or given up on: it never rejects).
+function updateMirror(fn) {
+    const run = async () => {
+        const data = await api.storage.local.get(PARKED_MIRROR_KEY);
+        const raw = data && data[PARKED_MIRROR_KEY];
+        const stored = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+        const pages = stored && stored.pages && typeof stored.pages === 'object' && !Array.isArray(stored.pages)
+            ? { ...stored.pages } : {};
+        await fn(stored, pages);
+        if (parkedHere.length) pages[pageId] = [...parkedHere];
+        else delete pages[pageId];
+        const list = readJson(PARKED_KEY, []);
+        const drafts = (Array.isArray(list) ? list : []).filter(d => d && typeof d.content === 'string');
+        if (!drafts.length && !Object.keys(pages).length) {
+            if (raw !== undefined) await api.storage.local.remove(PARKED_MIRROR_KEY);
+            return;
+        }
+        // An unstamped list (its stamp refused) is mirrored as older than any
+        // stamped one, but newer than a list that is gone.
+        const at = Number(readJson(PARKED_AT_KEY, 0)) || 1;
+        await api.storage.local.set({ [PARKED_MIRROR_KEY]: { at, drafts, pages } });
+    };
+    const locks = webLocks();
+    mirrorChain = mirrorChain
+        .then(() => (locks ? locks.request(PARKED_MIRROR_LOCK, run) : run()))
+        .catch((e) => console.warn('[TabPaladin] Could not mirror parked drafts', e));
+    return mirrorChain;
+}
+
+// The parked drafts changed here: bring the mirror up to date.
+function parkedChanged() {
+    return updateMirror(() => {});
+}
+
+// Back into the list: what it lost that the mirror holds (all of the
+// mirror's list, when that is newer than the list), and what pages that are
+// gone kept only in memory. They are in the list before the mirror lets them
+// go: stopped in between, a draft is found again and not taken twice.
+// Resolves with how many came back.
+export async function restoreParkedFromMirror() {
+    const alive = await livePages();
+    let back = 0;
+    await updateMirror((stored, pages) => {
+        const have = new Set(allParked().map(d => JSON.stringify(d)));
+        const missing = [];
+        const take = (drafts) => {
+            for (const d of Array.isArray(drafts) ? drafts : []) {
+                if (!d || typeof d.content !== 'string') continue;
+                const key = JSON.stringify(d);
+                if (have.has(key)) continue;
+                have.add(key);
+                missing.push(d);
+            }
+        };
+        const listAt = Number(readJson(PARKED_AT_KEY, 0)) || 0;
+        if (stored && Number(stored.at) > listAt) take(stored.drafts);
+        for (const [id, drafts] of Object.entries(pages)) {
+            if (id === pageId || (alive && alive.has(id))) continue;
+            delete pages[id];
+            take(drafts);
+        }
+        if (missing.length) putParked(missing);
+        back = missing.length;
+    });
+    if (back) {
+        view.checkParked = true;
+        if (view.opened) await refresh();
+    }
+    return back;
+}
+
+// Read, change and write the shared live-draft map, one page at a time.
+// `fn` returns false to write nothing. `before`, when given, runs first, in
+// turn, outside the lock; when it throws, nothing is written.
+function updateLiveDrafts(fn, before = null) {
+    const run = async () => {
+        const data = await api.storage.local.get(LIVE_DRAFT_KEY);
+        const stored = data && data[LIVE_DRAFT_KEY];
+        const map = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+        if ((await fn(map)) === false) return;
+        if (Object.keys(map).length) await api.storage.local.set({ [LIVE_DRAFT_KEY]: map });
+        else await api.storage.local.remove(LIVE_DRAFT_KEY);
+    };
+    const locks = webLocks();
+    const p = liveChain.then(async () => {
+        if (before) await before();
+        return locks ? locks.request(LIVE_DRAFT_LOCK, run) : run();
+    });
+    liveChain = p.catch(() => {});
+    return p;
+}
+
+// The editor is clean: whatever made it so is in storage before the live
+// draft lets go of the text — a save in the working copy (not only in this
+// page's memory, waiting out TreeStore's debounce), a draft parked into the
+// mirror. Throws while the working copy is not written.
+async function cleanEditorWritten() {
+    const [written] = await Promise.all([TreeStore.flush(), mirrorChain]);
+    if (written === false) throw new Error('The working copy is not written yet');
+}
+
+// Write this page's live draft now: the editor's text while it is unsaved,
+// nothing (the entry goes) once it is not — and what it was saved into, or
+// parked as, is written.
+function writeLiveDraft() {
+    clearTimeout(liveTimer);
+    liveTimer = null;
+    let draft = null;
+    try {
+        if (isDirty()) draft = draftFromEditor(view.copy || TreeStore.status());
+    } catch (e) {
+        draft = null;
+    }
+    const json = draft ? JSON.stringify(draft) : null;
+    if (json === liveWritten) return liveChain;
+    liveWritten = json;
+    return updateLiveDrafts((map) => {
+        if (draft) {
+            map[pageId] = { ...draft, at: new Date().toISOString() };
+            return true;
+        }
+        if (!(pageId in map)) return false;
+        delete map[pageId];
+        return true;
+    }, draft ? null : cleanEditorWritten).catch((e) => {
+        liveWritten = undefined; // written again next time
+        console.warn(draft ? '[TabPaladin] Could not keep the unsaved note' : '[TabPaladin] The unsaved note is kept for now', e);
+    });
+}
+
+// After any change to the editor: unsaved text is written once typing pauses,
+// and the entry goes as soon as there is nothing unsaved.
+function scheduleLiveDraft() {
+    if (!view.initialized) return;
+    let dirty = false;
+    try { dirty = isDirty(); } catch (e) { return; }
+    clearTimeout(liveTimer);
+    liveTimer = null;
+    if (dirty) liveTimer = setTimeout(writeLiveDraft, LIVE_DRAFT_DELAY_MS);
+    else if (liveWritten !== null) writeLiveDraft();
+}
+
+// Save what is unsaved now, for a page about to be reloaded (the extension
+// updating): resolves once it is written.
+export function saveLiveDraft() {
+    return writeLiveDraft();
+}
+
+function holdPageLock() {
+    const locks = webLocks();
+    if (!locks) return;
+    try {
+        // Held until the page goes.
+        locks.request(PAGE_LOCK_PREFIX + pageId, () => new Promise(() => {})).catch(() => {});
+    } catch (e) { /* no lock: other pages take this one's entry as gone */ }
+}
+
+// The pages alive now, by id, or null when this browser cannot say.
+async function livePages() {
+    const locks = webLocks();
+    if (!locks || typeof locks.query !== 'function') return null;
+    try {
+        const snapshot = await locks.query();
+        return new Set([...(snapshot.held || []), ...(snapshot.pending || [])]
+            .map(l => String(l.name || ''))
+            .filter(n => n.startsWith(PAGE_LOCK_PREFIX))
+            .map(n => n.slice(PAGE_LOCK_PREFIX.length)));
+    } catch (e) {
+        return null;
+    }
+}
+
+// Park the live drafts of pages that are gone. They are parked before their
+// entries go: stopped in between, a draft is only found twice.
+export async function recoverLiveDrafts() {
+    const alive = await livePages();
+    const taken = [];
+    await updateLiveDrafts(async (map) => {
+        for (const [id, d] of Object.entries(map)) {
+            if (id === pageId || (alive && alive.has(id))) continue;
+            delete map[id];
+            if (d && typeof d.content === 'string') taken.push(d);
+        }
+        if (!taken.length) return false;
+        await addParked(taken.map(d => ({
+            owner: d.owner || null,
+            origin: d.owner ? null : d.origin || null,
+            noteId: d.noteId || null,
+            notebookId: d.notebookId || null,
+            title: String(d.title || ''),
+            content: d.content,
+            loaded: d.loaded && typeof d.loaded === 'object' ? d.loaded : { title: '', content: '' },
+            parkedAt: d.at || new Date().toISOString(),
+            from: 'live'
+        })));
+        return true;
+    }).catch((e) => console.warn('[TabPaladin] Could not recover unsaved notes', e));
+    if (taken.length) {
+        view.checkParked = true;
+        if (view.opened) await refresh();
+    }
+    return taken.length;
 }
 
 // Ready for a parked draft to come back: the copy holds something, or has
@@ -282,10 +565,11 @@ export function dropParkedDrafts(drafts) {
     const gone = new Set((drafts || []).map(d => JSON.stringify(d)));
     if (!gone.size) return;
     const list = readJson(PARKED_KEY, []);
-    if (Array.isArray(list)) writeJson(PARKED_KEY, list.filter(d => !gone.has(JSON.stringify(d))));
+    if (Array.isArray(list)) writeParked(list.filter(d => !gone.has(JSON.stringify(d))));
     for (let i = parkedHere.length - 1; i >= 0; i--) {
         if (gone.has(JSON.stringify(parkedHere[i]))) parkedHere.splice(i, 1);
     }
+    parkedChanged();
 }
 
 // The drafts as one Markdown file, each as it was left.
@@ -312,9 +596,13 @@ export function parkedDraftsMarkdown(drafts) {
 
 // Back into the editor, unsaved, as it was left: the note it was editing if
 // that is still here, otherwise as text to keep (a draft, or a note removed
-// since).
+// since). A draft that says exactly what its note says now holds nothing
+// unsaved (it was saved after all) and is let go: returns false.
 function restoreParkedDraft(draft) {
     const note = draft.noteId ? view.lib.notes.find(n => n.id === draft.noteId) : null;
+    const title = String(draft.title || '');
+    const content = String(draft.content || '');
+    if (note ? note.title === title && note.content === content : !title.trim() && !content.trim()) return false;
     const nbId = draft.notebookId && view.lib.notebooks.has(draft.notebookId) ? draft.notebookId : null;
     view.noteId = note ? note.id : draft.noteId || null;
     view.isNew = !draft.noteId;
@@ -333,7 +621,11 @@ function restoreParkedDraft(draft) {
     renderBacklinks();
     markSelectedRow();
     layout();
-    toast(`Your unsaved note “${String(draft.title || '').trim() || 'Untitled'}” is back from before the account switch. Save it to keep it.`, 6000);
+    const name = title.trim() || 'Untitled';
+    toast(draft.from === 'live'
+        ? `Your unsaved note “${name}” is back: the page closed before it was saved. Save it to keep it.`
+        : `Your unsaved note “${name}” is back from before the account switch. Save it to keep it.`, 6000);
+    return true;
 }
 
 // Has the working copy become another one since the view last looked? Then
@@ -801,6 +1093,8 @@ function renderBacklinks() {
 // Everything around the editor: crumb, status, buttons, meta. Never touches
 // the title or text fields, so it is safe to call while someone types.
 function renderNoteChrome() {
+    // Every change to the editor comes through here: keep the live draft in step.
+    scheduleLiveDraft();
     const has = Boolean(view.isNew || view.noteId || view.removed);
     $('nv-note-empty').hidden = has;
     $('nv-note-main').hidden = !has;
@@ -940,6 +1234,10 @@ async function saveNote() {
         titleInput.value = result.title;
         if (textarea.value !== result.content) textarea.value = result.content;
         savePrefs();
+        // Into storage now, not after TreeStore's debounce: a page closed
+        // right after Save keeps it. (Until it is written, the live draft
+        // keeps the text too.)
+        await TreeStore.flush().catch((e) => console.warn('[TabPaladin] Could not write the working copy yet', e));
         await refresh();
         return true;
     } catch (e) {
@@ -1412,8 +1710,9 @@ async function refresh() {
     const st = TreeStore.status();
     if (view.checkParked && copyReady(st) && !view.noteId && !view.isNew && !view.removed) {
         view.checkParked = false;
-        const draft = takeParkedDraft(st);
-        if (draft) restoreParkedDraft(draft);
+        for (let draft = takeParkedDraft(st); draft; draft = takeParkedDraft(st)) {
+            if (restoreParkedDraft(draft)) break;
+        }
     }
 }
 
@@ -1470,9 +1769,15 @@ export function initNotesView() {
     if (view.initialized) return;
     view.initialized = true;
     loadPrefs();
+    holdPageLock();
     // The prefs just read are the current copy's account's: note which copy
-    // that is before anything can switch it.
-    TreeStore.load().then(() => { noticeCopySwitch(); }).catch(() => {});
+    // that is before anything can switch it. Then bring back what a page that
+    // is gone left unsaved: drafts only the mirror kept, and live drafts.
+    TreeStore.load()
+        .then(() => { noticeCopySwitch(); })
+        .then(() => restoreParkedFromMirror())
+        .then(() => recoverLiveDrafts())
+        .catch((e) => console.warn('[TabPaladin] Could not check for unsaved notes', e));
 
     $('viewNotesBtn')?.addEventListener('click', () => { openNotes(); });
 
@@ -1688,6 +1993,11 @@ export function initNotesView() {
         e.preventDefault();
         e.returnValue = '';
     });
+    // Hidden or going away: the unsaved text is written now, not after the pause.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') writeLiveDraft();
+    });
+    window.addEventListener('pagehide', () => { writeLiveDraft(); });
 
     let resizeQueued = false;
     window.addEventListener('resize', () => {
