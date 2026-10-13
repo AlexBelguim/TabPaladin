@@ -180,13 +180,30 @@ async function bootstrap() {
 // Universal import link: /#note=<percent-encoded markdown>[&notebook=<name>]
 // Used by LLM chats that cannot POST. The fragment never reaches the server;
 // the note opens in the editor for review and is only stored when the user
-// presses Save. First "# " heading becomes the title, as usual.
+// presses ✓ Done. A first-line "# " heading becomes the title, as usual.
 async function processImportHashIfAny() {
     const raw = location.hash.slice(1);
 
+    // Drop the fragment so a reload cannot import twice. A link tapped while
+    // the app is open arrived as a history entry of its own; it takes over
+    // whatever is on screen, so back still behaves.
+    const consumeHash = () => {
+        if (state.view === 'notes') {
+            navDepth++;
+            history.replaceState(nvHistoryState(), '', location.pathname);
+        } else {
+            history.replaceState(null, '', location.pathname);
+        }
+    };
+    // The review block lives in the Notes library.
+    const showReview = () => {
+        if (state.view === 'notes' && !state.nv.editing) openNotes({ pane: 'library' });
+        else renderView();
+    };
+
     // Multi-note batch: #notes=<percent-encoded JSON array of {"content","notebook"?}>
     if (raw.startsWith('notes=')) {
-        history.replaceState(null, '', location.pathname);
+        consumeHash();
         let items = null;
         try { items = JSON.parse(decodeURIComponent(raw.slice(6))); } catch (e) { /* invalid */ }
         if (!Array.isArray(items) || items.length === 0) {
@@ -201,14 +218,14 @@ async function processImportHashIfAny() {
             return;
         }
         state.importBatch = { kind: 'notes', items: notes };
-        renderView();
+        showReview();
         showToast('Review the import, then press Import.');
         return;
     }
 
     // Reorder: #reorder=<percent-encoded JSON array of note titles>
     if (raw.startsWith('reorder=')) {
-        history.replaceState(null, '', location.pathname);
+        consumeHash();
         let order = null;
         try { order = JSON.parse(decodeURIComponent(raw.slice(8))); } catch (e) { /* invalid */ }
         if (!Array.isArray(order) || order.length === 0) {
@@ -216,13 +233,13 @@ async function processImportHashIfAny() {
             return;
         }
         state.importBatch = { kind: 'reorder', order: order.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim()) };
-        renderView();
+        showReview();
         showToast('Review the new order, then press Apply.');
         return;
     }
 
     if (!raw.startsWith('note=')) return;
-    history.replaceState(null, '', location.pathname); // consume: refresh must not re-import
+    consumeHash();
 
     let payload = raw.slice(5);
     let notebook = null;
