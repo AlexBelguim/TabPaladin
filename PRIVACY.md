@@ -16,14 +16,19 @@ on services you choose to connect.
 | **Bookmarks** | Only when you press **Import this browser's bookmarks**, to copy them once into TabPaladin. Your browser's own bookmarks are read, never changed. |
 | **Storage / unlimited storage** | To keep your bookmark tree, workflows, notes and settings on your device. |
 | **Downloads** | Only when you export workflows or folders to a file. |
-| **Scripting + access to all sites** _(optional, off by default)_ | Only if you turn on **Scroll to seek in fullscreen videos**. It lets the mouse wheel skip through a fullscreen video. It reads nothing from the page and sends nothing anywhere. Turning it off removes the permission. |
+| **Private windows** | None: TabPaladin does not run in private (incognito) windows. |
+| **Scripting + access to all sites** _(optional, off by default)_ | Only if you turn on **Scroll to seek in fullscreen videos**. It lets the mouse wheel skip through a fullscreen video. It reads nothing from the page, reads none of TabPaladin's own data, and sends nothing anywhere. Turning it off removes the permission. |
 
 ## Where your data is stored
 
-- **On your device.** Your bookmark tree, workflows, notes and settings are kept in
+- **On your device.** Your bookmark tree, workflows, notes (including the text of a note
+  you have not saved yet, so it survives the extension reloading) and settings are kept in
   the extension's local storage. In the web app, your server address and sign-in session
   are kept in that browser's storage. TabPaladin has no built-in AI any more: a Gemini API
   key entered in an earlier version is deleted from your device when the extension updates.
+- **In a backup file, if you make one.** **Settings → Backup** saves a file to your computer
+  with everything the extension holds. Your sign-in session is left out of it. The file is
+  not sent anywhere.
 - **On your own sync server, if you set one up.** TabPaladin can sync with a server that
   *you* host (for example in Docker on a home NAS). When you sign in and push, your
   bookmark tree, workflows and notes are sent to that server and stored in its database,

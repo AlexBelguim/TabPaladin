@@ -69,6 +69,27 @@ and for any machine without the extension.
 - **Chrome**: `chrome://extensions` → Developer mode → **Load unpacked** → the repository folder
 - **Firefox**: build the package first (below), then `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → `dist/firefox.zip`
 
+#### Updating a sideloaded extension
+
+Update in place, never by removing and adding it again: Chrome derives the
+extension's id from its folder, and a new id starts with empty storage.
+
+- **Chrome / Edge / Opera**: `git pull` in the same folder, then **Reload** on the extensions page.
+- **Firefox**: build the package again and **Reload** it on `about:debugging` (the add-on id, `tabpaladin@extension`, stays the same).
+
+Before you reload, **save or close any note you are editing and Push**. From
+1.0.1 on, the extension keeps the text of a note you are typing (half a second
+after your last key) and writes other edits within a moment, so a reload costs
+at most the last keystrokes, and open workflow windows stay tracked across the
+update. The update *to* 1.0.1 still runs the old code and has none of that. If
+in doubt, **Settings → Backup → Download a backup** first: one file with
+everything this browser holds, minus your sign-in session.
+
+TabPaladin does not run in private (incognito) windows.
+
+TabPaladin is moving into the sync server's web app; the extension will become
+a small helper for the tab features. Push your edits before each update.
+
 #### Packaging for the stores
 
 ```bash
