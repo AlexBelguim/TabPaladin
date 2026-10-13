@@ -73,10 +73,11 @@ export function buildProviderFolder({ source, items }) {
     };
 }
 
-// The whole virtual root, or null when there are no import sources at all —
+// One account's virtual root, or null when it has no active import sources —
 // no point showing an empty managed folder to someone who never set imports up.
-export function buildImportsTree(store) {
-    const sources = store.listSources();
+// Removed sources keep their archive but are not drawn.
+export function buildImportsTree(store, userId) {
+    const sources = store.listSources(userId);
     if (!sources.length) return null;
     return {
         id: IMPORTS_ROOT_ID,

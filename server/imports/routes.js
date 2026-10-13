@@ -1,5 +1,10 @@
 // HTTP surface for importers.
+//
+// Every route that takes a source id resolves it with getSource(id, userId):
+// another account's source and a removed one are both a plain 404, so ids
+// cannot be probed across accounts.
 
+import crypto from 'node:crypto';
 import * as reddit from './reddit.js';
 import { runSource } from './runner.js';
 import { classify, isManualProvider } from './manual.js';
@@ -34,7 +39,9 @@ export function publicSource(store, source) {
         items: counts.total,
         goneFromSource: counts.goneFromSource,
         filed: counts.filed,
-        dismissed: store.countDismissed(source.id)
+        dismissed: store.countDismissed(source.id),
+        removed: Boolean(source.deletedAt),
+        removedAt: source.deletedAt || null
     };
 }
 
@@ -51,6 +58,25 @@ function resultPage(title, body) {
 <div class="card">${body}</div>`;
 }
 
+// The confirm page's form posts urlencoded. The global body parser only reads
+// JSON, so this reads the small form itself rather than pulling in another
+// middleware for one route.
+function readForm(req) {
+    if (req.body && typeof req.body === 'object' && Object.keys(req.body).length) {
+        return Promise.resolve(new URLSearchParams(Object.entries(req.body).map(([k, v]) => [k, String(v)])));
+    }
+    return new Promise((resolve, reject) => {
+        let raw = '';
+        req.setEncoding('utf8');
+        req.on('data', (chunk) => {
+            raw += chunk;
+            if (raw.length > 4096) { reject(new Error('Form too large')); req.destroy(); }
+        });
+        req.on('end', () => resolve(new URLSearchParams(raw)));
+        req.on('error', reject);
+    });
+}
+
 // Shared by the delete and file verbs: resolve a request body's externalIds
 // against one source's archive rows.
 function rowsForExternalIds(store, sourceId, externalIds) {
@@ -59,9 +85,12 @@ function rowsForExternalIds(store, sourceId, externalIds) {
     return store.itemsFor(sourceId).filter(r => wanted.has(String(r.external_id)));
 }
 
-export function attachRoutes(app, { store, requireAuth }) {
+export function attachRoutes(app, { store, requireAuth, accountName = () => null }) {
+    // ?includeRemoved=1 adds removed sources (flagged `removed`), whose
+    // archives are kept until purged.
     app.get('/api/imports', requireAuth, (req, res) => {
-        res.json({ ok: true, sources: store.listSources().map(s => publicSource(store, s)) });
+        const includeRemoved = req.query.includeRemoved === '1';
+        res.json({ ok: true, sources: store.listSources(req.user.id, { includeRemoved }).map(s => publicSource(store, s)) });
     });
 
     app.post('/api/imports', requireAuth, (req, res) => {
@@ -76,13 +105,14 @@ export function attachRoutes(app, { store, requireAuth }) {
             provider,
             label: label || 'Reddit saved',
             config: { clientId, clientSecret, listTitle: listTitle || 'Saved' },
-            intervalMinutes: Math.max(5, Number(intervalMinutes) || 60)
+            intervalMinutes: Math.max(5, Number(intervalMinutes) || 60),
+            userId: req.user.id
         });
         res.json({ ok: true, source: publicSource(store, source) });
     });
 
     app.patch('/api/imports/:id', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
 
         const body = req.body || {};
@@ -98,21 +128,31 @@ export function attachRoutes(app, { store, requireAuth }) {
                 ...(body.listTitle ? { listTitle: body.listTitle } : {})
             };
         }
-        res.json({ ok: true, source: publicSource(store, store.updateSource(source.id, patch)) });
+        res.json({ ok: true, source: publicSource(store, store.updateSource(source.id, req.user.id, patch)) });
     });
 
     // Deleting a source keeps its archived items unless ?purge=1. The archive is
     // the only copy of anything Reddit has already dropped, so losing it must be
     // an explicit choice rather than a side effect of removing a connection.
+    // Without purge the source is only marked removed; purge also reaches
+    // sources already removed.
     app.delete('/api/imports/:id', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const purge = req.query.purge === '1';
+        const source = store.getSource(req.params.id, req.user.id, { includeRemoved: purge });
         if (!source) return res.status(404).json({ error: 'Source not found' });
-        store.deleteSource(source.id, { purge: req.query.purge === '1' });
-        res.json({ ok: true });
+        store.deleteSource(source.id, req.user.id, { purge });
+        res.json({ ok: true, purged: purge });
+    });
+
+    app.post('/api/imports/:id/restore', requireAuth, (req, res) => {
+        const source = store.getSource(req.params.id, req.user.id, { includeRemoved: true });
+        if (!source) return res.status(404).json({ error: 'Source not found' });
+        const restored = source.deletedAt ? store.restoreSource(source.id, req.user.id) : source;
+        res.json({ ok: true, source: publicSource(store, restored) });
     });
 
     app.get('/api/imports/:id/items', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
         const offset = Math.max(0, Number(req.query.offset) || 0);
@@ -135,7 +175,7 @@ export function attachRoutes(app, { store, requireAuth }) {
     });
 
     app.post('/api/imports/:id/run', requireAuth, async (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         if (!store.hasCredentials(source.id)) {
             return res.status(409).json({ error: 'Connect the account first.' });
@@ -153,7 +193,7 @@ export function attachRoutes(app, { store, requireAuth }) {
     // be fetched again. The tombstone left behind is what stops the next sweep
     // from simply re-importing a post that is still saved at the source.
     app.post('/api/imports/:id/items/delete', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         const rows = rowsForExternalIds(store, source.id, (req.body || {}).externalIds);
         if (!rows) return res.status(400).json({ error: 'externalIds must be a non-empty array.' });
@@ -165,7 +205,7 @@ export function attachRoutes(app, { store, requireAuth }) {
     // item still counts and still came from the source — but it stops being
     // drawn into the virtual folder, so it does not show up twice.
     app.post('/api/imports/:id/items/file', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         const rows = rowsForExternalIds(store, source.id, (req.body || {}).externalIds);
         if (!rows) return res.status(400).json({ error: 'externalIds must be a non-empty array.' });
@@ -181,7 +221,7 @@ export function attachRoutes(app, { store, requireAuth }) {
     // that are still saved at the source. The only way back from a delete —
     // the archived copy itself is gone for good.
     app.post('/api/imports/:id/undismiss', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         const cleared = store.undismiss(source.id);
         res.json({ ok: true, cleared, note: 'Only items still present at the source will return.' });
@@ -203,13 +243,15 @@ export function attachRoutes(app, { store, requireAuth }) {
         const hit = classify(url);
         if (!hit) return res.json({ ok: true, captured: false, reason: 'not a manual import source' });
 
-        let source = store.listSources().find(s => s.provider === hit.provider);
+        // This account's active source for the provider, created on first use.
+        let source = store.listSources(req.user.id).find(s => s.provider === hit.provider);
         if (!source) {
             source = store.createSource({
                 provider: hit.provider,
                 label: hit.label,
                 config: { listTitle: 'Saved' },
-                intervalMinutes: 60
+                intervalMinutes: 60,
+                userId: req.user.id
             });
         }
 
@@ -248,7 +290,7 @@ export function attachRoutes(app, { store, requireAuth }) {
     // --- Reddit OAuth ---
 
     app.get('/api/imports/:id/authorize', requireAuth, (req, res) => {
-        const source = store.getSource(req.params.id);
+        const source = store.getSource(req.params.id, req.user.id);
         if (!source) return res.status(404).json({ error: 'Source not found' });
         if (source.provider !== 'reddit') return res.status(400).json({ error: 'Unsupported provider' });
         if (!source.config.clientId) return res.status(400).json({ error: 'Source has no clientId configured.' });
@@ -268,6 +310,12 @@ export function attachRoutes(app, { store, requireAuth }) {
     // No bearer auth: this is a browser redirect coming back from Reddit and it
     // cannot carry one. The one-shot `state` row is what authenticates it, the
     // same trade the /llm/:token routes already make.
+    //
+    // The state proves which source started the flow, not who completed
+    // Reddit's consent — anyone can be sent someone else's consent link. So
+    // nothing is stored as the connection here: the tokens wait as a pending
+    // connection, and this page asks the person in front of it to confirm
+    // which TabPaladin account receives which Reddit account.
     app.get('/api/imports/reddit/callback', async (req, res) => {
         const { code, state, error } = req.query;
         if (error) {
@@ -285,8 +333,8 @@ export function attachRoutes(app, { store, requireAuth }) {
                 '<h2>That link expired</h2><p>Start the connection again from TabPaladin settings.</p>'));
         }
 
-        const source = store.getSource(sourceId);
-        if (!source) {
+        const source = store.getSourceUnscoped(sourceId);
+        if (!source || source.deletedAt) {
             return res.status(404).type('html').send(resultPage('Gone', '<h2>That source no longer exists</h2>'));
         }
 
@@ -298,19 +346,59 @@ export function attachRoutes(app, { store, requireAuth }) {
                 code: String(code)
             });
             const username = await reddit.whoami({ accessToken: tokens.accessToken });
-            store.writeCredentials(source.id, { ...tokens, username });
-            store.markRun(source.id, { status: 'connected' });
-
-            res.type('html').send(resultPage('Connected',
-                `<h2>Connected as u/${escapeHtml(username || '?')}</h2>
-                 <p>TabPaladin will sweep your saved posts every ${source.intervalMinutes} minutes.</p>
-                 <p>You can close this tab.</p>`));
+            const nonce = crypto.randomBytes(32).toString('hex');
+            store.setPendingCredentials(source.id, { creds: { ...tokens, username }, username, nonce });
+            res.type('html').send(confirmPage({
+                redditName: username || '?',
+                account: accountName(source.userId) || `#${source.userId}`,
+                nonce
+            }));
         } catch (e) {
             store.markRun(source.id, { status: 'error', error: String(e && e.message || e) });
             res.status(502).type('html').send(resultPage('Failed',
                 `<h2>Could not complete the connection</h2><p><code>${escapeHtml(String(e && e.message || e).slice(0, 300))}</code></p>`));
         }
     });
+
+    // The confirm page's form lands here, with the one-time nonce only that
+    // page holds. Connect moves the pending tokens into place; Cancel drops
+    // them. Either way the nonce is spent.
+    app.post('/api/imports/reddit/confirm', async (req, res) => {
+        let form;
+        try { form = await readForm(req); } catch (e) {
+            return res.status(400).type('html').send(resultPage('Bad request', '<h2>That request was not understood</h2>'));
+        }
+        const nonce = form.get('nonce') || '';
+        const accept = form.get('accept') === '1';
+        const pending = store.pendingFor(nonce);
+        if (!pending) {
+            return res.status(400).type('html').send(resultPage('Expired',
+                '<h2>That confirmation expired</h2><p>Start the connection again from TabPaladin settings. Nothing was connected.</p>'));
+        }
+        const account = accountName(pending.source.userId) || `#${pending.source.userId}`;
+        if (!accept) {
+            store.clearPending(pending.source.id);
+            return res.type('html').send(resultPage('Cancelled',
+                `<h2>Not connected</h2><p>Nothing was stored for TabPaladin account <strong>${escapeHtml(account)}</strong>. You can close this tab.</p>`));
+        }
+        store.confirmPending(nonce);
+        store.markRun(pending.source.id, { status: 'connected' });
+        res.type('html').send(resultPage('Connected',
+            `<h2>Connected u/${escapeHtml(pending.username || '?')} to ${escapeHtml(account)}</h2>
+             <p>TabPaladin will sweep these saved posts every ${pending.source.intervalMinutes} minutes.</p>
+             <p>You can close this tab.</p>`));
+    });
+}
+
+function confirmPage({ redditName, account, nonce }) {
+    return resultPage('Confirm connection', `
+        <h2>Connect Reddit u/${escapeHtml(redditName)} to TabPaladin account <strong>${escapeHtml(account)}</strong>?</h2>
+        <p>Its saved posts will be archived into that account. If that is not your TabPaladin account, cancel.</p>
+        <form method="post" action="/api/imports/reddit/confirm" style="display:flex; gap:12px; justify-content:center; margin-top:1.5rem;">
+          <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+          <button type="submit" name="accept" value="1" style="font:inherit; padding:.6em 1.4em; border-radius:8px; border:0; background:#3b82f6; color:#fff;">Connect</button>
+          <button type="submit" name="accept" value="0" style="font:inherit; padding:.6em 1.4em; border-radius:8px; border:1px solid #444; background:transparent; color:inherit;">Cancel</button>
+        </form>`);
 }
 
 export { runSource };

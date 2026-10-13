@@ -19,7 +19,13 @@
 //               be bookmarks with a data:application/json url; they are rows
 //               now, which is what lets /llm and proposals read them with SQL
 //               instead of tree-walking a blob.
+//
+// Every account's tree lives in the same table, told apart by user_id. The
+// only way in is forUser(uid), whose every statement is scoped to that
+// account, so no caller can read or replace someone else's tree by forgetting
+// a WHERE clause.
 import crypto from 'node:crypto';
+import { bumpTreeVersion } from './tenancy.js';
 
 export const KINDS = new Set(['folder', 'bookmark', 'note']);
 export const ROLES = new Set(['bookmarks', 'pins', 'notes', 'workflows']);
@@ -27,6 +33,20 @@ export const TREE_FORMAT = 2;
 
 export function newId() {
     return crypto.randomBytes(8).toString('hex');
+}
+
+// A push that names ids already stored under another account. Item ids are a
+// global primary key, so this is either a working copy that belongs to
+// someone else or a stale one from before an account switch; either way it is
+// refused whole rather than re-minted, which would fork the other account's
+// items into this tree.
+export class ForeignIdError extends Error {
+    constructor(count) {
+        super(`${count} item(s) in this push belong to another account.`);
+        this.name = 'ForeignIdError';
+        this.code = 'foreign-ids';
+        this.count = count;
+    }
 }
 
 // --- Old-snapshot constants, needed only by the migration ---
@@ -48,6 +68,9 @@ function decodeDataJson(url) {
     }
 }
 
+// CREATE TABLE only: user_id and its guards are added by the ownership
+// migration (tenancy.js), and every statement is prepared at call time, so
+// this can run before that migration does.
 export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     db.exec(`
         CREATE TABLE IF NOT EXISTS items (
@@ -64,38 +87,76 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         );
         CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id, position);
 
+        -- The single-user metadata, frozen since accounts were separated;
+        -- user_tree_meta holds the live per-account values.
         CREATE TABLE IF NOT EXISTS tree_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
     `);
 
+    function forUser(uid) {
+        const userId = Number(uid);
+        if (!Number.isInteger(userId) || userId <= 0) throw new Error(`Not an account id: ${uid}`);
+        if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId)) throw new Error(`No account with id ${userId}`);
+        return makeUserStore(db, userId, { maxSnapshots });
+    }
+
+    // Boot-time heal of duplicate role folders, per account and role: two
+    // accounts each having a notes root is not a duplicate, and merging them
+    // would hand one account's notes to the other.
+    function healAllUsers() {
+        const rows = db.prepare(`
+            SELECT user_id, role FROM items
+            WHERE kind = 'folder' AND role IS NOT NULL AND user_id IN (SELECT id FROM users)
+            GROUP BY user_id, role HAVING COUNT(*) > 1
+        `).all();
+        const users = [];
+        for (const userId of new Set(rows.map(r => r.user_id))) {
+            const healed = forUser(userId).healDuplicateRoles();
+            if (healed.healed) users.push({ userId, roles: healed.roles });
+        }
+        return { healed: users.length > 0, users };
+    }
+
+    return { forUser, healAllUsers };
+}
+
+// One account's view of the store. Reached only through forUser, which has
+// already checked that the account exists.
+function makeUserStore(db, userId, { maxSnapshots }) {
     const getMeta = (key) => {
-        const row = db.prepare('SELECT value FROM tree_meta WHERE key = ?').get(key);
+        const row = db.prepare('SELECT value FROM user_tree_meta WHERE user_id = ? AND key = ?').get(userId, key);
         return row ? row.value : null;
     };
     const setMeta = (key, value) => {
-        db.prepare('INSERT INTO tree_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-            .run(key, String(value));
+        db.prepare(`
+            INSERT INTO user_tree_meta (user_id, key, value) VALUES (?, ?, ?)
+            ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
+        `).run(userId, key, String(value));
     };
 
     function version() {
         return Number(getMeta('treeVersion') || 0);
     }
 
+    // The next value of the server-wide version sequence, now this account's.
+    const bumpVersion = () => bumpTreeVersion(db, userId);
+
     // Every tree change funnels through here so history and the version counter
     // can never drift apart. History rows reuse the old snapshots table; new
     // entries are tagged with format 2 so a client browsing history can tell
-    // them from pre-migration browser-tree blobs.
+    // them from pre-migration browser-tree blobs. Pruned per account, so one
+    // account's pushes never evict another's history.
     function recordHistory(roots, deviceId) {
         const ts = new Date().toISOString();
-        db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
-            .run(ts, deviceId || null, JSON.stringify({ format: TREE_FORMAT, roots }));
+        db.prepare('INSERT INTO snapshots (timestamp, device_id, json, user_id) VALUES (?, ?, ?, ?)')
+            .run(ts, deviceId || null, JSON.stringify({ format: TREE_FORMAT, roots }), userId);
         db.prepare(`
-            DELETE FROM snapshots WHERE id NOT IN (
-                SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT ?
+            DELETE FROM snapshots WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
             )
-        `).run(maxSnapshots);
+        `).run(userId, userId, maxSnapshots);
         return ts;
     }
 
@@ -175,8 +236,8 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     // Heal a stored tree that already has duplicate role folders. Runs at boot.
     function healDuplicateRoles() {
         const dupes = db.prepare(
-            "SELECT role, COUNT(*) AS n FROM items WHERE kind = 'folder' AND role IS NOT NULL GROUP BY role HAVING n > 1"
-        ).all();
+            "SELECT role, COUNT(*) AS n FROM items WHERE user_id = ? AND kind = 'folder' AND role IS NOT NULL GROUP BY role HAVING n > 1"
+        ).all(userId);
         if (!dupes.length) return { healed: false };
         writeTree(readTree().roots, { deviceId: 'heal-duplicate-roles' });
         return { healed: true, roles: dupes.map(d => d.role) };
@@ -185,7 +246,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     // --- Tree <-> rows ------------------------------------------------------
 
     function readTree() {
-        const rows = db.prepare('SELECT * FROM items ORDER BY parent_id, position, id').all();
+        const rows = db.prepare('SELECT * FROM items WHERE user_id = ? ORDER BY parent_id, position, id').all(userId);
         const byParent = new Map();
         for (const r of rows) {
             const key = r.parent_id || '';
@@ -207,30 +268,50 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         return { version: version(), roots: (byParent.get('') || []).map(build) };
     }
 
+    // Ids stored under any other account — or under none: 'IS NOT' rather
+    // than '<>', which would miss a NULL-owned row.
+    function foreignIdCount(ids) {
+        let n = 0;
+        for (let i = 0; i < ids.length; i += 500) {
+            const chunk = ids.slice(i, i + 500);
+            n += db.prepare(`SELECT COUNT(*) AS n FROM items WHERE id IN (${chunk.map(() => '?').join(',')}) AND user_id IS NOT ?`)
+                .get(...chunk, userId).n;
+        }
+        return n;
+    }
+
     const writeTx = db.transaction((roots, deviceId) => {
-        db.prepare('DELETE FROM items').run();
+        const ids = [];
+        const collect = (node) => { ids.push(node.id); (node.children || []).forEach(collect); };
+        roots.forEach(collect);
+        const foreign = foreignIdCount(ids);
+        if (foreign) throw new ForeignIdError(foreign);
+
+        db.prepare('DELETE FROM items WHERE user_id = ?').run(userId);
         const now = new Date().toISOString();
         const insert = db.prepare(`
-            INSERT INTO items (id, parent_id, position, kind, role, title, url, payload, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items (id, parent_id, position, kind, role, title, url, payload, created_at, updated_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         const walk = (node, parentId, position) => {
             insert.run(
                 node.id, parentId, position, node.kind, node.role || null,
                 node.title, node.url || null,
                 node.payload ? JSON.stringify(node.payload) : null,
-                now, now
+                now, now, userId
             );
             if (node.kind === 'folder') {
                 (node.children || []).forEach((c, i) => walk(c, node.id, i));
             }
         };
         roots.forEach((r, i) => walk(r, null, i));
-        setMeta('treeVersion', version() + 1);
+        bumpVersion();
         recordHistory(roots, deviceId);
     });
 
-    // Replace the tree. Returns the new version.
+    // Replace this account's tree. Returns the new version. Throws
+    // ForeignIdError, having written nothing, when the push names another
+    // account's ids.
     function writeTree(roots, { deviceId = null } = {}) {
         const clean = normalizeRoots(roots);
         writeTx(clean, deviceId);
@@ -247,8 +328,8 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     // --- Role lookups -------------------------------------------------------
 
     function findRoleRow(role) {
-        return db.prepare("SELECT * FROM items WHERE kind = 'folder' AND role = ? ORDER BY parent_id IS NOT NULL, position LIMIT 1").get(role)
-            || null;
+        return db.prepare("SELECT * FROM items WHERE user_id = ? AND kind = 'folder' AND role = ? ORDER BY parent_id IS NOT NULL, position LIMIT 1")
+            .get(userId, role) || null;
     }
 
     // --- The main bookmarks root -------------------------------------------
@@ -267,7 +348,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     ]);
 
     function descendantCount(id) {
-        const kids = db.prepare('SELECT id FROM items WHERE parent_id = ?').all(id);
+        const kids = db.prepare('SELECT id FROM items WHERE user_id = ? AND parent_id = ?').all(userId, id);
         return kids.reduce((n, k) => n + 1 + descendantCount(k.id), 0);
     }
 
@@ -275,7 +356,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         const existing = findRoleRow('bookmarks');
         if (existing) return { id: existing.id, created: false };
 
-        const tops = db.prepare("SELECT * FROM items WHERE parent_id IS NULL AND kind = 'folder'").all();
+        const tops = db.prepare("SELECT * FROM items WHERE user_id = ? AND parent_id IS NULL AND kind = 'folder'").all(userId);
         const candidates = tops.filter(t => !t.role && !NOISE_TITLES.has((t.title || '').toLowerCase().trim()));
 
         const now = new Date().toISOString();
@@ -290,31 +371,31 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
 
         if (!chosen) {
             const id = newId();
-            const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id IS NULL').get().p;
+            const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id IS NULL').get(userId).p;
             db.prepare(`
-                INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at)
-                VALUES (?, NULL, ?, 'folder', 'bookmarks', 'Bookmarks', ?, ?)
-            `).run(id, max + 1, now, now);
-            setMeta('treeVersion', version() + 1);
+                INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at, user_id)
+                VALUES (?, NULL, ?, 'folder', 'bookmarks', 'Bookmarks', ?, ?, ?)
+            `).run(id, max + 1, now, now, userId);
+            bumpVersion();
             return { id, created: true };
         }
 
-        db.prepare("UPDATE items SET role = 'bookmarks', title = 'Bookmarks', updated_at = ? WHERE id = ?")
-            .run(now, chosen.id);
+        db.prepare("UPDATE items SET role = 'bookmarks', title = 'Bookmarks', updated_at = ? WHERE id = ? AND user_id = ?")
+            .run(now, chosen.id, userId);
 
         // Any other ordinary top-level folder becomes a child of it, so the top
         // level is the app's own sections rather than a browser's leftovers.
         // Noise roots are left where they are: they are hidden, not owned.
         let moved = 0;
-        const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id = ?').get(chosen.id).p;
+        const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, chosen.id).p;
         let pos = maxPos + 1;
         for (const c of candidates) {
             if (c.id === chosen.id) continue;
-            db.prepare('UPDATE items SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?')
-                .run(chosen.id, pos++, now, c.id);
+            db.prepare('UPDATE items SET parent_id = ?, position = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+                .run(chosen.id, pos++, now, c.id, userId);
             moved++;
         }
-        setMeta('treeVersion', version() + 1);
+        bumpVersion();
         return { id: chosen.id, created: false, renamedFrom: chosen.title, moved };
     });
 
@@ -344,9 +425,9 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     // share page.
     function listNotes() {
         const root = findRoleRow('notes');
-        const rows = db.prepare("SELECT * FROM items WHERE kind = 'note' ORDER BY position, id").all();
+        const rows = db.prepare("SELECT * FROM items WHERE user_id = ? AND kind = 'note' ORDER BY position, id").all(userId);
         const parentTitle = new Map(
-            db.prepare("SELECT id, title FROM items WHERE kind = 'folder'").all().map(r => [r.id, r.title])
+            db.prepare("SELECT id, title FROM items WHERE user_id = ? AND kind = 'folder'").all(userId).map(r => [r.id, r.title])
         );
         return rows.map(r => {
             const note = noteFromRow(r);
@@ -362,32 +443,33 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         if (existing) return existing.id;
         const now = new Date().toISOString();
         const id = newId();
-        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id IS NULL').get().p;
+        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id IS NULL').get(userId).p;
         db.prepare(`
-            INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at)
-            VALUES (?, NULL, ?, 'folder', 'notes', 'Notes', ?, ?)
-        `).run(id, max + 1, now, now);
+            INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at, user_id)
+            VALUES (?, NULL, ?, 'folder', 'notes', 'Notes', ?, ?, ?)
+        `).run(id, max + 1, now, now, userId);
         return id;
     }
 
     function ensureNotebook(rootId, name) {
         const existing = db.prepare(
-            "SELECT id FROM items WHERE kind = 'folder' AND parent_id = ? AND title = ?"
-        ).get(rootId, name);
+            "SELECT id FROM items WHERE user_id = ? AND kind = 'folder' AND parent_id = ? AND title = ?"
+        ).get(userId, rootId, name);
         if (existing) return existing.id;
         const now = new Date().toISOString();
         const id = newId();
-        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id = ?').get(rootId).p;
+        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, rootId).p;
         db.prepare(`
-            INSERT INTO items (id, parent_id, position, kind, title, created_at, updated_at)
-            VALUES (?, ?, ?, 'folder', ?, ?, ?)
-        `).run(id, rootId, max + 1, name, now, now);
+            INSERT INTO items (id, parent_id, position, kind, title, created_at, updated_at, user_id)
+            VALUES (?, ?, ?, 'folder', ?, ?, ?, ?)
+        `).run(id, rootId, max + 1, name, now, now, userId);
         return id;
     }
 
     // Create or replace the note with this title. Same-title matching is what
     // the LLM contract promises ("a proposal REPLACES the note with that
-    // title"), so it searches every note, not just the requested notebook —
+    // title"), so it searches every note of this account, not just the
+    // requested notebook —
     // but when two notes share the title, the one already in the requested
     // notebook wins over a same-named note elsewhere.
     const upsertNote = db.transaction((title, content, notebook) => {
@@ -396,32 +478,33 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         const targetId = notebook ? ensureNotebook(rootId, notebook) : rootId;
 
         const existing = db.prepare(`
-            SELECT * FROM items WHERE kind = 'note' AND title = ?
+            SELECT * FROM items WHERE user_id = ? AND kind = 'note' AND title = ?
             ORDER BY (parent_id = ?) DESC, position, id LIMIT 1
-        `).get(title, targetId);
+        `).get(userId, title, targetId);
         if (existing) {
             const old = noteFromRow(existing);
-            db.prepare('UPDATE items SET payload = ?, updated_at = ? WHERE id = ?').run(
-                JSON.stringify({ content, createdAt: old.createdAt || now, updatedAt: now }), now, existing.id
+            db.prepare('UPDATE items SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(
+                JSON.stringify({ content, createdAt: old.createdAt || now, updatedAt: now }), now, existing.id, userId
             );
         } else {
-            const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE parent_id = ?').get(targetId).p;
+            const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, targetId).p;
             db.prepare(`
-                INSERT INTO items (id, parent_id, position, kind, title, payload, created_at, updated_at)
-                VALUES (?, ?, ?, 'note', ?, ?, ?, ?)
+                INSERT INTO items (id, parent_id, position, kind, title, payload, created_at, updated_at, user_id)
+                VALUES (?, ?, ?, 'note', ?, ?, ?, ?, ?)
             `).run(newId(), targetId, max + 1, title,
-                JSON.stringify({ content, createdAt: now, updatedAt: now }), now, now);
+                JSON.stringify({ content, createdAt: now, updatedAt: now }), now, now, userId);
         }
-        setMeta('treeVersion', version() + 1);
+        bumpVersion();
     });
 
     // Reorder notes to match a list of titles, per parent folder; notes not in
     // the list keep their relative order after the listed ones.
     const reorderNotes = db.transaction((order) => {
         const rank = new Map(order.map((t, i) => [t, i]));
-        const parents = db.prepare("SELECT DISTINCT parent_id FROM items WHERE kind = 'note'").all();
+        const parents = db.prepare("SELECT DISTINCT parent_id FROM items WHERE user_id = ? AND kind = 'note'").all(userId);
         for (const { parent_id } of parents) {
-            const kids = db.prepare('SELECT id, kind, title FROM items WHERE parent_id IS ? ORDER BY position, id').all(parent_id);
+            const kids = db.prepare('SELECT id, kind, title FROM items WHERE user_id = ? AND parent_id IS ? ORDER BY position, id')
+                .all(userId, parent_id);
             const notes = kids.filter(k => k.kind === 'note');
             const sorted = notes.slice().sort((a, b) => {
                 const ra = rank.has(a.title) ? rank.get(a.title) : Infinity;
@@ -429,12 +512,12 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
                 return ra - rb;
             });
             let ni = 0;
-            const stmt = db.prepare('UPDATE items SET position = ? WHERE id = ?');
+            const stmt = db.prepare('UPDATE items SET position = ? WHERE id = ? AND user_id = ?');
             kids.forEach((k, i) => {
-                stmt.run(i, k.kind === 'note' ? sorted[ni++].id : k.id);
+                stmt.run(i, k.kind === 'note' ? sorted[ni++].id : k.id, userId);
             });
         }
-        setMeta('treeVersion', version() + 1);
+        bumpVersion();
     });
 
     function applyNoteProposal(prop) {
@@ -452,9 +535,8 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
 
     // --- Migration from a pre-format-2 snapshot -----------------------------
     //
-    // Runs once, on the first boot after the upgrade, when the items table is
-    // empty but the snapshots table is not. Converts the newest browser-tree
-    // blob:
+    // Runs once, on the first boot after the upgrade, when this account has no
+    // items but does have history. Converts its newest browser-tree blob:
     //   - browser roots ("Bookmarks Bar", "Other Bookmarks", ...) become plain
     //     top-level folders,
     //   - the three magic-title folders get their role tags, duplicates merged,
@@ -465,9 +547,9 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     //     already lives in import_items, and the tree copy was only ever a
     //     projection of it.
     function migrateFromLatestSnapshotIfNeeded() {
-        const already = db.prepare('SELECT COUNT(*) AS n FROM items').get().n;
+        const already = db.prepare('SELECT COUNT(*) AS n FROM items WHERE user_id = ?').get(userId).n;
         if (already > 0) return { migrated: false, reason: 'items table not empty' };
-        const row = db.prepare('SELECT json, timestamp FROM snapshots ORDER BY timestamp DESC LIMIT 1').get();
+        const row = db.prepare('SELECT json, timestamp FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1').get(userId);
         if (!row) {
             setMeta('treeVersion', version() || 0);
             return { migrated: false, reason: 'no snapshots' };
@@ -541,6 +623,7 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
     }
 
     return {
+        userId,
         version,
         ensureBookmarksRoot,
         bookmarksRootId,

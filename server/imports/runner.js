@@ -81,6 +81,30 @@ function isDue(source) {
     return elapsed >= source.intervalMinutes * 60 * 1000;
 }
 
+// One pass over every account's due sources. Returns the ids it swept.
+//
+// Only confirmed credentials count: a Reddit connection still waiting for its
+// confirm click has nothing in `credentials` yet, so it is skipped.
+export async function runDueSources(store) {
+    const swept = [];
+    for (const source of store.listAllSources()) {
+        if (!isDue(source)) continue;
+        // Manual sources have nothing to fetch — they fill from shares —
+        // and nothing to redraw either, since the subtree is built fresh
+        // on every read.
+        if (isManualProvider(source.provider)) continue;
+        if (!store.hasCredentials(source.id)) continue;
+        const result = await runSource(store, source);
+        swept.push(source.id);
+        if (!result.ok) {
+            console.warn(`[TabPaladin Imports] ${source.provider}#${source.id} failed: ${result.error}`);
+        } else if (result.added) {
+            console.log(`[TabPaladin Imports] ${source.provider}#${source.id}: +${result.added} new, ${result.fetched} seen`);
+        }
+    }
+    return swept;
+}
+
 // A plain interval rather than a cron dependency — the server is already a
 // long-lived process, and the schedule is "every N minutes" with no calendar
 // semantics to get wrong.
@@ -90,20 +114,7 @@ export function startScheduler(store) {
         if (running) return; // a slow sweep must not stack on the next tick
         running = true;
         try {
-            for (const source of store.listSources()) {
-                if (!isDue(source)) continue;
-                // Manual sources have nothing to fetch — they fill from shares —
-                // and nothing to redraw either, since the subtree is built fresh
-                // on every read.
-                if (isManualProvider(source.provider)) continue;
-                if (!store.hasCredentials(source.id)) continue;
-                const result = await runSource(store, source);
-                if (!result.ok) {
-                    console.warn(`[TabPaladin Imports] ${source.provider}#${source.id} failed: ${result.error}`);
-                } else if (result.added) {
-                    console.log(`[TabPaladin Imports] ${source.provider}#${source.id}: +${result.added} new, ${result.fetched} seen`);
-                }
-            }
+            await runDueSources(store);
         } catch (e) {
             console.warn('[TabPaladin Imports] scheduler tick failed:', e);
         } finally {

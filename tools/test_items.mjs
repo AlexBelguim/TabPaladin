@@ -11,10 +11,16 @@
 //      write, never stored.
 //   5. Notes SQL: listing with notebooks, proposal upsert-by-title, reorder.
 //
+// Every database here is a single-account one that has been through the
+// ownership migration, and the store is that account's (forUser(1)). What
+// changes when there are two accounts is tools/test_tenancy.mjs's business.
+//
 // Run: node tools/test_items.mjs
 
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import { makeItemsStore, TREE_FORMAT } from '../server/items.js';
+import { migrateUsers } from '../server/users.js';
+import { migrateOwnership } from '../server/tenancy.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -28,13 +34,25 @@ function check(name, cond, detail) {
 
 const enc = (o) => 'data:application/json,' + encodeURIComponent(JSON.stringify(o));
 
-function freshDb() {
+// A pre-multi-user database holding one account and, optionally, legacy
+// history rows, upgraded the way the server boots it. Returns the account's
+// store.
+function freshDb(legacySnapshots = []) {
     const db = new Database(':memory:');
     db.exec(`CREATE TABLE snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL, device_id TEXT, json TEXT NOT NULL
-    );`);
-    return db;
+    );
+    CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);`);
+    db.prepare("INSERT INTO users VALUES ('alex', 'scrypt:x:y', '2026-01-01T00:00:00Z')").run();
+    migrateUsers(db);
+    for (const snap of legacySnapshots) {
+        db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
+            .run(snap.timestamp, snap.deviceId, JSON.stringify(snap.json));
+    }
+    const store = makeItemsStore(db, { maxSnapshots: 10 });
+    migrateOwnership(db, { env: {} });
+    return { db, items: store.forUser(1) };
 }
 
 function findFolder(roots, title) {
@@ -56,7 +74,6 @@ function allNodes(roots, out = []) {
 
 console.log('\n1. Migration from a browser-tree snapshot');
 {
-    const db = freshDb();
     const oldSnap = {
         version: 1, type: 'root', title: '',
         children: [
@@ -92,10 +109,7 @@ console.log('\n1. Migration from a browser-tree snapshot');
             { type: 'folder', title: 'Trash', children: [] }
         ]
     };
-    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
-        .run('2026-08-01T00:00:00Z', 'extension', JSON.stringify(oldSnap));
-
-    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    const { db, items } = freshDb([{ timestamp: '2026-08-01T00:00:00Z', deviceId: 'extension', json: oldSnap }]);
     const mig = items.migrateFromLatestSnapshotIfNeeded();
     check('migration ran', mig.migrated === true, mig.reason);
 
@@ -182,10 +196,9 @@ console.log('\n1. Migration from a browser-tree snapshot');
 
 console.log('\n4b. The Bookmarks root');
 {
-    const db = freshDb();
     const enc2 = (o) => 'data:application/json,' + encodeURIComponent(JSON.stringify(o));
-    db.prepare('INSERT INTO snapshots (timestamp, device_id, json) VALUES (?, ?, ?)')
-        .run('2026-08-01T00:00:00Z', 'ext', JSON.stringify({
+    const { db, items } = freshDb([{
+        timestamp: '2026-08-01T00:00:00Z', deviceId: 'ext', json: {
             type: 'root', children: [
                 { type: 'folder', title: 'Bookmarks Bar', children: [{ type: 'bookmark', title: 'HN', url: 'https://hn' }] },
                 { type: 'folder', title: 'Other Bookmarks', children: [
@@ -194,8 +207,8 @@ console.log('\n4b. The Bookmarks root');
                 ] },
                 { type: 'folder', title: 'Trash', children: [{ type: 'bookmark', title: 'junk', url: 'https://junk' }] }
             ]
-        }));
-    const items = makeItemsStore(db, { maxSnapshots: 10 });
+        }
+    }]);
     items.migrateFromLatestSnapshotIfNeeded();
     const r = items.ensureBookmarksRoot();
 
@@ -228,8 +241,7 @@ console.log('\n4b. The Bookmarks root');
 
 console.log('\n5. Empty server: no snapshot, nothing to migrate');
 {
-    const db = freshDb();
-    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    const { db, items } = freshDb();
     const mig = items.migrateFromLatestSnapshotIfNeeded();
     check('no snapshots -> no migration', mig.migrated === false);
     check('version starts at 0', items.version() === 0);
@@ -245,8 +257,7 @@ console.log('\n5. Empty server: no snapshot, nothing to migrate');
 
 console.log('\n6. Normalization guards');
 {
-    const db = freshDb();
-    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    const { db, items } = freshDb();
     items.writeTree([
         { id: 'dup', kind: 'folder', title: 'A', children: [{ id: 'dup', kind: 'bookmark', title: 'x', url: 'https://x' }] },
         { kind: 'bookmark', title: 'no url' },              // dropped: bookmark without url
@@ -262,8 +273,7 @@ console.log('\n6. Normalization guards');
 
 console.log('\n7. Duplicate role folders are merged, nothing dropped');
 {
-    const db = freshDb();
-    const items = makeItemsStore(db, { maxSnapshots: 10 });
+    const { db, items } = freshDb();
     items.writeTree([
         { id: 'w1', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [
             { id: 'wf1', kind: 'folder', title: 'Old', children: [] }
@@ -283,8 +293,8 @@ console.log('\n7. Duplicate role folders are merged, nothing dropped');
 
     // A database that already holds duplicates (written before the merge
     // existed) is healed at boot.
-    db.prepare("INSERT INTO items (id, parent_id, position, kind, role, title) VALUES ('w3', NULL, 9, 'folder', 'workflows', 'Dup')").run();
-    db.prepare("INSERT INTO items (id, parent_id, position, kind, title, url) VALUES ('t3', 'w3', 0, 'bookmark', 'x', 'https://x3.example')").run();
+    db.prepare("INSERT INTO items (id, parent_id, position, kind, role, title, user_id) VALUES ('w3', NULL, 9, 'folder', 'workflows', 'Dup', 1)").run();
+    db.prepare("INSERT INTO items (id, parent_id, position, kind, title, url, user_id) VALUES ('t3', 'w3', 0, 'bookmark', 'x', 'https://x3.example', 1)").run();
     const healed = items.healDuplicateRoles();
     const after = allNodes(items.readTree().roots);
     check('boot heal merges stored duplicates',

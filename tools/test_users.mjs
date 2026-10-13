@@ -8,9 +8,14 @@
 //   2. ADMIN_USERNAME / ADMIN_PASSWORD create the first admin only when there
 //      are no users; the environment is ignored afterwards.
 //   3. A session token resolves to { id, username, role }; the legacy token
-//      acts as the first admin; anything else resolves to nobody.
-//   4. A backup is written before a schema change, not again within the
-//      interval, and pruned to `keep`.
+//      acts as the account the ownership migration pinned it to (the first
+//      admin only before that migration); anything else resolves to nobody.
+//   4. A schema step writes its own sync.db.pre-v<N>-* copy, once, and never
+//      touches the daily sync.db.bak-* rotation — so a crash loop below the
+//      new version cannot rotate the older daily copies away. Daily copies
+//      are not repeated within the interval and are pruned to `keep`.
+//   5. Account ids are never reused, names that differ only by case are
+//      refused (against deleted accounts too), and password bounds hold.
 //
 // Run: node tools/test_users.mjs
 
@@ -19,8 +24,10 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import {
-    migrateUsers, bootstrapAdmin, identify, backupDatabase, setSchemaVersion, createUser, SCHEMA_VERSION
+    migrateUsers, bootstrapAdmin, identify, backupDatabase, setSchemaVersion, createUser, SCHEMA_VERSION,
+    validatePassword, listBackups
 } from '../server/users.js';
+import { migrateOwnership, deleteUserData } from '../server/tenancy.js';
 import { verifyPassword } from '../server/security.js';
 
 let failures = 0;
@@ -119,6 +126,24 @@ console.log('identify');
         identify(db, TOKEN, 'old') === null && !db.prepare("SELECT 1 FROM sessions WHERE token = 'old'").get());
 }
 
+console.log('legacy token after the ownership migration');
+{
+    // Two accounts, so the migration has to be told whose data this is.
+    const db = legacyDb();
+    db.prepare("INSERT INTO users VALUES ('first', 'h', '2025-01-01')").run();
+    db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-02-01')").run();
+    migrateUsers(db);
+    migrateOwnership(db, { env: { TENANCY_OWNER: 'alex' } });
+    const alex = db.prepare("SELECT id FROM users WHERE username = 'alex'").get().id;
+    db.prepare("UPDATE users SET role = 'user' WHERE username = 'alex'").run();
+    db.prepare("UPDATE users SET role = 'admin' WHERE username = 'first'").run();
+    const who = identify(db, TOKEN, TOKEN);
+    check('the token acts as the pinned owner, even demoted and with a lower-id admin around',
+        who?.username === 'alex' && who.id === alex && who.via === 'token', JSON.stringify(who));
+    deleteUserData(db, alex);
+    check('a token whose pinned account is gone resolves to nobody', identify(db, TOKEN, TOKEN) === null);
+}
+
 // --- 4. Backup ---
 console.log('backup');
 {
@@ -127,31 +152,82 @@ console.log('backup');
     const db = legacyDb(file);
     db.pragma('journal_mode = WAL');
     db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-01-01')").run();
-    const list = () => fs.readdirSync(dir).filter(f => f.startsWith('sync.db.bak-')).sort();
+    const bak = () => listBackups(file, 'bak-').map(f => f.name);
+    const pre = () => listBackups(file, `pre-v${SCHEMA_VERSION}-`).map(f => f.name);
 
-    const t0 = new Date('2026-01-01T00:00:00Z');
+    // Seven older daily copies, as a server that has been running a while has.
+    const t0 = new Date('2026-01-10T00:00:00Z');
+    setSchemaVersion(db);
+    for (let i = 7; i >= 1; i--) {
+        backupDatabase(db, file, { keep: 7, intervalMs: 0, now: new Date(t0.getTime() - i * 86400000) });
+    }
+    db.pragma('user_version = 2');
+    const daily = bak();
+    check('seven daily copies to start with', daily.length === 7, daily.join(', '));
+
     const first = backupDatabase(db, file, { now: t0 });
-    check('pre-migration backup written', first && list().length === 1);
+    check('a schema step writes sync.db.pre-v3-*', first && path.basename(first).startsWith(`sync.db.pre-v${SCHEMA_VERSION}-`), first);
     const copy = new Database(first, { readonly: true });
-    check('backup holds the data (including WAL contents)',
+    check('the copy holds the data (including WAL contents)',
         copy.prepare('SELECT username FROM users').get()?.username === 'alex');
     copy.close();
 
+    // A container crash-looping below the new version: eight boots, a minute apart.
+    for (let i = 1; i <= 8; i++) {
+        backupDatabase(db, file, { keep: 7, now: new Date(t0.getTime() + i * 60000) });
+    }
+    check('a crash loop keeps every older daily copy', JSON.stringify(bak()) === JSON.stringify(daily), bak().join(', '));
+    check('and does not pile up pre-upgrade copies within ten minutes', pre().length === 1, pre().join(', '));
+    backupDatabase(db, file, { now: new Date(t0.getTime() + 11 * 60000) });
+    check('a later attempt, still below the version, takes a fresh one', pre().length === 2);
+
     setSchemaVersion(db);
     check('schema version recorded', db.pragma('user_version', { simple: true }) === SCHEMA_VERSION);
-    check('no second backup within the interval', backupDatabase(db, file, { now: new Date(t0.getTime() + 1000) }) === null);
-
+    const later = new Date(t0.getTime() + 3600000);
+    check('no daily copy within the interval of the last one',
+        backupDatabase(db, file, { now: new Date(t0.getTime() - 86400000 + 1000) }) === null);
     for (let i = 1; i <= 4; i++) {
-        backupDatabase(db, file, { keep: 3, intervalMs: 0, now: new Date(t0.getTime() + i * 60000) });
+        backupDatabase(db, file, { keep: 3, intervalMs: 0, now: new Date(later.getTime() + i * 60000) });
     }
-    check('pruned to keep', list().length === 3, list().join(', '));
-    check('oldest pruned first', !list().includes(path.basename(first)));
+    check('daily copies pruned to keep', bak().length === 3, bak().join(', '));
+    check('oldest pruned first', !bak().includes(daily[0]) && !bak().includes(daily[6]));
+    check('pruning never touches the pre-upgrade copies', pre().length === 2);
 
     const empty = new Database(path.join(dir, 'fresh.db'));
     check('brand-new database is not backed up', backupDatabase(empty, path.join(dir, 'fresh.db')) === null);
     empty.close();
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 5. Ids, names, passwords ---
+console.log('ids, names, passwords');
+{
+    const db = legacyDb();
+    db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-01-01')").run();
+    migrateUsers(db);
+    migrateOwnership(db, { env: {} });
+    const sam = await createUser(db, { username: 'sam', password: 'sam-password' });
+    const kim = await createUser(db, { username: 'kim', password: 'kim-password' });
+    deleteUserData(db, kim.id);
+    const lee = await createUser(db, { username: 'lee', password: 'lee-password' });
+    check('the highest id is not reused after its account is deleted', lee.id === kim.id + 1, `${kim.id} -> ${lee.id}`);
+    check('a new account starts at a fresh tree version',
+        Number(db.prepare("SELECT value FROM user_tree_meta WHERE user_id = ? AND key = 'treeVersion'").get(lee.id)?.value) > 0);
+
+    const clash = async (name) => { try { await createUser(db, { username: name, password: 'long-enough' }); return null; } catch (e) { return e; } };
+    const upper = await clash('Alex');
+    check('"Alex" refused when "alex" exists', upper && upper.code === 'name-clash' && /too close to existing "alex"/.test(upper.message),
+        upper && upper.message);
+    check('a deleted account\'s name is refused, in any case', (await clash('KIM'))?.code === 'name-clash' && (await clash('kim'))?.code === 'name-clash');
+    check('the exact same name is refused', (await clash('sam'))?.code === 'name-clash');
+    check('a refused name created nothing', db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 3);
+    void sam;
+
+    check('7-character password refused', Boolean(validatePassword('1234567').error));
+    check('8-character password accepted', validatePassword('12345678').password === '12345678');
+    check('256-character password accepted', !validatePassword('x'.repeat(256)).error);
+    check('257-character password refused', Boolean(validatePassword('x'.repeat(257)).error));
 }
 
 console.log(failures === 0 ? '\nAll users tests passed.\n' : `\n${failures} test(s) failed.\n`);
