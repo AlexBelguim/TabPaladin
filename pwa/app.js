@@ -3715,6 +3715,7 @@ async function flushShares(sids = null) {
     }
     for (const f of res.filed) applyFiled(f.result);
     if (res.filed.length) loadShareStats();
+    if (shareSheet) shareSheet.onFlushed(res);
     if (res.stopped === 'auth') {
         try { await api('/api/auth/me'); } catch (e) { /* api() has said so */ }
     }
@@ -4079,8 +4080,16 @@ function makeShareSheet() {
         toast: showToast,
         toastUndo: showUndoToast,
         openSettings: () => openSettings(),
+        // True once the note editor holds the text; the sheet keeps the share
+        // until then.
         saveAsNote: async (text) => {
-            if (!(await startNewNote({ parentId: null, content: text, from: 'Home' }))) showToast('Pull your notes first, then save it as a note.');
+            if (!configured()) {
+                showToast('Sign in first, then save it as a note.');
+                return false;
+            }
+            if (await startNewNote({ parentId: null, content: text, from: 'Home' })) return true;
+            showToast('Not saved as a note — it is kept in the Inbox until you do.');
+            return false;
         },
         openFolder: openFolderById,
         registerSync: registerShareSync,
@@ -5164,6 +5173,7 @@ window.addEventListener('DOMContentLoaded', () => {
             const data = e.data || {};
             if (data.type !== 'tp-outbox' || !data.result) return;
             for (const f of data.result.filed || []) applyFiled(f.result);
+            if (shareSheet) shareSheet.onFlushed(data.result);
             refreshInbox();
         });
     }
