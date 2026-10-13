@@ -662,7 +662,7 @@ app.post('/api/push', requireAuth, goneHandler);
 app.get('/api/pull', requireAuth, goneHandler);
 
 app.get('/api/history', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT 100')
+    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT 100')
         .all(req.user.id);
     res.json({ ok: true, snapshots: rows });
 });

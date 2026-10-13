@@ -15,13 +15,13 @@
 // Plain text, not text/markdown: some LLM fetch tools refuse text/markdown
 // responses. Every page is bounded; the main page says how to read the rest.
 // The link is the only credential: unguessable, expiring, and dead with its
-// account.
+// account or once the account's password is changed or reset.
 
 import crypto from 'node:crypto';
 import express from 'express';
 import { indexTree, pathText, folderContents, searchBookmarks, searchFolders, searchNotes, notePath } from './library.js';
 import { parseProposal } from './proposals.js';
-import { ChangeError } from './treeChanges.js';
+import { ChangeError, MAX_DELETES } from './treeChanges.js';
 
 export const FOLDERS_ON_PAGE = 1000;
 export const BOOKMARKS_ON_PAGE = 300;
@@ -161,11 +161,11 @@ export function attachLlmShareRoutes(app, { db, items, proposals, requireAuth, t
         md += `  - Add bookmarks: {"action": "add_bookmarks", "folderId": "<folder id>", "bookmarks": [{"title": "Page title", "url": "https://…"}]} — http(s) only, max 100.\n`;
         md += `  - Move bookmarks or folders: {"action": "move", "ids": ["<id>", "…"], "toFolderId": "<folder id>"}\n`;
         md += `  - Rename a bookmark or folder: {"action": "rename", "id": "<id>", "title": "New name"}\n`;
-        md += `  - Delete bookmarks or folders: {"action": "delete", "ids": ["<id>"]} — shown to the user as a DELETE; a folder goes with everything in it. Only propose this when the user asked for it.\n`;
+        md += `  - Delete bookmarks or folders: {"action": "delete", "ids": ["<id>"]} — shown to the user as a DELETE; a folder goes with everything in it; at most ${MAX_DELETES} in one proposal. Only propose this when the user asked for it.\n`;
         md += `  - Several at once, applied together: {"action": "changes", "reason": "…", "changes": [{"op": "create_folder", "parentId": "<folder id>", "path": "Reading", "ref": "reading"}, {"op": "move", "ids": ["<id>"], "toFolderRef": "reading"}]}\n`;
         md += `    ("op" takes the same kinds; "ref" names a folder created earlier in the same proposal, used as parentRef / folderRef / toFolderRef.)\n`;
         md += `- Read-only: folders marked "read-only" (Pinned, Workflows), the Notes notebooks (use note proposals) and imported archives (not shown).\n`;
-        md += `- If something a proposal names changes before the user approves it, the proposal is marked out of date and nothing of it is applied.\n`;
+        md += `- If something a proposal names changes before the user approves it (or what is in a folder it deletes), the proposal is marked out of date and nothing of it is applied.\n`;
         md += `- After posting, tell the user it is waiting in the TabPaladin app under Home › Suggested changes.\n\n`;
 
         md += `## Reading more\n\n`;

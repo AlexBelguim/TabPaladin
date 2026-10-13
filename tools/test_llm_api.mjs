@@ -25,6 +25,15 @@
 //      409 and changes nothing — never half-applied; reject drops it.
 //   6. Tenancy: another account's link, page, ids, review and approvals
 //      never touch this one's.
+//   And what review found: a delete past the 60th preview line is still
+//   flagged and listed; a folder delete goes stale when what is in it
+//   changes; approving checks the preview the user was shown (409 changed);
+//   approving a delete keeps a history version from before it, links filed
+//   since the last snapshot included; ids inside a folder deleted in the
+//   same proposal are skipped, not refused; refusals carry at most 50
+//   problems; a note body keeps being a note whatever "action" it guessed;
+//   and a password change ends the account's share links (test_mcp, and
+//   test_auth for an admin reset).
 //
 // Run: node tools/test_llm_api.mjs [--port 18990]
 // Starts this checkout's server on the port with a throwaway data directory.
@@ -34,7 +43,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { normalizeChanges, planChanges, ChangeError, MAX_CHANGES } from '../server/treeChanges.js';
+import { normalizeChanges, planChanges, ChangeError, MAX_CHANGES, MAX_PREVIEW, MAX_DELETES } from '../server/treeChanges.js';
 import { parseProposal } from '../server/proposals.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -86,6 +95,8 @@ console.log('\n1. Proposal shapes');
         ['11 levels', [{ op: 'create_folder', parentId: 'a', path: Array.from({ length: 11 }, (_, i) => `L${i}`).join(' / ') }]],
         ['a 201-character folder name', [{ op: 'create_folder', parentId: 'a', path: 'x'.repeat(201) }]],
         ['201 ids', [{ op: 'delete', ids: Array.from({ length: 201 }, (_, i) => `i${i}`) }]],
+        [`${MAX_DELETES + 1} deletions over two changes`, [{ op: 'delete', ids: Array.from({ length: 101 }, (_, i) => `a${i}`) },
+            { op: 'delete', ids: Array.from({ length: MAX_DELETES - 100 }, (_, i) => `b${i}`) }]],
         ['a rename without a title', [{ op: 'rename', id: 'x' }]],
         ['an id with a newline', [{ op: 'delete', ids: ['a\nb'] }]]
     ]) {
@@ -96,6 +107,16 @@ console.log('\n1. Proposal shapes');
         (() => { const p = parseProposal({ action: 'rename', id: 'x', title: 'Y', reason: ' because ' }); return p.type === 'tree' && p.changes.length === 1 && p.reason === 'because'; })());
     check('parseProposal: a note body is a note, as always', parseProposal({ title: 'T', content: 'c', notebook: ' NB ' }).notebook === 'NB');
     check('parseProposal: an unknown action is refused', throwsMsg(() => parseProposal({ action: 'nuke' })) !== null);
+    check(`parseProposal: ${MAX_DELETES} deletions over two changes are fine`, parseProposal({ action: 'changes', changes: [
+        { op: 'delete', ids: Array.from({ length: 100 }, (_, i) => `a${i}`) }, { op: 'delete', ids: Array.from({ length: 100 }, (_, i) => `b${i}`) }] }).changes.length === 2);
+    const guessed = ['create', 'create_note', 'add_note', 'update', 'edit', 'propose', 'remove', 'new_folder', 'delete', 'changes']
+        .map(action => [action, (() => { try { return parseProposal({ action, title: 'Groceries', content: '# Groceries\n\n- milk' }); } catch (e) { return e.message; } })()]);
+    check('parseProposal: a note body is a note whatever "action" it guessed, as the link always took it',
+        guessed.every(([, p]) => p && p.type === 'note' && p.title === 'Groceries'), JSON.stringify(guessed));
+    check('  but a bookmark change is still one, and a reorder still a reorder',
+        parseProposal({ action: 'remove', ids: ['x'] }).type === 'tree' && parseProposal({ action: 'delete', title: 'x', ids: ['x'] }).type === 'tree'
+        && parseProposal({ changes: [{ op: 'delete', ids: ['x'] }], content: 'stray' }).type === 'tree'
+        && parseProposal({ action: 'reorder', order: ['A'], content: 'x' }).type === 'reorder');
     check('parseProposal: a 1001-character reason is refused',
         throwsMsg(() => parseProposal({ action: 'delete', ids: ['x'], reason: 'r'.repeat(1001) })) !== null);
 }
@@ -168,6 +189,65 @@ console.log('\n2. Planning against a tree');
         && again.stale.some(s => /folder “AI” was moved/.test(s)), JSON.stringify(again.stale));
     const same = planChanges(rows, normalizeChanges([{ op: 'move', ids: ['hn', 'mdn'], toFolderId: 'ai' }]), { fingerprints: proposed.fingerprints, newId });
     check('against the same tree it is still good', same.ok && same.stale.length === 0);
+
+    // A DELETE past the preview's first MAX_PREVIEW lines is still flagged and shown.
+    const many = (n, tag) => Array.from({ length: n }, (_, i) => ({ title: `${tag} ${i}`, url: `https://${tag}.example/${i}` }));
+    const late = plan([{ op: 'add_bookmarks', folderId: 'tech', bookmarks: many(MAX_PREVIEW + 1, 'late') }, { op: 'delete', ids: ['ai'] }]);
+    const lateDanger = late.preview.filter(x => x.danger);
+    check('a delete after more than 60 other lines is flagged and still in the preview', late.ok && late.danger === true
+        && lateDanger.length === 1 && /^DELETE folder “AI” from Bookmarks \/ Tech \(empty\)$/.test(lateDanger[0].text)
+        && late.preview.length === MAX_PREVIEW + 2 && late.preview[late.preview.length - 1].op === 'more'
+        && late.preview[late.preview.length - 1].text === '… and 1 more, none of them a deletion', JSON.stringify(late.preview.slice(-3)));
+    const spread = plan([{ op: 'delete', ids: ['mdn'] }, { op: 'add_bookmarks', folderId: 'tech', bookmarks: many(100, 'a') },
+        { op: 'add_bookmarks', folderId: 'tech', bookmarks: many(10, 'b') }, { op: 'delete', ids: ['hn', 'ai'] }]);
+    check('  every DELETE line is kept, before and after the cut, in order', spread.ok && spread.danger
+        && spread.preview.filter(x => x.danger).map(x => x.text.split(' ')[2]).join() === '“MDN”,“HN”,“AI”'
+        && spread.preview.filter(x => !x.danger && x.op !== 'more').length === MAX_PREVIEW
+        && /^… and 50 more, none of them a deletion$/.test(spread.preview[spread.preview.length - 1].text), JSON.stringify(spread.preview.filter(x => x.danger)));
+    check('  and nothing deleted is no danger', plan([{ op: 'add_bookmarks', folderId: 'tech', bookmarks: many(70, 'c') }]).danger === false);
+
+    // A folder delete is fingerprinted by what is in it.
+    const delAi = plan([{ op: 'delete', ids: ['ai'] }]);
+    const withChild = [...rows, row('new-bm', 'ai', 'bookmark', 'Filed later', { url: 'https://later.example' })];
+    const grown = planChanges(withChild, normalizeChanges([{ op: 'delete', ids: ['ai'] }]), { fingerprints: delAi.fingerprints, newId });
+    check('a folder deleted while empty is stale once something is put in it', delAi.ok && delAi.fingerprints.ai.c && delAi.fingerprints.ai.c.n === 0
+        && !grown.ok && grown.stale.some(s => /What is in the folder “AI” changed since \(0 item\(s\) then, 1 now\)/.test(s))
+        && grown.actions.some(a => a.type === 'delete' && a.ids.includes('new-bm')), JSON.stringify(grown.stale));
+    const delTech = plan([{ op: 'delete', ids: ['tech'] }]);
+    const shrunk = planChanges(rows.filter(r => r.id !== 'hn'), normalizeChanges([{ op: 'delete', ids: ['tech'] }]), { fingerprints: delTech.fingerprints, newId });
+    const moved = planChanges(rows.map(r => r.id === 'hn' ? { ...r, parent_id: 'ai' } : r), normalizeChanges([{ op: 'delete', ids: ['tech'] }]), { fingerprints: delTech.fingerprints, newId });
+    check('  and once something in it goes; a move inside it changes nothing', delTech.fingerprints.tech.c.n === 2
+        && !shrunk.ok && shrunk.stale.some(s => /folder “Tech” changed since \(2 item\(s\) then, 1 now\)/.test(s))
+        && moved.ok, JSON.stringify([shrunk.stale, moved.stale]));
+    const keptAi = planChanges(rows, normalizeChanges([{ op: 'delete', ids: ['ai'] }]), { fingerprints: delAi.fingerprints, newId });
+    check('  the same contents are still good, with the same review key', keptAi.ok && keptAi.reviewKey === delAi.reviewKey);
+
+    // Ids inside a folder deleted in the same proposal.
+    const both = plan([{ op: 'delete', ids: ['tech', 'hn'] }]);
+    const bothRev = plan([{ op: 'delete', ids: ['hn', 'tech'] }]);
+    const twice = plan([{ op: 'delete', ids: ['tech'] }, { op: 'delete', ids: ['hn'] }]);
+    check('a folder and something in it, deleted together, in either order', both.ok && bothRev.ok && twice.ok
+        && both.preview.some(x => x.op === 'skip' && x.text === '“HN” goes with the folder “Tech”, deleted above')
+        && both.actions.length === 1 && both.counts.deleted === 1 && bothRev.counts.deleted === 2
+        && both.fingerprints.hn && twice.preview.some(x => x.op === 'skip'), JSON.stringify([both.problems, both.preview, twice.problems]));
+    const afterDel = plan([{ op: 'delete', ids: ['tech'] }, { op: 'move', ids: ['hn'], toFolderId: 'inbox' }]);
+    check('  moving something a delete above took is refused, saying so', !afterDel.ok
+        && afterDel.problems.some(m => /Change 2: “HN” is deleted by an earlier change in this proposal/.test(m)), JSON.stringify(afterDel.problems));
+
+    // The review key: what the preview says, whatever else changed.
+    const mv = [{ op: 'move', ids: ['mdn'], toFolderId: 'ai' }];
+    const mvPlan = plan(mv);
+    const renamedAbove = rows.map(r => r.id === 'tech' ? { ...r, title: 'Technology' } : r);
+    const mvLater = planChanges(renamedAbove, normalizeChanges(mv), { fingerprints: mvPlan.fingerprints, newId });
+    check('a review key names the preview: the same plan, the same key; other lines, another key',
+        mvPlan.reviewKey === plan(mv).reviewKey && mvLater.ok && mvLater.reviewKey !== mvPlan.reviewKey
+        && mvLater.preview[0].text === 'Move bookmark “MDN” from Bookmarks / Inbox to Bookmarks / Technology / AI', JSON.stringify(mvLater.preview));
+
+    // Preview lines show a bounded part of what a chat or a title can make long.
+    const long = plan([{ op: 'rename', id: 'hn', title: 'L'.repeat(1000) },
+        { op: 'add_bookmarks', folderId: 'tech', bookmarks: [{ title: 'T'.repeat(1000), url: 'https://long.example/' + 'u'.repeat(7000) }] }]);
+    check('long titles and addresses are cut short in the preview', long.ok && long.preview.every(x => x.text.length < 1200)
+        && long.preview.some(x => x.text.includes('…')), JSON.stringify(long.preview.map(x => x.text.length)));
 }
 
 // --- 3-6. A live server ------------------------------------------------------------------------
@@ -420,6 +500,85 @@ try {
     check('  but not notes, and not without a session', (await api('/api/proposals', { method: 'POST', token: A, body: { title: 'x', content: 'y' } })).status === 400
         && (await api('/api/proposals', { method: 'POST', body: { changes: [{ op: 'delete', ids: ['b-old'] }] } })).status === 401);
     check('  and not another account\'s ids', (await api('/api/proposals', { method: 'POST', token: S, body: { changes: [{ op: 'delete', ids: ['b-old'] }] } })).status === 400);
+
+    console.log('\n5b. What review found');
+    const reject = (id) => api(`/api/proposals/${id}/reject`, { method: 'POST', token: A });
+    const approveP = (id, body) => api(`/api/proposals/${id}/approve`, { method: 'POST', token: A, ...(body ? { body } : {}) });
+    const pushRoots = async (change) => {
+        const t = await treeNow();
+        change(t.roots);
+        const r = await api('/api/tree', { method: 'PUT', token: A, body: { roots: t.roots, baseVersion: t.version } });
+        if (r.status !== 200) throw new Error('push: ' + r.text);
+    };
+
+    // A delete hidden after 60 other lines is flagged, listed and named in the title.
+    const lateDel = await propose({ action: 'changes', changes: [
+        { op: 'add_bookmarks', folderId: 'f-tech', bookmarks: Array.from({ length: 61 }, (_, i) => ({ title: `Late ${i}`, url: `https://late.example/${i}` })) },
+        { op: 'delete', ids: ['f-ai'] }] });
+    const lateRow = (await review()).find(p => p.id === lateDel.json.id);
+    check('a delete after 61 new bookmarks is flagged as a delete, its line shown, the rest counted',
+        lateDel.status === 200 && lateRow.danger === true && lateRow.status === 'pending'
+        && lateRow.preview.filter(l => l.danger).length === 1 && /^DELETE folder “AI” from Bookmarks \/ Tech with everything in it/.test(lateRow.preview.find(l => l.danger).text)
+        && /none of them a deletion/.test(lateRow.preview[lateRow.preview.length - 1].text) && /1 DELETED/.test(lateRow.title), JSON.stringify(lateRow).slice(0, 400));
+    await reject(lateDel.json.id);
+
+    // Approving checks what the user was shown.
+    const mvOld = await propose({ action: 'move', ids: ['b-old'], toFolderId: 'f-ai' });
+    const shown = (await review()).find(p => p.id === mvOld.json.id);
+    await pushRoots((roots) => { find(roots, 'f-tech').title = 'Technology'; });
+    const nowShown = (await review()).find(p => p.id === mvOld.json.id);
+    check('a suggestion whose lines read otherwise since stays pending, retitled by what it would do now',
+        shown.status === 'pending' && nowShown.status === 'pending' && typeof shown.reviewKey === 'string' && nowShown.reviewKey !== shown.reviewKey
+        && nowShown.title === 'Move bookmark “Old thing” from Bookmarks / Empty to Bookmarks / Technology / AI', JSON.stringify([shown.title, nowShown.title]));
+    let vNow = (await treeNow()).version;
+    const changedR = await approveP(mvOld.json.id, { reviewed: shown.reviewKey });
+    check('  approving the preview shown before is refused (409 changed) and applies nothing', changedR.status === 409 && changedR.json.code === 'changed'
+        && (await treeNow()).version === vNow && parentOf((await treeNow()).roots, 'b-old').id === 'f-empty', changedR.text);
+    const okR = await approveP(mvOld.json.id, { reviewed: nowShown.reviewKey });
+    check('  approving the preview shown now applies it', okR.status === 200 && parentOf((await treeNow()).roots, 'b-old').id === 'f-ai', okR.text);
+
+    // A folder delete goes stale when what is in it changes; approving a
+    // delete keeps a history version from before it.
+    const delEmpty = await propose({ action: 'delete', ids: ['f-empty'] });
+    check('a delete of an empty folder says so', delEmpty.status === 200 && delEmpty.json.preview[0] === 'DELETE folder “Empty” from Bookmarks (empty)', delEmpty.text);
+    const sid = 'llm-api-filed-0001';
+    const intake = await api('/api/shares', { method: 'POST', token: A, body: { sid, url: 'https://filed.example/only-in-the-log', title: 'Filed into Empty' } });
+    const filedR = await api(`/api/shares/${sid}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'f-empty' }] } });
+    if (intake.status !== 200 || filedR.status !== 200) throw new Error('filing: ' + intake.text + ' ' + filedR.text);
+    const staleDel = (await review()).find(p => p.id === delEmpty.json.id);
+    check('  a link filed into it since makes it out of date, and keeps its old title', staleDel.status === 'stale'
+        && staleDel.stale.some(s => /What is in the folder “Empty” changed since \(0 item\(s\) then, 1 now\)/.test(s))
+        && staleDel.title === 'DELETE folder “Empty” from Bookmarks (empty)', JSON.stringify(staleDel));
+    vNow = (await treeNow()).version;
+    const staleR = await approveP(delEmpty.json.id);
+    check('  approving it is refused and deletes nothing', staleR.status === 409 && staleR.json.code === 'stale'
+        && (await treeNow()).version === vNow && JSON.stringify((await treeNow()).roots).includes('only-in-the-log'), staleR.text);
+    await reject(delEmpty.json.id);
+    const delAgain = await propose({ action: 'delete', ids: ['f-empty'] });
+    const againRow = (await review()).find(p => p.id === delAgain.json.id);
+    const h1 = (await history()).length;
+    const delR = await approveP(delAgain.json.id, { reviewed: againRow.reviewKey });
+    const hist = await history();
+    const snap = async (id) => JSON.stringify((await api(`/api/history/${id}`, { token: A })).json.snapshot);
+    const holding = [];
+    for (const h of hist) if ((await snap(h.id)).includes('only-in-the-log')) holding.push(h.device_id);
+    check('approving a delete keeps a history version from before it, with the link filed since',
+        againRow.preview[0].text === 'DELETE folder “Empty” from Bookmarks with everything in it: 1 bookmark(s), 0 folder(s)'
+        && delR.status === 200 && !find((await treeNow()).roots, 'f-empty') && hist.length === h1 + 2
+        && hist[0].device_id === 'ai-proposal' && hist[1].device_id === 'before-ai-proposal' && holding.join() === 'before-ai-proposal',
+        JSON.stringify([againRow.preview, delR.json, hist.slice(0, 3), holding]));
+
+    // Refusals are bounded, and a note body is a note whatever it guessed.
+    const flood = await propose({ action: 'changes', changes: Array.from({ length: 50 }, (_, i) => ({
+        op: 'move', ids: Array.from({ length: 200 }, (_, j) => `nope-${i}-${j}`), toFolderId: 'f-tech' })) });
+    check('a proposal naming 10000 unknown ids is refused with 50 problems and a count of the rest', flood.status === 400
+        && flood.json.problems.length === 51 && flood.json.problems[50] === '… and 9950 more problems.' && flood.text.length < 20 * 1024,
+        `${flood.status} ${flood.text.length}`);
+    const guessedNote = await propose({ action: 'create', title: 'Guessed', content: '# Guessed\n\n- milk' });
+    const guessedRow = (await review()).find(p => p.kind === 'note' && p.title === 'Guessed');
+    check('a note posted with a guessed "action" is stored as a note, as before', guessedNote.status === 200
+        && guessedNote.json.status === 'pending_approval' && Boolean(guessedRow), guessedNote.text);
+    if (guessedRow) await reject(guessedRow.id);
 
     console.log('\n6. The cap');
     const samLink = new URL((await api('/api/share', { method: 'POST', token: S })).json.url).pathname;

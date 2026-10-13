@@ -131,10 +131,13 @@ folders, new bookmarks, moves, renames, deletions, notes. **Nothing changes
 until you approve it** in the web app: bookmark suggestions wait on
 **Home › Suggested changes**, note suggestions in **Notes**. Each one shows
 what it would do, line by line, where it came from and the chat's reason; a
-deletion is flagged in red and asked about again. One whose bookmarks changed
-since it was made is marked out of date and can only be rejected — it is
-never half-applied. Approving on a phone with unpushed edits asks you to push
-first, as for any change made on the server.
+deletion is flagged in red and asked about again, every deleted item named.
+One whose bookmarks changed since it was made (for a folder it deletes, what
+is in it) is marked out of date and can only be rejected — it is never
+half-applied, and Approve applies only what you were shown. Approving on a
+phone with unpushed edits asks you to push first, as for any change made on
+the server. Before a suggestion deletes anything, the server keeps a history
+version of your bookmarks as they were.
 
 Everything goes through your own sync server. It needs the server (see
 [server/README.md](server/README.md)); the web app is where you approve.

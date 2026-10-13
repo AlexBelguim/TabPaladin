@@ -222,7 +222,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
             .run(ts, deviceId || null, JSON.stringify({ format: TREE_FORMAT, roots }), userId);
         db.prepare(`
             DELETE FROM snapshots WHERE user_id = ? AND id NOT IN (
-                SELECT id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
+                SELECT id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?
             )
         `).run(userId, userId, maxSnapshots);
         return ts;
@@ -960,9 +960,15 @@ function makeUserStore(db, userId, { maxSnapshots }) {
     // moves (as a replace: clients pull, as after any proposal), a history
     // snapshot is written, and `after()` runs (the proposal row's removal),
     // all or nothing. Returns the plan with {version}, or the refusal.
+    //
+    // A plan that deletes anything first snapshots the tree as it is
+    // (`before-<deviceId>`): links filed since the last snapshot live only
+    // in the ops log, which the replace below clears, and would otherwise
+    // be in no history version once deleted.
     const applyTreeChanges = db.transaction((plan, { deviceId = 'ai-proposal', after = null } = {}) => {
         const result = plan(treeRows());
         if (!result || !result.ok) return result || { ok: false, stale: ['Nothing to apply.'] };
+        if (result.actions.some(a => a.type === 'delete')) recordHistory(readTree().roots, `before-${deviceId}`);
         const now = new Date().toISOString();
         const insert = db.prepare(`
             INSERT INTO items (id, parent_id, position, kind, title, url, created_at, updated_at, user_id)
@@ -1018,7 +1024,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
     function migrateFromLatestSnapshotIfNeeded() {
         const already = db.prepare('SELECT COUNT(*) AS n FROM items WHERE user_id = ?').get(userId).n;
         if (already > 0) return { migrated: false, reason: 'items table not empty' };
-        const row = db.prepare('SELECT json, timestamp FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1').get(userId);
+        const row = db.prepare('SELECT json, timestamp FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1').get(userId);
         if (!row) {
             setMeta('treeVersion', version() || 0);
             return { migrated: false, reason: 'no snapshots' };

@@ -352,11 +352,11 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/shared` | legacy: the waiting links, `{ links: [{ id, url, title, created_at }] }` |
 | POST | `/api/shared` | legacy: add `{ url, title? }` (http(s) only) |
 | DELETE | `/api/shared/:id`, `/api/shared` | legacy: dismiss one, or every waiting link of yours (nothing is deleted) |
-| POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`) |
+| POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`); a password change or reset ends every link of the account |
 | GET | `/api/proposals` | pending note and reorder proposals, as it always answered (`{ id, title, content, notebook, kind, created_at }`) |
-| GET | `/api/proposals/review` | every pending proposal, newest first: `{ id, kind: 'note'\|'reorder'\|'tree', title, createdAt, source: 'link'\|'mcp', tokenName, reason, status: 'pending'\|'stale', stale: [why], preview: [{ op, text, danger? }], counts, danger }`, bookmark changes planned against the tree as it is now |
+| GET | `/api/proposals/review` | every pending proposal, newest first: `{ id, kind: 'note'\|'reorder'\|'tree', title, createdAt, source: 'link'\|'mcp', tokenName, reason, status: 'pending'\|'stale', stale: [why], preview: [{ op, text, danger? }], counts, danger, reviewKey }`, bookmark changes planned against the tree as it is now: `title` says what one would do now (what it was proposed as, once stale), `danger` whether it deletes anything |
 | POST | `/api/proposals` | file bookmark changes `{ changes, reason? }` (or one `{ action, … }`) for review — what the web app does with a `#changes=` review link; nothing is applied |
-| POST | `/api/proposals/:id/approve` | apply a proposal: one transaction for the account (the change, a version bump, a history snapshot, the proposal's removal); **409** `code: 'stale'` with `stale: [why]` when something it names changed since — nothing applied |
+| POST | `/api/proposals/:id/approve` | apply a proposal: one transaction for the account (the change, a version bump, a history snapshot, the proposal's removal); body `{ reviewed? }`, the `reviewKey` of the preview the user was shown; **409** `code: 'stale'` with `stale: [why]` when something it names changed since, **409** `code: 'changed'` when it would now do something other than the preview `reviewed` names — nothing applied either way |
 | POST | `/api/proposals/:id/reject` | discard a proposal |
 | GET | `/llm/:token` | **no auth** — instructions, every bookmark folder (id and path), the first bookmarks and every note, as plain text; 410 when expired or the account is gone |
 | GET | `/llm/:token/bookmarks?page=N` | **no auth** — every bookmark, 500 per page |
@@ -449,25 +449,38 @@ proposal waits for the user. Bookmark proposals name nodes by id:
 | `add_bookmarks` | `{ folderId, bookmarks: [{ title, url }] }` — http(s), at most 100; one already in the folder is skipped |
 | `move` | `{ ids, toFolderId }` — bookmarks and folders (with everything in them) |
 | `rename` | `{ id, title }` |
-| `delete` | `{ ids }` — shown to the user flagged as a DELETE; a folder goes with what it holds |
+| `delete` | `{ ids }` — shown to the user flagged as a DELETE; a folder goes with what it holds; at most 200 deleted per proposal |
 | `changes` | `{ changes: [{ op, … }] }` — up to 50 of the above, applied together; a `create_folder` may set `ref`, and later ones use `parentRef` / `folderRef` / `toFolderRef` |
 
 Every body may carry a `reason`, shown to the user. Only the bookmark side
 can change: never a role folder (Bookmarks, Notes, Workflows, Pinned) itself,
 nothing inside Notes, Workflows or Pinned, no note, and not the imported
 archive. A proposal is checked against the tree when it is made (a bad one is
-refused with the reasons) and again whenever it is listed or approved: every
-node it names was fingerprinted (kind, title, parent, address), and one that
-changed since makes it **stale** — shown with why, never applied. At most
-`MAX_PROPOSALS_PER_USER` wait per account, link and MCP together.
+refused with the reasons, at most 50 of them) and again whenever it is listed
+or approved: every node it names was fingerprinted (kind, title, parent,
+address), a folder it deletes also by what it holds (every id below it), and
+one that changed since makes it **stale** — shown with why, never applied. At
+most `MAX_PROPOSALS_PER_USER` wait per account, link and MCP together.
+
+The preview has a line per change. Every DELETE line is in it; past 60 other
+lines the rest are counted (`… and N more, none of them a deletion`).
+`danger` is set when anything at all is deleted. A body that carries a note's
+`content` is a note proposal whatever its `action` says (unless it is a
+`reorder` or has a `changes` list), as the link took it before bookmark
+changes.
 
 Approving a bookmark proposal applies all of it in one transaction for the
 account, bumps the version (clients pull, as after any proposal), writes a
-history snapshot (`device_id: 'ai-proposal'`) and removes the proposal. A
-note proposal writes the note straight into the items table (creating or
-replacing the note with that title), as always.
+history snapshot (`device_id: 'ai-proposal'`) and removes the proposal; one
+that deletes anything first snapshots the tree as it was
+(`device_id: 'before-ai-proposal'`), so links filed since the last snapshot
+are in a history version too. The web app sends the `reviewKey` of the
+preview it showed, and the server refuses (409 `changed`) when the plan now
+reads otherwise. A note proposal writes the note straight into the items
+table (creating or replacing the note with that title), as always.
 
 Links expire after 1 hour by default; override with `SHARE_TTL_MINUTES`.
+Changing the account's password, or an admin resetting it, ends them at once.
 The imported archive (Reddit, X, Instagram) is not on the page.
 
 Notes are grouped into **notebooks** (subfolders of the notes root);
