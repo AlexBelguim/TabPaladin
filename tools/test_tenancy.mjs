@@ -514,7 +514,7 @@ async function isolationTests() {
 // listed with the reason they are safe; an exception that no longer matches
 // anything fails too, so the list cannot rot.
 
-const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops)\b/i;
+const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops|mcp_tokens)\b/i;
 const SCAN_SKIP = new Set(['server/tenancy.js']); // operates across accounts by design: the migration, deletion, stats
 const ALLOWED = [
     ['server/llmShare.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],

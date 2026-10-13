@@ -15,7 +15,8 @@ import { initTenancySchema, nextUserId, bumpTreeVersion, getServerMeta } from '.
 // it is backed up before anything touches it. 3: every row names its account.
 // 4: shared links are a per-account inbox with filings (shares.js), and the
 // tree logs its appends (tree_ops). 5 (AI access): proposals gain bookmark
-// changes and where they came from (proposals.js).
+// changes and where they came from (proposals.js), and MCP tokens get a
+// table (mcp.js).
 export const SCHEMA_VERSION = 5;
 
 export const MIN_PASSWORD_LENGTH = 8;

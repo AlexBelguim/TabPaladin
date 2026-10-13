@@ -26,6 +26,7 @@ import { attachUserAdmin } from './admin.js';
 import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
 import { migrateProposals, makeProposalsStore, attachProposalRoutes } from './proposals.js';
 import { attachLlmShareRoutes } from './llmShare.js';
+import { migrateMcpTokens, attachMcp } from './mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -81,7 +82,7 @@ db.pragma('journal_mode = WAL');
 //   4. the first admin, so a token-only database has an owner to migrate to;
 //   5. the ownership migration, one transaction, refused rather than guessed,
 //      then the share inbox's columns and the tree's ops floors, then the AI
-//      proposals' columns — all additive,
+//      access tables (proposal columns, MCP tokens) — all additive,
 //      idempotent, after the ownership migration has named every row's owner;
 //   6. the schema version and, the first time, a post-migration copy;
 //   7. ownership warnings, then the owner's own boot steps;
@@ -216,11 +217,12 @@ try {
     console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
     process.exit(1);
 }
-// AI chats (schema 5): the proposals' new columns. The same rule: additive,
-// one transaction, refused rather than half-done.
+// AI chats (schema 5): the proposals' new columns and the MCP tokens. The
+// same rule: additive, one transaction each, refused rather than half-done.
 try {
     const props = migrateProposals(db);
     if (props.added.length) console.log(`[TabPaladin] AI proposals: added ${props.added.join(', ')} to note_proposals.`);
+    migrateMcpTokens(db);
 } catch (e) {
     const marker = writeRefusal(DATA_DIR, e, schemaBackup);
     console.error(`[TabPaladin] AI access migration refused, nothing changed, backup at ${schemaBackup || '(none)'}: ${e.message}`);
@@ -331,10 +333,12 @@ app.use(cors((req, cb) => {
 
 // Small bodies everywhere except a tree push, which carries the whole tree,
 // and a saved workflow, which may carry 500 long URLs (its route parses it).
+// The MCP endpoint parses its own, after checking the token (mcp.js).
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
 const ownBodyParser = (req) => (req.method === 'PUT' && req.path === '/api/tree')
-    || (req.method === 'POST' && req.path === '/api/workflows');
+    || (req.method === 'POST' && req.path === '/api/workflows')
+    || req.path === '/mcp';
 app.use((req, res, next) => (ownBodyParser(req) ? next() : jsonSmall(req, res, next)));
 
 // Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
@@ -493,6 +497,8 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
             if (!now || now.password_hash !== row.password_hash || !stillSignedIn(req)) return null;
             db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
             db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+            // AI chats' tokens too: a new password is how you lock everyone out.
+            db.prepare('DELETE FROM mcp_tokens WHERE user_id = ?').run(row.id);
             return issueSession(row.username);
         })();
         if (!session) return res.status(401).json({ error: 'Your password or session changed meanwhile. Sign in again.' });
@@ -672,11 +678,13 @@ app.get('/api/history/:id', requireAuth, (req, res) => {
 const SHARE_TTL_MS = Math.max(1, Number(process.env.SHARE_TTL_MINUTES || 60)) * 60 * 1000;
 
 // --- AI chats ---
-// The 1-hour LLM share link (llmShare.js) and the proposals it makes, which
-// wait for the account's approval in the web app (proposals.js). Read and
-// propose only: nothing it can reach changes the tree.
+// The 1-hour LLM share link (llmShare.js), the MCP endpoint (mcp.js) and the
+// proposals both of them make, which wait for the account's approval in the
+// web app (proposals.js). Read and propose only: nothing either of them can
+// reach changes the tree.
 attachProposalRoutes(app, { store: proposals, requireAuth });
 attachLlmShareRoutes(app, { db, items, proposals, requireAuth, ttlMs: SHARE_TTL_MS });
+attachMcp(app, { db, items, proposals, requireAuth });
 
 // --- Share target fallback ---
 //

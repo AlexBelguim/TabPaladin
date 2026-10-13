@@ -169,6 +169,8 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
                 if (hash) {
                     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
                     signedOut = db.prepare('DELETE FROM sessions WHERE username = ?').run(cur.username).changes;
+                    // And the AI chats' tokens: a reset locks everyone out.
+                    db.prepare('DELETE FROM mcp_tokens WHERE user_id = ?').run(id);
                 }
                 return { signedOut };
             })();
