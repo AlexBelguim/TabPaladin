@@ -23,7 +23,8 @@
 //
 // Never throws: losing this costs a few collapsed folders, nothing more.
 
-const api = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
+// The browser's API, unless a page installed a platform first (see treeStore.js).
+const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null));
 
 export const EXPAND_KEY = 'tpUiExpanded';
 export const OPEN_TABS_KEY = '__open_tabs__';

@@ -53,6 +53,9 @@
 //  12. A workflow appended on the server (POST /api/workflows) folds in with
 //      its folder's payload {createdAt}; the copy that already holds it skips
 //      every id.
+//  13. A page that sets globalThis.__tpPlatform before loading the store (the
+//      web app, over IndexedDB) has treeStore.js, storageManager.js and
+//      expandState.js use it instead of the browser's storage.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -1418,6 +1421,43 @@ console.log('\n16. A workflow saved on the server folds in with its createdAt');
         again && again.applied === 0 && again.skipped === 3 && TreeStore.status().baseVersion === server.version
         && (await TreeStore.getNode('wf-new-0001')).children.length === 2, JSON.stringify(again));
     await clearStashes();
+}
+
+console.log('\n17. A page can install its own platform before the store loads');
+{
+    const kv = new Map([['tpTree', { baseVersion: 7, roots: [{ id: 'on-platform', kind: 'folder', title: 'From the platform', children: [] }] }],
+        ['settings', { focusedFolderIds: ['on-platform'] }],
+        ['tpUiExpanded', { v: 1, cards: { 'on-platform': { o: 1, t: 1 } } }]]);
+    const reads = [];
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    globalThis.__tpPlatform = {
+        storage: {
+            local: {
+                async get(keys) {
+                    const list = keys == null ? [...kv.keys()] : Array.isArray(keys) ? keys : [keys];
+                    reads.push(...list);
+                    return Object.fromEntries(list.filter(k => kv.has(k)).map(k => [k, JSON.parse(JSON.stringify(kv.get(k)))]));
+                },
+                async set(obj) { for (const [k, v] of Object.entries(obj)) kv.set(k, JSON.parse(JSON.stringify(v))); },
+                async remove(keys) { for (const k of [].concat(keys)) kv.delete(k); }
+            },
+            onChanged: { addListener() {} }
+        }
+    };
+    try {
+        const { TreeStore: OnPlatform } = await import('../src/utils/treeStore.js?platform');
+        const { StorageManager: SettingsOnPlatform } = await import('../src/utils/storageManager.js?platform');
+        await OnPlatform.load();
+        check('treeStore.js reads its copy from globalThis.__tpPlatform', Boolean(await OnPlatform.getNode('on-platform')) && reads.includes('tpTree'));
+        check('storageManager.js reads settings from it too', eq((await SettingsOnPlatform.getSettings()).focusedFolderIds, ['on-platform']));
+        const { ExpandState: ExpandOnPlatform } = await import('../src/utils/expandState.js?platform');
+        await ExpandOnPlatform.load();
+        check('expandState.js reads open folders from it too', ExpandOnPlatform.isOpen('on-platform') && reads.includes('tpUiExpanded'));
+        check('  and the browser storage of the other pages is untouched', !has(storageData.get('tpTree'), 'on-platform'));
+    } finally {
+        delete globalThis.__tpPlatform;
+    }
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);

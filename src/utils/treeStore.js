@@ -77,7 +77,10 @@
 
 import { ExpandState } from './expandState.js';
 
-const api = typeof browser !== 'undefined' ? browser : chrome;
+// The storage API: the browser's, unless a page installed a platform first
+// (globalThis.__tpPlatform, the web app's storage over IndexedDB). The same
+// line opens storageManager.js and expandState.js.
+const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser : chrome);
 
 const STORE_KEY = 'tpTree';
 const DATA_PREFIX = 'data:application/json,';
