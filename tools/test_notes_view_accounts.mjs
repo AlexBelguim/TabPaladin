@@ -1101,5 +1101,30 @@ console.log('\n14. A page that is gone: its live draft comes back, for its copy 
     ls.delete('tp_notes_parked_v1');
 }
 
+console.log('\n15. A draft localStorage refused is kept by the mirror for the next page');
+{
+    if (NV.isDirty()) await discardDraft();
+    ls.delete('tp_notes_parked_v1');
+    await otherPageLoads(ALICE, aliceRoots());
+    await settle();
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nLOCALSTORAGE IS FULL');
+    const setItem = localStorage.setItem;
+    localStorage.setItem = (k, v) => { if (k === 'tp_notes_parked_v1') throw new Error('QuotaExceededError'); return setItem(k, v); };
+    await otherPageLoads(BOB, bobRoots());
+    await settle();
+    localStorage.setItem = setItem;
+    const mirror = storageData.get('tpParkedMirror') || { drafts: [] };
+    check('localStorage refused it: the list does not have it, the mirror does',
+        parked().length === 0 && mirror.drafts.length === 1 && mirror.drafts[0].content === '# Diary\nLOCALSTORAGE IS FULL'
+        && Number(mirror.at) > Number(ls.get('tp_notes_parked_at_v1') || 0), JSON.stringify(mirror));
+    // The next page to start (a fresh copy of the module: nothing in memory).
+    const NextPage = await import('../src/app/notesView.js?next-page');
+    await NextPage.restoreParkedFromMirror();
+    check('the next page takes it back from the mirror into the list', parked().length === 1
+        && parked()[0].content === '# Diary\nLOCALSTORAGE IS FULL' && parked()[0].owner.userId === 1, JSON.stringify(parked()));
+    ls.delete('tp_notes_parked_v1');
+}
+
 console.log(failures === 0 ? '\nAll notes-view account tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -307,7 +307,10 @@ function webLocks() {
 
 function parkedChanged() {
     const at = Date.now();
-    writeJson(PARKED_AT_KEY, at);
+    // The list's stamp says the list holds every draft. While some are held
+    // only here (localStorage refused them), it does not: left older, it
+    // makes the next page take them back from the mirror.
+    if (!parkedHere.length) writeJson(PARKED_AT_KEY, at);
     const drafts = allParked();
     mirrorChain = mirrorChain
         .then(() => api.storage.local.set({ [PARKED_MIRROR_KEY]: { at, drafts } }))
