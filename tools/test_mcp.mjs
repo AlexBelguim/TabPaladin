@@ -24,6 +24,8 @@
 //      against this account's items, and its proposals never show up here.
 //   6. Limits: requests per token per minute (429 with Retry-After), bad
 //      tokens per IP, and the body size (413).
+//   And the stdio bridge (tools/mcp_bridge.mjs) carries a stdio client, as
+//   Claude Desktop starts one, to the endpoint and back.
 //
 // Run: node tools/test_mcp.mjs [--port 18991]
 // Starts this checkout's server on the port with a throwaway data directory.
@@ -37,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import { Client } from '../server/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js';
 import { StreamableHTTPClientTransport } from '../server/node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js';
+import { StdioClientTransport } from '../server/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (name, fallback = null) => {
@@ -314,6 +317,25 @@ try {
         && !(await tool(client, 'list_my_proposals', {})).text.includes('Renamed by sams chat'));
     check('sam cannot revoke alex\'s token', (await api(`/api/mcp/tokens/${madeA.id}`, { method: 'DELETE', token: S })).status === 404
         && (await rpc(TA, 'tools/list')).status === 200);
+
+    console.log('\n4b. Through the stdio bridge (tools/mcp_bridge.mjs, for Claude Desktop)');
+    const bridgeTo = (tokenValue) => new StdioClientTransport({
+        command: process.execPath,
+        args: [path.join(ROOT, 'tools', 'mcp_bridge.mjs'), `${BASE}/mcp`],
+        env: { TABPALADIN_MCP_TOKEN: tokenValue },
+        stderr: 'pipe'
+    });
+    const bridged = new Client({ name: 'bridged', version: '1' });
+    await bridged.connect(bridgeTo(TS));
+    clients.push(bridged);
+    check('a stdio client reaches the tools through the bridge', bridged.getServerVersion().name === 'tabpaladin'
+        && (await bridged.listTools()).tools.length === want.length
+        && (await tool(bridged, 'search_bookmarks', { query: 'secret' })).data.results[0].id === 's-b1');
+    const badBridge = new Client({ name: 'bridged-bad', version: '1' });
+    let bridgeRefused = null;
+    try { await badBridge.connect(bridgeTo('tpm_' + 'Z'.repeat(43))); } catch (e) { bridgeRefused = e; }
+    try { await badBridge.close(); } catch (e) { /* closed */ }
+    check('  a wrong token through it is refused, with the server\'s reason', bridgeRefused !== null && /refused/.test(String(bridgeRefused)), String(bridgeRefused));
 
     console.log('\n5. Auth');
     const noAuth = await rpc(null, 'tools/list');
