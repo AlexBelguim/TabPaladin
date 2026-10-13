@@ -138,6 +138,9 @@ first, as for any change made on the server.
 
 Everything goes through your own sync server. It needs the server (see
 [server/README.md](server/README.md)); the web app is where you approve.
+Approval is the safety net, too: a chat reads your bookmarks' titles, and a
+page you bookmarked could have a title written to steer it — so read what a
+suggestion would do before you approve it.
 
 | Chat | How it connects | What works |
 |---|---|---|
