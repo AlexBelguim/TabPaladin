@@ -51,6 +51,7 @@ const state = {
     },
     snapshot: null,           // wrapper { type:'root', children: [...] } around the server's top-level folders
     snapshotUserId: null,     // the account that snapshot belongs to (from the pull)
+    snapshotUsername: null,   // its name, kept for the sign-in guard after a sign-out
     treeVersion: 0,           // server tree version this working copy is based on
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
@@ -388,6 +389,7 @@ async function pullSnapshot() {
         // navigation model; only its children are real.
         state.snapshot = { type: 'root', title: '', children: (data.roots || []).map(fromWire) };
         state.snapshotUserId = data.userId ?? currentUserId();
+        state.snapshotUsername = localStorage.getItem(LS.username);
         state.treeVersion = Number(data.version) || 0;
         state.pathIds = [getRootId(state.snapshot)];
         state.dirty = false;
@@ -2697,10 +2699,10 @@ async function submitAuth() {
         const user = data.user || {};
         const name = data.username || username;
         const previousId = state.snapshotUserId ?? currentUserId();
-        const previousName = localStorage.getItem(LS.username) || 'the previous account';
+        const previousName = state.snapshotUsername || localStorage.getItem(LS.username) || 'the previous account';
         const sameAccount = user.id !== undefined && user.id !== null && previousId !== null
             ? Number(user.id) === Number(previousId)
-            : (localStorage.getItem(LS.username) || name) === name;
+            : (state.snapshotUsername || localStorage.getItem(LS.username) || name) === name;
         if (state.dirty && state.snapshot && !sameAccount) {
             fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
             const n = state.editCount || 1;
@@ -2726,6 +2728,7 @@ async function submitAuth() {
             // none of it may show up under this account.
             state.snapshot = null;
             state.snapshotUserId = null;
+            state.snapshotUsername = null;
             state.inbox = [];
             state.proposals = [];
             state.importers = [];
@@ -2750,6 +2753,7 @@ function discardPreviousEdits() {
     if (typed === null || typed.trim() !== account) return;
     state.snapshot = null;
     state.snapshotUserId = null;
+    state.snapshotUsername = null;
     state.dirty = false;
     state.editCount = 0;
     state.inbox = [];
@@ -2760,8 +2764,22 @@ function discardPreviousEdits() {
     if (err) { err.textContent = 'Discarded. Sign in again.'; err.classList.remove('hidden'); }
 }
 
+// Unpushed edits are not discarded by a sign-out either. After a yes they stay
+// in memory with the account they belong to, so the next sign-in follows the
+// same rules as after an expired session: that account keeps them, anyone else
+// is refused until they are pushed or discarded by name.
 async function signOut() {
     const base = currentServerUrl();
+    const keepEdits = Boolean(state.dirty && state.snapshot);
+    const n = state.editCount || 1;
+    const who = localStorage.getItem(LS.username) || 'this account';
+    if (keepEdits) {
+        if (!confirm(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${who}.\n\n`
+            + `Sign out anyway? They stay here until ${who} signs in again and pushes them (closing the app loses them), `
+            + `and nobody else can sign in here until they are pushed or discarded.`)) return;
+        state.snapshotUserId = state.snapshotUserId ?? currentUserId();
+        state.snapshotUsername = state.snapshotUsername || localStorage.getItem(LS.username);
+    }
     // Best effort — the local token is cleared either way, so a server that is
     // unreachable can't leave you stuck signed in on the device.
     try {
@@ -2773,12 +2791,17 @@ async function signOut() {
     state.config.token = '';
     forgetUser();
     mirrorConfigToSW();
-    state.snapshot = null;
-    state.snapshotUserId = null;
-    state.dirty = false;
-    state.editCount = 0;
+    if (!keepEdits) {
+        state.snapshot = null;
+        state.snapshotUserId = null;
+        state.snapshotUsername = null;
+        state.dirty = false;
+        state.editCount = 0;
+    }
     refreshAuthUi();
-    setStatus('Signed out.');
+    setStatus(keepEdits
+        ? `Signed out. ${n} unpushed edit${n === 1 ? ' for ' + who + ' stays' : 's for ' + who + ' stay'} on this phone until ${who} signs in and pushes.`
+        : 'Signed out.');
 }
 
 // --- Users (admins) ---

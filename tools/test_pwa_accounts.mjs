@@ -14,6 +14,8 @@
 //   5. A share the server refuses while you are signed in (a full inbox) is
 //      kept on the phone, the app says why, and it is delivered once there is
 //      room.
+//   6. Signing out with unpushed edits asks first and keeps them: nobody else
+//      can sign in over them, and the same account gets them back.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -302,6 +304,37 @@ try {
     await signIn('alex', 'new horse battery');
     check('once there is room, the next start delivers it',
         (await api('/api/shared', { token: alexNew })).json.links.some(l => l.url === ARTICLE) && !localStorageShim.getItem('tp_pending_shares'));
+
+    console.log('\n6. Signing out with unpushed edits');
+    // Another device pushes, so the phone's next push meets a 409 and the
+    // edit stays unpushed.
+    const before = (await api('/api/tree', { token: alexNew })).json;
+    await api('/api/tree', { method: 'PUT', token: alexNew, body: { roots: before.roots, baseVersion: before.version, deviceId: 'laptop' } });
+    answers.prompt.push('Unpushed at sign-out');
+    answers.confirm.push(false); // "Another device pushed… overwrite?" No.
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    check('an edit the server did not take stays on the phone', !(await treeTitles(alexNew)).includes('Unpushed at sign-out'));
+    const asked = dialogs.confirm.length;
+    answers.confirm.push(false); // "Sign out anyway?" No.
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('signing out asks first, and Cancel stays signed in',
+        /unpushed edit/.test(dialogs.confirm[asked] || '') && Boolean(localStorageShim.getItem('tp_pwa_token')), dialogs.confirm[asked]);
+    answers.confirm.push(true);
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('OK signs out and says the edits stay on the phone',
+        !localStorageShim.getItem('tp_pwa_token') && /stays? on this phone until alex signs in/.test(byId('status').textContent), byId('status').textContent);
+    const pullsAtSignOut = requests.filter(r => r === 'GET /api/tree').length;
+    await signIn('sam', 'sam-password-1');
+    check('sam cannot sign in over alex\'s unpushed edits',
+        /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent)
+        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    await signIn('alex', 'new horse battery');
+    check('alex signs back in to his edits, with no pull over them',
+        requests.filter(r => r === 'GET /api/tree').length === pullsAtSignOut
+        && /unpushed edits from before you were signed out/.test(byId('status').textContent), byId('status').textContent);
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);
