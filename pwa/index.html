@@ -104,11 +104,13 @@
         <small id="auth-setup-hint" class="hint hidden"></small>
         <small id="auth-error" class="hint error hidden"></small>
         <button id="auth-submit" class="primary">Sign in</button>
+        <button id="auth-discard" class="ghost-block danger hidden"></button>
       </div>
 
       <div id="auth-signed-in" class="hidden">
-        <p class="hint">Signed in as <strong id="auth-username-label"></strong>.</p>
+        <p class="hint">Signed in as <strong id="auth-username-label"></strong><span id="auth-role-label"></span>.</p>
         <button id="cfg-save" class="primary">Save server</button>
+        <button id="auth-change-password" class="ghost-block">Change password</button>
         <button id="auth-signout" class="ghost-block">Sign out</button>
 
         <hr class="sep">
@@ -125,8 +127,50 @@
         <strong class="block-title">Imports</strong>
         <p class="hint">Reddit only ever shows your most recent 1000 saved posts. TabPaladin sweeps the list on a schedule and keeps everything it has ever seen, so the archive outgrows that cap.</p>
         <div id="imports-list"></div>
+        <label class="check-row"><input id="imports-show-removed" type="checkbox"> Show removed sources</label>
         <button id="imports-add" class="ghost-block">+ Connect Reddit</button>
+
+        <div id="users-block" class="hidden">
+          <hr class="sep">
+          <strong class="block-title">Users</strong>
+          <p class="hint">Every account has its own bookmarks, notes, inbox and imports. Changes here ask for your password again.</p>
+          <div id="users-list"></div>
+          <button id="users-add" class="ghost-block">+ Add user</button>
+        </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Account changes: add, reset, role, delete, and your own password -->
+  <div id="user-sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-header">
+      <strong id="user-sheet-title">Add user</strong>
+      <button id="user-sheet-close" class="ghost">✕</button>
+    </div>
+    <div class="sheet-body">
+      <p id="user-sheet-hint" class="hint"></p>
+      <label class="field" id="user-sheet-name-field">
+        <span>Username</span>
+        <input id="user-sheet-name" type="text" autocapitalize="none" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="field" id="user-sheet-password-field">
+        <span>New password</span>
+        <input id="user-sheet-password" type="text" autocapitalize="none" spellcheck="false" autocomplete="new-password">
+      </label>
+      <button id="user-sheet-generate" class="ghost-block">Generate</button>
+      <label class="field" id="user-sheet-role-field">
+        <span>Role</span>
+        <select id="user-sheet-role">
+          <option value="user" selected>user</option>
+          <option value="admin">admin</option>
+        </select>
+      </label>
+      <label class="field">
+        <span id="user-sheet-current-label">Your password</span>
+        <input id="user-sheet-current" type="password" autocomplete="current-password">
+      </label>
+      <small id="user-sheet-error" class="hint error hidden"></small>
+      <button id="user-sheet-submit" class="primary">Create</button>
     </div>
   </div>
 

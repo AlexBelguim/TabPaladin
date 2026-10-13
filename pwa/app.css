@@ -883,6 +883,43 @@ select.note-move {
 }
 .import-row .import-actions button:hover { background: var(--border); color: var(--text); }
 .import-row .import-actions button.danger { color: var(--danger); }
+.import-row .import-actions button:disabled,
+.ghost-block:disabled { opacity: 0.45; cursor: not-allowed; }
+.import-row .import-actions button:disabled:hover { background: none; color: var(--muted); }
+
+/* A removed import source: still holds its archive, greyed until restored. */
+.import-row.removed { opacity: 0.7; border: 1px dashed var(--border); background: none; }
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* ---------- users ---------- */
+.pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  vertical-align: middle;
+}
+.pill.admin { color: #93c5fd; border-color: #93c5fd66; }
+.pill.owner { color: #fbbf24; border-color: #fbbf2466; }
+
+/* Full-width, thumb-sized buttons: these are the destructive ones. */
+.user-row .user-actions { flex-direction: column; }
+.user-row .user-actions button { min-height: 44px; font-size: 0.85rem; }
+.user-row .user-actions .hint { margin: 0; }
+#user-sheet .primary.danger { background: var(--danger); }
+#auth-discard { color: var(--danger); }
 
 /* Wordmark doubles as the way home. */
 #brand-home {
