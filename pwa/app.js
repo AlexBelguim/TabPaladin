@@ -62,6 +62,7 @@ const state = {
     editCount: 0,             // how many, for "N unpushed edits"
     view: 'home',             // 'home' (search, pins, bookmark folders) | 'notes'
     nv: freshNv(),            // notes navigation: pane, scope, open note, editor draft
+    keptDraft: null,          // an unsaved note's nv, set aside by a sign-out for that account's return
     proposals: [],            // pending LLM note proposals awaiting approval
     importers: [],            // configured import sources: [{id, provider, connected, items, ...}]
     importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
@@ -577,6 +578,14 @@ function renderContent() {
     const root = $('content');
     if (!root) return;
     root.innerHTML = '';
+    // Signed out with a copy kept for its account: it waits for that account
+    // and is not for whoever picks up the phone to browse meanwhile. An
+    // expired session still knows its user, and keeps showing their copy.
+    if (state.snapshot && !state.config.token && !localStorage.getItem(LS.username)) {
+        root.classList.remove('in-imports');
+        root.innerHTML = '<div class="empty">Signed out — open Settings (⚙) to sign in.</div>';
+        return;
+    }
     if (state.view === 'notes') {
         renderNotesScreen(root);
         return;
@@ -1130,9 +1139,13 @@ function findNotesFolderWithPath() {
     return walk(state.snapshot, [state.snapshot._pwaId]);
 }
 
-// Locate the notes folder, offering to create + push it if missing.
-// Returns { node, path } or null.
-async function ensureNotesFolder() {
+// Locate the notes folder, pulling the tree first if there is none yet.
+// Returns { node, path }, or null when there is no tree to look in. A missing
+// folder is only created with { create: true }, by the saves, right before
+// they mark the copy dirty: opening an editor or a name prompt and cancelling
+// must leave nothing behind to push. Without it, a missing folder comes back
+// as { node: null, path: null }.
+async function ensureNotesFolder({ create = false } = {}) {
     if (!configured()) {
         showToast('Please open settings (⚙) first.');
         return null;
@@ -1150,19 +1163,16 @@ async function ensureNotesFolder() {
 
     const existing = findNotesFolderWithPath();
     if (existing) return existing;
+    if (!create) return { node: null, path: null };
 
     // Safe to create now: the notes root is identified by its role, so there
-    // is no title-guessing and no duplicate-roots hazard. Created locally only
-    // — deliberately NOT auto-pushed. Merely opening Notes must never push a
-    // whole tree; if this phone's copy were stale, that push would raise the
-    // conflict/force dialog as a side effect of viewing notes. The root rides
-    // along with the next real save or explicit push.
+    // is no title-guessing and no duplicate-roots hazard. Created locally, as
+    // part of the save that asked for it: that save marks the copy dirty and
+    // pushes, and the root goes with it.
     const nb = { type: 'folder', title: NOTES_ROOT_TITLE, _role: 'notes', children: [] };
     assignIds(nb);
     state.snapshot.children = state.snapshot.children || [];
     state.snapshot.children.push(nb);
-    markDirty();
-    updatePushBtnState();
     return findNotesFolderWithPath();
 }
 
@@ -1895,7 +1905,8 @@ function ensureNotebookByName(name) {
 async function saveNoteEdit() {
     const nv = state.nv;
     if (!nv.editing) return;
-    const found = await ensureNotesFolder();
+    // Only a new note needs the folder made; an existing one is already in it.
+    const found = await ensureNotesFolder({ create: nv.isNew });
     if (!found) return;
     const content = nv.draft == null ? '' : nv.draft;
     const now = new Date().toISOString();
@@ -2013,12 +2024,15 @@ function folderTitles(folder, exceptId = null) {
 async function createNotebookIn(parentId = null, { andThen } = {}) {
     const found = await ensureNotesFolder();
     if (!found) return null;
-    const parent = parentId ? findNotesNode(parentId)?.node : found.node;
-    if (!isFolderNode(parent)) { showToast('That notebook is gone.'); return null; }
+    let parent = parentId ? findNotesNode(parentId)?.node : found.node;
+    if (parentId && !isFolderNode(parent)) { showToast('That notebook is gone.'); return null; }
     const name = prompt(parentId ? `New notebook inside “${parent.title}”:` : 'New notebook name:');
     if (name === null) return null;
-    const problem = NM.notebookNameProblem(name, folderTitles(parent));
+    const problem = NM.notebookNameProblem(name, parent ? folderTitles(parent) : []);
     if (problem) { showToast(problem); return null; }
+    // A first notebook brings the notes folder with it, now that there is a name.
+    if (!parent) parent = (await ensureNotesFolder({ create: true }))?.node;
+    if (!isFolderNode(parent)) return null;
     const nb = { type: 'folder', title: name.trim(), children: [] };
     assignIds(nb);
     parent.children = parent.children || [];
@@ -2554,7 +2568,7 @@ function renderProposalsBlock() {
 async function resolveProposal(p, approve) {
     try {
         setStatus(approve ? 'Approving…' : 'Rejecting…');
-        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+        const res = await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
         setStatus('');
         if (approve) {
             if (p.kind === 'reorder') {
@@ -2562,8 +2576,16 @@ async function resolveProposal(p, approve) {
                 NV_UI.sort = 'manual';
                 saveNotesPrefs();
             }
-            showToast(p.kind === 'reorder' ? 'New order applied (Manual order)' : `Note "${p.title}" added.`);
-            await pullSnapshot(); // server applied the change — pull it down
+            const done = p.kind === 'reorder' ? 'New order applied (Manual order)' : `Note “${p.title}” added`;
+            if (state.dirty && state.snapshot) {
+                // A pull would replace this copy and its unpushed edits, so
+                // the server's change is made here as well and the edits stay.
+                await applyApprovedProposal(p, res && res.version);
+                showToast(`${done} — your unpushed edits are kept, ⬆️ to push them.`);
+            } else {
+                showToast(`${done}.`);
+                await pullSnapshot(); // server applied the change — pull it down
+            }
         } else {
             showToast('Proposal rejected.');
         }
@@ -2573,6 +2595,51 @@ async function resolveProposal(p, approve) {
         setStatus('');
         alert('Action failed: ' + e.message);
     }
+}
+
+// An approved proposal, made on this copy the way the server just made it on
+// its tree (upsertNote and reorderNotes in server/items.js): the note with
+// this exact title is replaced, preferring one in the named notebook, or a new
+// one is filed there. `version` is the server's tree version after the
+// approval. When it is exactly one past this copy's base, nothing else reached
+// the server in between, so the copy is now that version plus its own edits
+// and the next push needs no overwrite. Otherwise the base stays: the push
+// meets the usual conflict question, and this copy has the note either way.
+async function applyApprovedProposal(p, version) {
+    const mine = state.snapshotUserId == null || currentUserId() == null
+        || Number(state.snapshotUserId) === Number(currentUserId());
+    if (!mine) return; // never write one account's note into another's copy
+    const found = await ensureNotesFolder({ create: p.kind !== 'reorder' });
+    if (found && found.node) {
+        if (p.kind === 'reorder') {
+            let order = null;
+            try { order = JSON.parse(p.content); } catch (e) { /* corrupt */ }
+            if (Array.isArray(order)) applyNoteOrder(found.node, order);
+        } else {
+            const target = p.notebook ? (ensureNotebookByName(p.notebook) || found.node) : found.node;
+            const same = [];
+            const walk = (folder) => {
+                for (const c of folder.children || []) {
+                    if (isNoteBookmark(c) && c.title === p.title) same.push({ node: c, parent: folder });
+                    else if (isFolderNode(c)) walk(c);
+                }
+            };
+            walk(found.node);
+            const hit = same.find(h => h.parent === target) || same[0];
+            const now = new Date().toISOString();
+            if (hit) {
+                const meta = decodeNote(hit.node);
+                hit.node.url = encodeNoteUrl({ content: p.content || '', createdAt: meta.createdAt || now, updatedAt: now });
+            } else {
+                const note = { type: 'bookmark', title: p.title, url: encodeNoteUrl({ content: p.content || '', createdAt: now, updatedAt: now }) };
+                assignIds(note);
+                target.children = target.children || [];
+                target.children.push(note);
+            }
+        }
+    }
+    const v = Number(version);
+    if (Number.isFinite(v) && v === (state.treeVersion || 0) + 1) state.treeVersion = v;
 }
 
 // --- Import links (#notes / #reorder): review block in the notes section ---
@@ -2619,7 +2686,7 @@ function renderImportBlock() {
 async function applyImportBatch() {
     const batch = state.importBatch;
     if (!batch) return;
-    const found = await ensureNotesFolder();
+    const found = await ensureNotesFolder({ create: true });
     if (!found) return;
     const now = new Date().toISOString();
 
@@ -3584,6 +3651,8 @@ async function submitAuth() {
         // keeps them (and bootstrap skips its pull); another account is
         // refused until they are pushed or deliberately discarded. The same
         // id on another server is another account: ids start at 1 everywhere.
+        // An unsaved note counts the same, open (a session that expired
+        // mid-edit) or set aside by a sign-out.
         const user = data.user || {};
         const name = data.username || username;
         const previousId = state.snapshotUserId ?? currentUserId();
@@ -3594,11 +3663,15 @@ async function submitAuth() {
         const sameAccount = sameServer && (user.id !== undefined && user.id !== null && previousId !== null
             ? Number(user.id) === Number(previousId)
             : (state.snapshotUsername || localStorage.getItem(LS.username) || name) === name);
-        if (state.dirty && state.snapshot && !sameAccount) {
+        const draft = editorDirty() || Boolean(state.keptDraft);
+        if ((state.dirty || draft) && state.snapshot && !sameAccount) {
             fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
             const n = state.editCount || 1;
             const where = sameServer ? '' : ` on ${state.snapshotUrl || 'another server'}`;
-            setErr(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${previousName}${where}. Sign in as ${previousName}${where ? ' there' : ''} and push them, or discard them.`);
+            const what = [state.dirty ? `${n} unpushed edit${n === 1 ? '' : 's'}` : '', draft ? 'an unsaved note' : '']
+                .filter(Boolean).join(' and ');
+            const todo = state.dirty ? 'push them, or discard them' : 'save it, or discard it';
+            setErr(`This phone has ${what} for ${previousName}${where}. Sign in as ${previousName}${where ? ' there' : ''} and ${todo}.`);
             const discard = $('auth-discard');
             if (discard) {
                 discard.textContent = `Discard ${previousName}'s edits`;
@@ -3617,14 +3690,15 @@ async function submitAuth() {
         mirrorConfigToSW();
         if (!sameAccount) {
             // A clean copy of someone else's: nothing of theirs is lost, and
-            // none of it may show up under this account.
+            // none of it may show up under this account — the copy, the
+            // lists, an open note or an import waiting for review.
             state.snapshot = null;
             state.snapshotUserId = null;
             state.snapshotUsername = null;
-            state.inbox = [];
-            state.proposals = [];
-            state.importers = [];
-            updateInboxFab();
+            state.keptDraft = null;
+            resetAccountUi();
+        } else {
+            reopenKeptDraft();
         }
         if ($('cfg-password')) $('cfg-password').value = '';
         hide($('auth-discard'));
@@ -3648,9 +3722,8 @@ function discardPreviousEdits() {
     state.snapshotUsername = null;
     state.dirty = false;
     state.editCount = 0;
-    state.inbox = [];
-    state.proposals = [];
-    state.importers = [];
+    state.keptDraft = null;
+    resetAccountUi();
     hide(btn);
     const err = $('auth-error');
     if (err) { err.textContent = 'Discarded. Sign in again.'; err.classList.remove('hidden'); }
@@ -3663,12 +3736,20 @@ function discardPreviousEdits() {
 async function signOut() {
     const base = currentServerUrl();
     const keepEdits = Boolean(state.dirty && state.snapshot);
+    // An open note with unsaved changes is asked about the same way. It is
+    // set aside with the copy, which says whose it is, and reopens only for
+    // that account.
+    const keepDraft = editorDirty() && Boolean(state.snapshot);
     const n = state.editCount || 1;
     const who = localStorage.getItem(LS.username) || 'this account';
-    if (keepEdits) {
-        if (!confirm(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${who}.\n\n`
-            + `Sign out anyway? They stay here until ${who} signs in again and pushes them (closing the app loses them), `
-            + `and nobody else can sign in here until they are pushed or discarded.`)) return;
+    const kept = [keepEdits ? `${n} unpushed edit${n === 1 ? '' : 's'}` : '', keepDraft ? 'an unsaved note' : '']
+        .filter(Boolean).join(' and ');
+    if (kept) {
+        if (!confirm(`This phone has ${kept} for ${who}.\n\n` + (keepEdits
+            ? `Sign out anyway? They stay here until ${who} signs in again and pushes them (closing the app loses them), `
+                + `and nobody else can sign in here until they are pushed or discarded.`
+            : `Sign out anyway? It stays here until ${who} signs in again to finish it (closing the app loses it), `
+                + `and nobody else can sign in here until it is saved or discarded.`))) return;
         state.snapshotUserId = state.snapshotUserId ?? currentUserId();
         state.snapshotUsername = state.snapshotUsername || localStorage.getItem(LS.username);
     }
@@ -3683,17 +3764,63 @@ async function signOut() {
     state.config.token = '';
     forgetUser();
     mirrorConfigToSW();
-    if (!keepEdits) {
+    state.keptDraft = keepDraft ? { ...state.nv } : null;
+    if (!kept) {
         state.snapshot = null;
         state.snapshotUserId = null;
         state.snapshotUsername = null;
         state.dirty = false;
         state.editCount = 0;
     }
+    resetAccountUi();
     refreshAuthUi();
-    setStatus(keepEdits
-        ? `Signed out. ${n} unpushed edit${n === 1 ? ' for ' + who + ' stays' : 's for ' + who + ' stay'} on this phone until ${who} signs in and pushes.`
-        : 'Signed out.');
+    const plural = (keepEdits && keepDraft) || (keepEdits && n !== 1);
+    setStatus(!kept ? 'Signed out.'
+        : keepEdits ? `Signed out. ${kept} for ${who} ${plural ? 'stay' : 'stays'} on this phone until ${who} signs in and pushes.`
+            : `Signed out. ${who}’s unsaved note stays on this phone until ${who} signs in again.`);
+}
+
+// What the screen holds for the signed-in account besides the working copy:
+// the server's lists (inbox, proposals, importers), an import waiting for
+// review, unfiled-link suggestions, and the notes screen with whatever note is
+// open in it. Dropped whenever the account changes or signs out, back to
+// Home, so none of it shows up — or can be saved — under whoever signs in
+// next. The working copy follows its own rules above; an unsaved note is set
+// aside by signOut before this runs.
+function resetAccountUi() {
+    closeNotesSheets();
+    hide($('inbox-sheet'));
+    hide($('quick-file-sheet'));
+    state.inbox = [];
+    state.proposals = [];
+    state.importers = [];
+    renderImporters(); // Settings stays open over a sign-out
+    state.importBatch = null;
+    activeQuickFileItems = [];
+    updateClipBtnBadge();
+    state.nv = freshNv();
+    state.view = 'home';
+    if (state.snapshot) state.pathIds = [state.snapshot._pwaId];
+    // Back to the Home entry, as goHome does, so back from here leaves the
+    // app instead of reopening the last account's notes.
+    if (navDepth > 0) history.go(-navDepth);
+    else if (history.state) history.replaceState(null, '', location.pathname);
+    navDepth = 0;
+    renderView();
+}
+
+// The note a sign-out set aside, back in its editor now that its account has
+// signed in again. The pull that follows goes through validateNv as usual: a
+// note deleted meanwhile keeps the text as a new one.
+function reopenKeptDraft() {
+    const nv = state.keptDraft;
+    state.keptDraft = null;
+    if (!nv) return;
+    state.view = 'notes';
+    state.nv = nv;
+    navDepth++;
+    history.pushState(nvHistoryState(), '', location.pathname);
+    renderView();
 }
 
 // --- Users (admins) ---

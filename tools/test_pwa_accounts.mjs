@@ -16,6 +16,16 @@
 //      room.
 //   6. Signing out with unpushed edits asks first and keeps them: nobody else
 //      can sign in over them, and the same account gets them back.
+//   7. Nothing of the notes screen crosses accounts. An unsaved note counts
+//      as unpushed work: signing out asks, it reopens only for its account,
+//      and nobody else signs in over it, even after an expired session. A
+//      clean sign-out or account switch closes any open note, the import
+//      review and the server's lists, so the next account can neither see
+//      the last one's text nor save it into its own tree. Opening a new
+//      notebook or note and cancelling leaves nothing to push.
+//   8. Approving an LLM proposal with unpushed edits keeps them: no pull over
+//      them, the note goes into this copy too, and the next push takes both
+//      without a conflict.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -46,7 +56,12 @@ function check(name, cond, detail) {
 // --- A permissive DOM -------------------------------------------------------
 //
 // Just enough for app.js to run its sign-in, sync and settings paths. Elements
-// accept anything; rendering is not what is under test here.
+// accept anything; rendering is not what is under test here, beyond what got
+// drawn: every element is kept, so a check can look for text it must not show.
+// querySelector hands back the same element per selector, so a listener the
+// app wires onto one (an Approve button) can be fired.
+
+const created = [];
 
 function classList() {
     const set = new Set();
@@ -66,8 +81,8 @@ function makeElement(id = null, tag = 'div') {
         classList: classList(),
         addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
         removeEventListener() {},
-        async fire(ev) {
-            const event = { preventDefault() {}, stopPropagation() {}, target: el, key: '' };
+        async fire(ev, extra = {}) {
+            const event = { preventDefault() {}, stopPropagation() {}, target: el, key: '', ...extra };
             await Promise.all((listeners[ev] || []).map(fn => fn(event)));
         },
         appendChild(c) { el.children.push(c); return c; },
@@ -75,7 +90,8 @@ function makeElement(id = null, tag = 'div') {
         append() {}, prepend() {}, remove() {}, replaceWith() {}, replaceChildren() {}, insertAdjacentHTML() {},
         // Rendering code wires listeners onto what it just rendered; hand it
         // something to wire onto.
-        querySelector() { return makeElement(); },
+        _qs: {},
+        querySelector(sel) { return el._qs[sel] || (el._qs[sel] = makeElement()); },
         querySelectorAll() { return []; },
         closest() { return makeElement(); },
         setAttribute() {}, getAttribute() { return null; }, removeAttribute() {}, hasAttribute() { return false; },
@@ -85,8 +101,15 @@ function makeElement(id = null, tag = 'div') {
         contains() { return false; },
         getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
     };
+    created.push(el);
     return el;
 }
+
+// Whether anything drawn since `mark` carries this text.
+const drawnSince = (mark, text) => created.slice(mark)
+    .some(e => [e.value, e.textContent, e.innerHTML].some(s => typeof s === 'string' && s.includes(text)));
+// The note editor's text as last drawn.
+const lastEditorText = () => [...created].reverse().find(e => e.tagName === 'TEXTAREA')?.value ?? null;
 
 const elements = new Map();
 const byId = (id) => {
@@ -147,6 +170,7 @@ globalThis.addEventListener = (ev, fn) => { (windowListeners[ev] = windowListene
 globalThis.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
 globalThis.history.pushState = (a, b, url) => { if (url) currentUrl = new URL(url, currentUrl); };
 globalThis.history.back = () => {};
+globalThis.history.go = () => {};
 globalThis.history.state = null;
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
 globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
@@ -155,13 +179,20 @@ globalThis.innerWidth = 375;
 globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
 Object.defineProperty(globalThis, 'navigator', { value: { clipboard: null }, configurable: true });
 
-// Every request the app makes, so the test can tell a pull from no pull.
+// Every request the app makes, so the test can tell a pull from no pull. One
+// can be made to fail as if the phone were offline.
 const requests = [];
 const realFetch = globalThis.fetch;
 let inFlight = 0;
 let lastActivity = Date.now();
+let failNext = null; // e.g. 'PUT /api/tree'
 globalThis.fetch = async (url, opts = {}) => {
-    requests.push(`${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`);
+    const line = `${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`;
+    requests.push(line);
+    if (failNext && line.startsWith(failNext)) {
+        failNext = null;
+        throw new TypeError('Failed to fetch');
+    }
     inFlight++;
     try { return await realFetch(url, opts); } finally { inFlight--; lastActivity = Date.now(); }
 };
@@ -213,6 +244,25 @@ async function signIn(username, password, url = BASE) {
 
 const treeTitles = async (token) => JSON.stringify((await api('/api/tree', { token })).json.roots);
 
+// A tap on something the notes screen drew, by its data-nv action.
+async function clickNv(nv, id = null) {
+    const t = { dataset: { nv, ...(id ? { id } : {}) }, closest: (sel) => (sel === '[data-nv]' ? t : null) };
+    await byId('content').fire('click', { target: t });
+    await settle();
+}
+// Typing into the open note's editor.
+async function typeNote(text) {
+    await byId('content').fire('input', { target: { id: 'note-body-input', value: text, style: {}, scrollHeight: 0 } });
+}
+const bodyHas = (c) => document.body.classList.contains(c);
+const badgeShown = () => !byId('bottom-nav').querySelector('.bn-badge').classList.contains('hidden');
+
+async function propose(token, body) {
+    const share = (await api('/api/share', { method: 'POST', token })).json;
+    const res = await api(new URL(share.url).pathname + '/propose', { method: 'POST', body });
+    if (res.status !== 200) throw new Error('could not propose: ' + JSON.stringify(res.json));
+}
+
 try {
     for (let i = 0; i < 100; i++) {
         try { if ((await realFetch(BASE + '/api/health')).ok) break; } catch (e) { /* not yet */ }
@@ -221,6 +271,8 @@ try {
     const alexAdmin = (await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token;
     const madeSam = await api('/api/users', { method: 'POST', token: alexAdmin, body: { username: 'sam', password: 'sam-password-1', role: 'user', currentPassword: PASSWORD } });
     if (madeSam.status !== 200) throw new Error('could not create sam: ' + JSON.stringify(madeSam.json));
+    const madeKim = await api('/api/users', { method: 'POST', token: alexAdmin, body: { username: 'kim', password: 'kim-password-1', role: 'user', currentPassword: PASSWORD } });
+    if (madeKim.status !== 200) throw new Error('could not create kim: ' + JSON.stringify(madeKim.json));
 
     // The per-device lists from before accounts.
     localStorageShim.setItem('tp_dismissed_urls', JSON.stringify(['https://legacy-dismissed.example']));
@@ -352,6 +404,125 @@ try {
     check('alex signs back in to his edits, with no pull over them',
         requests.filter(r => r === 'GET /api/tree').length === pullsAtSignOut
         && /unpushed edits from before you were signed out/.test(byId('status').textContent), byId('status').textContent);
+
+    console.log('\n7. Notes never cross accounts');
+    answers.confirm.push(true); // the laptop's push from section 6: overwrite it
+    await byId('pushBtn').fire('click');
+    await settle();
+    // alex keeps a diary, and an LLM has a note waiting for his approval.
+    const t7 = (await api('/api/tree', { token: alexNew })).json;
+    await api('/api/tree', { method: 'PUT', token: alexNew, body: { baseVersion: t7.version, deviceId: 'laptop', roots: [...t7.roots,
+        { id: 'alex-notes-root', kind: 'folder', title: 'Notes', role: 'notes', children: [
+            { id: 'alex-diary', kind: 'note', title: 'Diary', payload: { content: '# Diary\n\nALEX PRIVATE TEXT' } }
+        ] }] } });
+    await propose(alexNew, { title: 'From the LLM', content: '# From the LLM\n\nproposed text', notebook: 'LLM inbox' });
+    await signIn('alex', 'new horse battery');
+    check('alex\'s proposal and inbox show on the phone', badgeShown() && !byId('inbox-fab').classList.contains('hidden'));
+
+    await byId('notesBtn').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    await typeNote('# Diary\n\nALEX PRIVATE TEXT\nhalf-written thought');
+    let asked7 = dialogs.confirm.length;
+    answers.confirm.push(false); // "Sign out anyway?" No.
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('signing out with an unsaved note asks first, and Cancel stays signed in',
+        /an unsaved note for alex/.test(dialogs.confirm[asked7] || '') && Boolean(localStorageShim.getItem('tp_pwa_token')), dialogs.confirm[asked7]);
+    answers.confirm.push(true);
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('OK signs out, closes the note and says it is kept',
+        !localStorageShim.getItem('tp_pwa_token') && !bodyHas('view-notes') && !bodyHas('nv-editing')
+        && /unsaved note stays on this phone until alex signs in/.test(byId('status').textContent), byId('status').textContent);
+    check('  and nothing of alex\'s is on screen: no copy, proposals or inbox',
+        /Signed out/.test(byId('content').innerHTML) && !badgeShown() && byId('inbox-fab').classList.contains('hidden'),
+        byId('content').innerHTML);
+    await signIn('sam', 'sam-password-1');
+    check('sam cannot sign in over alex\'s unsaved note',
+        /an unsaved note for alex/.test(byId('auth-error').textContent) && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    await signIn('alex', 'new horse battery');
+    check('alex signs back in to his note, still open with his text',
+        bodyHas('nv-editing') && /half-written thought/.test(lastEditorText() || ''), lastEditorText());
+    await clickNv('done');
+    check('  and ✓ Done saves it to alex\'s tree', (await treeTitles(alexNew)).includes('half-written thought'));
+
+    // A clean sign-out with the note open in the editor, then sam.
+    await clickNv('edit');
+    asked7 = dialogs.confirm.length;
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('a clean sign-out asks nothing', dialogs.confirm.length === asked7 && byId('status').textContent === 'Signed out.',
+        dialogs.confirm.slice(asked7).join(' | '));
+    let mark = created.length;
+    await signIn('sam', 'sam-password-1');
+    const samNow = (await api('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json.token;
+    check('sam signs in to Home, with no note of alex\'s open or drawn',
+        localStorageShim.getItem('tp_pwa_userid') === '2' && !bodyHas('view-notes') && !bodyHas('nv-editing')
+        && !drawnSince(mark, 'ALEX PRIVATE') && !drawnSince(mark, 'From the LLM'));
+    await clickNv('done');
+    check('  and nothing of alex\'s can be saved into sam\'s tree', !(await treeTitles(samNow)).includes('ALEX PRIVATE'));
+
+    // kim has never used notes: a notebook prompt or a new note, cancelled.
+    await signIn('kim', 'kim-password-1');
+    await byId('notesBtn').fire('click');
+    await clickNv('new-notebook'); // the name prompt is cancelled
+    await clickNv('new-note');
+    await clickNv('cancel-edit');
+    asked7 = dialogs.confirm.length;
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('opening a notebook prompt or a new note and cancelling leaves nothing to push',
+        dialogs.confirm.length === asked7 && byId('status').textContent === 'Signed out.', dialogs.confirm.slice(asked7).join(' | '));
+
+    // alex's session expires in the middle of an edit.
+    await signIn('alex', 'new horse battery');
+    await byId('notesBtn').fire('click');
+    await clickNv('open-note', 'alex-diary');
+    await clickNv('edit');
+    await typeNote('# Diary\n\nALEX PRIVATE TEXT\nmid-session thought');
+    const alex3 = (await api('/api/auth/password', { method: 'POST', token: alexNew, body: { currentPassword: 'new horse battery', newPassword: 'third horse battery' } })).json.token;
+    await byId('pullBtn').fire('click');
+    await settle();
+    check('the session expires under an open edit', !localStorageShim.getItem('tp_pwa_token') && bodyHas('nv-editing'));
+    await signIn('sam', 'sam-password-1');
+    check('sam cannot sign in over the note alex was writing',
+        /an unsaved note for alex/.test(byId('auth-error').textContent) && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    answers.prompt.push('alex');
+    await byId('auth-discard').fire('click');
+    check('discarding alex\'s edits by name closes the note', !bodyHas('view-notes') && !bodyHas('nv-editing'));
+    mark = created.length;
+    await signIn('sam', 'sam-password-1');
+    check('then sam signs in, with nothing of alex\'s drawn', localStorageShim.getItem('tp_pwa_userid') === '2'
+        && !bodyHas('nv-editing') && !drawnSince(mark, 'ALEX PRIVATE') && !drawnSince(mark, 'mid-session'));
+    await clickNv('done');
+    check('  or saved into sam\'s tree', !/ALEX PRIVATE|mid-session/.test(await treeTitles(samNow)));
+
+    console.log('\n8. Approving a proposal over unpushed edits');
+    await signIn('alex', 'third horse battery');
+    failNext = 'PUT /api/tree'; // the phone is offline for this push
+    answers.prompt.push('Offline folder');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    check('an edit that could not be pushed stays on the phone', !(await treeTitles(alex3)).includes('Offline folder')
+        && dialogs.alert.some(m => /Failed to save folder/.test(m)));
+    await byId('notesBtn').fire('click');
+    const proposal = [...created].reverse().find(e => e.className === 'proposal');
+    check('alex\'s proposal waits in Notes', Boolean(proposal));
+    const asked8 = dialogs.confirm.length;
+    const pullsBeforeApprove = requests.filter(r => r === 'GET /api/tree').length;
+    await proposal.querySelector('.proposal-approve').fire('click');
+    await settle();
+    const afterApprove = await treeTitles(alex3);
+    check('approving it does not pull over the unpushed edit', requests.filter(r => r === 'GET /api/tree').length === pullsBeforeApprove
+        && dialogs.confirm.length === asked8 && afterApprove.includes('From the LLM') && !afterApprove.includes('Offline folder'));
+    await byId('pushBtn').fire('click');
+    await settle();
+    const pushed = await treeTitles(alex3);
+    const count = (s) => pushed.split(s).length - 1;
+    check('Push then lands both, with no conflict question and no duplicate',
+        dialogs.confirm.length === asked8 && pushed.includes('Offline folder')
+        && count('"title":"From the LLM"') === 1 && count('"title":"LLM inbox"') === 1, pushed);
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);
