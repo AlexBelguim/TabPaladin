@@ -41,6 +41,8 @@ services:
       # "off" stops the import scheduler (for a rehearsal on a copy of a real
       # database, which would otherwise sweep the real Reddit account).
       - IMPORTS_SCHEDULER=${IMPORTS_SCHEDULER:-}
+      # Failed sign-ins per IP across all usernames (default 5 x AUTH_MAX_FAILURES).
+      - AUTH_IP_MAX_FAILURES=${AUTH_IP_MAX_FAILURES:-}
       # Per-account caps; they refuse new rows and never prune old ones.
       - MAX_INBOX_PER_USER=${MAX_INBOX_PER_USER:-5000}
       - MAX_PROPOSALS_PER_USER=${MAX_PROPOSALS_PER_USER:-200}
