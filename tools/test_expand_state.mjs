@@ -9,8 +9,19 @@
 //      empty working copy or after a failed startup pull, where every saved
 //      folder would look deleted. Driven through the same guard the sidepanel
 //      uses (pruneAgainstTree), against the real TreeStore.
+//   3. Row paging in big folders: a body shows its first rows with "Show
+//      more" buttons, and every bulk action on a domain group (drag, ▶ All,
+//      ▶ 10, delete) still acts on the whole group, not on the visible rows.
+//      appendDomainGroups is lifted from sidepanel.js itself and run against
+//      a minimal DOM, since the sidepanel cannot be imported headless.
 //
 // Run: node tools/test_expand_state.mjs
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -170,6 +181,376 @@ try { await fresh.ExpandState.load(); } catch (e) { threw = true; }
 local.get = realGet;
 check('a failing read loads defaults instead of throwing',
     !threw && fresh.ExpandState.isOpen('aaaa') === false && fresh.ExpandState.isOpen(OPEN_TABS_KEY, true) === true);
+
+// --- Row paging -----------------------------------------------------------
+//
+// Just enough DOM for appendDomainGroups: elements, fragments, a tiny HTML
+// parser for its innerHTML templates, class selectors and listeners.
+
+class Node {
+    constructor() { this.parentNode = null; this.childNodes = []; }
+    appendChild(n) { return this.insertBefore(n, null); }
+    insertBefore(n, ref) {
+        const nodes = n instanceof Fragment ? n.childNodes.splice(0) : [n];
+        for (const x of nodes) {
+            if (x.parentNode) x.parentNode._drop(x);
+            x.parentNode = this;
+        }
+        const at = ref ? this.childNodes.indexOf(ref) : -1;
+        this.childNodes.splice(at < 0 ? this.childNodes.length : at, 0, ...nodes);
+        return n;
+    }
+    replaceChildren(...nodes) {
+        for (const c of this.childNodes) c.parentNode = null;
+        this.childNodes = [];
+        for (const n of nodes) this.appendChild(n);
+    }
+    _drop(x) {
+        const i = this.childNodes.indexOf(x);
+        if (i >= 0) this.childNodes.splice(i, 1);
+        x.parentNode = null;
+    }
+    remove() { if (this.parentNode) this.parentNode._drop(this); }
+    replaceWith(...nodes) {
+        const p = this.parentNode;
+        if (!p) return;
+        for (const n of nodes) p.insertBefore(n, this);
+        this.remove();
+    }
+    get textContent() { return this.childNodes.map(c => c.textContent).join(''); }
+    set textContent(v) { this.replaceChildren(new Text(String(v))); }
+    *walk() {
+        for (const c of this.childNodes) {
+            if (c instanceof Element) { yield c; yield* c.walk(); }
+        }
+    }
+    querySelectorAll(sel) {
+        const cls = sel.replace(/^\./, '');
+        return [...this.walk()].filter(e => e.classList.contains(cls));
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+}
+class Text extends Node {
+    constructor(t) { super(); this.data = t; }
+    get textContent() { return this.data; }
+}
+class Fragment extends Node {}
+class Element extends Node {
+    constructor(tag) {
+        super();
+        this.tagName = tag.toUpperCase();
+        this.attrs = {};
+        this.dataset = {};
+        this.style = {};
+        this.listeners = {};
+        const el = this;
+        this.classList = {
+            contains: (c) => el.className.split(/\s+/).includes(c),
+            add: (c) => { if (!el.classList.contains(c)) el.className = (el.className + ' ' + c).trim(); },
+            remove: (c) => { el.className = el.className.split(/\s+/).filter(x => x && x !== c).join(' '); }
+        };
+    }
+    get className() { return this.attrs.class || ''; }
+    set className(v) { this.attrs.class = v; }
+    get title() { return this.attrs.title || ''; }
+    set title(v) { this.attrs.title = String(v); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    removeAttribute(k) { delete this.attrs[k]; }
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+    closest(sel) {
+        const cls = sel.replace(/^\./, '');
+        for (let e = this; e instanceof Element; e = e.parentNode) {
+            if (e.classList.contains(cls) || e.tagName === sel.toUpperCase()) return e;
+        }
+        return null;
+    }
+    set innerHTML(html) { this.replaceChildren(...parseHtml(html)); }
+}
+
+const VOID = new Set(['img', 'input', 'br']);
+const decode = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+function parseHtml(html) {
+    const root = new Fragment();
+    const stack = [root];
+    const re = /<(\/?)([a-zA-Z0-9]+)((?:\s+[a-zA-Z-]+(?:="[^"]*")?)*)\s*\/?>|([^<]+)/g;
+    let m;
+    while ((m = re.exec(html))) {
+        const top = stack[stack.length - 1];
+        if (m[4] !== undefined) { top.appendChild(new Text(decode(m[4]))); continue; }
+        if (m[1]) { stack.pop(); continue; }
+        const el = new Element(m[2]);
+        for (const a of m[3].matchAll(/([a-zA-Z-]+)(?:="([^"]*)")?/g)) el.setAttribute(a[1], decode(a[2] ?? ''));
+        top.appendChild(el);
+        if (!VOID.has(m[2].toLowerCase())) stack.push(el);
+    }
+    return root.childNodes.splice(0);
+}
+
+const fakeDocument = {
+    createElement: (t) => new Element(t),
+    createDocumentFragment: () => new Fragment()
+};
+
+function fire(el, type, extra = {}) {
+    const ev = {
+        type, target: el, button: 0,
+        stopPropagation() {}, preventDefault() {},
+        dataTransfer: { data: {}, setData(k, v) { this.data[k] = v; } },
+        ...extra
+    };
+    for (const fn of el.listeners[type] || []) fn(ev);
+    return ev;
+}
+
+// Lift the paging code out of sidepanel.js: its top-level functions end at
+// the first line that is a lone `}`.
+const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'sidepanel', 'sidepanel.js'), 'utf8').split('\n');
+function lift(name) {
+    const start = SRC.findIndex(l => new RegExp(`^(async )?function ${name}\\(`).test(l));
+    if (start < 0) throw new Error(`sidepanel.js has no function ${name}`);
+    const end = SRC.indexOf('}', start);
+    return SRC.slice(start, end + 1).join('\n');
+}
+function liftConst(name) {
+    const line = SRC.find(l => l.startsWith(`const ${name} = `));
+    if (!line) throw new Error(`sidepanel.js has no const ${name}`);
+    return line;
+}
+
+const calls = { opened: [], removed: [], refreshed: [] };
+const env = {
+    document: fakeDocument,
+    openBookmarksAsNewWindow: async (list) => { calls.opened.push(list.map(b => b.id)); },
+    openBookmarkInCurrentWindow: async () => {},
+    removeBookmarksSmart: async (ids) => { calls.removed.push([...ids]); },
+    refreshFolderBodyIfOpen: async (...args) => { calls.refreshed.push(args); },
+    confirm: () => true,
+    alert: (msg) => { throw new Error('unexpected alert: ' + msg); },
+    // The fade-out delay is cosmetic; run it at once.
+    setTimeout: (fn) => { fn(); return 0; }
+};
+const code = [
+    liftConst('BODY_ROW_CAP'), liftConst('SHOW_MORE_STEP'),
+    lift('tabDomain'), lift('escapeHtml'),
+    lift('appendDomainGroups'), lift('appendDomainGroup'), lift('buildBookmarkRow'),
+    'return { appendDomainGroups, BODY_ROW_CAP, SHOW_MORE_STEP };'
+].join('\n\n');
+const paging = new Function(...Object.keys(env), code)(...Object.values(env));
+
+const bm = (domain, n) => Array.from({ length: n }, (_, i) => ({
+    id: `${domain}-${i}`, title: `${domain} ${i}`, url: `https://${domain}/p/${i}`
+}));
+const nf = (n) => n.toLocaleString();
+const flushMicrotasks = () => new Promise(r => setImmediate(r));
+
+console.log('row paging');
+check('cap and step are the spec values', paging.BODY_ROW_CAP === 200 && paging.SHOW_MORE_STEP === 500);
+
+const body = new Element('div');
+const all = [...bm('a.com', 4000), ...bm('b.com', 1500), ...bm('c.com', 500)];
+paging.appendDomainGroups(body, all, 'folder1');
+const groups = () => body.querySelectorAll('.src-domain-group');
+const groupOf = (d) => groups().find(g => g.dataset.domain === d);
+const rowsIn = (el) => el.querySelectorAll('.src-tab-row').length;
+const moreIn = (g) => g.childNodes.find(c => c instanceof Element && c.classList.contains('src-more-btn'));
+const bodyMore = () => body.childNodes.find(c => c instanceof Element && c.classList.contains('src-more-btn'));
+
+check('opening a 6000-row folder builds 200 rows', rowsIn(body) === 200, String(rowsIn(body)));
+check('only the groups the cap reached are built', groups().length === 1 && !!groupOf('a.com'));
+let a = groupOf('a.com');
+check('the cut group says how many are left, inside the group',
+    moreIn(a) && moreIn(a).textContent === `Show ${nf(3800)} more`, moreIn(a) && moreIn(a).textContent);
+check('unreached groups sit behind one button at the end of the body',
+    bodyMore() && bodyMore().textContent === `Show ${nf(2000)} more bookmarks in 2 sites`
+    && body.childNodes[body.childNodes.length - 1] === bodyMore(), bodyMore() && bodyMore().textContent);
+check('the domain count is the full group, not the rows shown',
+    a.querySelector('.src-domain-count').textContent === '(4000)');
+
+fire(a.querySelector('.domain-open-all-btn'), 'click');
+check('▶ All opens the whole group', calls.opened.at(-1).length === 4000, String(calls.opened.at(-1).length));
+fire(a.querySelector('.domain-open-10-btn'), 'click');
+check('▶ 10 opens the first ten', calls.opened.at(-1).join() === bm('a.com', 10).map(b => b.id).join());
+let ev = fire(a.querySelector('.domain-drag-handle'), 'dragstart');
+check('dragging the group carries every id in it',
+    JSON.parse(ev.dataTransfer.data['text/tp-bookmark-ids']).length === 4000);
+
+fire(moreIn(a), 'click');
+check('"Show more" adds 500 rows to its group', rowsIn(a) === 700, String(rowsIn(a)));
+check('…and counts down', moreIn(a).textContent === `Show ${nf(3300)} more`);
+check('…keeping itself below the rows',
+    a.childNodes.filter(c => c instanceof Element).at(-1) === moreIn(a));
+
+// Delete one visible row: the group's list shrinks, so do the bulk actions.
+const firstRow = a.querySelector('.src-tab-row');
+fire(firstRow.querySelector('.bookmark-delete-btn'), 'click');
+await flushMicrotasks();
+check('a single delete removes just that bookmark', calls.removed.at(-1).join() === 'a.com-0');
+check('…its row goes', rowsIn(a) === 699 && !a.querySelectorAll('.src-tab-row').includes(firstRow));
+check('…the count follows the list, not the DOM', a.querySelector('.src-domain-count').textContent === '(3999)');
+check('…the remaining "more" is unchanged', moreIn(a).textContent === `Show ${nf(3300)} more`);
+fire(a.querySelector('.domain-open-all-btn'), 'click');
+check('…and ▶ All no longer includes it',
+    calls.opened.at(-1).length === 3999 && !calls.opened.at(-1).includes('a.com-0'));
+check('…the body is not rebuilt (other pages of rows stay), only stats refreshed',
+    calls.refreshed.at(-1)[0] === 'folder1' && calls.refreshed.at(-1).length === 2);
+
+fire(bodyMore(), 'click');
+const b = groupOf('b.com');
+check('the end button builds the next 500 rows', b && rowsIn(b) === 500 && rowsIn(body) === 699 + 500);
+check('…with its own in-group "more"', moreIn(b) && moreIn(b).textContent === `Show ${nf(1000)} more`);
+check('…and a new end button for what is still unreached',
+    bodyMore() && bodyMore().textContent === 'Show 500 more bookmarks in 1 site');
+check('groups stay in domain order', groups().map(g => g.dataset.domain).join() === 'a.com,b.com');
+
+fire(b.querySelector('.domain-delete-btn'), 'click');
+await flushMicrotasks();
+check('deleting a domain group deletes all of it, shown or not', calls.removed.at(-1).length === 1500);
+check('…removes the group and refreshes the folder',
+    !groupOf('b.com') && calls.refreshed.at(-1).length === 1 && calls.refreshed.at(-1)[0] === 'folder1');
+
+const small = new Element('div');
+paging.appendDomainGroups(small, [...bm('x.org', 3), ...bm('y.org', 2)], 'folder2');
+check('a small folder shows everything with no buttons',
+    rowsIn(small) === 5 && small.querySelectorAll('.src-more-btn').length === 0);
+const x = small.querySelectorAll('.src-domain-group')[0];
+for (const row of x.querySelectorAll('.src-tab-row')) {
+    fire(row.querySelector('.bookmark-delete-btn'), 'click');
+    await flushMicrotasks();
+}
+check('deleting the last row of a group removes the group',
+    small.querySelectorAll('.src-domain-group').length === 1 && calls.refreshed.at(-1).length === 1);
+
+// --- Folder cards ---------------------------------------------------------
+//
+// The card controller from sidepanel.js against the real TreeStore working
+// copy: restore while detached, collapse keeps children's state, the
+// per-render budget, drag-hover opens, and overlapping builds.
+
+const bmk = (prefix, n) => Array.from({ length: n }, (_, i) => ({
+    id: `${prefix}-${i}`, kind: 'bookmark', title: `${prefix} ${i}`, url: `https://${prefix}.example/${i}`
+}));
+const BIG = 11;
+await local.set({
+    tpTree: {
+        baseVersion: 4,
+        dirty: false,
+        rev: 'cards',
+        roots: [
+            { id: 'bm', kind: 'folder', title: 'Bookmarks', role: 'bookmarks', children: [
+                { id: 'fA', kind: 'folder', title: 'A', children: [
+                    { id: 'fA1', kind: 'folder', title: 'A1', children: bmk('a1', 2) },
+                    { id: 'fA2', kind: 'folder', title: 'A2', children: [] },
+                    ...bmk('a', 3)
+                ]},
+                { id: 'fB', kind: 'folder', title: 'B', children: bmk('b', 1) },
+                ...Array.from({ length: BIG }, (_, i) => ({
+                    id: `big${i}`, kind: 'folder', title: `Big ${i}`, children: bmk(`big${i}`, 300)
+                }))
+            ]},
+            { id: 'wf', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [] }
+        ]
+    }
+});
+
+const cardEnv = {
+    ...env,
+    Tree: TreeStore.bookmarks,
+    TreeStore,
+    ExpandState,
+    findWorkflowRootSilent: async () => TreeStore.findRoleRoot('workflows')
+};
+const cardCode = [
+    ...['BODY_ROW_CAP', 'SHOW_MORE_STEP', 'RESTORE_ROW_BUDGET', 'RESTORE_SKIPPED_TIP', 'IMPORTS_ROOT_TITLE',
+        'TP_META_TITLE', 'TP_ROOT_MARKER_TITLE', 'cardControls'].map(liftConst),
+    ...['tabDomain', 'escapeHtml', 'isInternalBookmark', 'isVisibleBookmark', 'newRestoreBudget', 'folderStatsText',
+        'buildFolderCard', 'renderFolderCard', 'buildFolderBody',
+        'appendDomainGroups', 'appendDomainGroup', 'buildBookmarkRow'].map(lift),
+    'return { buildFolderCard, renderFolderCard, newRestoreBudget, cardControls };'
+].join('\n\n');
+const cards = new Function(...Object.keys(cardEnv), cardCode)(...Object.values(cardEnv));
+
+const settle = async () => { for (let i = 0; i < 20; i++) await flushMicrotasks(); };
+const headerOf = (card) => card.childNodes.find(c => c instanceof Element && c.classList.contains('source-folder-header'));
+const bodyOf = (card) => card.childNodes.find(c => c instanceof Element && c.classList.contains('source-folder-body'));
+const caretOf = (card) => headerOf(card).querySelector('.folder-caret').textContent;
+const subCards = (card) => bodyOf(card).childNodes.filter(c => c instanceof Element && c.classList.contains('source-folder-card'));
+const subCard = (card, id) => subCards(card).find(c => c.dataset.id === id);
+const isShownOpen = (card) => card.dataset.open === '1' && bodyOf(card).style.display === 'block' && caretOf(card) === '▼';
+const rootSub = { id: 'bm', title: 'Bookmarks', folderCount: 2 + BIG, fileCount: 0, icon: '🔖' };
+
+console.log('folder cards');
+ExpandState.set('bm', true);
+ExpandState.set('fA', true);
+ExpandState.set('fA1', true);
+ExpandState.set('fB', false);
+let root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+check('a remembered-open column comes back open, fully built before it is attached',
+    isShownOpen(root) && root.parentNode === null && subCards(root).length === 2 + BIG);
+let fA = subCard(root, 'fA');
+check('nested remembered-open folders reopen with it', isShownOpen(fA) && isShownOpen(subCard(fA, 'fA1')));
+check('never-opened and closed folders stay closed',
+    subCard(fA, 'fA2').dataset.open === '' && subCard(root, 'fB').dataset.open === ''
+    && bodyOf(subCard(root, 'fB')).childNodes.length === 0 && caretOf(subCard(root, 'fB')) === '▶');
+
+fire(headerOf(fA), 'click');
+await settle();
+check('a header click closes the folder and empties its body',
+    fA.dataset.open === '' && bodyOf(fA).childNodes.length === 0 && caretOf(fA) === '▶');
+check('…and is remembered', ExpandState.isOpen('fA') === false);
+check('collapsing a parent keeps the children\'s state', ExpandState.isOpen('fA1') === true);
+fire(headerOf(fA), 'click');
+await settle();
+check('re-opening the parent brings its open subfolders back', isShownOpen(fA) && isShownOpen(subCard(fA, 'fA1')));
+
+console.log('restore budget');
+for (let i = 0; i < BIG; i++) ExpandState.set(`big${i}`, true);
+root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+const bigs = subCards(root).filter(c => c.dataset.id.startsWith('big'));
+const opened = bigs.filter(c => c.dataset.open === '1');
+const skipped = bigs.filter(c => c.classList.contains('restore-skipped'));
+const rowsBuilt = root.querySelectorAll('.src-tab-row').length;
+check('open big folders show their first 200 rows each',
+    opened.length > 0 && opened.every(c => bodyOf(c).querySelectorAll('.src-tab-row').length === 200));
+check('restoring stops at the per-render budget', skipped.length > 0 && rowsBuilt <= 2000,
+    `${opened.length} opened, ${skipped.length} skipped, ${rowsBuilt} rows`);
+const sk = skipped[0];
+check('a card over the budget stays closed with a hollow caret and says why',
+    sk.dataset.open === '' && caretOf(sk) === '▷' && bodyOf(sk).childNodes.length === 0
+    && /not reopened automatically/.test(headerOf(sk).title));
+check('…its saved state is left alone', ExpandState.isOpen(sk.dataset.id) === true);
+fire(headerOf(sk), 'click');
+await settle();
+check('one click opens it normally and clears the marker',
+    isShownOpen(sk) && !sk.classList.contains('restore-skipped') && headerOf(sk).title === '');
+for (let i = 0; i < BIG; i++) ExpandState.set(`big${i}`, false);
+
+console.log('drag-hover and overlapping builds');
+const fB = subCard(root, 'fB');
+await cards.cardControls.get(fB).springOpen();
+check('drag-hover opens a closed folder', isShownOpen(fB));
+await ExpandState.flush();
+check('…without saving it', stored().fB && stored().fB.o === 0);
+root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+check('…and it stays open through the re-render after the drop', isShownOpen(subCard(root, 'fB')));
+
+const race = cards.renderFolderCard({ id: 'fA', title: 'A', folderCount: 2, fileCount: 3 }, 0);
+const rc = cards.cardControls.get(race);
+await Promise.all([rc.setOpen(true), rc.refresh(), rc.refresh(), rc.restore(cards.newRestoreBudget())]);
+check('overlapping opens and refreshes never duplicate subfolders',
+    isShownOpen(race) && subCards(race).length === 2
+    && bodyOf(race).childNodes.filter(c => c instanceof Element && c.classList.contains('src-domain-group')).length === 1,
+    `${subCards(race).length} subfolder cards`);
+const closing = rc.setOpen(true);
+await rc.setOpen(false);
+await closing;
+check('closing while an open is still building leaves it closed', race.dataset.open === '' && bodyOf(race).childNodes.length === 0);
+
+const ghost = cards.renderFolderCard({ id: 'deadbeefdeadbeef', title: 'Gone', folderCount: 0, fileCount: 0 }, 1);
+await cards.cardControls.get(ghost).setOpen(true);
+check('opening a folder deleted elsewhere says so instead of throwing',
+    bodyOf(ghost).textContent === 'Folder no longer exists.');
 
 console.log(failures === 0 ? '\nAll expand-state tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);

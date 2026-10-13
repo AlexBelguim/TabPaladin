@@ -11,6 +11,7 @@ import { StorageManager } from '../utils/storageManager.js';
 import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
 import { AIService } from '../utils/aiService.js';
 import { TreeStore } from '../utils/treeStore.js';
+import { ExpandState, OPEN_TABS_KEY, aiGroupKey } from '../utils/expandState.js';
 import { NotesManager } from '../utils/notesManager.js';
 import { resolveServerUrl } from '../utils/config.js';
 
@@ -44,7 +45,9 @@ function showStartupSyncBanner() {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
-    await TreeStore.load();
+    // Which cards were open last time is read alongside the tree, so the first
+    // render already has it and paints once, in its final state.
+    await Promise.all([TreeStore.load(), ExpandState.load()]);
 
     // First run after the update (or a fresh install): the working copy is
     // empty. If we're already signed in, pull the server's tree silently so
@@ -81,6 +84,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {
         console.warn('[TabPaladin] Could not prune focused folders:', e.message);
     }
+    await pruneStaleExpandState();
+    window.addEventListener('pagehide', () => { ExpandState.flush(); });
 
     // One-time migration of legacy storage.local workflows into the tree.
     try {
@@ -319,6 +324,17 @@ async function pruneStaleFocusedFolders() {
     return ids.length - kept.length;
 }
 
+// Forget open/closed state for folders that are gone. At startup the guard
+// in pruneAgainstTree matters: a failed startup pull leaves an empty working
+// copy in which every remembered folder looks deleted. A pull that just
+// succeeded is trustworthy whatever happened at startup.
+async function pruneStaleExpandState({ afterPull = false } = {}) {
+    const dropped = await ExpandState.pruneAgainstTree(TreeStore, {
+        syncError: afterPull ? null : startupSyncError
+    });
+    if (dropped) console.log(`[TabPaladin] Forgot open/closed state of ${dropped} deleted folder(s).`);
+}
+
 // --- Tabs Logic ---
 async function loadCurrentTabs() {
     try {
@@ -490,9 +506,14 @@ async function renderGroupedTabs() {
     await renderMainView({ regroup: false });
 }
 
+// Every drop, pull and regroup rebuilds the main view. It is built off-screen
+// and swapped in whole, so the page never flashes empty or loses its scroll,
+// and a render that a newer one overtook is thrown away instead of landing last.
+let mainRenderSeq = 0;
+
 async function renderMainView({ regroup = true } = {}) {
+    const seq = ++mainRenderSeq;
     const container = document.getElementById('groups-container');
-    container.innerHTML = '';
     container.className = 'main-view';
 
     const api = typeof browser !== 'undefined' ? browser : chrome;
@@ -558,41 +579,60 @@ async function renderMainView({ regroup = true } = {}) {
         <span style="font-weight:600; color:#ddd; font-size:1rem; flex:1;">Open Tabs &amp; Suggestions</span>
         <button class="sm-btn" id="mainRegroupBtn" title="Re-run smart grouping on the current open tabs">↻ Re-group</button>
     `;
-    container.appendChild(headerBar);
     headerBar.querySelector('#mainRegroupBtn').addEventListener('click', () => renderMainView({ regroup: true }));
 
     const grid = document.createElement('div');
     grid.className = 'roots-row';
-    container.appendChild(grid);
 
     // Columns, side by side: Open Tabs, Workflows, Bookmarks. Each is a
     // section you scan independently, so they sit next to each other rather
     // than stacking and pushing the later ones below the fold.
     grid.appendChild(renderOpenTabsCard(unclaimedTabs, mainViewState.aiGroups));
-    const rootsRow = grid;
 
+    // One budget across all columns: it caps how much the remembered-open
+    // folders may build on their own in this pass.
+    const budget = newRestoreBudget();
     for (const r of realRoots) {
         try {
             const c = await BookmarkOrganizer.getDirectoryContents(r.id);
             if (!c) continue;
-            const card = renderFolderCard({
+            grid.appendChild(await buildFolderCard({
                 id: c.id,
                 title: c.title,
                 folderCount: c.subfolders.length,
                 fileCount: c.looseCount,
                 icon: r.isWorkflow ? '🛡️' : (r.isBookmarks ? '🔖' : '📁')
-            }, 0);
-            rootsRow.appendChild(card);
+            }, 0, budget));
         } catch (e) {
             console.warn("Could not load root", r.id, e);
         }
+    }
+
+    if (seq !== mainRenderSeq) return;
+    swapKeepingColumnScroll(container, headerBar, grid);
+}
+
+// Replace a view's contents in one go. Each column is its own scroll box, so
+// carry every column's scrollTop over to its rebuilt counterpart (same
+// data-id) — a drop deep in a long column should not throw you to its top.
+function swapKeepingColumnScroll(container, ...nodes) {
+    const COLUMNS = ':scope > .roots-row > .source-folder-card';
+    const scrolls = new Map();
+    for (const col of container.querySelectorAll(COLUMNS)) {
+        if (col.scrollTop) scrolls.set(col.dataset.id, col.scrollTop);
+    }
+    container.replaceChildren(...nodes);
+    if (!scrolls.size) return;
+    for (const col of container.querySelectorAll(COLUMNS)) {
+        const top = scrolls.get(col.dataset.id);
+        if (top) col.scrollTop = top;
     }
 }
 
 function renderOpenTabsCard(unclaimedTabs, aiGroups) {
     const card = document.createElement('div');
     card.className = 'source-folder-card open-tabs-card';
-    card.dataset.id = '__open_tabs__';
+    card.dataset.id = OPEN_TABS_KEY;
 
     const totalTabs = unclaimedTabs.length + aiGroups.reduce((n, g) => n + g.items.length, 0);
 
@@ -608,7 +648,6 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
 
     const body = document.createElement('div');
     body.className = 'source-folder-body';
-    body.style.display = 'block';
     card.appendChild(body);
 
     if (totalTabs === 0) {
@@ -630,17 +669,7 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
     }
 
     // Expand/collapse the whole Open Tabs card
-    const caret = header.querySelector('.folder-caret');
-    header.addEventListener('click', (e) => {
-        if (e.target.closest('button') || e.target.closest('input')) return;
-        if (body.style.display === 'none') {
-            body.style.display = 'block';
-            caret.textContent = '▼';
-        } else {
-            body.style.display = 'none';
-            caret.textContent = '▶';
-        }
-    });
+    wireRememberedToggle(card, header, body, OPEN_TABS_KEY);
 
     // Drop target: tabs (single or bulk) dragged back from a group return to Open Tabs (un-claim).
     card.addEventListener('dragover', (e) => {
@@ -684,6 +713,25 @@ function renderOpenTabsCard(unclaimedTabs, aiGroups) {
     });
 
     return card;
+}
+
+// Open Tabs and the AI groups build their whole body up front (one window's
+// tabs), so collapsing only hides it. Both default to open; an explicit
+// toggle is remembered under `key`.
+function wireRememberedToggle(card, header, body, key) {
+    const caret = header.querySelector('.folder-caret');
+    const paint = (open) => {
+        card.dataset.open = open ? '1' : '';
+        body.style.display = open ? 'block' : 'none';
+        caret.textContent = open ? '▼' : '▶';
+    };
+    paint(ExpandState.isOpen(key, true));
+    header.addEventListener('click', (e) => {
+        if (e.target.closest('button') || e.target.closest('input') || e.target.classList.contains('folder-drag-handle')) return;
+        const open = card.dataset.open !== '1';
+        ExpandState.set(key, open);
+        paint(open);
+    });
 }
 
 // Same as appendDomainGroups but the rows carry tab payloads, not bookmark payloads.
@@ -778,7 +826,6 @@ function renderGroupCard(group) {
 
     const body = document.createElement('div');
     body.className = 'source-folder-body';
-    body.style.display = 'block';
     card.appendChild(body);
 
     if (group.items.length === 0) {
@@ -787,18 +834,9 @@ function renderGroupCard(group) {
         appendTabDomainGroups(body, group.items, group.id);
     }
 
-    // Expand/collapse
-    const caret = header.querySelector('.folder-caret');
-    header.addEventListener('click', (e) => {
-        if (e.target.closest('button') || e.target.closest('input') || e.target.classList.contains('folder-drag-handle')) return;
-        if (body.style.display === 'none') {
-            body.style.display = 'block';
-            caret.textContent = '▼';
-        } else {
-            body.style.display = 'none';
-            caret.textContent = '▶';
-        }
-    });
+    // Expand/collapse. Group ids are regenerated on every regroup, so the
+    // remembered state goes by the group's name.
+    wireRememberedToggle(card, header, body, aiGroupKey(group.name));
 
     // Drag the WHOLE group via the handle.
     const handle = header.querySelector('.folder-drag-handle');
@@ -887,30 +925,30 @@ function escapeHtml(s) {
     }[c]));
 }
 
+// Built off-screen and swapped in. Two loads close together (a tree edit and
+// a pull) used to interleave their appends and list workflows twice; now the
+// later render wins and the earlier one is dropped.
+let workflowsRenderSeq = 0;
+
 async function renderWorkflows() {
+    // Every tree edit lands here. While the view is hidden, rebuilding the
+    // workflow cards (and any remembered-open bodies) is wasted work; the
+    // Workflows button loads them again when it shows the view.
+    const view = document.getElementById('workflows-container');
+    if (view && view.style.display === 'none') return;
+
+    const seq = ++workflowsRenderSeq;
     const list = document.getElementById('workflows-list');
-    list.innerHTML = '';
+    const frag = document.createDocumentFragment();
 
     const wfRoot = await findWorkflowRootSilent();
-    if (!wfRoot) {
-        list.innerHTML = '<li class="empty-state">No saved workflows.</li>';
-        return;
-    }
-
-    const children = await Tree.getChildren(wfRoot.id);
-    const wfFolders = children.filter(c => !c.url);
-    if (wfFolders.length === 0) {
-        list.innerHTML = '<li class="empty-state">No saved workflows.</li>';
-        return;
-    }
-
+    const wfFolders = wfRoot ? (await Tree.getChildren(wfRoot.id)).filter(c => !c.url) : [];
+    const budget = newRestoreBudget();
     // Render each workflow as a folder card with the workflow Open button.
     // List items become non-list divs since the folder-card UI doesn't fit <li> semantics.
-    list.style.listStyle = 'none';
-    list.style.padding = '0';
     for (const wf of wfFolders) {
         const wfChildren = await Tree.getChildren(wf.id);
-        const card = renderFolderCard({
+        const card = await buildFolderCard({
             id: wf.id,
             title: wf.title,
             parentId: wfRoot.id,
@@ -918,12 +956,21 @@ async function renderWorkflows() {
             fileCount: wfChildren.filter(isVisibleBookmark).length,
             icon: '🛡️',
             isWorkflow: true
-        }, 0);
+        }, 0, budget);
         const li = document.createElement('li');
         li.style.listStyle = 'none';
         li.appendChild(card);
-        list.appendChild(li);
+        frag.appendChild(li);
     }
+
+    if (seq !== workflowsRenderSeq) return;
+    if (wfFolders.length === 0) {
+        list.innerHTML = '<li class="empty-state">No saved workflows.</li>';
+        return;
+    }
+    list.style.listStyle = 'none';
+    list.style.padding = '0';
+    list.replaceChildren(frag);
 }
 
 function renderWorkflowBody(wf, body) {
@@ -1214,10 +1261,23 @@ async function openWorkflowAsTabs(folderId, folderTitle) {
     } catch (e) {}
 }
 
+// Same build-then-swap as the main view; drill, Back and drops all land here,
+// and each level comes back with its remembered-open cards already open.
+let sourceRenderSeq = 0;
+
 async function renderSourceGrid(folderId) {
+    const seq = ++sourceRenderSeq;
     const sourceList = document.getElementById('source-list');
-    sourceList.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    await buildSourceGrid(frag, folderId);
+    if (seq !== sourceRenderSeq) return;
     sourceList.className = 'source-folder-list';
+    swapKeepingColumnScroll(sourceList, frag);
+}
+
+// The Organize grid for one level, built into `out` (a detached fragment).
+async function buildSourceGrid(out, folderId) {
+    const budget = newRestoreBudget();
 
     // Virtual root: TabPaladin Workflows + focused folders (if any), laid out side-by-side.
     if (folderId === VIRTUAL_ROOT_ID) {
@@ -1246,24 +1306,23 @@ async function renderSourceGrid(folderId) {
             }
         }
 
-        sourceList.appendChild(buildOrganizeHeader('Sources', null));
+        out.appendChild(buildOrganizeHeader('Sources', null));
 
         const grid = document.createElement('div');
         grid.className = 'roots-row'; // side by side — see renderMainView
-        sourceList.appendChild(grid);
+        out.appendChild(grid);
 
         for (const r of roots) {
             try {
                 const c = await BookmarkOrganizer.getDirectoryContents(r.id);
                 if (!c) continue;
-                const card = renderFolderCard({
+                grid.appendChild(await buildFolderCard({
                     id: c.id,
                     title: c.title,
                     folderCount: c.subfolders.length,
                     fileCount: c.looseCount,
                     icon: r.isWorkflow ? '🛡️' : (r.isBookmarks ? '🔖' : '📁')
-                }, 0);
-                grid.appendChild(card);
+                }, 0, budget));
             } catch (e) {
                 console.warn("Could not load root", r.id, e);
             }
@@ -1274,7 +1333,7 @@ async function renderSourceGrid(folderId) {
     const content = await BookmarkOrganizer.getDirectoryContents(folderId);
     if (!content) return;
 
-    sourceList.appendChild(buildOrganizeHeader(content.title, content.id));
+    out.appendChild(buildOrganizeHeader(content.title, content.id));
 
     // Render each subfolder as a card. Direct bookmarks of `folderId` would be siblings —
     // surface them by expanding the breadcrumb itself: any user who wants to see them
@@ -1283,13 +1342,13 @@ async function renderSourceGrid(folderId) {
     if (content.looseCount > 0) {
         const looseChildren = (await Tree.getChildren(content.id)).filter(isVisibleBookmark);
         if (looseChildren.length > 0) {
-            sourceList.appendChild(renderTopLevelLooseSection(content.id, looseChildren));
+            out.appendChild(renderTopLevelLooseSection(content.id, looseChildren));
         }
     }
 
     for (const sub of content.subfolders) {
         // Pass parentId so refresh-on-drop knows where to update.
-        sourceList.appendChild(renderFolderCard({ ...sub, parentId: content.id }, 0));
+        out.appendChild(await buildFolderCard({ ...sub, parentId: content.id }, 0, budget));
     }
 }
 
@@ -1362,6 +1421,51 @@ function buildOrganizeHeader(title, parentFolderId) {
 // the user apart from taking things out of it.
 const IMPORTS_ROOT_TITLE = 'TabPaladin Imports';
 
+// --- Remembered open folders ---
+// Folder cards reopen the way the user left them (ExpandState, keyed by node
+// id, so a folder is open or closed alike in the main view, Organize and
+// Workflows). Every rebuild restores that while the card is still detached,
+// so the view paints once, in its final shape. Building rows is the slow part
+// (~180 ms for 6000), so it is bounded twice: a body shows its first
+// BODY_ROW_CAP rows with "Show more" for the rest, and one render pass reopens
+// at most RESTORE_ROW_BUDGET rows' worth of cards on its own.
+const BODY_ROW_CAP = 200;
+const SHOW_MORE_STEP = 500;
+const RESTORE_ROW_BUDGET = 2000;
+const RESTORE_SKIPPED_TIP = 'Open last time — not reopened automatically to keep the page fast. Click to open.';
+
+function newRestoreBudget() {
+    return { rows: RESTORE_ROW_BUDGET };
+}
+
+// Folder card element -> its open/close controller (see renderFolderCard).
+const cardControls = new WeakMap();
+
+// A folder card ready to attach: reopened — with its own remembered-open
+// subfolders — when the user left it open and the pass's budget allows it,
+// otherwise closed, with a hollow caret saying why.
+async function buildFolderCard(sub, depth, budget) {
+    const card = renderFolderCard(sub, depth);
+    if (ExpandState.isOpen(sub.id)) {
+        const ctl = cardControls.get(card);
+        const cost = (sub.folderCount || 0) + Math.min(sub.fileCount || 0, BODY_ROW_CAP);
+        if (cost <= budget.rows) {
+            budget.rows -= cost;
+            await ctl.restore(budget);
+        } else {
+            ctl.markSkipped();
+        }
+    }
+    return card;
+}
+
+function folderStatsText(folderCount, fileCount) {
+    const parts = [];
+    if (folderCount > 0) parts.push(`${folderCount} 📁`);
+    if (fileCount > 0) parts.push(`${fileCount} 📄`);
+    return parts.join(' · ') || 'Empty';
+}
+
 function renderFolderCard(sub, depth = 0) {
     const card = document.createElement('div');
     card.className = 'source-folder-card';
@@ -1388,10 +1492,7 @@ function renderFolderCard(sub, depth = 0) {
     header.className = 'source-folder-header' + (isImports ? ' is-imports' : '');
     card.dataset.imports = isImports ? '1' : '';
 
-    const statsParts = [];
-    if (sub.folderCount > 0) statsParts.push(`${sub.folderCount} 📁`);
-    if (sub.fileCount > 0) statsParts.push(`${sub.fileCount} 📄`);
-    const stats = statsParts.join(' · ') || 'Empty';
+    const stats = folderStatsText(sub.folderCount, sub.fileCount);
 
     const openBtnHtml = sub.isWorkflow
         ? `<button class="sm-btn open-workflow-btn" title="Open all bookmarks in a new window" style="padding:2px 8px;">▶ Open</button>`
@@ -1422,24 +1523,79 @@ function renderFolderCard(sub, depth = 0) {
     `;
     card.appendChild(header);
 
-    // Body (collapsed by default)
+    // Body (collapsed by default). It is built when the card opens and emptied
+    // when it closes, so a closed big folder holds no rows.
+    //
+    // card.dataset.open is the one source of truth for open/closed. Every way
+    // of opening the card — header click, new subfolder, drag-hover, restore
+    // on render, refresh — goes through the controller below, so the caret,
+    // the body and the remembered state cannot drift apart.
     const body = document.createElement('div');
     body.className = 'source-folder-body';
     body.style.display = 'none';
     card.appendChild(body);
+    card.dataset.open = '';
+
+    const caret = header.querySelector('.folder-caret');
+    // Bumped by every open and close: a build that was overtaken (a quick
+    // second click, a refresh racing a click) is dropped rather than landing
+    // on top, which used to append the subfolders twice.
+    let bodySeq = 0;
+    const showBody = async (budget) => {
+        card.dataset.open = '1';
+        caret.textContent = '▼';
+        const seq = ++bodySeq;
+        const frag = await buildFolderBody(sub.id, depth, isImports, budget);
+        if (seq !== bodySeq || card.dataset.open !== '1') return;
+        body.replaceChildren(frag);
+        body.style.display = 'block';
+    };
+    const hideBody = () => {
+        bodySeq++;
+        card.dataset.open = '';
+        caret.textContent = '▶';
+        body.style.display = 'none';
+        body.replaceChildren();
+    };
+    const clearSkipped = () => {
+        card.classList.remove('restore-skipped');
+        header.removeAttribute('title');
+    };
+    const ctl = {
+        // The user opened or closed it: remembered on this device.
+        async setOpen(open) {
+            clearSkipped();
+            ExpandState.set(sub.id, open);
+            if (open) await showBody(newRestoreBudget());
+            else hideBody();
+        },
+        // Drag-hover: open for the rest of this page session, never saved.
+        async springOpen() {
+            clearSkipped();
+            ExpandState.openForSession(sub.id);
+            await showBody(newRestoreBudget());
+        },
+        // Rebuilding a view: reopen as remembered, writing nothing.
+        restore(budget) {
+            return showBody(budget);
+        },
+        // Over this pass's budget: left closed, marked as open last time.
+        markSkipped() {
+            card.classList.add('restore-skipped');
+            caret.textContent = '▷';
+            header.title = RESTORE_SKIPPED_TIP;
+        },
+        // The folder's contents changed: rebuild the body if it is showing.
+        async refresh() {
+            if (card.dataset.open === '1') await showBody(newRestoreBudget());
+        }
+    };
+    cardControls.set(card, ctl);
 
     // Toggle expand on header click (ignoring interactive children).
-    const caret = header.querySelector('.folder-caret');
-    header.addEventListener('click', async (e) => {
+    header.addEventListener('click', (e) => {
         if (e.target.closest('button') || e.target.closest('input')) return;
-        if (body.style.display === 'none') {
-            await renderFolderBody(sub.id, body, depth, isImports);
-            body.style.display = 'block';
-            caret.textContent = '▼';
-        } else {
-            body.style.display = 'none';
-            caret.textContent = '▶';
-        }
+        ctl.setOpen(card.dataset.open !== '1');
     });
 
     // Drill — push breadcrumb and re-render at that folder (only for non-workflow cards).
@@ -1478,16 +1634,10 @@ function renderFolderCard(sub, depth = 0) {
         try {
             await Tree.create({ parentId: sub.id, title: name.trim() });
             // Expand the card so the user sees the new folder.
-            const caret = header.querySelector('.folder-caret');
-            if (body.style.display === 'none') {
-                await renderFolderBody(sub.id, body, depth, isImports);
-                body.style.display = 'block';
-                if (caret) caret.textContent = '▼';
-            } else {
-                await renderFolderBody(sub.id, body, depth, isImports);
-            }
-            // Update header stats.
-            await refreshFolderBodyIfOpen(sub.id);
+            if (card.dataset.open === '1') await ctl.refresh();
+            else await ctl.setOpen(true);
+            // Update header stats, and any other open copy of this folder.
+            await refreshFolderBodyIfOpen(sub.id, card);
         } catch (err) {
             alert('Could not create folder: ' + err.message);
         }
@@ -1580,14 +1730,11 @@ function renderFolderCard(sub, depth = 0) {
         card.classList.add('drop-hover');
 
         // Schedule auto-expand if collapsed.
-        if (body.style.display === 'none' && springTimer == null) {
-            springTimer = setTimeout(async () => {
+        if (card.dataset.open !== '1' && springTimer == null) {
+            springTimer = setTimeout(() => {
                 springTimer = null;
-                if (body.style.display !== 'none') return; // user expanded it manually meanwhile
-                await renderFolderBody(sub.id, body, depth, isImports);
-                body.style.display = 'block';
-                const caretEl = header.querySelector('.folder-caret');
-                if (caretEl) caretEl.textContent = '▼';
+                if (card.dataset.open === '1') return; // user expanded it manually meanwhile
+                ctl.springOpen();
             }, 700);
         }
     });
@@ -1737,7 +1884,14 @@ function renderFolderCard(sub, depth = 0) {
 
 // Render domain groups into `container`. Each group is draggable as a unit via a ⋮⋮ handle;
 // each row is also draggable individually.
-function appendDomainGroups(container, bookmarks, parentFolderId) {
+//
+// Only the first `rowCap` rows are built: a folder of thousands (an import
+// archive) would otherwise cost every re-render hundreds of milliseconds. The
+// group the cap cuts through gets its own "Show N more"; groups the cap never
+// reached sit behind one button at the end. Whatever a group header does —
+// drag, ▶ All, ▶ 10, delete — acts on the group's full list, never only on
+// the rows on screen.
+function appendDomainGroups(container, bookmarks, parentFolderId, { rowCap = BODY_ROW_CAP } = {}) {
     if (!bookmarks || bookmarks.length === 0) return;
 
     const byDomain = {};
@@ -1747,189 +1901,275 @@ function appendDomainGroups(container, bookmarks, parentFolderId) {
         byDomain[d].push(b);
     });
 
-    Object.keys(byDomain).sort().forEach(d => {
-        const group = document.createElement('div');
-        group.className = 'src-domain-group';
-        group.dataset.domain = d;
-        group.dataset.parentId = String(parentFolderId);
+    const domains = Object.keys(byDomain).sort();
+    let rowsLeft = rowCap;
+    let next = 0;
+    for (; next < domains.length && rowsLeft > 0; next++) {
+        const d = domains[next];
+        rowsLeft -= appendDomainGroup(container, d, byDomain[d], parentFolderId, rowsLeft);
+    }
+    if (next === domains.length) return;
 
-        const header = document.createElement('div');
-        header.className = 'src-domain-header';
-        const ids = byDomain[d].map(b => b.id);
-        const count = byDomain[d].length;
-        // Show "Open 10" only when there's more than 10 to make a difference.
-        const open10Html = count > 10
-            ? `<button class="sm-btn domain-open-10-btn" title="Open first 10 in a new window" style="padding:2px 6px;">▶ 10</button>`
-            : '';
-        header.innerHTML = `
-            <span class="domain-drag-handle" title="Drag entire group" draggable="true">⋮⋮</span>
-            <span class="domain-name">${escapeHtml(d)}</span>
-            <span class="src-domain-count">(${count})</span>
-            <button class="sm-btn domain-open-all-btn" title="Open all in a new window" style="padding:2px 6px;">▶ All</button>
-            ${open10Html}
-            <button class="sm-btn domain-delete-btn" title="Delete all ${count} bookmarks under this domain" style="padding:2px 6px; color: #f87171;">🗑</button>
-        `;
-        group.appendChild(header);
-
-        // Open All / Open 10 click handlers
-        header.querySelector('.domain-open-all-btn').addEventListener('click', async (e) => {
-            e.stopPropagation();
-            await openBookmarksAsNewWindow(byDomain[d]);
-        });
-        const open10Btn = header.querySelector('.domain-open-10-btn');
-        if (open10Btn) {
-            open10Btn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                await openBookmarksAsNewWindow(byDomain[d].slice(0, 10));
-            });
-        }
-
-        // Delete entire domain group click handler
-        header.querySelector('.domain-delete-btn').addEventListener('click', async (e) => {
-            e.stopPropagation();
-            if (!confirm(`Delete all ${count} bookmarks under "${d}"?`)) return;
-            try {
-                await removeBookmarksSmart(ids);
-                group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
-                group.style.opacity = '0';
-                group.style.transform = 'translateX(20px)';
-                setTimeout(async () => {
-                    group.remove();
-                    await refreshFolderBodyIfOpen(parentFolderId);
-                }, 200);
-            } catch (err) {
-                alert('Could not delete bookmarks: ' + err.message);
-            }
-        });
-
-        // Middle click on the domain row opens all in a new window too.
-        const ignoreOnInteractive = (e) => e.target.closest('button') || e.target.closest('input');
-        header.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
-        header.addEventListener('auxclick', async (e) => {
-            if (e.button !== 1 || ignoreOnInteractive(e)) return;
-            e.preventDefault();
-            await openBookmarksAsNewWindow(byDomain[d]);
-        });
-
-        // Group-level drag (all bookmarks in this domain)
-        const handle = header.querySelector('.domain-drag-handle');
-        handle.addEventListener('dragstart', (e) => {
-            e.dataTransfer.setData('text/tp-bookmark-ids', JSON.stringify(ids));
-            e.dataTransfer.setData('text/tp-parent-id', String(parentFolderId));
-            e.dataTransfer.effectAllowed = 'move';
-            group.classList.add('dragging');
-            e.stopPropagation();
-        });
-        handle.addEventListener('dragend', () => group.classList.remove('dragging'));
-
-        // Individual rows
-        byDomain[d].forEach(b => {
-            const row = document.createElement('div');
-            row.className = 'src-tab-row';
-            row.draggable = true;
-            row.dataset.bookmarkId = b.id;
-            row.dataset.parentId = String(parentFolderId);
-            row.innerHTML = `
-                <img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=16" width="16" height="16" style="flex-shrink:0;">
-                <span title="${escapeHtml(b.url)}" style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(b.title || b.url)}</span>
-                <button class="sm-btn bookmark-delete-btn" title="Delete bookmark" style="padding:2px 6px; color: #f87171;">🗑</button>
-            `;
-            row.addEventListener('dragstart', (e) => {
-                e.dataTransfer.setData('text/tp-bookmark-id', String(b.id));
-                e.dataTransfer.setData('text/tp-parent-id', String(parentFolderId));
-                e.dataTransfer.effectAllowed = 'move';
-                row.classList.add('dragging');
-                e.stopPropagation();
-            });
-            row.addEventListener('dragend', () => row.classList.remove('dragging'));
-
-            // Delete individual bookmark click handler
-            row.querySelector('.bookmark-delete-btn').addEventListener('click', async (e) => {
-                e.stopPropagation();
-                if (!confirm(`Delete bookmark "${b.title || b.url}"?`)) return;
-                try {
-                    await removeBookmarksSmart([b.id]);
-                    row.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
-                    row.style.opacity = '0';
-                    row.style.transform = 'translateX(20px)';
-                    setTimeout(async () => {
-                        row.remove();
-                        const siblings = group.querySelectorAll('.src-tab-row');
-                        if (siblings.length === 0) {
-                            group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
-                            group.style.opacity = '0';
-                            group.style.transform = 'translateX(20px)';
-                            setTimeout(async () => {
-                                group.remove();
-                                await refreshFolderBodyIfOpen(parentFolderId);
-                            }, 200);
-                        } else {
-                            const countSpan = header.querySelector('.src-domain-count');
-                            if (countSpan) {
-                                countSpan.textContent = `(${siblings.length})`;
-                            }
-                            await refreshFolderBodyIfOpen(parentFolderId);
-                        }
-                    }, 200);
-                } catch (err) {
-                    alert('Could not delete bookmark: ' + err.message);
-                }
-            });
-
-            // Middle-click on a bookmark row → open in a new background tab in the current window.
-            row.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
-            row.addEventListener('auxclick', async (e) => {
-                if (e.button !== 1) return;
-                e.preventDefault();
-                await openBookmarkInCurrentWindow(b.url);
-            });
-
-            group.appendChild(row);
-        });
-
-        container.appendChild(group);
+    const restDomains = domains.slice(next);
+    const rest = restDomains.flatMap(d => byDomain[d]);
+    const more = document.createElement('button');
+    more.className = 'sm-btn src-more-btn';
+    more.textContent = `Show ${rest.length.toLocaleString()} more bookmarks in `
+        + `${restDomains.length.toLocaleString()} site${restDomains.length === 1 ? '' : 's'}`;
+    more.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const frag = document.createDocumentFragment();
+        appendDomainGroups(frag, rest, parentFolderId, { rowCap: SHOW_MORE_STEP });
+        more.replaceWith(frag);
     });
+    container.appendChild(more);
 }
 
-// inImports rides down the recursion so the whole archive subtree is locked,
-// not just its root.
-async function renderFolderBody(folderId, body, depth = 0, inImports = false) {
-    // Recursive: show subfolders (as nested cards) + loose bookmarks (grouped by domain).
-    const tree = await Tree.getSubTree(folderId);
-    if (!tree || !tree[0]) return;
-    const children = tree[0].children || [];
-    const subfolders = children.filter(c => !c.url);
-    const looseBookmarks = children.filter(isVisibleBookmark);
+// One domain group showing its first `firstRows` rows. `items` is the group's
+// full list, rendered or not; a row deleted on its own is taken out of it, so
+// the header's bulk actions stay exact. Returns how many rows it built.
+function appendDomainGroup(container, d, items, parentFolderId, firstRows) {
+    const group = document.createElement('div');
+    group.className = 'src-domain-group';
+    group.dataset.domain = d;
+    group.dataset.parentId = String(parentFolderId);
 
-    body.innerHTML = '';
+    const header = document.createElement('div');
+    header.className = 'src-domain-header';
+    const count = items.length;
+    // Show "Open 10" only when there's more than 10 to make a difference.
+    const open10Html = count > 10
+        ? `<button class="sm-btn domain-open-10-btn" title="Open first 10 in a new window" style="padding:2px 6px;">▶ 10</button>`
+        : '';
+    header.innerHTML = `
+        <span class="domain-drag-handle" title="Drag entire group" draggable="true">⋮⋮</span>
+        <span class="domain-name">${escapeHtml(d)}</span>
+        <span class="src-domain-count">(${count})</span>
+        <button class="sm-btn domain-open-all-btn" title="Open all in a new window" style="padding:2px 6px;">▶ All</button>
+        ${open10Html}
+        <button class="sm-btn domain-delete-btn" title="Delete all ${count} bookmarks under this domain" style="padding:2px 6px; color: #f87171;">🗑</button>
+    `;
+    group.appendChild(header);
+    const countSpan = header.querySelector('.src-domain-count');
+    const deleteBtn = header.querySelector('.domain-delete-btn');
 
-    if (subfolders.length === 0 && looseBookmarks.length === 0) {
-        body.innerHTML = '<div class="src-empty-state">This folder is empty.</div>';
-        return;
+    // Open All / Open 10 click handlers
+    header.querySelector('.domain-open-all-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await openBookmarksAsNewWindow([...items]);
+    });
+    const open10Btn = header.querySelector('.domain-open-10-btn');
+    if (open10Btn) {
+        open10Btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await openBookmarksAsNewWindow(items.slice(0, 10));
+        });
     }
 
-    // If this body belongs to the TabPaladin Workflows root, mark each child folder as a workflow.
-    const wfRoot = await findWorkflowRootSilent();
-    const parentIsWorkflowsRoot = wfRoot && wfRoot.id === folderId;
+    // Delete entire domain group click handler
+    deleteBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete all ${items.length} bookmarks under "${d}"?`)) return;
+        try {
+            await removeBookmarksSmart(items.map(b => b.id));
+            group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+            group.style.opacity = '0';
+            group.style.transform = 'translateX(20px)';
+            setTimeout(async () => {
+                group.remove();
+                await refreshFolderBodyIfOpen(parentFolderId);
+            }, 200);
+        } catch (err) {
+            alert('Could not delete bookmarks: ' + err.message);
+        }
+    });
 
-    // Subfolders first — each as a nested expandable card.
-    for (const sf of subfolders) {
-        const sfChildren = await Tree.getChildren(sf.id);
-        const card = renderFolderCard({
-            id: sf.id,
-            title: sf.title,
-            parentId: folderId,
-            folderCount: sfChildren.filter(c => !c.url).length,
-            fileCount: sfChildren.filter(isVisibleBookmark).length,
-            icon: parentIsWorkflowsRoot ? '🛡️' : '📁',
-            isWorkflow: parentIsWorkflowsRoot,
-            inImports: inImports || sf.title === IMPORTS_ROOT_TITLE
-        }, depth + 1);
-        body.appendChild(card);
+    // Middle click on the domain row opens all in a new window too.
+    const ignoreOnInteractive = (e) => e.target.closest('button') || e.target.closest('input');
+    header.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+    header.addEventListener('auxclick', async (e) => {
+        if (e.button !== 1 || ignoreOnInteractive(e)) return;
+        e.preventDefault();
+        await openBookmarksAsNewWindow([...items]);
+    });
+
+    // Group-level drag (all bookmarks in this domain)
+    const handle = header.querySelector('.domain-drag-handle');
+    handle.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('text/tp-bookmark-ids', JSON.stringify(items.map(b => b.id)));
+        e.dataTransfer.setData('text/tp-parent-id', String(parentFolderId));
+        e.dataTransfer.effectAllowed = 'move';
+        group.classList.add('dragging');
+        e.stopPropagation();
+    });
+    handle.addEventListener('dragend', () => group.classList.remove('dragging'));
+
+    // Individual rows: items[0..shown) are on screen, the rest behind "Show more".
+    let shown = 0;
+    let moreBtn = null;
+    const syncMore = () => {
+        const left = items.length - shown;
+        if (left <= 0) {
+            moreBtn?.remove();
+            moreBtn = null;
+            return;
+        }
+        if (!moreBtn) {
+            moreBtn = document.createElement('button');
+            moreBtn.className = 'sm-btn src-more-btn';
+            moreBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showRows(SHOW_MORE_STEP);
+            });
+            group.appendChild(moreBtn);
+        }
+        moreBtn.textContent = `Show ${left.toLocaleString()} more`;
+    };
+    const showRows = (n) => {
+        const end = Math.min(items.length, shown + n);
+        const frag = document.createDocumentFragment();
+        for (let i = shown; i < end; i++) {
+            frag.appendChild(buildBookmarkRow(items[i], d, parentFolderId, onRowDeleted));
+        }
+        group.insertBefore(frag, moreBtn);
+        shown = end;
+        syncMore();
+    };
+    // After a single row's delete: the count comes from the list, not from
+    // the rows on screen, which are only the first page of it.
+    async function onRowDeleted(b) {
+        const idx = items.indexOf(b);
+        if (idx >= 0) {
+            items.splice(idx, 1);
+            if (idx < shown) shown--;
+        }
+        if (items.length === 0) {
+            group.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+            group.style.opacity = '0';
+            group.style.transform = 'translateX(20px)';
+            setTimeout(async () => {
+                group.remove();
+                await refreshFolderBodyIfOpen(parentFolderId);
+            }, 200);
+            return;
+        }
+        countSpan.textContent = `(${items.length})`;
+        deleteBtn.title = `Delete all ${items.length} bookmarks under this domain`;
+        syncMore();
+        // This body is already right; rebuilding it would fold away any
+        // "Show more" pages. Header stats, and other copies, still update.
+        await refreshFolderBodyIfOpen(parentFolderId, group.closest('.source-folder-card'));
     }
 
-    // Loose bookmarks grouped by domain.
-    appendDomainGroups(body, looseBookmarks, folderId);
+    showRows(Math.max(0, firstRows));
+    container.appendChild(group);
+    return shown;
+}
+
+function buildBookmarkRow(b, d, parentFolderId, onDeleted) {
+    const row = document.createElement('div');
+    row.className = 'src-tab-row';
+    row.draggable = true;
+    row.dataset.bookmarkId = b.id;
+    row.dataset.parentId = String(parentFolderId);
+    row.innerHTML = `
+        <img src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=16" width="16" height="16" style="flex-shrink:0;">
+        <span title="${escapeHtml(b.url)}" style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(b.title || b.url)}</span>
+        <button class="sm-btn bookmark-delete-btn" title="Delete bookmark" style="padding:2px 6px; color: #f87171;">🗑</button>
+    `;
+    row.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('text/tp-bookmark-id', String(b.id));
+        e.dataTransfer.setData('text/tp-parent-id', String(parentFolderId));
+        e.dataTransfer.effectAllowed = 'move';
+        row.classList.add('dragging');
+        e.stopPropagation();
+    });
+    row.addEventListener('dragend', () => row.classList.remove('dragging'));
+
+    // Delete individual bookmark click handler
+    row.querySelector('.bookmark-delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete bookmark "${b.title || b.url}"?`)) return;
+        try {
+            await removeBookmarksSmart([b.id]);
+            row.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+            row.style.opacity = '0';
+            row.style.transform = 'translateX(20px)';
+            setTimeout(() => {
+                row.remove();
+                onDeleted(b);
+            }, 200);
+        } catch (err) {
+            alert('Could not delete bookmark: ' + err.message);
+        }
+    });
+
+    // Middle-click on a bookmark row → open in a new background tab in the current window.
+    row.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+    row.addEventListener('auxclick', async (e) => {
+        if (e.button !== 1) return;
+        e.preventDefault();
+        await openBookmarkInCurrentWindow(b.url);
+    });
+
+    return row;
+}
+
+// The body of an open folder card, built detached: subfolders first as nested
+// cards (each reopened as remembered, against `budget`), then the loose
+// bookmarks by domain. inImports rides down the recursion so the whole archive
+// subtree is locked, not just its root.
+async function buildFolderBody(folderId, depth = 0, inImports = false, budget = newRestoreBudget()) {
+    const frag = document.createDocumentFragment();
+    const note = (text) => {
+        frag.replaceChildren();
+        const el = document.createElement('div');
+        el.className = 'src-empty-state';
+        el.textContent = text;
+        frag.appendChild(el);
+        return frag;
+    };
+
+    try {
+        // One level is all a body shows; getSubTree would build a view of the
+        // folder's entire subtree on every open.
+        const children = await Tree.getChildren(folderId);
+        const subfolders = children.filter(c => !c.url);
+        const looseBookmarks = children.filter(isVisibleBookmark);
+
+        if (subfolders.length === 0 && looseBookmarks.length === 0) {
+            return note('This folder is empty.');
+        }
+
+        // If this body belongs to the TabPaladin Workflows root, mark each child folder as a workflow.
+        const wfRoot = await findWorkflowRootSilent();
+        const parentIsWorkflowsRoot = wfRoot && wfRoot.id === folderId;
+
+        // Subfolders first — each as a nested expandable card.
+        for (const sf of subfolders) {
+            const sfChildren = await Tree.getChildren(sf.id);
+            frag.appendChild(await buildFolderCard({
+                id: sf.id,
+                title: sf.title,
+                parentId: folderId,
+                folderCount: sfChildren.filter(c => !c.url).length,
+                fileCount: sfChildren.filter(isVisibleBookmark).length,
+                icon: parentIsWorkflowsRoot ? '🛡️' : '📁',
+                isWorkflow: parentIsWorkflowsRoot,
+                inImports: inImports || sf.title === IMPORTS_ROOT_TITLE
+            }, depth + 1, budget));
+        }
+
+        // Loose bookmarks grouped by domain.
+        appendDomainGroups(frag, looseBookmarks, folderId);
+    } catch (e) {
+        // Deleted while this was open (another view, a pull): say so instead
+        // of leaving a half-built body behind.
+        if (!(await TreeStore.getNode(folderId))) return note('Folder no longer exists.');
+        console.warn('[TabPaladin] Could not show folder', folderId, e);
+        return note('Could not load this folder.');
+    }
+    return frag;
 }
 
 // Helper: walk parent chain to detect cycles for folder drops.
@@ -1948,32 +2188,34 @@ async function isAncestorOf(ancestorId, descendantId) {
     return false;
 }
 
-// Surgical refresh: re-render only the open body of the given folder card(s).
-// Used after a drop so expanded siblings remain expanded.
-async function refreshFolderBodyIfOpen(folderId) {
-    if (!folderId) return;
-    const cards = document.querySelectorAll(`.source-folder-card[data-id="${CSS.escape(String(folderId))}"]`);
+function folderCardsFor(folderId) {
+    return document.querySelectorAll(`.source-folder-card[data-id="${CSS.escape(String(folderId))}"]`);
+}
+
+// Header stats of every card showing this folder, open or closed.
+async function updateFolderCardStats(folderId) {
+    const cards = folderCardsFor(folderId);
+    if (!cards.length) return;
+    let children;
+    try {
+        children = await Tree.getChildren(folderId);
+    } catch (e) { return; /* folder gone — fine */ }
+    const text = folderStatsText(children.filter(c => !c.url).length, children.filter(isVisibleBookmark).length);
     for (const card of cards) {
-        const body = card.querySelector('.source-folder-body');
-        const depth = parseInt(card.dataset.depth || '0');
+        const statsEl = card.querySelector(':scope > .source-folder-header .folder-stats');
+        if (statsEl) statsEl.textContent = text;
+    }
+}
 
-        // Update header stats regardless of body open/closed
-        try {
-            const children = await Tree.getChildren(folderId);
-            const folderCount = children.filter(c => !c.url).length;
-            const fileCount = children.filter(isVisibleBookmark).length;
-            const statsEl = card.querySelector('.folder-stats');
-            if (statsEl) {
-                const parts = [];
-                if (folderCount > 0) parts.push(`${folderCount} 📁`);
-                if (fileCount > 0) parts.push(`${fileCount} 📄`);
-                statsEl.textContent = parts.join(' · ') || 'Empty';
-            }
-        } catch (e) { /* folder gone — fine */ }
-
-        if (body && body.style.display !== 'none') {
-            await renderFolderBody(folderId, body, depth, card.dataset.imports === '1');
-        }
+// Surgical refresh: re-render only the open body of the given folder card(s).
+// Used after a drop so expanded siblings remain expanded — and the rebuilt
+// body reopens its own remembered-open subfolders. `except` is a card the
+// caller has already brought up to date.
+async function refreshFolderBodyIfOpen(folderId, except = null) {
+    if (!folderId) return;
+    await updateFolderCardStats(folderId);
+    for (const card of folderCardsFor(folderId)) {
+        if (card !== except) await cardControls.get(card)?.refresh();
     }
 }
 
@@ -2449,6 +2691,13 @@ document.getElementById('cancelSourceBtn').addEventListener('click', () => {
     document.getElementById('organizer-source-container').style.display = 'none';
     document.getElementById('groups-container').style.display = 'block';
     document.getElementById('source-list').className = ''; // Reset class just in case
+    // Folders opened or closed in Organize share their state with the main
+    // view; bring its columns in line instead of showing them as they were.
+    if (isMainViewVisible()) renderMainView({ regroup: false });
+});
+// The app page's wordmark (app.js goHome) is the other way back.
+window.addEventListener('tabpaladin:home-refresh', () => {
+    if (isMainViewVisible()) renderMainView({ regroup: false });
 });
 
 // Step 2: Analyze & Propose
@@ -4044,6 +4293,9 @@ async function doPull({ skipConfirm = false } = {}) {
         let items = 0;
         const walk = (n) => { items++; (n.children || []).forEach(walk); };
         (tree[0].children || []).forEach(walk);
+        // Folders deleted on another device drop out of the open/closed
+        // state — but never against an empty pull, where all would look gone.
+        if (items > 0) await pruneStaleExpandState({ afterPull: true });
         return items === 0
             ? `Pulled (v${version}) — but the server's tree is EMPTY.`
             : `Pulled ${items} item(s) (v${version}).`;

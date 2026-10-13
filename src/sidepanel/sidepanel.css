@@ -804,6 +804,22 @@ ol {
   opacity: 0.4;
 }
 
+/* "Show N more": a big folder shows its first rows, the rest on demand. Lined
+   up with the rows it continues. */
+.src-more-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 8px 4px 24px;
+  margin-top: 2px;
+  font-size: 0.8rem;
+}
+
+/* Open last time, but left closed so the page stays fast (hollow caret). */
+.source-folder-card.restore-skipped > .source-folder-header .folder-caret {
+  opacity: 0.6;
+}
+
 /* Nested folder cards (rendered inside another card's body) */
 .source-folder-card.nested {
   background-color: rgba(255, 255, 255, 0.02);
