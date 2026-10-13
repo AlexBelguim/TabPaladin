@@ -5217,8 +5217,9 @@ window.addEventListener('DOMContentLoaded', () => {
     });
     safeAddListener('inbox-close', 'click', () => hide($('inbox-sheet')));
 
-    // The share sheet's keys on a desktop: 1-4 save to that chip, typing
-    // searches, Esc steps back or means Later.
+    // The share sheet's keys on a desktop: a number saves to that chip (as
+    // drawn, the starter first), typing searches, Esc steps back or means
+    // Later, Enter is Done unless a button has the focus.
     document.addEventListener('keydown', (e) => {
         if (shareSheet && shareSheet.onKey(e) && e.stopImmediatePropagation) e.stopImmediatePropagation();
     }, true);
