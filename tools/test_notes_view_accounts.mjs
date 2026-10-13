@@ -45,6 +45,16 @@
 //      success is never applied to it, a pull agreed to stops when the copy
 //      is edited before it lands, and Discard discards nothing — drafts
 //      included — once the copy it listed was restored or replaced.
+//  13. The live draft: the open note's unsaved text is written to extension
+//      storage (tpLiveDraft, per page) half a second after the last key, at
+//      once on pagehide and when an update asks (saveLiveDraft), stamped with
+//      its copy; saving, discarding or typing back to the saved text clears
+//      it.
+//  14. The live drafts of pages that are gone (their lock is free) are parked
+//      and mirrored (tpParkedMirror), the living page's left alone, and come
+//      back into the editor only for their own copy; one that says what its
+//      note now says is let go. Drafts only the mirror still holds come back
+//      into the list; a mirror older than the list brings back nothing.
 //
 // Run: node tools/test_notes_view_accounts.mjs
 
@@ -978,6 +988,117 @@ console.log('\n12. Every answer applies only to the copy it was about');
         again && again.key === first.key && again.setAsideAt !== first.setAsideAt
         && (await TreeStore.listStashes()).some(s => s.key === first.key) && has(stashWith('ALICE LATER EDIT'), 'ALICE UNPUSHED')
         && /Nothing was discarded/.test($('stash-status').textContent), $('stash-status').textContent);
+}
+
+console.log('\n13. The live draft: unsaved text outlives the page');
+{
+    if (NV.isDirty()) await discardDraft();
+    await clearStashes();
+    ls.delete('tp_notes_parked_v1');
+    await otherPageLoads(ALICE, aliceRoots());
+    await settle();
+    const live = () => storageData.get('tpLiveDraft') || {};
+    const mine = () => Object.values(live());
+    const firePagehide = () => { for (const fn of winListeners.pagehide || []) fn({ type: 'pagehide' }); };
+
+    await NV.openNotes({ noteId: 'a-note1' });
+    await type('noteContentInput', '# Diary\nLIVE ONE');
+    await sleep(200);
+    check('while typing goes on, nothing is written yet', mine().length === 0, JSON.stringify(live()));
+    await sleep(500);
+    check('half a second after the last key, the unsaved text is in extension storage, stamped with its copy',
+        mine().length === 1 && mine()[0].content === '# Diary\nLIVE ONE' && mine()[0].noteId === 'a-note1'
+        && mine()[0].owner.userId === 1 && mine()[0].owner.url === URL_S && mine()[0].loaded.content === '# Diary\nalice old text'
+        && typeof mine()[0].at === 'string', JSON.stringify(live()));
+
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    check('Save clears it', mine().length === 0, JSON.stringify(live()));
+
+    await type('noteContentInput', '# Diary\nLIVE TWO');
+    firePagehide();
+    await sleep(30);
+    check('the page going away writes it at once', mine().length === 1 && mine()[0].content === '# Diary\nLIVE TWO');
+    await type('noteContentInput', '# Diary\nalice old text');
+    await sleep(30);
+    await type('noteContentInput', (await NotesManager.getLibrary()).notes.find(n => n.id === 'a-note1').content);
+    await sleep(30);
+    check('typing back to what is saved clears it', !NV.isDirty() && mine().length === 0, JSON.stringify(live()));
+
+    await type('noteContentInput', '# Diary\nLIVE THREE');
+    await NV.saveLiveDraft();
+    check('saveLiveDraft (an update about to reload the page) writes it now', mine().length === 1 && mine()[0].content === '# Diary\nLIVE THREE');
+    await discardDraft();
+    await sleep(30);
+    check('discarding clears it', mine().length === 0, JSON.stringify(live()));
+}
+
+console.log('\n14. A page that is gone: its live draft comes back, for its copy only');
+{
+    const live = () => storageData.get('tpLiveDraft') || {};
+    const at = '2026-10-13T10:00:00.000Z';
+    const draft = (owner, content, extra = {}) => ({ owner, origin: null, noteId: 'a-note1', notebookId: 'a-nb', title: 'Diary', content,
+        loaded: { title: 'Diary', content: '# Diary\nalice old text' }, at, ...extra });
+    // A page still open elsewhere holds its lock; the others are gone.
+    let releaseLive = null;
+    navigator.locks.request('tp-notes-page:living-page', () => new Promise(r => { releaseLive = r; }));
+    await sleep(0);
+    const saved = (await NotesManager.getLibrary()).notes.find(n => n.id === 'a-note1');
+    await chrome.storage.local.set({ tpLiveDraft: {
+        'living-page': draft(ALICE, '# Diary\nSTILL BEING TYPED ELSEWHERE'),
+        'gone-alice': draft(ALICE, '# Diary\nFROM A PAGE THAT CLOSED'),
+        'gone-bob': { ...draft(BOB, '# Bob todo\nBOB FROM A CLOSED PAGE'), noteId: 'b-note1', notebookId: 'b-nb', title: 'Bob todo' },
+        // By its turn, its note says the same (the draft above, saved).
+        'gone-same': { ...draft(ALICE, '# Diary\nFROM A PAGE THAT CLOSED'), title: saved.title, at: '2026-10-13T09:00:00.000Z' }
+    } });
+    leaveNotes();
+    // As a page that starts does: its editor is empty. (Here the copy is
+    // loaded again, as another page writing it under a new id would, which
+    // starts the view over.)
+    const reload = async () => {
+        await TreeStore.flush();
+        await otherPageLoads(ALICE, storageData.get('tpTree').roots);
+        await settle();
+    };
+    await reload();
+    check('(the editor starts empty)', editorText() === '\n' && !NV.isDirty());
+    const n = await NV.recoverLiveDrafts();
+    check('the drafts of the three pages that are gone are taken, the living page\'s left alone',
+        n === 3 && JSON.stringify(Object.keys(live())) === '["living-page"]', JSON.stringify(Object.keys(live())));
+    check('they are parked (and mirrored) before anything else', parked().length === 3 && parked().every(d => d.from === 'live')
+        && JSON.stringify((storageData.get('tpParkedMirror') || {}).drafts) === JSON.stringify(parked()), JSON.stringify(parked()));
+    await NV.openNotes();
+    await settle();
+    check('alice\'s comes back into the editor on its note, unsaved',
+        $('noteContentInput').value === '# Diary\nFROM A PAGE THAT CLOSED' && NV.isDirty() && $('nv-removed').hidden === true);
+    check('bob\'s stays parked for bob', parked().length >= 1 && parked().some(d => d.owner.userId === 2)
+        && !editorText().includes('BOB'), JSON.stringify(parked()));
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    leaveNotes();
+    await reload();
+    await NV.openNotes();
+    await settle();
+    check('one that says what its note already says holds nothing unsaved: it is let go, not shown',
+        !NV.isDirty() && parked().length === 1 && parked()[0].owner.userId === 2, JSON.stringify(parked()));
+    check('saving the recovered text updates her note', (await NotesManager.getLibrary()).notes.find(n => n.id === 'a-note1').content
+        === '# Diary\nFROM A PAGE THAT CLOSED');
+    releaseLive();
+
+    // localStorage lost the list (or never could hold it): the mirror has it.
+    const mirror = storageData.get('tpParkedMirror');
+    ls.delete('tp_notes_parked_v1');
+    ls.delete('tp_notes_parked_at_v1');
+    await NV.restoreParkedFromMirror();
+    check('drafts only the mirror still holds come back into the list', parked().length === 1 && parked()[0].owner.userId === 2
+        && JSON.stringify(parked()) === JSON.stringify(mirror.drafts), JSON.stringify(parked()));
+    // A mirror older than the list (the list was written last) brings back nothing.
+    await chrome.storage.local.set({ tpParkedMirror: { at: 1, drafts: [...mirror.drafts, { owner: ALICE, content: 'STALE', title: 'x', noteId: null, parkedAt: at }] } });
+    await NV.restoreParkedFromMirror();
+    check('a mirror older than the list brings back nothing it no longer has', parked().length === 1 && !JSON.stringify(parked()).includes('STALE'));
+    await sleep(20);
+    check('and is brought up to date', JSON.stringify((storageData.get('tpParkedMirror') || {}).drafts) === JSON.stringify(parked()));
+    ls.delete('tp_notes_parked_v1');
 }
 
 console.log(failures === 0 ? '\nAll notes-view account tests passed.\n' : `\n${failures} test(s) failed.\n`);
