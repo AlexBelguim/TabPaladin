@@ -79,9 +79,14 @@ with at `/api/identity`. Keep it with your backups of `sync.db`. A server
 restored without it makes a new key, and every client that pinned this server
 (the browser helper, once it ships) then refuses it until someone pins it
 again by hand. The file is private: whoever holds it can pass as your server.
-An unreadable key file is moved aside (`identity.jwk.unreadable-<timestamp>`),
-never deleted, and a new key made; the log says so, and prints the key's id
-(`identity key <id>`) on every start.
+A key file whose content is not a valid key is moved aside
+(`identity.jwk.unreadable-<timestamp>`), never deleted, and a new key made; the
+log says so, and prints the key's id (`identity key <id>`) on every start. A
+key file the server cannot read at all is left as it is and no new key is
+made: `/api/identity` answers 503 and the log says what to fix. After a
+restore, check that the file belongs to the server's user (in the container,
+`node`; `sudo chown 1000:1000 identity.jwk` on the host) before the first
+start, or the server serves without its identity until it does.
 
 ### Upgrading an existing server
 

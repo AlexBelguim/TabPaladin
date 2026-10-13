@@ -242,7 +242,7 @@ const SERVER_ID = serverId(db);
 // having one is not a reason to stop serving everyone's data.
 const IDENTITY = loadOrCreateIdentity(DATA_DIR);
 if (!IDENTITY.ok) {
-    console.warn(`[TabPaladin] No identity key (${IDENTITY.error}); /api/identity answers 503 until the next start.`);
+    console.warn(`[TabPaladin] No identity key, so /api/identity answers 503 until the next start: ${IDENTITY.error}`);
 } else if (IDENTITY.created) {
     console.log(`[TabPaladin] Made this server's identity key ${IDENTITY.keyId} in ${path.join(DATA_DIR, IDENTITY_FILE)}. Back it up with the database.`);
 }

@@ -9,9 +9,11 @@
 //
 // The file is part of a backup. A server restored without it makes a new key
 // on its next start, and every pinned client then refuses it until someone
-// pins it again by hand. A file that cannot be read is moved aside (never
-// deleted) and a new one made, with a loud warning; if no key can be had at
-// all, the server still runs and /api/identity answers 503.
+// pins it again by hand. A file whose content is not a valid key is moved
+// aside (never deleted) and a new one made, with a loud warning. A file the
+// server cannot read at all (its owner or mode, a disk error) is left alone
+// and no key is made: that is a fault to fix, not a reason to change identity.
+// With no key, the server still runs and /api/identity answers 503.
 //
 // Top-level on purpose: the Dockerfile copies server/*.js and server/imports
 // only, and a module in a new subdirectory would crash-loop the container.
@@ -84,13 +86,31 @@ export function loadOrCreateIdentity(dataDir, { log = console } = {}) {
     let key = null;
     let record = null;
     try {
-        if (fs.existsSync(file)) {
-            try { record = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { record = null; }
+        let text = null;
+        try {
+            text = fs.readFileSync(file, 'utf8');
+        } catch (e) {
+            // No file: make one. A file there that cannot be read (wrong owner
+            // or mode after a restore, a disk error) is not a broken key, and a
+            // new identity is exactly what a pin flags: leave it where it is
+            // and serve without one until someone fixes it.
+            if (e.code !== 'ENOENT') {
+                const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+                return {
+                    ok: false,
+                    error: `${file} is there but cannot be read (${e.code || e.message}), and was left as it is. `
+                        + `Let the server's user read it${uid === null ? '' : ` (on the host: sudo chown ${uid}:${uid} <that file>)`}`
+                        + ' and restart, and the server keeps its identity.'
+                };
+            }
+        }
+        if (text !== null) {
+            try { record = JSON.parse(text); } catch (e) { record = null; }
             key = validPrivateJwk(record);
             if (!key) {
                 movedAside = `${file}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
                 fs.renameSync(file, movedAside);
-                log.warn(`[TabPaladin] ${file} could not be read as a key; moved it to ${movedAside} and made a new identity. `
+                log.warn(`[TabPaladin] ${file} is not a valid key; moved it to ${movedAside} and made a new identity. `
                     + 'Clients that pinned this server must pin it again.');
             }
         }

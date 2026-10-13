@@ -12,16 +12,18 @@
 //   4. HTML escaping covers the characters that matter in text and attributes.
 //   5. The server's identity key (identity.js): made once in the data
 //      directory and read back the same, a signature over the nonce and the
-//      server id that WebCrypto verifies, and an unreadable key file moved
-//      aside (never deleted) for a new one.
+//      server id that WebCrypto verifies, a key file whose content is not a
+//      key moved aside (never deleted) for a new one, and a key file that
+//      cannot be read (its permissions, a directory in its place) left as it
+//      is, with no new key made, so the identity is back once it is fixed.
 //   6. A live server (on --port): the web app's files carry its CSP (script,
 //      object, base, frame-ancestors and form-action enforced; connect-src
 //      and img-src only reported), COOP and X-Frame-Options on its HTML;
 //      every other HTML response — the /api/imports pages, Express's 404,
 //      error and redirect pages — the strict script-free CSP; nosniff and
 //      Referrer-Policy on every response; /api/health says app and serverId;
-//      /api/identity signs the nonce, refuses a bad one, and keeps its key
-//      across a restart.
+//      /api/identity signs the nonce, refuses a bad one, keeps its key
+//      across a restart, and answers 503 while its key file cannot be read.
 //
 // Run: node tools/test_security.mjs [--port 18988]
 
@@ -153,8 +155,63 @@ const warnings = [];
         fs.writeFileSync(file, '{"kty":"EC","crv":"P-256","x":"broken"}');
         const healed = loadOrCreateIdentity(dir, { log: quiet });
         const aside = fs.readdirSync(dir).filter(f => f.startsWith(`${IDENTITY_FILE}.unreadable-`));
-        check('an unreadable key file is moved aside, not deleted, and a new key made', healed.ok && healed.created && healed.keyId !== first.keyId
+        check('a key file whose content is not a key is moved aside, not deleted, and a new key made', healed.ok && healed.created && healed.keyId !== first.keyId
             && aside.length === 1 && fs.readFileSync(path.join(dir, aside[0]), 'utf8').includes('broken') && warnings.some(w => /pin it again/.test(w)));
+
+        // A key file the server cannot read (restored root-owned, mode 0600,
+        // into a directory it can write) is a fault to fix, not a broken key:
+        // it stays where it is, no key is made, and once it can be read the
+        // same identity is back. readFileSync is made to fail for that one
+        // file, as on Linux; renaming would still work, as it would there.
+        const keyText = fs.readFileSync(file, 'utf8');
+        const asideBefore = fs.readdirSync(dir).filter(f => f.startsWith(`${IDENTITY_FILE}.unreadable-`)).length;
+        const warnedBefore = warnings.length;
+        const realRead = fs.readFileSync;
+        fs.readFileSync = function (p, ...rest) {
+            if (path.resolve(String(p)) === path.resolve(file)) {
+                throw Object.assign(new Error(`EACCES: permission denied, open '${file}'`), { code: 'EACCES', errno: -13, syscall: 'open', path: file });
+            }
+            return realRead.call(this, p, ...rest);
+        };
+        let denied;
+        try {
+            denied = loadOrCreateIdentity(dir, { log: quiet });
+        } finally {
+            fs.readFileSync = realRead;
+        }
+        const asideAfter = fs.readdirSync(dir).filter(f => f.startsWith(`${IDENTITY_FILE}.unreadable-`)).length;
+        check('a key file that cannot be read is left as it is, and no new key is made', denied && !denied.ok
+            && /cannot be read \(EACCES\)/.test(denied.error) && /left as it is/.test(denied.error)
+            && fs.readFileSync(file, 'utf8') === keyText && asideAfter === asideBefore && warnings.length === warnedBefore,
+            JSON.stringify(denied));
+        const restored = loadOrCreateIdentity(dir, { log: quiet });
+        check('  and once it can be read, the identity is the same one', restored.ok && !restored.created && restored.keyId === healed.keyId);
+
+        // The same for a real read error: identity.jwk a directory (Docker
+        // makes one when a bind-mounted file is missing on the host).
+        const dirCase = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-identity-dir-'));
+        try {
+            fs.mkdirSync(path.join(dirCase, IDENTITY_FILE));
+            const isDir = loadOrCreateIdentity(dirCase, { log: quiet });
+            check('  a key path that is a directory is left alone too (no key, nothing moved, nothing made)', !isDir.ok && /EISDIR/.test(isDir.error)
+                && fs.statSync(path.join(dirCase, IDENTITY_FILE)).isDirectory() && fs.readdirSync(dirCase).length === 1, JSON.stringify(isDir));
+        } finally {
+            fs.rmSync(dirCase, { recursive: true, force: true });
+        }
+
+        // And on Linux or macOS, for real: mode 000 (root reads anything, so
+        // only when not root).
+        if (process.platform !== 'win32' && typeof process.getuid === 'function' && process.getuid() !== 0) {
+            fs.chmodSync(file, 0o000);
+            let locked;
+            try {
+                locked = loadOrCreateIdentity(dir, { log: quiet });
+            } finally {
+                fs.chmodSync(file, 0o600);
+            }
+            check('  a key file with mode 000 is left as it is', !locked.ok && /EACCES/.test(locked.error) && fs.readFileSync(file, 'utf8') === keyText,
+                JSON.stringify(locked));
+        }
         check('the nonce rule wants 128 bits of hex', NONCE_RE.test('0'.repeat(32)) && !NONCE_RE.test('0'.repeat(31)) && !NONCE_RE.test('G'.repeat(32))
             && !NONCE_RE.test('0'.repeat(129)));
     } finally {
@@ -285,9 +342,26 @@ try {
     server = startServer();
     await server.ready;
     const id3 = await (await get('/api/identity?nonce=' + nonce)).json();
-    check('a server whose key file is unreadable still starts, with a new key, and says so',
+    check('a server whose key file is not a key still starts, with a new key, and says so',
         id3.ok && id3.keyId !== id.keyId && /pin it again/.test(server.log())
         && fs.readdirSync(liveDir).some(f => f.startsWith(`${IDENTITY_FILE}.unreadable-`)), server.log());
+    await server.stop();
+
+    // A key path it cannot read at all: served without an identity, the path
+    // untouched, and the log says what to fix.
+    const keyFile = path.join(liveDir, IDENTITY_FILE);
+    const asideCount = () => fs.readdirSync(liveDir).filter(f => f.startsWith(`${IDENTITY_FILE}.unreadable-`)).length;
+    const asideBefore = asideCount();
+    fs.rmSync(keyFile);
+    fs.mkdirSync(keyFile);
+    server = startServer();
+    await server.ready;
+    const id4 = await get('/api/identity?nonce=' + nonce);
+    const health4 = await get('/api/health');
+    check('a server whose key file cannot be read serves on, /api/identity answers 503, nothing is moved or made, and the log says why',
+        id4.status === 503 && health4.status === 200 && fs.statSync(keyFile).isDirectory() && asideCount() === asideBefore
+        && /No identity key/.test(server.log()) && /cannot be read/.test(server.log()) && !/pin it again/.test(server.log()),
+        `${id4.status} ${server.log()}`);
 } catch (e) {
     failures++;
     console.error(`FAIL  live server: ${e.stack || e}`);
