@@ -181,7 +181,8 @@ async function main() {
         const [entry] = await outboxEntries(caches);
         check('and the entry stays, uploaded, for the app to read', entry && entry.uploaded === true && entry.phase === 'uploaded'
             && entry.account.userId === 1 && entry.fields.text.includes('nasa'));
-        check('open windows are told', w.posted.some(m => m.type === 'tp-outbox' && m.result.uploaded.includes(entry.sid)));
+        check('open windows are told, and as whom it flushed', w.posted.some(m => m.type === 'tp-outbox' && m.result.uploaded.includes(entry.sid)
+            && m.account && m.account.userId === 1 && m.account.username === entry.account.username));
     }
 
     console.log('\n2. Whatever the network does, the share is kept and the app opens on it');

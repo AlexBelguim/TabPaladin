@@ -67,14 +67,15 @@ async function readConfig() {
 }
 
 // Upload what waits in the outbox, for the account signed in now, and tell
-// any open window what happened (it folds filed links into its copy).
+// any open window what happened, and as whom (it folds filed links into its
+// copy only when that copy is the same account's).
 async function flush(opts = {}) {
     const cfg = await readConfig();
     if (!cfg) return null;
     const result = await Share.flushOutbox({ outbox: outbox(), cfg, fetch: (u, o) => fetch(u, o), timeoutMs: UPLOAD_TIMEOUT_MS, ...opts });
     try {
         const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-        for (const w of wins) w.postMessage({ type: 'tp-outbox', result });
+        for (const w of wins) w.postMessage({ type: 'tp-outbox', result, account: Share.accountOf(cfg) });
     } catch (e) { /* no window to tell */ }
     return result;
 }

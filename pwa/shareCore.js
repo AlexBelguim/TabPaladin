@@ -10,7 +10,8 @@
 //   makeEntry         an outbox entry for a share
 //   cacheOutbox       the outbox in Cache Storage (tp-outbox), shared by the
 //                     worker and the page; localOutbox is the page's fallback
-//   flushOutbox       upload what waits, file what was chosen offline
+//   flushOutbox       upload what waits, file what was chosen
+//   mergeIntent       the folders chosen for a share, tap after tap
 //   indexFolders      the tree's folders a link can be filed into
 //   suggest           the chips for an app; searchFolders for the picker
 //   applyOps          fold the server's logged appends into a working copy
@@ -24,7 +25,11 @@
     // closing brackets it ends with only when it opened them.
     const TRAILING = new Set(['.', ',', ';', ':', '!', '?', "'", '"', '»', '…', '”', '’', '>', '。', '、', '，']);
     const PAIRS = { ')': '(', ']': '[', '}': '{', '>': '<', '）': '（', '」': '「', '』': '『', '】': '【' };
-    const URL_RE = /https?:\/\/[^\s<>"'`\u00a0\u2028\u2029]+/gi;
+    // A link in running text: an apostrophe may be inside it (Ender's_Game,
+    // /maps/place/Joe's+Pizza) and is trimmed only at its end; it stops at
+    // CJK text and at full-width or CJK punctuation, which share texts put
+    // straight after it ('.../AbC' then '，复制本条信息').
+    const URL_RE = /https?:\/\/[^\s<>"`\u00a0\u2028\u2029\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]+/gi;
     const BARE_RE = /^(?:www\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,24}(?::\d{2,5})?(?:[/?#]\S*)?$/i;
 
     function count(s, ch) {
@@ -79,7 +84,12 @@
     // --- Hosts and apps ----------------------------------------------------------
 
     const hostOf = (u) => u.hostname.toLowerCase().replace(/\.$/, '');
-    const bare = (host) => host.replace(/^(?:www|m|mobile)\./, '');
+    // Without a www., m. or mobile. subdomain — never one that is part of the
+    // site's own name (mobile.de, m.me).
+    const bare = (host) => {
+        const b = host.replace(/^(?:www|m|mobile)\./, '');
+        return b.length >= registrableDomain(host).length ? b : host;
+    };
     const on = (host, domain) => host === domain || host.endsWith('.' + domain);
 
     // Two-label public suffixes common enough to matter: bbc.co.uk is the
@@ -138,7 +148,7 @@
         if (!u) return 'site:unknown';
         const h = hostOf(u);
         for (const [app, , test] of APPS) if (test(h, u)) return app;
-        const site = 'site:' + bare(registrableDomain(h));
+        const site = 'site:' + registrableDomain(h);
         return /^[a-z0-9:._-]{1,80}$/.test(site) ? site : 'site:unknown';
     }
 
@@ -189,9 +199,10 @@
     }
 
     // The same link, however it was written: scheme, www./m./mobile., a
-    // trailing slash, tracking parameters and the fragment are ignored;
-    // twitter.com is x.com and a post is its id; youtu.be/ID and /shorts/ID
-    // are watch?v=ID.
+    // trailing slash, tracking parameters and a fragment that only scrolls
+    // (#section) are ignored; one that routes (#/item/1, #!/item, Gmail's
+    // #inbox/ID) is part of the page and kept. twitter.com is x.com and a
+    // post is its id; youtu.be/ID and /shorts/ID are watch?v=ID.
     function dedupeKey(url) {
         const u = parseHttp(cleanUrl(String(url || '')));
         if (!u) return String(url || '').trim().toLowerCase();
@@ -211,13 +222,14 @@
             if (id) { host = 'youtube.com'; path = '/watch'; search = '?v=' + id; }
         }
         if (path.length > 1) path = path.replace(/\/+$/, '');
-        return host + (path === '/' ? '' : path) + search;
+        const route = /^#!|^#[^#]*\//.test(u.hash) ? u.hash : '';
+        return host + (path === '/' ? '' : path) + search + route;
     }
 
     // --- What was shared --------------------------------------------------------------
 
     const collapse = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-    const stripEdges = (s) => s.replace(/^[\s\-–—:|·•,;]+|[\s\-–—:|·•,;]+$/g, '').trim();
+    const stripEdges = (s) => s.replace(/^[\s\-–—:|·•,;，、：；]+|[\s\-–—:|·•,;，、：；]+$/g, '').trim();
     // What taking a link out of running text leaves behind: the brackets or
     // quotes it sat in, and punctuation standing on its own.
     const tidy = (s) => String(s || '')
@@ -245,11 +257,12 @@
     }
 
     // The link, title and app in {title, text, url} as a share target got
-    // them. The link is the first http(s) URL in url, then text, then title
-    // (or a whole field that is a bare 'host.tld/path'); further links go to
-    // `others`. The title is the subject, else the text with the link taken
-    // out, else one made from the link. No link: url is null and the text is
-    // kept, for Save as note.
+    // them. The link is the url field when the whole of it is an http(s) URL
+    // (taken as written: it is no running text), else the first http(s) URL
+    // in url, then text, then title (or a whole field that is a bare
+    // 'host.tld/path'); further links go to `others`. The title is the
+    // subject, else the text with the link taken out, else one made from the
+    // link. No link: url is null and the text is kept, for Save as note.
     function extractShare(fields) {
         const f = {
             title: String((fields && fields.title) || ''),
@@ -258,6 +271,8 @@
         };
         const found = [];
         for (const key of ['url', 'text', 'title']) {
+            const whole = key === 'url' ? f.url.trim() : '';
+            if (whole && !/\s/.test(whole) && parseHttp(whole)) { found.push({ link: whole, at: 0, key }); continue; }
             for (const hit of linksIn(f[key])) found.push({ ...hit, key });
         }
         if (!found.length) {
@@ -345,17 +360,24 @@
     //   {v, sid, createdAt, account, fields:{title,text,url}, url, rawUrl,
     //    title, text, app, urlKey, others, source,
     //    uploaded, share, archived,          set once the server has it
-    //    file:{targets, folders, title, url, labels, at} | null,  chosen offline
+    //    file:{targets, folders, title, labels, at} | null,  folders chosen
+    //                                         and not filed yet
     //    later, dismiss,                      what to do once it is uploaded
-    //    attempts, lastError:{status, message, at, failed?} | null}
+    //    attempts, lastError:{status, message, at, failed?, permanent} | null}
     // Each writer changes only its own fields, through update(), which reads
-    // the entry again just before writing. An entry goes once its file,
-    // dismiss or Later is confirmed by the server, or a day after it was
-    // uploaded with nothing chosen (the server's copy waits in the inbox).
+    // the entry again just before writing; in one page or worker those reads
+    // and writes never interleave. A tap adds its folders to `file` (never
+    // replaces what an earlier tap chose), and a filing takes out only the
+    // folders it sent: one chosen meanwhile stays, and goes next. An entry
+    // goes once everything chosen is filed, a dismiss or Later is confirmed
+    // by the server, or a day after it was uploaded with nothing chosen (the
+    // server's copy waits in the inbox).
 
     const OUTBOX_CACHE = 'tp-outbox';
     const OUTBOX_PREFIX = '/__tp_share/';
     const UPLOADED_TTL_MS = 24 * 3600 * 1000;
+    // The most folders the server files into at once; more go in turns.
+    const MAX_TARGETS = 16;
 
     function phaseOf(e) {
         if (!e) return null;
@@ -386,7 +408,76 @@
 
     const stamp = (e) => ({ ...e, phase: phaseOf(e) });
 
-    // Over Cache Storage, which the worker and the page share.
+    // A share taken over by the account signed in now (a yes to "Upload to
+    // …"): new for it. Whatever another account's server or tree made of it —
+    // its upload there, a folder choice in that tree — stays behind.
+    function claimEntry(e, account) {
+        return {
+            ...e, account, uploaded: false, uploadedAt: null, share: null, archived: null,
+            file: null, dismiss: false, attempts: 0, lastError: null
+        };
+    }
+
+    // --- Folders chosen for a share ---------------------------------------------------
+    //
+    // file = {targets: [{folderId} | {newFolder, existing?}, each with its
+    // label], folders: [the never-pushed ancestors they need], title, labels,
+    // at}. A target's key is its folder id, or the new folder's.
+
+    const targetKey = (t) => (t && (t.folderId || (t.newFolder && t.newFolder.id))) || null;
+    const intentKeys = (intent) => ((intent && intent.targets) || []).map(targetKey).filter(Boolean);
+
+    function shapeIntent(targets, folders, rest) {
+        if (!targets.length) return null;
+        const keep = new Set(targets.map(t => t.newFolder && t.newFolder.id).filter(Boolean));
+        for (const t of targets) {
+            // A new folder's never-pushed ancestors, and theirs.
+            let parent = t.newFolder && t.newFolder.parentId;
+            for (let hops = 0; parent && hops < 64; hops++) {
+                const f = folders.find(x => x.id === parent);
+                if (!f) break;
+                keep.add(f.id);
+                parent = f.parentId;
+            }
+        }
+        return {
+            ...rest,
+            targets,
+            folders: folders.filter(f => keep.has(f.id)),
+            labels: targets.map(t => t.label).filter(Boolean)
+        };
+    }
+
+    // What an earlier choice and a new one ask for together: every folder of
+    // both, once, the new title, the new time.
+    function mergeIntent(prev, next) {
+        if (!prev || !prev.targets || !prev.targets.length) return next || null;
+        if (!next) return prev;
+        const targets = [];
+        const seen = new Set();
+        for (const t of [...prev.targets, ...(next.targets || [])]) {
+            const k = targetKey(t);
+            if (!k || seen.has(k)) continue;
+            seen.add(k);
+            targets.push(t);
+        }
+        const folders = [];
+        for (const f of [...(prev.folders || []), ...(next.folders || [])]) {
+            if (f && f.id && !folders.some(x => x.id === f.id)) folders.push(f);
+        }
+        return shapeIntent(targets, folders, { title: next.title || prev.title, at: next.at || prev.at });
+    }
+
+    // The choice without the folders a filing sent, or null when that was all.
+    function withoutTargets(intent, sent) {
+        if (!intent || !intent.targets) return null;
+        const gone = new Set((sent || []).map(targetKey));
+        return shapeIntent(intent.targets.filter(t => !gone.has(targetKey(t))), intent.folders || [], { title: intent.title, at: intent.at });
+    }
+
+    // Over Cache Storage, which the worker and the page share. Within one of
+    // them, every change runs on its own: a read for an update and its write
+    // never have another change in between.
     function cacheOutbox(cachesImpl) {
         const open = () => cachesImpl.open(OUTBOX_CACHE);
         const keyFor = (sid) => OUTBOX_PREFIX + encodeURIComponent(sid);
@@ -394,19 +485,28 @@
             const s = typeof k === 'string' ? k : k.url;
             try { return s.startsWith('/') ? s : new URL(s).pathname; } catch (e) { return s; }
         };
+        let queue = Promise.resolve();
+        const serial = (fn) => {
+            const run = queue.then(fn, fn);
+            queue = run.catch(() => {});
+            return run;
+        };
+        const read = async (sid) => {
+            const c = await open();
+            const hit = await c.match(keyFor(sid));
+            if (!hit) return null;
+            try { return await hit.json(); } catch (e) { return null; }
+        };
+        const write = async (entry) => {
+            const c = await open();
+            const e = stamp(entry);
+            await c.put(keyFor(e.sid), new Response(JSON.stringify(e), { headers: { 'Content-Type': 'application/json' } }));
+            return e;
+        };
+        const drop = async (sid) => (await open()).delete(keyFor(sid));
         const box = {
-            async put(entry) {
-                const c = await open();
-                const e = stamp(entry);
-                await c.put(keyFor(e.sid), new Response(JSON.stringify(e), { headers: { 'Content-Type': 'application/json' } }));
-                return e;
-            },
-            async get(sid) {
-                const c = await open();
-                const hit = await c.match(keyFor(sid));
-                if (!hit) return null;
-                try { return await hit.json(); } catch (e) { return null; }
-            },
+            put: (entry) => serial(() => write(entry)),
+            get: (sid) => read(sid),
             async list() {
                 const c = await open();
                 const out = [];
@@ -418,16 +518,23 @@
                 }
                 return out.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
             },
-            async update(sid, patch) {
-                const cur = await box.get(sid);
+            update: (sid, patch) => serial(async () => {
+                const cur = await read(sid);
                 if (!cur) return null;
                 const next = typeof patch === 'function' ? patch(cur) : { ...cur, ...patch };
-                return next ? box.put(next) : cur;
-            },
-            async remove(sid) {
-                const c = await open();
-                return c.delete(keyFor(sid));
-            }
+                return next ? write(next) : cur;
+            }),
+            // fn(entry) -> the entry to keep, or null to take it out. Returns
+            // what was kept, or null.
+            settle: (sid, fn) => serial(async () => {
+                const cur = await read(sid);
+                if (!cur) return null;
+                const next = fn(cur);
+                if (next) return write(next);
+                await drop(sid);
+                return null;
+            }),
+            remove: (sid) => serial(() => drop(sid))
         };
         return box;
     }
@@ -460,6 +567,16 @@
                 all[sid] = stamp(next);
                 write(all);
                 return all[sid];
+            },
+            async settle(sid, fn) {
+                const all = read();
+                const cur = all[sid];
+                if (!cur) return null;
+                const next = fn(cur);
+                if (next) all[sid] = stamp(next);
+                else delete all[sid];
+                write(all);
+                return next ? all[sid] : null;
             },
             async remove(sid) { const all = read(); const had = sid in all; delete all[sid]; write(all); return had; }
         };
@@ -511,10 +628,44 @@
         ...extra
     });
 
+    // What the share target received goes up with the link, as context the
+    // server keeps to 10 KB: its text is cut first, then its subject, by
+    // UTF-8 bytes (3,500 CJK characters are over it), never half a character.
+    const RAW_BYTES = 9 * 1024;
+    const utf8Bytes = (s) => (typeof TextEncoder !== 'undefined'
+        ? new TextEncoder().encode(s).length : unescape(encodeURIComponent(s)).length);
+
+    function fitRaw(raw, limit = RAW_BYTES) {
+        const size = (o) => utf8Bytes(JSON.stringify(o));
+        if (size(raw) <= limit) return raw;
+        const o = { ...raw };
+        for (const key of ['text', 'title']) {
+            const chars = Array.from(String(o[key] || ''));
+            let lo = 0;
+            let hi = chars.length;
+            while (lo < hi) {
+                const mid = Math.ceil((lo + hi) / 2);
+                if (size({ ...o, [key]: chars.slice(0, mid).join('') }) <= limit) lo = mid;
+                else hi = mid - 1;
+            }
+            o[key] = chars.slice(0, lo).join('');
+            if (size(o) <= limit) return o;
+        }
+        return undefined;
+    }
+
+    // The account the phone kept the share for: the server refuses (412) to
+    // take it in or change it under any other, whatever token is sent.
+    const expected = (e) => ({
+        expectUserId: e.account && e.account.userId !== null && e.account.userId !== undefined ? e.account.userId : undefined,
+        expectServerId: (e.account && e.account.serverId) || undefined
+    });
+
     function intakeBody(e) {
         return {
             sid: e.sid, url: e.url, title: e.title || '', app: e.app || undefined, urlKey: e.urlKey || undefined,
-            source: e.source || 'share', raw: { title: e.fields.title, text: e.fields.text.slice(0, 4000), url: e.rawUrl || e.fields.url }
+            source: e.source || 'share', ...expected(e),
+            raw: fitRaw({ title: e.fields.title, text: e.fields.text, url: e.rawUrl || e.fields.url })
         };
     }
 
@@ -522,28 +673,49 @@
     // worker and the page may, and the server's idempotency on sid and on
     // (share, folder) makes that harmless.
     const inFlight = new Set();
+    const idleWaiters = new Map();
 
-    // Upload what waits and carry out what was chosen while offline, for the
-    // account `cfg` is signed in as only. Stops at a 401 (signed out) or a
-    // network failure, both of which leave every entry as it was. Returns
-    // {uploaded:[sid], filed:[{sid, result}], removed:[sid], failed:[{sid, error}],
-    // skipped:[sid], stopped: null|'auth'|'network'|'signed-out'}.
+    // Resolves once no flush of this context holds the share.
+    function whenIdle(sid) {
+        if (!inFlight.has(sid)) return Promise.resolve();
+        return new Promise((resolve) => {
+            if (!idleWaiters.has(sid)) idleWaiters.set(sid, []);
+            idleWaiters.get(sid).push(resolve);
+        });
+    }
+
+    const busy = (sid) => inFlight.has(sid);
+
+    // Upload what waits and carry out what was chosen, for the account `cfg`
+    // is signed in as only. Stops at a 401 (signed out), a 412 (the session is
+    // another account's) or a network failure, all of which leave every entry
+    // as it was. A share the server refused for good is not sent again unless
+    // asked for by its id (a tap, Retry). Returns {uploaded:[sid],
+    // filed:[{sid, result}] (a share may be filed in turns), removed:[sid],
+    // failed:[{sid, error}], skipped:[sid], stopped: null|'auth'|'account'|
+    // 'network'|'signed-out'}.
     async function flushOutbox({ outbox, cfg, fetch: fetchImpl, timeoutMs = 6000, sids = null, now = Date.now }) {
         const out = { uploaded: [], filed: [], removed: [], failed: [], skipped: [], stopped: null };
         if (!cfg || !cfg.url || !cfg.token) { out.stopped = 'signed-out'; return out; }
         const want = sids ? new Set(sids) : null;
         let entries;
         try { entries = await outbox.list(); } catch (e) { out.stopped = 'storage'; return out; }
+        const stopOn = (r) => {
+            if (r.status === 401) throw new Stop('auth', 'Signed out');
+            if (r.status === 412) throw new Stop('account', 'This share belongs to another account.');
+        };
         for (const listed of entries) {
             if (want && !want.has(listed.sid)) continue;
             if (!listed.url || !sameAccount(listed.account, cfg) || inFlight.has(listed.sid)) { out.skipped.push(listed.sid); continue; }
+            const refused = !listed.uploaded && listed.lastError && listed.lastError.permanent;
+            if (refused && !want) { out.skipped.push(listed.sid); continue; }
             inFlight.add(listed.sid);
             try {
                 let e = await outbox.get(listed.sid);
                 if (!e) continue;
                 if (!e.uploaded) {
                     const r = await send(fetchImpl, cfg, 'POST', '/api/shares', intakeBody(e), timeoutMs);
-                    if (r.status === 401) throw new Stop('auth', 'Signed out');
+                    stopOn(r);
                     if (!r.ok) {
                         e = await outbox.update(e.sid, (c) => ({ ...c, attempts: (c.attempts || 0) + 1, lastError: errorOf(r) }));
                         out.failed.push({ sid: listed.sid, error: e.lastError });
@@ -556,33 +728,56 @@
                     out.uploaded.push(e.sid);
                 }
                 if (e.file) {
-                    const ref = (e.share && e.share.sid) || e.sid;
-                    const r = await send(fetchImpl, cfg, 'POST', `/api/shares/${encodeURIComponent(ref)}/file`, {
-                        targets: e.file.targets, folders: e.file.folders || [], title: e.file.title || e.title || undefined,
-                        url: e.file.url || undefined, app: e.app || undefined
-                    }, timeoutMs);
-                    if (r.status === 401) throw new Stop('auth', 'Signed out');
-                    if (r.status === 404) {
-                        // The server has no such share (any more): upload it again.
-                        await outbox.update(e.sid, (c) => ({ ...c, uploaded: false, share: null }));
-                        out.failed.push({ sid: e.sid, error: errorOf(r, { permanent: false }) });
-                        continue;
+                    // In turns of MAX_TARGETS folders, and then whatever was
+                    // chosen while they were on their way.
+                    let reupload = false;
+                    let refusedHere = false;
+                    for (let turn = 0; e && e.file && turn < 16; turn++) {
+                        const ask = e.file;
+                        const batch = ask.targets.slice(0, MAX_TARGETS);
+                        const ref = (e.share && e.share.sid) || e.sid;
+                        const r = await send(fetchImpl, cfg, 'POST', `/api/shares/${encodeURIComponent(ref)}/file`, {
+                            targets: batch.map(({ label, ...t }) => t), folders: (ask.folders || []).slice(0, MAX_TARGETS),
+                            title: ask.title || e.title || undefined, url: ask.url || undefined, app: e.app || undefined, ...expected(e)
+                        }, timeoutMs);
+                        stopOn(r);
+                        if (r.status === 404) {
+                            // The server has no such share (any more): upload it again.
+                            await outbox.update(e.sid, (c) => ({ ...c, uploaded: false, share: null }));
+                            out.failed.push({ sid: e.sid, error: errorOf(r, { permanent: false }) });
+                            reupload = true;
+                            break;
+                        }
+                        if (!r.ok) {
+                            const failed = (r.json && r.json.failed) || null;
+                            // None of those folders can take it (422), or the
+                            // request is one the server will never take: that
+                            // choice goes, saying why. Anything else (a 5xx)
+                            // keeps it for the next try.
+                            const final = r.status === 422 || errorOf(r).permanent;
+                            e = await outbox.update(e.sid, (c) => ({
+                                ...c, file: final ? withoutTargets(c.file, batch) : c.file, lastError: errorOf(r, { failed, permanent: false })
+                            }));
+                            out.failed.push({ sid: listed.sid, error: e ? e.lastError : errorOf(r, { failed }) });
+                            refusedHere = true;
+                            if (!final) break;
+                            continue;
+                        }
+                        out.filed.push({ sid: e.sid, result: r.json });
+                        // Only what was sent is done: a folder chosen meanwhile
+                        // (another tap here, or the worker) stays, and goes next.
+                        e = await outbox.settle(e.sid, (c) => {
+                            const rest = withoutTargets(c.file, batch);
+                            return rest ? { ...c, file: rest, share: r.json.share || c.share, lastError: null } : null;
+                        });
+                        if (!e) out.removed.push(listed.sid);
                     }
-                    if (!r.ok) {
-                        const failed = (r.json && r.json.failed) || null;
-                        e = await outbox.update(e.sid, (c) => ({ ...c, file: r.status === 422 ? null : c.file, lastError: errorOf(r, { failed, permanent: false }) }));
-                        out.failed.push({ sid: listed.sid, error: e.lastError });
-                        continue;
-                    }
-                    await outbox.remove(e.sid);
-                    out.filed.push({ sid: e.sid, result: r.json });
-                    out.removed.push(e.sid);
-                    continue;
+                    if (reupload || refusedHere || !e || e.file) continue;
                 }
                 if (e.dismiss) {
                     const ref = (e.share && e.share.sid) || e.sid;
-                    const r = await send(fetchImpl, cfg, 'POST', `/api/shares/${encodeURIComponent(ref)}/dismiss`, {}, timeoutMs);
-                    if (r.status === 401) throw new Stop('auth', 'Signed out');
+                    const r = await send(fetchImpl, cfg, 'POST', `/api/shares/${encodeURIComponent(ref)}/dismiss`, { ...expected(e) }, timeoutMs);
+                    stopOn(r);
                     if (r.ok || r.status === 404) { await outbox.remove(e.sid); out.removed.push(e.sid); }
                     continue;
                 }
@@ -601,6 +796,8 @@
                 out.failed.push({ sid: listed.sid, error: { status: 0, message: String(err && err.message || err), permanent: false } });
             } finally {
                 inFlight.delete(listed.sid);
+                const waiting = idleWaiters.get(listed.sid);
+                if (waiting) { idleWaiters.delete(listed.sid); waiting.forEach(fn => fn()); }
             }
         }
         return out;
@@ -791,18 +988,21 @@
     //   find(id) -> node | null, kindOf(node), urlOf(node), childCount(node),
     //   insert(parentNode | null, {id, kind, title, url?}) -> node (at the end),
     //   remove(node), fallbackParent() -> node | null (the Bookmarks root).
-    // An append inserts each node whose id is missing; one whose parent is
-    // gone here goes to the end of the Bookmarks root and counts as relocated,
-    // so a later push cannot drop it. An unappend removes a node only while it
-    // is still that bookmark (same URL) or an empty folder.
+    // An append inserts each node whose id is missing; a folder with no
+    // parent (one a phone made at the top level) goes at the top level; one
+    // whose parent is gone here goes to the end of the Bookmarks root and
+    // counts as relocated, so a later push cannot drop it. An unappend
+    // removes a node only while it is still that bookmark (same URL) or an
+    // empty folder.
     function applyOps(ops, a) {
         const out = { applied: 0, relocated: 0, removed: 0, skipped: 0 };
         for (const op of ops || []) {
             if (op.kind === 'append') {
                 for (const n of (op.payload && op.payload.nodes) || []) {
                     if (!n || !n.id || a.find(n.id)) { out.skipped++; continue; }
+                    const topLevel = n.kind === 'folder' && (n.parentId === null || n.parentId === undefined || n.parentId === '');
                     let parent = n.parentId ? a.find(n.parentId) : null;
-                    if (!parent || a.kindOf(parent) !== 'folder') {
+                    if (!topLevel && (!parent || a.kindOf(parent) !== 'folder')) {
                         parent = a.fallbackParent();
                         out.relocated++;
                     }
@@ -867,7 +1067,9 @@
     root.TPShare = {
         extractShare, cleanUrl, dedupeKey, appOf, appLabel, isKnownApp, registrableDomain, fallbackTitle, linksIn,
         newSid, accountOf, sameAccount,
-        makeEntry, phaseOf, cacheOutbox, localOutbox, flushOutbox, OUTBOX_CACHE, OUTBOX_PREFIX, UPLOADED_TTL_MS,
+        makeEntry, claimEntry, phaseOf, cacheOutbox, localOutbox, flushOutbox, whenIdle, busy, OUTBOX_CACHE, OUTBOX_PREFIX, UPLOADED_TTL_MS,
+        makeIntent: (targets, folders = [], rest = {}) => shapeIntent(targets || [], folders || [], rest),
+        mergeIntent, withoutTargets, intentKeys, targetKey, fitRaw, MAX_TARGETS,
         indexFolders, parentPath, fullPath, recentFolders, suggest, searchFolders,
         applyOps, wireAdapter
     };

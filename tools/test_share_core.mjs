@@ -7,11 +7,14 @@
 //   1. Extraction against real Android share payloads (Chrome, X, YouTube,
 //      Reddit, Instagram, TikTok, Google Maps, links in brackets and quotes,
 //      Wikipedia's balanced parentheses, a link only in the title, two links,
-//      a scheme-less link, no link at all).
+//      a scheme-less link, no link at all); an apostrophe inside a link, the
+//      url field taken whole, and a link run into CJK text ending there.
 //   2. Cleaning is host by host (YouTube keeps v and t, X drops s and t,
 //      utm_* goes everywhere) and leaves a link with nothing to drop exactly
-//      as written; dedupeKey treats the same link written differently as one.
-//   3. appOf for every app it knows, and the registrable domain otherwise.
+//      as written; dedupeKey treats the same link written differently as one,
+//      and keeps a fragment that routes (two Gmail threads are two links).
+//   3. appOf for every app it knows, and the registrable domain otherwise
+//      (mobile.de and m.me are sites, not 'de' and 'me').
 //   4. indexFolders leaves out the archive, notes, workflows, pins and noise
 //      roots — 300 X links saved in a workflow never make it the top X chip.
 //   5. suggest: pins first in order, hidden never, the last-used folder, then
@@ -22,10 +25,17 @@
 //   6. The outbox (Cache Storage and localStorage) and flushOutbox: never an
 //      entry of another account or of nobody's, stops on 401 and on a fetch
 //      that never answers, keeps a refused entry, files what was chosen
-//      offline, and two flushes at once send a share once.
+//      offline, and two flushes at once send a share once. A second tap adds
+//      to the first, never replacing it; a filing takes out only what it sent
+//      and files what was chosen meanwhile next; more than sixteen folders go
+//      in turns; raw goes up cut to the server's 10 KB; a refusal for good is
+//      not sent again on its own, and a filing the server never takes is no
+//      queued choice; every request names the share's account, and a 412
+//      leaves it as it was.
 //   7. applyOps: an append inserts, an id already there is skipped, a node
-//      whose parent is gone goes to the Bookmarks root, and an unappend
-//      removes only an unchanged bookmark or an empty folder.
+//      whose parent is gone goes to the Bookmarks root, a folder with no
+//      parent at the top level, and an unappend removes only an unchanged
+//      bookmark or an empty folder.
 //
 // Run: node tools/test_share_core.mjs
 
@@ -100,7 +110,25 @@ const cases = [
         { url: 'https://first.example/a', title: 'Also', others: ['https://second.example/b'] }],
     ['no link at all',
         { text: 'Just a thought to keep' },
-        { url: null, text: 'Just a thought to keep' }]
+        { url: null, text: 'Just a thought to keep' }],
+    ['an apostrophe inside a link in the url field: the field is taken whole',
+        { url: "https://en.wikipedia.org/wiki/Ender's_Game" },
+        { url: "https://en.wikipedia.org/wiki/Ender's_Game", app: 'wikipedia' }],
+    ['a Google Maps place with an apostrophe, in the url field',
+        { url: "https://www.google.com/maps/place/Joe's+Pizza/@40.7,-73.9,17z" },
+        { url: "https://www.google.com/maps/place/Joe's+Pizza/@40.7,-73.9,17z", app: 'maps' }],
+    ['an apostrophe inside a link in running text, and one after it',
+        { text: "Read https://en.wikipedia.org/wiki/Ender's_Game' tonight" },
+        { url: "https://en.wikipedia.org/wiki/Ender's_Game", title: 'Read tonight' }],
+    ['a link in single quotes',
+        { text: "See 'https://example.com/quoted' here" },
+        { url: 'https://example.com/quoted', title: 'See here' }],
+    ['Xiaohongshu: the link ends where the Chinese text starts',
+        { text: 'http://xhslink.com/a/AbC，复制本条信息，打开【小红书】App查看精彩内容！' },
+        { url: 'http://xhslink.com/a/AbC', title: '复制本条信息，打开【小红书】App查看精彩内容！' }],
+    ['a link run into CJK text on both sides',
+        { text: '看看这个https://example.com/页面。很好' },
+        { url: 'https://example.com/' }]
 ];
 for (const [name, fields, want] of cases) {
     const got = S.extractShare(fields);
@@ -132,6 +160,13 @@ check('youtu.be/ID is watch?v=ID, as are m., shorts and a timestamp', same('http
 check('www., m., the scheme, a trailing slash and the fragment do not count', same('https://www.example.com/page/', 'http://example.com/page')
     && same('https://m.example.com/page#frag', 'https://example.com/page'));
 check('different pages stay different', !same('https://example.com/a', 'https://example.com/b') && !same('https://example.com/?id=1', 'https://example.com/?id=2'));
+check('a fragment that routes is part of the page: two Gmail threads, two #/ or #! routes stay different',
+    !same('https://mail.google.com/mail/u/0/#inbox/AAA', 'https://mail.google.com/mail/u/0/#inbox/BBB')
+    && !same('https://example.com/app/#/item/1', 'https://example.com/app/#/item/2') && !same('https://example.com/#!/a', 'https://example.com/#!/b')
+    && same('https://example.com/app/#/item/1', 'http://www.example.com/app#/item/1'),
+    [S.dedupeKey('https://mail.google.com/mail/u/0/#inbox/AAA'), S.dedupeKey('https://example.com/app/#/item/1')].join(' '));
+check('a www., m. or mobile. that is the site\'s own name stays in the key', !same('https://mobile.de/a', 'https://de/a') && S.dedupeKey('https://m.me/foo') === 'm.me/foo'
+    && S.dedupeKey('https://www.mobile.de/a') === 'mobile.de/a', [S.dedupeKey('https://m.me/foo'), S.dedupeKey('https://www.mobile.de/a')].join(' '));
 
 console.log('\n3. Apps');
 const apps = {
@@ -154,7 +189,10 @@ const apps = {
     'https://news.ycombinator.com/item?id=1': 'hackernews', 'https://medium.com/@a/b': 'medium', 'https://blog.medium.com/x': 'medium',
     'https://en.wikipedia.org/wiki/A': 'wikipedia', 'https://en.m.wikipedia.org/wiki/A': 'wikipedia', 'https://www.twitch.tv/a': 'twitch',
     'https://www.bbc.co.uk/news/x': 'site:bbc.co.uk', 'https://www.nytimes.com/2026/x.html': 'site:nytimes.com',
-    'https://edition.cnn.com/x': 'site:cnn.com', 'https://www.abc.net.au/news': 'site:abc.net.au', 'https://www.google.com/search?q=x': 'site:google.com'
+    'https://edition.cnn.com/x': 'site:cnn.com', 'https://www.abc.net.au/news': 'site:abc.net.au', 'https://www.google.com/search?q=x': 'site:google.com',
+    // A www., m. or mobile. that is the site's own name is kept.
+    'https://www.mobile.de/x': 'site:mobile.de', 'https://mobile.de/a': 'site:mobile.de', 'https://suchen.mobile.de/x': 'site:mobile.de',
+    'https://m.mobile.de/x': 'site:mobile.de', 'https://m.me/foo': 'site:m.me', 'https://www.m.me/x': 'site:m.me', 'https://www.example.de/': 'site:example.de'
 };
 const wrong = Object.entries(apps).filter(([u, a]) => S.appOf(u) !== a).map(([u, a]) => `${u} -> ${S.appOf(u)} (want ${a})`);
 check(`appOf knows every app and falls back to the registrable domain (${Object.keys(apps).length} links)`, wrong.length === 0, wrong.join('; '));
@@ -350,6 +388,134 @@ await lbox.update('sid-local-00000001', { later: true });
 check('the localStorage outbox does the same', (await lbox.get('sid-local-00000001')).later === true && (await lbox.list()).length === 1
     && (await lbox.remove('sid-local-00000001')) === true && !mem.has('tp_outbox'));
 
+console.log('\n6b. Choices made one after another, and what the server cannot take');
+// The sheet's tap: the folders go into the entry's choice, added to what an
+// earlier tap chose, and a flush follows.
+const tap = (b, sid, folderId) => b.update(sid, (c) => ({
+    ...c, later: false, file: S.mergeIntent(c.file, S.makeIntent([{ folderId, label: folderId.toUpperCase() }], [], { at: new Date().toISOString() }))
+}));
+const filedOk = (sid) => (p, o) => {
+    if (p === '/api/shares') return json(shareJson(JSON.parse(o.body).sid));
+    const body = JSON.parse(o.body);
+    return json({ ok: true, baseVersion: 1, version: 2, created: body.targets.map((t, i) => ({ id: `b${i}`, kind: 'bookmark', parentId: t.folderId })), share: { sid, status: 'filed', filings: [] } });
+};
+for (const [name, b] of [['Cache Storage', S.cacheOutbox(fakeCaches())], ['localStorage', S.localOutbox({ getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, String(v)), removeItem: (k) => mem.delete(k) })]]) {
+    const sidA = 'sid-two-taps-000001';
+    await b.put(S.makeEntry({ fields: { text: 'https://example.com/two-taps' }, account: S.accountOf(ALEX), sid: sidA }));
+    const offline = server(() => { throw new TypeError('Failed to fetch'); });
+    await tap(b, sidA, 'fa');
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: offline });
+    await tap(b, sidA, 'fb');
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: offline });
+    const both = await b.get(sidA);
+    check(`${name}: offline, a second tap adds its folder to the first, never replacing it`,
+        JSON.stringify(S.intentKeys(both.file)) === '["fa","fb"]' && JSON.stringify(both.file.labels) === '["FA","FB"]', JSON.stringify(both.file));
+    const back = server(filedOk(sidA));
+    const res = await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: back });
+    const fileCalls = back.calls.filter(c => c.url.endsWith('/file'));
+    check(`${name}:   back online, both are filed and the entry goes`, fileCalls.length === 1
+        && JSON.stringify(fileCalls[0].body.targets) === '[{"folderId":"fa"},{"folderId":"fb"}]' && res.filed.length === 1 && !(await b.get(sidA)),
+        JSON.stringify(fileCalls.map(c => c.body.targets)));
+}
+
+// Online: the second tap lands while the first one's filing is on its way.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const sidR = 'sid-race-taps-00001';
+    await b.put({ ...S.makeEntry({ fields: { text: 'https://example.com/race' }, account: S.accountOf(ALEX), sid: sidR }), uploaded: true, share: { sid: sidR } });
+    let release = null;
+    const held = new Promise(r => { release = r; });
+    let first = true;
+    const slow = server(async (p, o) => {
+        if (first) { first = false; await held; }
+        return filedOk(sidR)(p, o);
+    });
+    await tap(b, sidR, 'fa');
+    const flushA = S.flushOutbox({ outbox: b, cfg: ALEX, fetch: slow, sids: [sidR] });
+    await new Promise(r => setTimeout(r, 20));
+    await tap(b, sidR, 'fb');
+    const flushB = await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: slow, sids: [sidR] });
+    check('a flush while another holds the share skips it, and says so', flushB.skipped.includes(sidR) && S.busy(sidR));
+    const idle = S.whenIdle(sidR);
+    release();
+    const resA = await flushA;
+    await idle;
+    const sent = slow.calls.filter(c => c.url.endsWith('/file')).map(c => c.body.targets.map(t => t.folderId).join());
+    check('  the first filing\'s answer takes out only what it sent: the second tap is filed next, in the same flush, and then the entry goes',
+        JSON.stringify(sent) === '["fa","fb"]' && resA.filed.length === 2 && !(await b.get(sidR)) && !S.busy(sidR), JSON.stringify({ sent, filed: resA.filed.length }));
+}
+
+// More folders than the server takes at once go in turns.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const sidM = 'sid-many-folders-01';
+    await b.put({ ...S.makeEntry({ fields: { text: 'https://example.com/many' }, account: S.accountOf(ALEX), sid: sidM }), uploaded: true, share: { sid: sidM } });
+    for (let i = 0; i < 20; i++) await tap(b, sidM, `f${i}`);
+    const many = server(filedOk(sidM));
+    const r = await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: many });
+    const sizes = many.calls.map(c => c.body.targets.length);
+    check('twenty folders are filed sixteen, then four', JSON.stringify(sizes) === '[16,4]' && r.filed.length === 2 && !(await b.get(sidM)), JSON.stringify(sizes));
+}
+
+// What the share target received goes up cut to fit the server's 10 KB.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const e = S.makeEntry({ fields: { title: 'Т'.repeat(3000), text: '中'.repeat(3500) + ' https://example.com/cjk' }, account: S.accountOf(ALEX), sid: 'sid-long-cjk-00001' });
+    await b.put(e);
+    const up = server((p, o) => json(shareJson(JSON.parse(o.body).sid)));
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: up });
+    const rawSent = up.calls[0].body.raw;
+    check('a long CJK share\'s raw goes up under 10 KB of UTF-8, subject included, the text cut and not the link',
+        rawSent && new TextEncoder().encode(JSON.stringify(rawSent)).length <= 10 * 1024 && rawSent.url === 'https://example.com/cjk'
+        && /^中+/.test(rawSent.text) && rawSent.text.length < e.fields.text.length && up.calls[0].body.url === 'https://example.com/cjk',
+        rawSent && new TextEncoder().encode(JSON.stringify(rawSent)).length);
+}
+
+// A refusal for good is not sent again on its own; a tap (asked by id) does.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const sidP = 'sid-refused-0000001';
+    await b.put(S.makeEntry({ fields: { text: 'https://example.com/refused' }, account: S.accountOf(ALEX), sid: sidP }));
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: server(() => json({ error: 'url: at most 4096 characters.' }, 400)) });
+    const again = server(() => json({ error: 'url: at most 4096 characters.' }, 400));
+    const bg = await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: again });
+    check('a share refused for good is not sent again by a flush on its own', again.calls.length === 0 && bg.skipped.includes(sidP));
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: again, sids: [sidP] });
+    check('  only when asked for by its id', again.calls.length === 1);
+}
+
+// A filing the server will never take is no queued choice.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const sidF = 'sid-bad-filing-0001';
+    await b.put({ ...S.makeEntry({ fields: { text: 'https://example.com/bad-filing' }, account: S.accountOf(ALEX), sid: sidF }), uploaded: true, share: { sid: sidF } });
+    await tap(b, sidF, 'fa');
+    await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: server(() => json({ error: 'title: at most 1000 characters.' }, 400)) });
+    const bad = await b.get(sidF);
+    check('a filing refused with a 400 drops that choice, keeping the server\'s words', bad && !bad.file && /at most 1000/.test(bad.lastError.message)
+        && bad.lastError.permanent === false, JSON.stringify(bad && { file: bad.file, lastError: bad.lastError }));
+}
+
+// The account the phone kept the share for goes with every request, and a
+// session of another account (412) changes nothing.
+{
+    const b = S.cacheOutbox(fakeCaches());
+    const sidW = 'sid-wrong-account-1';
+    const e = S.makeEntry({ fields: { text: 'https://example.com/whose' }, account: S.accountOf(ALEX), sid: sidW });
+    await b.put(e);
+    const wrong = server(() => json({ error: 'This share belongs to another account.', code: 'wrong-account' }, 412));
+    const r = await S.flushOutbox({ outbox: b, cfg: ALEX, fetch: wrong });
+    const left = await b.get(sidW);
+    check('every request names the account the share was kept for', wrong.calls[0].body.expectUserId === 1 && wrong.calls[0].body.expectServerId === 'srv');
+    check('  and a 412 stops the flush, leaving the share exactly as it was', r.stopped === 'account' && left.uploaded === false && !left.lastError
+        && left.attempts === 0, JSON.stringify(r));
+}
+
+const claimed = S.claimEntry({ ...S.makeEntry({ fields: { text: 'https://example.com/theirs' }, account: S.accountOf(SAM) }),
+    uploaded: true, share: { sid: 'x' }, file: { targets: [{ folderId: 'sams' }] }, lastError: { status: 500 } }, S.accountOf(ALEX));
+check('a share taken over by another account is new for it: no upload, share or folder choice of the last one\'s',
+    claimed.account.userId === 1 && claimed.uploaded === false && claimed.share === null && claimed.file === null && claimed.lastError === null);
+
 console.log('\n7. Folding the server\'s appends into a working copy');
 const copy = JSON.parse(JSON.stringify(TREE));
 const a = S.wireAdapter(copy);
@@ -365,6 +531,13 @@ check('an append inserts each node at the end of its folder', r1.applied === 4 &
     && find('fun').children.at(-1).id === 'nb2' && find('ai').children.at(-1).id === 'nf');
 check('  a node already there is skipped', r1.skipped === 1 && find('ai').children.filter(c => c.id === 'a1').length === 1);
 check('  and one whose folder is gone here goes to the Bookmarks root', r1.relocated === 1 && find('bm').children.at(-1).id === 'lost');
+const rTop = S.applyOps([{ version: 10, kind: 'append', payload: { nodes: [
+    { id: 'phone-top', parentId: null, kind: 'folder', title: 'Top on the phone' },
+    { id: 'phone-top-b', parentId: 'phone-top', kind: 'bookmark', title: 'In it', url: 'https://top.example/' }
+] } }], a);
+check('  a folder logged with no parent (a phone\'s top-level folder) goes at the top level, and is no relocation',
+    rTop.applied === 2 && rTop.relocated === 0 && copy.some(r => r.id === 'phone-top') && !find('bm').children.some(c => c.id === 'phone-top')
+    && find('phone-top').children[0].id === 'phone-top-b', JSON.stringify(rTop));
 find('nb2').url = 'https://changed.example/';
 find('nf').children.push({ id: 'mine', kind: 'bookmark', title: 'Mine', url: 'https://mine.example/' });
 const r2 = S.applyOps([{ version: 11, kind: 'unappend', payload: { items: [
