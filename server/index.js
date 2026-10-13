@@ -315,10 +315,12 @@ app.use(securityHeaders());
 // extension calls cross-origin from chrome-extension:// / moz-extension://
 // with a bearer token, so those are always allowed; any other origin (a
 // separately hosted client) must be listed in CORS_ORIGIN. No cookies are
-// used, so credentials stay off.
+// used, so credentials stay off. /mcp is not covered here: it answers its own
+// preflights, for the origins MCP_ALLOWED_ORIGINS lists (mcp.js).
 const CORS_ORIGINS = new Set((process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean));
 const EXTENSION_ORIGIN = /^(chrome-extension|moz-extension|safari-web-extension):\/\/[\w.-]+$/;
 app.use(cors((req, cb) => {
+    if (req.path === '/mcp') return cb(null, { origin: false });
     const origin = req.headers.origin;
     let allowed = !origin || EXTENSION_ORIGIN.test(origin) || CORS_ORIGINS.has(origin);
     if (!allowed) {

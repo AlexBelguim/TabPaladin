@@ -49,7 +49,7 @@ the network.
 | `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the links waiting in the shared-links inbox and on pending AI proposals (share link and MCP together). Past them new rows get `429`; nothing is pruned. |
 | `MCP_RATE_LIMIT_PER_MINUTE` | `120` | [MCP](#mcp-ai-chats-with-a-token) requests allowed per token per minute before `429`. |
 | `MCP_AUTH_MAX_FAILURES` | `20` | Wrong MCP tokens allowed per client address per 15 minutes before `429`. |
-| `MCP_ALLOWED_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call `/mcp` (a request with any other `Origin` header gets `403`). MCP clients send none. |
+| `MCP_ALLOWED_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call `/mcp` (a request with any other `Origin` header gets `403`); a listed one gets CORS, preflights included, from `/mcp` itself (`CORS_ORIGIN` plays no part there). MCP clients send none. |
 | `IMPORT_SECRET` | *(off)* | Encrypts importer OAuth refresh tokens at rest. |
 | `TRUST_PROXY` | `loopback, uniquelocal` | Express `trust proxy`: which proxies may set `X-Forwarded-For` / `-Proto`. Set `1` or `true` if your proxy reaches the server from a public address. |
 | `CORS_ORIGIN` | *(off)* | Extra comma-separated origins allowed to call the API cross-origin. The server's own origin and browser-extension origins (`chrome-extension://`, `moz-extension://`) are always allowed. |
@@ -523,11 +523,17 @@ each is in the [main README](../README.md#-use-tabpaladin-with-ai-chats).
   is changed or reset, or when the account is deleted.
 - **Limits:** `MCP_RATE_LIMIT_PER_MINUTE` requests per token (default 120),
   `MCP_AUTH_MAX_FAILURES` wrong tokens per client address per 15 minutes
-  (default 20), a 256 KB body, and every tool answer at most 100 KB (lists
-  are paged; a huge note is cut short and says so).
+  (default 20), a 256 KB body, and every tool answer, errors included, at
+  most 100 KB of UTF-8 (lists, `list_my_proposals` too, are paged with
+  `offset` / `limit`; a long note comes in parts: `read_note` answers
+  `nextOffset` until the end, and takes `offset`).
 - **Origin:** a request with an `Origin` header (a web page) is refused with
   403 unless `MCP_ALLOWED_ORIGINS` (comma-separated) lists it — the MCP
-  transport's DNS-rebinding rule. MCP clients send none.
+  transport's DNS-rebinding rule. MCP clients send none. A listed origin (the
+  MCP Inspector in a browser, say) gets CORS from `/mcp` itself: its
+  preflight is answered (`POST`; `Content-Type`, `Authorization`,
+  `Mcp-Protocol-Version`, `Mcp-Session-Id`, `Last-Event-ID`), and every
+  answer carries `Access-Control-Allow-Origin`.
 
 **Not yet: claude.ai custom connectors with OAuth.** The hosted Claude apps
 (claude.ai, Claude Desktop's Connectors, mobile) reach a remote MCP server

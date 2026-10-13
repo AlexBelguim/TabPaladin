@@ -24,6 +24,12 @@
 //      against this account's items, and its proposals never show up here.
 //   6. Limits: requests per token per minute (429 with Retry-After), bad
 //      tokens per IP, and the body size (413).
+//   3b. Long answers: every answer, errors included, at most 100 KB of
+//      UTF-8 — a note of short lines read in parts with offset, a refusal
+//      naming 10000 unknown ids, list_my_proposals paged.
+//   And CORS for an origin MCP_ALLOWED_ORIGINS lists (preflight answered by
+//   /mcp, even when CORS_ORIGIN lists it too), and a password change ending
+//   the account's share links as well as its tokens.
 //   And the stdio bridge (tools/mcp_bridge.mjs) carries a stdio client, as
 //   Claude Desktop starts one, to the endpoint and back.
 //
@@ -67,7 +73,7 @@ const server = spawn(process.execPath, [path.join(ROOT, 'server', 'index.js')], 
     env: {
         ...env, PORT: String(PORT), DATA_DIR: dataDir, PWA_DIR: path.join(ROOT, 'pwa'), ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: PASSWORD,
         IMPORTS_SCHEDULER: 'off', AUTH_TOKEN: LEGACY, MCP_RATE_LIMIT_PER_MINUTE: String(PER_MINUTE),
-        MCP_AUTH_MAX_FAILURES: String(BAD_TOKENS), MCP_ALLOWED_ORIGINS: ALLOWED_ORIGIN
+        MCP_AUTH_MAX_FAILURES: String(BAD_TOKENS), MCP_ALLOWED_ORIGINS: ALLOWED_ORIGIN, CORS_ORIGIN: ALLOWED_ORIGIN
     },
     stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -297,6 +303,42 @@ try {
     const lastUsed = (await api('/api/mcp/tokens', { token: A })).json.tokens.find(t => t.name === 'Laptop Claude Code').lastUsedAt;
     check('the token\'s last use is kept', typeof lastUsed === 'string' && Date.now() - Date.parse(lastUsed) < 60000, String(lastUsed));
 
+    console.log('\n3b. Long answers');
+    const bytes = (s) => Buffer.byteLength(s, 'utf8');
+    // Short lines: every newline is two characters once escaped as JSON.
+    const lines = '# Lines\n\n' + Array.from({ length: 5000 }, (_, i) => `- [ ] item ${String(i).padStart(4, '0')} todo`).join('\n') + '\n- [ ] ünïcødé 😀 end\n';
+    {
+        const t = await treeA();
+        t.roots.find(r => r.role === 'notes').children.push({ id: 'n-lines', kind: 'note', title: 'Lines', payload: { content: lines, createdAt: T, updatedAt: T } });
+        if ((await api('/api/tree', { method: 'PUT', token: A, body: { roots: t.roots, baseVersion: t.version } })).status !== 200) throw new Error('push lines');
+    }
+    const parts = [];
+    let offset = 0;
+    for (let i = 0; i < 10; i++) {
+        const p = await tool(client, 'read_note', { id: 'n-lines', ...(offset ? { offset } : {}) });
+        parts.push(p);
+        if (p.isError || p.data.nextOffset === undefined) break;
+        offset = p.data.nextOffset;
+    }
+    check('a long note of short lines is read in parts, each under 100 KB, together the whole note',
+        parts.length > 1 && parts.every(p => !p.isError && bytes(p.text) <= 100 * 1024) && parts[0].data.truncated === true
+        && parts[0].data.characters === lines.length && parts.map(p => p.data.content).join('') === lines,
+        JSON.stringify(parts.map(p => [p.isError, bytes(p.text), p.data && p.data.offset, p.data && p.data.nextOffset])));
+    r = await tool(client, 'read_note', { id: 'n-lines', offset: 100, limit: 50 });
+    check('  from any offset, as much as asked', !r.isError && r.data.content === lines.slice(100, 150) && r.data.nextOffset === 150);
+    const bulky = await tool(client, 'propose_changes', { changes: Array.from({ length: 50 }, (_, i) => ({
+        op: 'move', ids: Array.from({ length: 200 }, (_, j) => `x${i}_${j}`), toFolderId: 'f-tech' })) });
+    check('a proposal naming 10000 unknown ids is refused in an answer under 100 KB, with a count of the rest',
+        bulky.isError && bytes(bulky.text) <= 100 * 1024 && bulky.data.problems.length <= 51
+        && /more problems/.test(bulky.data.problems[bulky.data.problems.length - 1]), `${bytes(bulky.text)} ${bulky.text.slice(0, 200)}`);
+    const all = (await tool(client, 'list_my_proposals', {})).data;
+    const page1 = (await tool(client, 'list_my_proposals', { limit: 3 })).data;
+    const pageLast = (await tool(client, 'list_my_proposals', { offset: all.total - 1, limit: 3 })).data;
+    check('list_my_proposals is paged', all.total === 7 && all.pending.length === 7 && all.nextOffset === null
+        && page1.pending.length === 3 && page1.nextOffset === 3 && page1.pending[0].id === all.pending[0].id
+        && pageLast.pending.length === 1 && pageLast.nextOffset === null && pageLast.pending[0].id === all.pending[6].id,
+        JSON.stringify([all.total, page1.nextOffset, pageLast.nextOffset]));
+
     console.log('\n4. Isolation');
     const sam = await connect(TS);
     clients.push(sam.client);
@@ -352,6 +394,21 @@ try {
     check('a request from a web page (Origin) is refused with 403', evil.status === 403 && evil.json?.error && evil.json.id === null, evil.text);
     check('  unless MCP_ALLOWED_ORIGINS lists it', (await rpc(TA, 'tools/list', {}, { Origin: ALLOWED_ORIGIN })).status === 200);
     check('  and the server\'s own origin is no exception', (await rpc(TA, 'tools/list', {}, { Origin: BASE })).status === 403);
+    const preflight = await api('/mcp', { method: 'OPTIONS', headers: { Origin: ALLOWED_ORIGIN, 'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'authorization,content-type,mcp-protocol-version' } });
+    const allowHeaders = (preflight.headers.get('access-control-allow-headers') || '').toLowerCase();
+    check('a listed origin\'s preflight is answered by /mcp, with the MCP headers allowed',
+        preflight.status === 204 && preflight.headers.get('access-control-allow-origin') === ALLOWED_ORIGIN
+        && /\bpost\b/i.test(preflight.headers.get('access-control-allow-methods') || '')
+        && ['authorization', 'content-type', 'mcp-protocol-version', 'mcp-session-id'].every(h => allowHeaders.includes(h)),
+        `${preflight.status} ${[...preflight.headers].join(' | ')}`);
+    const fromPage = await rpc(TA, 'tools/list', {}, { Origin: ALLOWED_ORIGIN, 'MCP-Protocol-Version': '2025-11-25' });
+    check('  and its requests can be read by it', fromPage.status === 200 && fromPage.headers.get('access-control-allow-origin') === ALLOWED_ORIGIN
+        && /mcp-session-id/i.test(fromPage.headers.get('access-control-expose-headers') || ''));
+    const evilPre = await api('/mcp', { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' } });
+    check('  another origin\'s preflight gets no CORS', evilPre.status === 403 && !evilPre.headers.get('access-control-allow-origin'));
+    const linkA = new URL((await api('/api/share', { method: 'POST', token: A })).json.url).pathname;
+    check('alex\'s share link works before the password change', (await api(linkA)).status === 200);
     const revoked = await api(`/api/mcp/tokens/${madeA2.id}`, { method: 'DELETE', token: A });
     check('a revoked token stops working at once', revoked.status === 200 && (await rpc(TA2, 'tools/list')).status === 401
         && (await api('/api/mcp/tokens', { token: A })).json.tokens.length === 1);
@@ -361,6 +418,9 @@ try {
     const pw = await api('/api/auth/password', { method: 'POST', token: A, body: { currentPassword: PASSWORD, newPassword: 'battery staple horse' } });
     check('a password change revokes the account\'s tokens', pw.status === 200 && (await rpc(TA, 'tools/list')).status === 401
         && (await api('/api/mcp/tokens', { token: pw.json.token })).json.tokens.length === 0, pw.text);
+    check('  and ends its share links: the page, search and proposals', (await api(linkA)).status === 410
+        && (await api(linkA + '/search?q=hacker')).status === 410
+        && (await api(linkA + '/propose', { method: 'POST', body: { title: 'x', content: 'y' } })).status === 410);
     const A2 = pw.json.token;
     const users = (await api('/api/users', { token: A2 })).json.users;
     const kimId = users.find(u => u.username === 'kim').id;

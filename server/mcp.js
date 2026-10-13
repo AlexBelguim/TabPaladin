@@ -19,12 +19,15 @@
 // accepted anywhere else (requireAuth only knows sessions and AUTH_TOKEN).
 //
 // Limits: requests per token per minute, failed tokens per client IP, the
-// body size, and every tool's answer (lists are paged and capped).
+// body size, and every tool's answer, errors included: at most MAX_TOOL_TEXT
+// bytes of UTF-8. Lists are paged; a long note is read in parts (offset).
 //
 // Origin: browsers send one, MCP clients do not. A request carrying an Origin
 // header is refused (403) unless MCP_ALLOWED_ORIGINS lists it, as the MCP
 // transport spec asks against DNS rebinding — a page in the user's browser
-// has no business calling this, with or without a token.
+// has no business calling this, with or without a token. A listed origin
+// (an MCP inspector in a browser, say) gets CORS here, preflights included:
+// the server-wide CORS layer leaves /mcp alone (index.js).
 //
 // Top-level on purpose: the Dockerfile copies server/*.js and server/imports.
 
@@ -44,9 +47,17 @@ export const TOKEN_PREFIX = 'tpm_';
 export const MAX_TOKENS_PER_USER = 20;
 export const MAX_TOKEN_NAME = 60;
 export const MAX_TOOL_TEXT = 100 * 1024;
+export const NOTE_PART = 100000;
 export const MCP_BODY_LIMIT = '256kb';
 const LAST_USED_EVERY_MS = 60 * 1000;
 const SERVER_INFO = { name: 'tabpaladin', title: 'TabPaladin', version: '1.0.0' };
+// What a listed browser origin may send and read.
+const CORS_PREFLIGHT = {
+    'Access-Control-Allow-Methods': 'POST',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID',
+    'Access-Control-Max-Age': '600'
+};
+const CORS_EXPOSE = 'Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate, Retry-After';
 
 // One table, born per account: guarded like every other (tenancy.js) and
 // removed with its account. Additive and idempotent.
@@ -189,8 +200,13 @@ export const TOOLS = [
     },
     {
         name: 'read_note', title: 'Read a note',
-        description: 'One note\'s full text, by id or by title.',
-        inputSchema: { type: 'object', properties: { id: str('The note\'s id.'), title: str('The note\'s title.') } },
+        description: 'One note\'s text, by id or by title. A long note comes in parts: when the answer has "nextOffset", call again with that offset for the rest.',
+        inputSchema: { type: 'object', properties: {
+            id: str('The note\'s id.'),
+            title: str('The note\'s title.'),
+            offset: int('Start at this character.', 0, 100000000, 0),
+            limit: int('At most this many characters (fewer when the answer would be too large).', 1, NOTE_PART, NOTE_PART)
+        } },
         annotations: READ
     },
     {
@@ -282,7 +298,10 @@ export const TOOLS = [
     {
         name: 'list_my_proposals', title: 'List my pending proposals',
         description: 'The proposals made with this connection that still wait for the user: what each would do and whether it is out of date. Approved or rejected ones are no longer listed.',
-        inputSchema: { type: 'object', properties: {} },
+        inputSchema: { type: 'object', properties: {
+            offset: int('Skip this many.', 0, 1000000, 0),
+            limit: int('How many to return.', 1, 100, 20)
+        } },
         annotations: READ
     }
 ];
@@ -305,18 +324,48 @@ const clamp = (v, min, max, def) => {
 };
 const opt = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
 
+// An answer's size as sent: the UTF-8 bytes of its text.
+const sizeOf = (value) => Buffer.byteLength(JSON.stringify(value, null, 1), 'utf8');
+const fits = (value) => sizeOf(value) <= MAX_TOOL_TEXT;
+
+// The largest n in [0, max] for which build(n) fits in an answer (0 when
+// none does). build(n) must grow with n.
+function mostThatFit(max, build) {
+    if (max <= 0 || fits(build(max))) return Math.max(0, max);
+    let lo = 0;
+    let hi = max - 1;
+    while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(build(mid))) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
+// The first n of `lines`, and a last line saying how many more there are.
+const firstLines = (lines, n, more) => (n < lines.length ? [...lines.slice(0, n), `… and ${lines.length - n} ${more}`] : lines);
+
 function text(value) {
     let out = JSON.stringify(value, null, 1);
-    if (out.length > MAX_TOOL_TEXT) {
+    if (Buffer.byteLength(out, 'utf8') > MAX_TOOL_TEXT) {
         out = JSON.stringify({ error: 'The answer was too large to send. Ask for less: use offset and limit, or a narrower folder or query.' });
         return { content: [{ type: 'text', text: out }], isError: true };
     }
     return { content: [{ type: 'text', text: out }] };
 }
-const failed = (message, extra = {}) => ({
-    content: [{ type: 'text', text: JSON.stringify({ error: message, ...extra }, null, 1) }],
-    isError: true
-});
+
+// A tool error, with what was wrong: as many of the problems as fit.
+function failed(message, extra = {}) {
+    let body = { error: message, ...extra };
+    if (Array.isArray(extra.problems) && !fits(body)) {
+        const all = extra.problems;
+        const build = (n) => ({ error: message, ...extra, problems: firstLines(all, n, 'more not shown.') });
+        body = build(mostThatFit(all.length, build));
+    }
+    let out = JSON.stringify(body, null, 1);
+    if (Buffer.byteLength(out, 'utf8') > MAX_TOOL_TEXT) out = JSON.stringify({ error: String(message).slice(0, 1000) });
+    return { content: [{ type: 'text', text: out }], isError: true };
+}
 
 const bookmarkOut = (b) => ({ id: b.id, title: b.title, url: b.url, folderId: b.parentId, folderPath: pathText(b.path), ...(b.readOnly ? { readOnly: true } : {}) });
 const folderOut = (f) => ({ id: f.id, title: f.title, path: pathText(f.path), folders: f.folders, bookmarks: f.bookmarks, ...(f.readOnly ? { readOnly: true } : {}) });
@@ -405,13 +454,23 @@ function makeToolRunner({ items, proposals }) {
             const n = id ? notes.find(x => x.id === id)
                 : notes.find(x => x.title === title) || notes.find(x => String(x.title).toLowerCase() === title.toLowerCase());
             if (!n) throw new ToolError(`No note ${id ? `with id ${id}` : `titled "${title}"`}.`);
+            // As much from `offset` on as fits once escaped as JSON (a
+            // newline or a quote takes two characters there, and the cap is
+            // in bytes); the rest is one call away, at nextOffset.
             const content = String(n.content || '');
-            const cap = MAX_TOOL_TEXT - 4096;
-            return text({
-                id: n.id, title: n.title, notebook: notePath(n) || null, updatedAt: n.updatedAt,
-                content: content.length > cap ? content.slice(0, cap) : content,
-                ...(content.length > cap ? { truncated: true, characters: content.length } : {})
-            });
+            const offset = clamp(a.offset, 0, content.length, 0);
+            const part = (len) => {
+                let end = Math.min(content.length, offset + len);
+                const c = content.charCodeAt(end - 1);
+                if (end > offset && end < content.length && c >= 0xd800 && c <= 0xdbff) end--; // never half a surrogate pair
+                const more = end < content.length;
+                return {
+                    id: n.id, title: n.title, notebook: notePath(n) || null, updatedAt: n.updatedAt,
+                    characters: content.length, offset, content: content.slice(offset, end),
+                    ...(more ? { truncated: true, nextOffset: end } : {})
+                };
+            };
+            return text(part(mostThatFit(clamp(a.limit, 1, NOTE_PART, NOTE_PART), part)));
         }
         if (name === 'search_notes') {
             const query = opt(a.query);
@@ -432,26 +491,39 @@ function makeToolRunner({ items, proposals }) {
             }
             const out = proposals.forUser(ctx.userId).propose(parsed, { source: 'mcp', tokenId: ctx.tokenId });
             if (!out.ok) return failed(out.error, out.problems ? { problems: out.problems } : {});
-            return text({
+            // Stored: the answer must say so, so a long preview is cut to fit.
+            const lines = out.preview ? out.preview.map(p => p.text) : null;
+            const answer = (k) => ({
                 id: out.id,
                 status: 'pending_approval',
                 summary: out.summary,
-                ...(out.preview ? { preview: out.preview.map(p => p.text) } : {}),
+                ...(lines ? { preview: firstLines(lines, k, 'more lines; the app shows them all.') } : {}),
                 message: 'Stored as a proposal. Nothing has changed yet: tell the user it is waiting for their approval in the TabPaladin app'
                     + (out.kind === 'tree' ? ' (Home › Suggested changes).' : ' (Notes).')
             });
+            return text(answer(lines ? mostThatFit(lines.length, answer) : 0));
         }
         if (name === 'list_my_proposals') {
             const list = proposals.forUser(ctx.userId).list({ tokenId: ctx.tokenId });
-            return text({
-                pending: list.map(p => ({
+            const offset = clamp(a.offset, 0, 1e6, 0);
+            const page = list.slice(offset, offset + clamp(a.limit, 1, 100, 20)).map(p => {
+                const item = (k) => ({
                     id: p.id, kind: p.kind, title: p.title, createdAt: p.createdAt, status: p.status,
                     ...(p.stale && p.stale.length ? { outOfDate: p.stale } : {}),
-                    ...(p.preview && p.preview.length ? { preview: p.preview.map(x => x.text) } : {}),
+                    ...(p.preview && p.preview.length ? { preview: firstLines(p.preview.map(x => x.text), k, 'more lines; the app shows them all.') } : {}),
                     ...(p.notebook ? { notebook: p.notebook } : {})
-                })),
+                });
+                // One alone must fit: a very long preview is cut.
+                const lines = p.preview ? p.preview.length : 0;
+                return item(mostThatFit(lines, (k) => ({ pending: [item(k)] })));
+            });
+            const answer = (n) => ({
+                total: list.length, offset,
+                nextOffset: offset + n < list.length ? offset + n : null,
+                pending: page.slice(0, n),
                 note: 'Only proposals still waiting are listed; approved and rejected ones are gone.'
             });
+            return text(answer(Math.max(Math.min(1, page.length), mostThatFit(page.length, answer))));
         }
         throw new ToolError(`Unknown tool ${name}.`);
     };
@@ -500,6 +572,17 @@ export function attachMcp(app, { db, items, proposals, requireAuth, env = proces
         const origin = req.headers.origin;
         if (origin !== undefined && !allowedOrigins.has(origin)) {
             return rpcError(res, 403, -32000, 'Forbidden: requests from a web page (Origin header) are not accepted here.');
+        }
+        if (origin !== undefined) {
+            // A listed browser origin: CORS on every answer, and its
+            // preflight answered here (the token is checked on the POST).
+            res.set('Access-Control-Allow-Origin', origin);
+            res.vary('Origin');
+            res.set('Access-Control-Expose-Headers', CORS_EXPOSE);
+            if (req.method === 'OPTIONS') {
+                res.set(CORS_PREFLIGHT);
+                return res.status(204).end();
+            }
         }
         if (req.method !== 'POST') {
             return rpcError(res, 405, -32000, 'Method not allowed: this MCP endpoint is stateless and only takes POST.', { Allow: 'POST' });
