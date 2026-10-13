@@ -126,7 +126,7 @@ function makeEl(id) {
         focus() { document.activeElement = el; },
         select() {}, blur() {}, setSelectionRange() {}, scrollIntoView() {},
         setAttribute() {}, getAttribute() { return null; }, removeAttribute() {}, toggleAttribute() {},
-        appendChild(c) { return c; }, append() {}, remove() {},
+        appendChild(c) { return c; }, append() {}, remove() {}, replaceChildren() {},
         showModal() { this.open = true; }, close() { this.open = false; },
         getBoundingClientRect() { return { top: 0, left: 0, width: 1400, height: 800, right: 1400, bottom: 800 }; }
     };
@@ -140,6 +140,7 @@ globalThis.document = {
     querySelectorAll() { return []; },
     addEventListener() {},
     createElement(tag) { return makeEl(`<${tag}>`); },
+    createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
     body: makeEl('body')
 };
 const ls = new Map();

@@ -988,14 +988,16 @@
     // `ops` as GET /api/tree/ops gives them, applied in order through an
     // adapter over whatever shape the copy has:
     //   find(id) -> node | null, kindOf(node), urlOf(node), childCount(node),
-    //   insert(parentNode | null, {id, kind, title, url?}) -> node (at the end),
-    //   remove(node), fallbackParent() -> node | null (the Bookmarks root).
+    //   insert(parentNode | null, {id, kind, title, url?, payload?}) -> node
+    //   (at the end), remove(node), fallbackParent() -> node | null (the
+    //   Bookmarks root).
     // An append inserts each node whose id is missing; a folder with no
     // parent (one a phone made at the top level) goes at the top level; one
     // whose parent is gone here goes to the end of the Bookmarks root and
-    // counts as relocated, so a later push cannot drop it. An unappend
-    // removes a node only while it is still that bookmark (same URL) or an
-    // empty folder.
+    // counts as relocated, so a later push cannot drop it. A node's payload
+    // (a saved workflow's {createdAt}) comes along: dropping it here would
+    // erase it for every device at the next push. An unappend removes a node
+    // only while it is still that bookmark (same URL) or an empty folder.
     function applyOps(ops, a) {
         const out = { applied: 0, relocated: 0, removed: 0, skipped: 0 };
         for (const op of ops || []) {
@@ -1008,7 +1010,9 @@
                         parent = a.fallbackParent();
                         out.relocated++;
                     }
-                    a.insert(parent, { id: n.id, kind: n.kind === 'folder' ? 'folder' : 'bookmark', title: String(n.title || ''), url: n.url });
+                    const spec = { id: n.id, kind: n.kind === 'folder' ? 'folder' : 'bookmark', title: String(n.title || ''), url: n.url };
+                    if (n.payload && typeof n.payload === 'object' && !Array.isArray(n.payload)) spec.payload = JSON.parse(JSON.stringify(n.payload));
+                    a.insert(parent, spec);
                     out.applied++;
                 }
             } else if (op.kind === 'unappend') {
@@ -1048,6 +1052,7 @@
                 const node = { id: spec.id, kind: spec.kind, title: spec.title };
                 if (spec.kind === 'bookmark') node.url = spec.url;
                 else node.children = [];
+                if (spec.payload) node.payload = spec.payload;
                 const siblings = parent ? (parent.children = parent.children || []) : roots;
                 siblings.push(node);
                 nodes.set(node.id, node);

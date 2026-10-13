@@ -176,6 +176,13 @@ input:focus { outline: none; border-color: var(--primary); }
   white-space: nowrap;
 }
 .row.bookmark img { width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0; }
+/* Not an http(s) link (a bookmarklet, a file: URL): shown, never opened. */
+.row.bookmark .bookmark-inert {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* --- Imported bookmarks ---
    The imports folder is not like the rest of the tree: the server owns it, and
@@ -577,6 +584,14 @@ button.ghost.dirty {
 
 .note-urllink { color: var(--primary); }
 
+.note-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: var(--surface-2);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
 .note-backlinks {
   margin-top: 12px;
   padding-top: 10px;
@@ -675,6 +690,7 @@ button.ghost.dirty {
 }
 
 .pin-tile:active { border-color: var(--primary); }
+.pin-tile.pin-inert { opacity: 0.5; cursor: default; }
 
 .pin-fav {
   position: relative;
@@ -711,6 +727,13 @@ button.ghost.dirty {
 
 /* ---------- sign in ---------- */
 .hint.error { color: var(--danger); }
+.origin-notice {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.origin-notice .hint { display: block; margin-bottom: 6px; }
 
 .ghost-block {
   display: block;

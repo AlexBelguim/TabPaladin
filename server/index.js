@@ -9,7 +9,7 @@ import { attachImports, initSchema as initImportsSchema } from './imports/index.
 import { buildImportsTree } from './imports/project.js';
 import { makeItemsStore, ForeignIdError } from './items.js';
 import {
-    authTokenProblem, hashPassword, verifyPassword, makeRateLimiter
+    authTokenProblem, hashPassword, verifyPassword, makeRateLimiter, securityHeaders, markAppResponse
 } from './security.js';
 import {
     backupDatabase, backupNow, latestBackup, migrateUsers, setSchemaVersion, bootstrapAdmin,
@@ -20,6 +20,8 @@ import {
     initTenancySchema, migrateOwnership, preflight, writeRefusal, checkOwnership, serverId
 } from './tenancy.js';
 import { attachPrefs } from './prefs.js';
+import { loadOrCreateIdentity, attachIdentity, IDENTITY_APP, IDENTITY_FILE } from './identity.js';
+import { attachWorkflowRoutes } from './workflows.js';
 import { attachUserAdmin } from './admin.js';
 import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
 
@@ -236,6 +238,14 @@ for (const warning of checkOwnership(db)) console.warn(`[TabPaladin] Ownership: 
 // Sent with every sign-in and tree response, so a client can tell this
 // server's accounts from another server's with the same ids (see tenancy.js).
 const SERVER_ID = serverId(db);
+// The key this server proves itself with at /api/identity (identity.js). Not
+// having one is not a reason to stop serving everyone's data.
+const IDENTITY = loadOrCreateIdentity(DATA_DIR);
+if (!IDENTITY.ok) {
+    console.warn(`[TabPaladin] No identity key, so /api/identity answers 503 until the next start: ${IDENTITY.error}`);
+} else if (IDENTITY.created) {
+    console.log(`[TabPaladin] Made this server's identity key ${IDENTITY.keyId} in ${path.join(DATA_DIR, IDENTITY_FILE)}. Back it up with the database.`);
+}
 
 // The owner's boot steps, only while the owner exists: rows for an account
 // that is gone would be refused by the guards anyway.
@@ -279,6 +289,12 @@ const TRUST_PROXY = process.env.TRUST_PROXY || 'loopback, uniquelocal';
 app.set('trust proxy', /^(true|false)$/.test(TRUST_PROXY) ? TRUST_PROXY === 'true'
     : /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
 
+// nosniff and no-referrer on everything, the web app's CSP on its files and a
+// script-free one on every other HTML page, error pages included. First, so
+// nothing answers without them. See security.js.
+app.disable('x-powered-by');
+app.use(securityHeaders());
+
 // CORS: the PWA is served from this origin and needs none. The browser
 // extension calls cross-origin from chrome-extension:// / moz-extension://
 // with a bearer token, so those are always allowed; any other origin (a
@@ -299,10 +315,13 @@ app.use(cors((req, cb) => {
     });
 }));
 
-// Small bodies everywhere except a tree push, which carries the whole tree.
+// Small bodies everywhere except a tree push, which carries the whole tree,
+// and a saved workflow, which may carry 500 long URLs (its route parses it).
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
-app.use((req, res, next) => (req.method === 'PUT' && req.path === '/api/tree' ? next() : jsonSmall(req, res, next)));
+const ownBodyParser = (req) => (req.method === 'PUT' && req.path === '/api/tree')
+    || (req.method === 'POST' && req.path === '/api/workflows');
+app.use((req, res, next) => (ownBodyParser(req) ? next() : jsonSmall(req, res, next)));
 
 // Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
 app.use('/api', (req, res, next) => {
@@ -470,10 +489,13 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
     }
 });
 
-// --- Health (no auth) ---
+// --- Health and identity (no auth) ---
+// app and serverId say which server this is before anything is signed in;
+// /api/identity proves it (identity.js). Older clients ignore both.
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, version: 2, configured: userCount() > 0 });
+    res.json({ ok: true, version: 2, configured: userCount() > 0, app: IDENTITY_APP, serverId: SERVER_ID });
 });
+attachIdentity(app, { identity: IDENTITY, serverId: SERVER_ID });
 
 // --- Accounts and preferences ---
 // Before the static handler, so /api/users and /api/prefs win over the PWA.
@@ -499,6 +521,11 @@ const { store: importsStore } = attachImports(app, {
 // After the importers, because X and Instagram shares go to their archive.
 const shares = makeSharesStore(db, { items, importsStore, maxPending: MAX_INBOX_PER_USER });
 attachShareRoutes(app, { store: shares, items, requireAuth, serverId: SERVER_ID });
+
+// --- Saved workflows ---
+// One workflow appended under the account's workflows root, without the rest
+// of the client's copy (workflows.js). Logged in the same ops log.
+attachWorkflowRoutes(app, { items, requireAuth, serverId: SERVER_ID });
 
 // --- The tree ---
 //
@@ -810,9 +837,12 @@ app.post('/share', express.urlencoded({ extended: false }), (req, res) => {
 if (fs.existsSync(PWA_DIR)) {
     // no-cache: browsers/proxies may store but must revalidate (ETag → cheap
     // 304s). Prevents stale app shells; deploys must show up immediately.
+    // Every file here gets the app's CSP (see security.js): the worker's
+    // script is governed by its own response's policy.
     app.use('/', express.static(PWA_DIR, {
         setHeaders: (res) => {
             res.set('Cache-Control', 'no-cache');
+            markAppResponse(res);
         }
     }));
 } else {
@@ -831,4 +861,5 @@ app.listen(PORT, '0.0.0.0', () => {
     }
     console.log(`[TabPaladin] PWA served from ${PWA_DIR}`);
     console.log(`[TabPaladin] Data dir ${DATA_DIR}`);
+    if (IDENTITY.ok) console.log(`[TabPaladin] Server ${SERVER_ID}, identity key ${IDENTITY.keyId}`);
 });

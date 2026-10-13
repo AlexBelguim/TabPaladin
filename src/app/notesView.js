@@ -447,28 +447,9 @@ function scopeNotebookId() {
     return id && view.lib.notebooks.has(id) ? id : null;
 }
 
-// --- rendered note (moved from sidepanel.js unchanged) -----------------------------
+// --- rendered note --------------------------------------------------------------
 
-// Inline markup shared by every line: [[wiki-links]] become clickable chips
-// and bare URLs become links. Takes already-escaped text.
-function renderNoteInlineHtml(escaped) {
-    let html = escaped.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
-        `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
-    html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
-        `<a href="$1" class="note-urllink" title="Open in new tab">$1</a>`);
-    return html;
-}
-
-// Inline markdown: **bold**, *italic*, `code`. Applied after escaping, so the
-// patterns only ever see safe text.
-function renderNoteEmphasis(html) {
-    return html
-        .replace(/`([^`]+)`/g, '<code class="note-code">$1</code>')
-        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
-}
-
-// Render note content as HTML.
+// Render note content as DOM nodes; returns the block elements.
 //
 // Tasks become real checkboxes carrying their source line number, so toggling
 // one edits exactly that line of the stored markdown. Headings, bullets and
@@ -476,28 +457,43 @@ function renderNoteEmphasis(html) {
 // as escaped text, so a note full of "## Meat" and "- 260 g soy sauce" read as
 // raw markdown with only the checkboxes working.
 //
+// The inline parts (**bold**, *italic*, `code`, [[wiki-links]] as chips, bare
+// URLs as links) come from notesModel's tokens (NM.appendInlineNodes): text
+// only ever goes in as text, a chip's target through dataset and a link's
+// href through safeHref. This used to be an HTML string, and a URL inside a
+// wikilink broke out of the chip's attribute. `doc` is the document to build
+// with (tools/test_render_safety.mjs passes its own).
+//
 // `skipTitle` drops a leading "# Heading" that just repeats the note's title,
 // which is otherwise shown twice: once in the title field, once at the top of
 // the body.
-function renderNoteContentHtml(content, skipTitle = '') {
+export function renderNoteContent(content, skipTitle = '', doc = document) {
     const lines = String(content == null ? '' : content).split('\n');
-    const out = [];
-    let inList = false;
+    const blocks = [];
+    let list = null;
     let titleDropped = false;
 
-    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+    const el = (tag, cls) => {
+        const node = doc.createElement(tag);
+        if (cls) node.className = cls;
+        return node;
+    };
+    const inline = (parent, text) => NM.appendInlineNodes(doc, parent, NM.renderInlineTokens(text), { title: 'Open in new tab' });
+    const closeList = () => { list = null; };
 
     lines.forEach((raw, i) => {
         const task = NotesManager.parseTaskLine(raw);
         if (task) {
             closeList();
-            const label = renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(task.label)));
-            out.push(
-                `<label class="note-task"${task.indent ? ` style="margin-left:${task.indent * 14}px;"` : ''}>` +
-                `<input type="checkbox" class="note-task-box" data-line="${i}"${task.checked ? ' checked' : ''}>` +
-                `<span class="note-task-label${task.checked ? ' done' : ''}">${label}</span>` +
-                `</label>`
-            );
+            const label = el('label', 'note-task');
+            if (task.indent) label.style.marginLeft = `${task.indent * 14}px`;
+            const box = el('input', 'note-task-box');
+            box.type = 'checkbox';
+            box.dataset.line = String(i);
+            box.checked = task.checked;
+            label.appendChild(box);
+            label.appendChild(inline(el('span', `note-task-label${task.checked ? ' done' : ''}`), task.label));
+            blocks.push(label);
             return;
         }
 
@@ -512,24 +508,26 @@ function renderNoteContentHtml(content, skipTitle = '') {
                 return;
             }
             const level = Math.min(heading[1].length + 1, 5); // h1 -> h2, so page structure stays sane
-            out.push(`<h${level} class="note-h">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(text)))}</h${level}>`);
+            blocks.push(inline(el(`h${level}`, 'note-h'), text));
             return;
         }
 
         const bullet = raw.match(/^(\s*)[-*]\s+(.*)$/);
         if (bullet) {
-            if (!inList) { out.push('<ul class="note-list">'); inList = true; }
-            out.push(`<li>${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(bullet[2])))}</li>`);
+            if (!list) {
+                list = el('ul', 'note-list');
+                blocks.push(list);
+            }
+            list.appendChild(inline(el('li'), bullet[2]));
             return;
         }
 
         closeList();
-        if (raw.trim() === '') { out.push('<div class="note-gap"></div>'); return; }
-        out.push(`<p class="note-p">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(raw)))}</p>`);
+        if (raw.trim() === '') { blocks.push(el('div', 'note-gap')); return; }
+        blocks.push(inline(el('p', 'note-p'), raw));
     });
 
-    closeList();
-    return out.join('');
+    return blocks;
 }
 
 // --- layout -----------------------------------------------------------------------
@@ -772,8 +770,18 @@ function setMode(mode, { remember = true, focus = true } = {}) {
 
 function renderPreview() {
     const title = $('noteTitleInput').value.trim() || view.loaded.title;
-    const html = renderNoteContentHtml($('noteContentInput').value, title);
-    $('notePreview').innerHTML = `<div class="note-preview-body">${html || '<span class="nv-muted">Empty note.</span>'}</div>`;
+    const body = document.createElement('div');
+    body.className = 'note-preview-body';
+    const blocks = renderNoteContent($('noteContentInput').value, title);
+    if (blocks.length) {
+        for (const b of blocks) body.appendChild(b);
+    } else {
+        const empty = document.createElement('span');
+        empty.className = 'nv-muted';
+        empty.textContent = 'Empty note.';
+        body.appendChild(empty);
+    }
+    $('notePreview').replaceChildren(body);
 }
 
 function renderBacklinks() {
@@ -1588,7 +1596,10 @@ export function initNotesView() {
         const urlLink = e.target.closest('.note-urllink');
         if (urlLink) {
             e.preventDefault();
-            const url = urlLink.getAttribute('href');
+            // Only ever an http(s) link (the renderer made it through
+            // safeHref); checked again here rather than trusted.
+            const url = NM.safeHref(urlLink.getAttribute('href'));
+            if (!url) return;
             try { await api.tabs.create({ url }); } catch (err) { window.open(url, '_blank', 'noopener'); }
             return;
         }

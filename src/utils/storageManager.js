@@ -10,7 +10,8 @@
 // Settings stay in extension storage; they are device-local, not tree data.
 import { TreeStore } from './treeStore.js';
 
-const api = typeof browser !== 'undefined' ? browser : chrome;
+// The browser's API, unless a page installed a platform first (see treeStore.js).
+const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser : chrome);
 
 function hydrateWorkflow(folderNode) {
     const tabs = [];

@@ -870,6 +870,81 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         return { baseVersion, version: v, removed, kept, gone };
     });
 
+    // --- Appends: a workflow saved from a browser window ---------------------
+    //
+    // POST /api/workflows (workflows.js): one workflow folder with its tabs,
+    // appended at the end of this account's workflows root and logged as one
+    // 'append' op, like a filed link (appendToFolders): none of the client's
+    // other unpushed edits go with it, and no history snapshot is written.
+    //
+    // The ids are the client's. An id already here as the same thing — the
+    // folder with that title under that root, a tab with that URL in that
+    // folder — is reused, so a retry after a lost answer adds nothing; an id
+    // that is anything else here, or another account's, is a conflict, and
+    // then nothing at all is written. It never makes the workflows root: with
+    // none here, or another one than `rootId`, it answers 'no-root'. The
+    // folder's payload is {createdAt}, as StorageManager.saveWorkflow writes.
+    //
+    //   request  {rootId, workflow: {id, title, createdAt, tabs: [{id, title, url}]}},
+    //            already validated (workflows.js parseWorkflowRequest)
+    //   returns  {ok: true, baseVersion, version, created: [node], already: [id]}
+    //            | {ok: false, code: 'no-root', rootId: <this account's root or null>}
+    //            | {ok: false, code: 'conflict', ids: [id]}
+    const appendWorkflow = db.transaction(({ rootId, workflow }) => {
+        const baseVersion = version();
+        const root = findRoleRow('workflows');
+        if (!root || root.id !== rootId) return { ok: false, code: 'no-root', rootId: root ? root.id : null };
+
+        const own = db.prepare('SELECT id, kind, title, url, parent_id FROM items WHERE user_id = ? AND id = ?');
+        const foreign = db.prepare('SELECT 1 FROM items WHERE id = ? AND user_id IS NOT ?');
+        const conflicts = [];
+        const already = [];
+
+        // Everything is checked before anything is written.
+        const folder = own.get(userId, workflow.id);
+        if (folder) {
+            const same = folder.kind === 'folder' && folder.title === workflow.title && folder.parent_id === rootId;
+            if (same) already.push(workflow.id);
+            else conflicts.push(workflow.id);
+        } else if (foreign.get(workflow.id, userId)) {
+            conflicts.push(workflow.id);
+        }
+        const toAdd = [];
+        for (const t of workflow.tabs) {
+            const row = own.get(userId, t.id);
+            if (row) {
+                if (row.kind === 'bookmark' && row.parent_id === workflow.id && row.url === t.url) already.push(t.id);
+                else conflicts.push(t.id);
+            } else if (foreign.get(t.id, userId)) {
+                conflicts.push(t.id);
+            } else {
+                toAdd.push(t);
+            }
+        }
+        if (conflicts.length) return { ok: false, code: 'conflict', ids: conflicts };
+
+        const now = new Date().toISOString();
+        const created = [];
+        if (!folder) {
+            const payload = { createdAt: workflow.createdAt };
+            db.prepare(`
+                INSERT INTO items (id, parent_id, position, kind, title, payload, created_at, updated_at, user_id)
+                VALUES (?, ?, ?, 'folder', ?, ?, ?, ?, ?)
+            `).run(workflow.id, rootId, nextPosition(rootId), workflow.title, JSON.stringify(payload), now, now, userId);
+            created.push({ id: workflow.id, parentId: rootId, kind: 'folder', title: workflow.title, payload });
+        }
+        const insertTab = db.prepare(`
+            INSERT INTO items (id, parent_id, position, kind, title, url, created_at, updated_at, user_id)
+            VALUES (?, ?, ?, 'bookmark', ?, ?, ?, ?, ?)
+        `);
+        for (const t of toAdd) {
+            insertTab.run(t.id, workflow.id, nextPosition(workflow.id), t.title, t.url, now, now, userId);
+            created.push({ id: t.id, parentId: workflow.id, kind: 'bookmark', title: t.title, url: t.url });
+        }
+        const v = created.length ? bump('append', { nodes: created }) : baseVersion;
+        return { ok: true, baseVersion, version: v, created, already };
+    });
+
     // How deep a folder sits, for removing created folders children first.
     function depthOf(id) {
         const up = db.prepare('SELECT parent_id FROM items WHERE user_id = ? AND id = ?');
@@ -989,6 +1064,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         opsSince,
         folderTarget,
         appendToFolders,
+        appendWorkflow,
         removeAppended,
         depthOf
     };
