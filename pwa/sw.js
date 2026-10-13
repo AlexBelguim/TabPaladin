@@ -4,7 +4,7 @@
 // Release ritual: bump the version here AND the ?v= queries in index.html
 // together — all four numbers below included. Miss one and the phone keeps
 // serving the old bundle from cache while the desktop looks fixed.
-const SHELL_CACHE = 'tp-shell-v28';
+const SHELL_CACHE = 'tp-shell-v29';
 
 // Server URL + session token, mirrored here by the app.
 //
@@ -18,8 +18,8 @@ const CONFIG_KEY = '/__tp_config';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=28',
-    '/app.js?v=28',
+    '/app.css?v=29',
+    '/app.js?v=29',
     '/bookmarksHtml.js',
     '/pendingShares.js',
     '/notesModel.js',
