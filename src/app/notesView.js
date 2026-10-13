@@ -1294,7 +1294,11 @@ export function initNotesView() {
             }
             return;
         }
+        // The Move to… dialog is modal: its keys are its own.
+        if ($('nv-move-dialog').open) return;
         const inField = t && t.closest && t.closest('input, textarea, select, [contenteditable="true"]');
+        // Enter on a focused button or link already means "press this".
+        const onControl = t && t.closest && t.closest('button, a[href], summary, [role="button"], [role="menuitem"]');
         if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && (!inField || t === search)) {
             e.preventDefault();
             moveSelection(e.key === 'ArrowDown' ? 1 : -1);
@@ -1306,7 +1310,7 @@ export function initNotesView() {
             if (view.cols < 3 && view.pane !== 'list') setPane('list');
             search.focus();
             search.select();
-        } else if (e.key === 'Enter' && view.noteId && !view.isNew && $('note-editor').offsetParent !== null) {
+        } else if (e.key === 'Enter' && !onControl && view.noteId && !view.isNew && $('note-editor').offsetParent !== null) {
             e.preventDefault();
             setMode('edit', { remember: false });
         }
