@@ -13,7 +13,8 @@ import { AIService } from '../utils/aiService.js';
 import { TreeStore } from '../utils/treeStore.js';
 import { ExpandState, OPEN_TABS_KEY, aiGroupKey } from '../utils/expandState.js';
 import { resolveServerUrl } from '../utils/config.js';
-import { parkedDraftsOnlyWith, dropParkedDrafts, parkedDraftsMarkdown } from '../app/notesView.js';
+import { parkedDraftsOnlyWith, dropParkedDrafts, parkedDraftsMarkdown, saveLiveDraft } from '../app/notesView.js';
+import { downloadBackup } from '../utils/backup.js';
 
 // Every read and write goes against the local working copy of the synced tree
 // (chrome.bookmarks-compatible facade). The browser's own bookmarks are only
@@ -3036,6 +3037,17 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </button>
             </div>
 
+            <!-- Backup -->
+            <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Backup</h3>
+            <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                    Everything this browser's TabPaladin holds as one file: the working copy with its unpushed edits,
+                    set-aside copies, unsaved note drafts and your settings. Your sign-in session is left out.
+                </div>
+                <button id="backup-download-btn" class="sm-btn" style="width:100%;">📦 Download a backup</button>
+                <div id="backup-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
+            </div>
+
             <!-- Working copies of other accounts, kept when you switched -->
             <div id="stash-block" style="display:none;">
                 <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Set-aside working copies</h3>
@@ -3814,6 +3826,19 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     document.getElementById('backend-pull-btn').addEventListener('click', async () => {
         await beforeSync('pull');
         writeBackendStatus(await doPull() || '');
+    });
+
+    document.getElementById('backup-download-btn').addEventListener('click', async () => {
+        const status = document.getElementById('backup-status');
+        status.textContent = 'Preparing…';
+        try {
+            const backup = await downloadPageBackup();
+            const s = backup.summary;
+            status.textContent = `Saved: ${s.workingCopy.items} items, ${s.workingCopy.unpushedEdits} unpushed edit(s), `
+                + `${s.setAsideCopies} set-aside cop${s.setAsideCopies === 1 ? 'y' : 'ies'}, ${s.parkedDrafts + s.liveDrafts} note draft(s). No session token.`;
+        } catch (e) {
+            status.textContent = 'Backup failed: ' + e.message;
+        }
     });
 
     document.getElementById('browser-import-btn').addEventListener('click', async () => {
@@ -4741,4 +4766,13 @@ function closeSettings() {
 
     // Reload tabs in case settings changed context logic
     loadCurrentTabs();
+}
+
+// Settings › Backup: the working copy and the open note's unsaved text are
+// written first, so the file has what is on screen.
+function downloadPageBackup() {
+    return downloadBackup({
+        api: globalThis.browser || chrome,
+        prepare: () => Promise.allSettled([TreeStore.flush(), saveLiveDraft()])
+    });
 }

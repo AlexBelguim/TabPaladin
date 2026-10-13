@@ -25,6 +25,19 @@
       </div>
     </header>
 
+    <!-- Shown until dismissed on this device (app.js). -->
+    <div id="tp-moving-banner" class="tp-moving-banner" role="note" hidden>
+      <div class="tp-moving-text">
+        <strong>TabPaladin is moving into your server's web app.</strong>
+        Push your edits before updating the extension.
+        <span id="tp-moving-unpushed"></span>
+      </div>
+      <div class="tp-moving-actions">
+        <button id="tp-moving-backup" class="sm-btn" type="button">📦 Download a backup</button>
+        <button id="tp-moving-dismiss" class="sm-btn" type="button" title="Hide this message on this device" aria-label="Hide this message">✕</button>
+      </div>
+    </div>
+
     <main>
       <!-- ============ HOME ============ -->
       <section id="home-container">

@@ -1490,3 +1490,30 @@ body.tp-app .pin-remove {
   border: 1px solid var(--border-color);
   font-size: 0.8rem;
 }
+
+/* "TabPaladin is moving into your server's web app": above every view until
+   dismissed on this device (app.js). */
+.tp-moving-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin: -8px 0 20px;
+  padding: 10px 14px;
+  border: 1px solid var(--primary-color);
+  border-radius: var(--radius-md);
+  background: rgba(59, 130, 246, 0.12);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.tp-moving-banner[hidden] {
+  display: none;
+}
+
+.tp-moving-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
