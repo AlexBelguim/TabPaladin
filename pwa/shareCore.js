@@ -725,7 +725,9 @@
                         ...c, uploaded: true, uploadedAt: new Date(now()).toISOString(),
                         share: r.json.share, archived: r.json.archived || null, lastError: null
                     }));
-                    out.uploaded.push(e.sid);
+                    out.uploaded.push(listed.sid);
+                    // Discarded on the phone while it went up: nothing more to do.
+                    if (!e) continue;
                 }
                 if (e.file) {
                     // In turns of MAX_TARGETS folders, and then whatever was

@@ -34,7 +34,10 @@ const UPLOAD_TIMEOUT_MS = 6000;
 const NAVIGATION_TIMEOUT_MS = 3000;
 
 const Share = self.TPShare;
-const outbox = () => Share.cacheOutbox(caches);
+// One outbox for the worker's lifetime, so its changes to an entry run one at
+// a time across flushes, as the page's do.
+let workerOutbox = null;
+const outbox = () => (workerOutbox = workerOutbox || Share.cacheOutbox(caches));
 
 // One SHELL file failing (a 404 mid-deploy) must not leave nothing cached.
 self.addEventListener('install', (event) => {
