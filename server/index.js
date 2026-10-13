@@ -656,10 +656,13 @@ app.get('/llm/:token', (req, res) => {
     // the link.
     const notes = items.forUser(share.user_id).listNotes();
     // Group notebooks together, loose notes first, keeping each group's order.
+    // A nested notebook is headed by its path ('Work / Meetings'), so two
+    // 'Meetings' under different parents no longer merge into one group; a
+    // top-level one is headed exactly as before.
     const groupOrder = [];
     const groups = new Map();
     for (const n of notes) {
-        const key = n.notebook || '';
+        const key = (n.notebookPath && n.notebookPath.length ? n.notebookPath.join(' / ') : n.notebook) || '';
         if (!groups.has(key)) { groups.set(key, []); groupOrder.push(key); }
         groups.get(key).push(n);
     }
@@ -679,6 +682,7 @@ app.get('/llm/:token', (req, res) => {
     md += `- You are viewing the user's personal note collection via a temporary link.\n`;
     md += `- Notes are plain markdown-ish text. A line starting with \`# \` is the note's title; notes reference each other with wikilinks like [[Note Title]]. Keep this styling when writing notes.\n`;
     md += `- Notes are organized into notebooks (named groups). When the user asks for a note about a topic, file it in the matching notebook via the optional "notebook" field (max 100 chars; created if missing). Omit it if no notebook fits.\n`;
+    md += `- A notebook inside another is listed as "Parent / Child"; pass that whole path as "notebook" to file into it.\n`;
     md += `- You CANNOT create or edit notes directly. ALWAYS ask the user for approval first:\n`;
     md += `  1. Tell the user what you want to write and get their confirmation.\n`;
     md += `  2. POST the proposal to ${proposeUrl} as shown at the top of this page.\n`;

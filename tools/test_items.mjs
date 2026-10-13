@@ -9,7 +9,9 @@
 //   3. Versioning: every write bumps the version and lands in history.
 //   4. Virtual nodes (the imports subtree a pull appends) are stripped on
 //      write, never stored.
-//   5. Notes SQL: listing with notebooks, proposal upsert-by-title, reorder.
+//   5. Notes SQL: listing with notebooks (and their paths), proposal
+//      upsert-by-title that keeps unknown payload fields, notebook names
+//      resolved the way the clients resolve them, reorder.
 //
 // Every database here is a single-account one that has been through the
 // ownership migration, and the store is that account's (forUser(1)). What
@@ -21,6 +23,7 @@ import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import { makeItemsStore, TREE_FORMAT } from '../server/items.js';
 import { migrateUsers } from '../server/users.js';
 import { migrateOwnership } from '../server/tenancy.js';
+import * as NM from '../src/utils/notesModel.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -237,6 +240,107 @@ console.log('\n4b. The Bookmarks root');
     check('a renamed root is not renamed back',
         items.readTree().roots.find(n => n.role === 'bookmarks').title === 'My stuff');
     db.close();
+}
+
+// Work > Meetings and Recipes > Meetings share a leaf name; Elsewhere is
+// outside the notes root.
+function nestedNotesTree() {
+    const note = (id, title, extra = {}) => ({ id, kind: 'note', title, payload: { content: `# ${title}`, createdAt: '2026-01-01T00:00:00Z', ...extra } });
+    return [
+        { id: 'nr', kind: 'folder', title: 'TabPaladin Notes', role: 'notes', children: [
+            note('n-loose', 'Loose'),
+            { id: 'nb-work', kind: 'folder', title: 'Work', children: [
+                note('n-standup', 'Standup', { pinned: true }),
+                { id: 'nb-wmeet', kind: 'folder', title: 'Meetings', children: [note('n-q4', 'Q4 planning')] },
+                { id: 'nb-sprint', kind: 'folder', title: 'Sprint', children: [] }
+            ] },
+            { id: 'nb-recipes', kind: 'folder', title: 'Recipes', children: [
+                { id: 'nb-rmeet', kind: 'folder', title: 'Meetings', children: [note('n-bake', 'Bake-off')] }
+            ] },
+            { id: 'nb-journal', kind: 'folder', title: 'Journal', children: [note('n-day', 'Day 1')] }
+        ] },
+        { id: 'elsewhere', kind: 'folder', title: 'Elsewhere', children: [note('n-stray', 'Stray')] }
+    ];
+}
+
+console.log('\n4c. Nested notebooks: paths in listNotes, proposals resolve like the clients');
+{
+    const { db, items } = freshDb();
+    items.writeTree(nestedNotesTree());
+    const byTitle = (t) => items.listNotes().find(n => n.title === t);
+    const parentOf = (t) => db.prepare("SELECT parent_id FROM items WHERE kind = 'note' AND title = ?").get(t).parent_id;
+    const folderCount = () => db.prepare("SELECT COUNT(*) AS n FROM items WHERE kind = 'folder'").get().n;
+
+    check('nested note keeps its leaf notebook', byTitle('Q4 planning').notebook === 'Meetings');
+    check('... and gains its path', JSON.stringify(byTitle('Q4 planning').notebookPath) === '["Work","Meetings"]');
+    check('same-named notebooks get distinct paths', byTitle('Bake-off').notebookPath.join(' / ') === 'Recipes / Meetings');
+    check('top-level notebook path is just its title', JSON.stringify(byTitle('Standup').notebookPath) === '["Work"]');
+    check('a loose note has an empty path', byTitle('Loose').notebook === null && byTitle('Loose').notebookPath.length === 0);
+    check('a note outside the notes root keeps its folder as its path',
+        byTitle('Stray').notebook === 'Elsewhere' && JSON.stringify(byTitle('Stray').notebookPath) === '["Elsewhere"]');
+
+    let before = folderCount();
+    items.applyNoteProposal({ kind: 'note', title: 'Retro', content: 'x', notebook: 'Work / Meetings' });
+    check('an "A / B" path files into the existing nested notebook', parentOf('Retro') === 'nb-wmeet');
+    items.applyNoteProposal({ kind: 'note', title: 'Velocity', content: 'x', notebook: 'sprint' });
+    check('a unique nested name (any case) files into it', parentOf('Velocity') === 'nb-sprint');
+    items.applyNoteProposal({ kind: 'note', title: 'Diary', content: 'x', notebook: 'journal' });
+    check('a top-level name matches ignoring case', parentOf('Diary') === 'nb-journal');
+    check('none of those created a folder', folderCount() === before, `${before} -> ${folderCount()}`);
+
+    items.applyNoteProposal({ kind: 'note', title: 'Agenda', content: 'x', notebook: 'Meetings' });
+    const topMeet = db.prepare("SELECT id FROM items WHERE kind = 'folder' AND parent_id = 'nr' AND title = 'Meetings'").get();
+    check('an ambiguous nested name creates a top-level notebook', topMeet && parentOf('Agenda') === topMeet.id);
+    items.applyNoteProposal({ kind: 'note', title: 'Agenda 2', content: 'x', notebook: 'Meetings' });
+    check('... which the next proposal finds first', parentOf('Agenda 2') === topMeet.id);
+
+    before = folderCount();
+    items.applyNoteProposal({ kind: 'note', title: 'Jan', content: 'x', notebook: 'Journal / 2026' });
+    const y2026 = db.prepare("SELECT id, parent_id FROM items WHERE kind = 'folder' AND title = '2026'").get();
+    check('a partly missing path creates only the missing part, inside the match',
+        y2026 && y2026.parent_id === 'nb-journal' && parentOf('Jan') === y2026.id && folderCount() === before + 1);
+    items.applyNoteProposal({ kind: 'note', title: 'Idea', content: 'x', notebook: 'Garden / Beds' });
+    const garden = db.prepare("SELECT id, parent_id FROM items WHERE kind = 'folder' AND title = 'Garden'").get();
+    const beds = db.prepare("SELECT id, parent_id FROM items WHERE kind = 'folder' AND title = 'Beds'").get();
+    check('a wholly missing path is created top-down', garden && garden.parent_id === 'nr' && beds && beds.parent_id === garden.id
+        && parentOf('Idea') === beds.id);
+
+    items.applyNoteProposal({ kind: 'note', title: 'Standup', content: 'new body', notebook: 'Work' });
+    const standup = JSON.parse(db.prepare("SELECT payload FROM items WHERE id = 'n-standup'").get().payload);
+    check('a replacing proposal keeps the payload fields it does not own',
+        standup.pinned === true && standup.content === 'new body' && standup.createdAt === '2026-01-01T00:00:00Z');
+    check('... and stamps the edit', typeof standup.updatedAt === 'string');
+    db.close();
+
+    // The server and the clients' import links must send the same name to the
+    // same notebook, or an LLM proposal and an import link disagree.
+    const adapter = {
+        children: (n) => n.children || [], isFolder: (n) => n.kind === 'folder', isNote: (n) => n.kind === 'note',
+        id: (n) => n.id, title: (n) => n.title || '', fields: (n) => n.payload || {}
+    };
+    const lib = NM.buildLibrary(nestedNotesTree()[0], adapter);
+    for (const name of ['Work', 'work', 'Work / Meetings', 'recipes / meetings', 'Sprint', 'Meetings', 'Journal / 2026', 'Nowhere']) {
+        const { db: fresh, items: store } = freshDb();
+        store.writeTree(nestedNotesTree());
+        store.applyNoteProposal({ kind: 'note', title: 'Probe', content: 'x', notebook: name });
+        const serverId = fresh.prepare("SELECT parent_id FROM items WHERE title = 'Probe'").get().parent_id;
+        const client = NM.resolveNotebookByName(lib, name);
+        // A created chain must match the client's segments, under its parent.
+        const createdChain = () => {
+            const titles = [];
+            let id = serverId;
+            for (let i = 0; i < client.create.segments.length; i++) {
+                const row = fresh.prepare('SELECT title, parent_id FROM items WHERE id = ?').get(id);
+                titles.unshift(row.title);
+                id = row.parent_id;
+            }
+            return !lib.notebooks.has(serverId) && id === (client.create.parentId || lib.rootId)
+                && JSON.stringify(titles) === JSON.stringify(client.create.segments);
+        };
+        const agree = client.id ? serverId === client.id : createdChain();
+        check(`server and clients agree on "${name}"`, agree, `server ${serverId}, client ${JSON.stringify(client)}`);
+        fresh.close();
+    }
 }
 
 console.log('\n5. Empty server: no snapshot, nothing to migrate');

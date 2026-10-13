@@ -740,8 +740,11 @@ async function endToEnd() {
         }
         check('import sources identical (removed ones hidden by default)',
             JSON.stringify(withoutKeys(newView.imports, ['removed', 'removedAt'])) === JSON.stringify(oldView.imports));
+        // The page gained one instruction line about nested notebooks; every
+        // note, heading and the rest of the instructions must be unchanged.
+        const NESTED_HINT = '- A notebook inside another is listed as "Parent / Child"; pass that whole path as "notebook" to file into it.\n';
         check('the LLM share page serves the same notes',
-            newView.llm.split(srv.base).join('BASE') === oldView.llm.split(old.base).join('BASE'));
+            newView.llm.split(srv.base).join('BASE').replace(NESTED_HINT, '') === oldView.llm.split(old.base).join('BASE'));
         const removed = (await http(srv.base, '/api/imports?includeRemoved=1', { token: tok })).json.sources.filter(s => s.removed);
         check('the orphaned X archive is back, as a removed source', removed.length === 1 && removed[0].provider === 'x' && removed[0].items === 1,
             JSON.stringify(removed));

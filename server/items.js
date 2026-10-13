@@ -423,16 +423,31 @@ function makeUserStore(db, userId, { maxSnapshots }) {
     // and the note, when there is one). Notes outside the notes root still
     // count — a note the user filed elsewhere should not vanish from the LLM
     // share page.
+    //   notebook      the immediate folder's title, as it always was;
+    //   notebookPath  the titles from the notes root down (['Work', 'Meetings']),
+    //                 so same-named notebooks under different parents stay
+    //                 apart. A note outside the notes root keeps [notebook].
     function listNotes() {
         const root = findRoleRow('notes');
         const rows = db.prepare("SELECT * FROM items WHERE user_id = ? AND kind = 'note' ORDER BY position, id").all(userId);
-        const parentTitle = new Map(
-            db.prepare("SELECT id, title FROM items WHERE user_id = ? AND kind = 'folder'").all(userId).map(r => [r.id, r.title])
+        const folders = new Map(
+            db.prepare("SELECT id, parent_id, title FROM items WHERE user_id = ? AND kind = 'folder'").all(userId).map(r => [r.id, r])
         );
+        const pathOf = (folderId) => {
+            const titles = [];
+            let id = folderId;
+            while (id && id !== root.id && folders.has(id) && titles.length < 1000) {
+                titles.unshift(folders.get(id).title);
+                id = folders.get(id).parent_id;
+            }
+            return id === root.id ? titles : null; // null: outside the notes root
+        };
         return rows.map(r => {
             const note = noteFromRow(r);
-            if (root && r.parent_id && r.parent_id !== root.id && parentTitle.has(r.parent_id)) {
-                note.notebook = parentTitle.get(r.parent_id);
+            note.notebookPath = [];
+            if (root && r.parent_id && r.parent_id !== root.id && folders.has(r.parent_id)) {
+                note.notebook = folders.get(r.parent_id).title;
+                note.notebookPath = pathOf(r.parent_id) || [note.notebook];
             }
             return note;
         });
@@ -451,19 +466,70 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         return id;
     }
 
-    function ensureNotebook(rootId, name) {
-        const existing = db.prepare(
-            "SELECT id FROM items WHERE user_id = ? AND kind = 'folder' AND parent_id = ? AND title = ?"
-        ).get(userId, rootId, name);
-        if (existing) return existing.id;
+    function insertFolder(parentId, title) {
         const now = new Date().toISOString();
         const id = newId();
-        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, rootId).p;
+        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, parentId).p;
         db.prepare(`
             INSERT INTO items (id, parent_id, position, kind, title, created_at, updated_at, user_id)
             VALUES (?, ?, ?, 'folder', ?, ?, ?, ?)
-        `).run(id, rootId, max + 1, name, now, now, userId);
+        `).run(id, parentId, max + 1, title, now, now, userId);
         return id;
+    }
+
+    // The notebook a proposal names, found the way the clients' import links
+    // find it (resolveNotebookByName in notesModel.js), so the same name lands
+    // in the same place from either. Order: an exact top-level title; an exact
+    // nested title that itself contains ' / '; an 'A / B' path, creating what
+    // is missing below the deepest match; a unique nested title; otherwise a
+    // new top-level notebook. Matching ignores case, preferring an exact-case
+    // match among equals. Only ever adds folders.
+    function ensureNotebook(rootId, name) {
+        const wanted = String(name).trim();
+        const kids = new Map();
+        for (const r of db.prepare("SELECT id, parent_id, title FROM items WHERE user_id = ? AND kind = 'folder' ORDER BY position, id").all(userId)) {
+            if (!kids.has(r.parent_id)) kids.set(r.parent_id, []);
+            kids.get(r.parent_id).push({ id: r.id, title: String(r.title || '') });
+        }
+        const childrenOf = (id) => kids.get(id) || [];
+        const same = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
+        const pick = (list, t) => list.find(b => b.title.trim() === t) || list[0];
+
+        const roots = childrenOf(rootId);
+        const top = roots.filter(b => same(b.title, wanted));
+        if (top.length) return pick(top, wanted).id;
+
+        const nested = [];
+        const walk = (list) => {
+            for (const b of list) {
+                const below = childrenOf(b.id);
+                nested.push(...below);
+                walk(below);
+            }
+        };
+        walk(roots);
+
+        let parentId = rootId;
+        let segments = [wanted];
+        if (wanted.includes(' / ')) {
+            const literal = nested.filter(b => same(b.title, wanted));
+            if (literal.length) return pick(literal, wanted).id;
+            segments = wanted.split(/\s+\/\s+/).map(t => t.trim()).filter(Boolean);
+            let level = roots;
+            let i = 0;
+            for (; i < segments.length; i++) {
+                const hits = level.filter(b => same(b.title, segments[i]));
+                if (!hits.length) break;
+                parentId = pick(hits, segments[i]).id;
+                level = childrenOf(parentId);
+            }
+            segments = segments.slice(i);
+        } else {
+            const hits = nested.filter(b => same(b.title, wanted));
+            if (hits.length === 1) return hits[0].id;
+        }
+        for (const segment of segments) parentId = insertFolder(parentId, segment);
+        return parentId;
     }
 
     // Create or replace the note with this title. Same-title matching is what
@@ -482,9 +548,14 @@ function makeUserStore(db, userId, { maxSnapshots }) {
             ORDER BY (parent_id = ?) DESC, position, id LIMIT 1
         `).get(userId, title, targetId);
         if (existing) {
+            // Merge into the stored payload: fields a client added (pinned,
+            // say) are not the proposal's to drop.
             const old = noteFromRow(existing);
+            let raw = {};
+            try { raw = JSON.parse(existing.payload || '{}'); } catch (e) { /* corrupt */ }
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
             db.prepare('UPDATE items SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(
-                JSON.stringify({ content, createdAt: old.createdAt || now, updatedAt: now }), now, existing.id, userId
+                JSON.stringify({ ...raw, content, createdAt: old.createdAt || now, updatedAt: now }), now, existing.id, userId
             );
         } else {
             const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id = ?').get(userId, targetId).p;

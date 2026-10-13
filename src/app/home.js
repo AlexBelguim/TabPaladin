@@ -8,6 +8,8 @@ import { PinsManager, initialsFor, colorFor } from '../utils/pinsManager.js';
 import { StorageManager } from '../utils/storageManager.js';
 import { NotesManager } from '../utils/notesManager.js';
 import { TreeStore } from '../utils/treeStore.js';
+import { sortNotes, relativeTime, pathLabel } from '../utils/notesModel.js';
+import { openNotes } from './notesView.js';
 
 const DDG = 'https://duckduckgo.com/?q=';
 
@@ -210,18 +212,44 @@ function fillPanel(id, rows, emptyText) {
     for (const r of rows) box.appendChild(r);
 }
 
-// Open tasks in a note, for the "3 of 6 open" style count.
-function openTaskCount(content) {
-    const lines = String(content || '').split(/\r?\n/);
-    let open = 0;
-    let total = 0;
-    for (const line of lines) {
-        const task = NotesManager.parseTaskLine(line);
-        if (!task) continue;
-        total++;
-        if (!task.checked) open++;
+// One recent note: title · notebook on the left, task progress and how long
+// ago on the right. A button, because it opens the note.
+function recentNoteRow(note, now) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'home-row home-row-btn';
+    row.dataset.note = note.id;
+
+    const left = document.createElement('span');
+    left.className = 'home-row-text';
+    const title = document.createElement('span');
+    title.textContent = note.title || 'Untitled';
+    if (!note.title) title.className = 'home-row-untitled';
+    left.appendChild(title);
+    if (note.path.length) {
+        const nb = document.createElement('span');
+        nb.className = 'home-row-nb';
+        nb.textContent = ` · ${pathLabel(note.path, 28)}`;
+        nb.title = note.path.join(' › ');
+        left.appendChild(nb);
     }
-    return { open, total };
+
+    const right = document.createElement('span');
+    right.className = 'home-row-meta';
+    const t = note.tasks;
+    if (t.total) {
+        const pill = document.createElement('span');
+        pill.className = 'nv-pill' + (t.open ? '' : ' is-done');
+        pill.textContent = t.open ? `${t.done}/${t.total}` : `✓ ${t.done}/${t.total}`;
+        pill.title = `${t.done} of ${t.total} tasks done`;
+        right.appendChild(pill);
+    }
+    const when = document.createElement('span');
+    when.textContent = relativeTime(note.updatedAt, now);
+    right.appendChild(when);
+
+    row.append(left, right);
+    return row;
 }
 
 async function renderRecents() {
@@ -235,12 +263,11 @@ async function renderRecents() {
     }
 
     try {
-        const notes = await NotesManager.listNotes();
+        // True recency, from any notebook depth.
+        const lib = await NotesManager.getLibrary();
+        const now = Date.now();
         fillPanel('recent-notes',
-            notes.slice(0, 5).map(n => {
-                const { open, total } = openTaskCount(n.content);
-                return recentRow(n.title || 'Untitled', total ? `${open} of ${total} open` : '');
-            }),
+            sortNotes(lib.notes, 'edited').slice(0, 5).map(n => recentNoteRow(n, now)),
             'No notes yet.');
     } catch (e) {
         fillPanel('recent-notes', [], 'Could not load notes.');
@@ -287,6 +314,14 @@ export async function initHome() {
             if (tile && !tile.classList.contains('pin-add')) openPin(tile.dataset.url);
         });
     }
+
+    // A recent note opens Notes with that note selected and its notebook
+    // expanded; 'All notes ›' does what the Notes tile does.
+    $('recent-notes')?.addEventListener('click', (e) => {
+        const row = e.target.closest('[data-note]');
+        if (row) openNotes({ noteId: row.dataset.note });
+    });
+    $('homeAllNotesBtn')?.addEventListener('click', () => $('viewNotesBtn')?.click());
 
     await renderPins();
     await renderRecents();

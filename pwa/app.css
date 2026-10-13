@@ -333,38 +333,7 @@ button.ghost.dirty {
 
 
 /* --- Notes --- */
-.row.note {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.row.note .note-row-text {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  flex: 1;
-}
-
-.row.note .title {
-  font-weight: 600;
-  font-size: 0.9rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.row.note .snippet {
-  color: var(--muted);
-  font-size: 0.78rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Fullscreen note page: no bookmark chrome while a note is open */
-body.note-open #breadcrumb { display: none; }
-
+/* The note page: black paper, no bookmark chrome. */
 .note-page {
   background: #000;
   margin: 0 -16px;
@@ -421,8 +390,6 @@ body.note-open #breadcrumb { display: none; }
   border-radius: 8px;
 }
 
-#note-menu-pop button.danger { background: var(--danger); color: #fff; }
-
 /* Note-app look: the editor is a page, not an input box */
 .note-page textarea {
   width: 100%;
@@ -443,7 +410,7 @@ body.note-open #breadcrumb { display: none; }
   border: none;
 }
 
-/* --- Notes section (root view) --- */
+/* --- Section blocks on the root view (workflows) --- */
 .notes-section {
   margin-top: 24px;
   border-top: 1px solid var(--border);
@@ -550,13 +517,6 @@ body.note-open #breadcrumb { display: none; }
 
 .import-actions { margin-top: 10px; }
 
-/* --- Notes section while a note is open: strip list chrome --- */
-.notes-section.detail-open {
-  margin-top: 0;
-  border-top: none;
-  padding-top: 0;
-}
-
 .note-preview-body {
   padding: 4px 2px;
   font-size: 1.05rem;
@@ -624,52 +584,6 @@ body.note-open #breadcrumb { display: none; }
   font-size: 0.8rem;
 }
 
-/* --- Notebooks (note groups) --- */
-.notebook {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 4px 10px 10px;
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.notebook .row.note { margin-top: 6px; }
-
-.notebook summary {
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 2px;
-  font-weight: 600;
-  font-size: 0.9rem;
-  list-style: none;
-}
-
-.notebook summary::-webkit-details-marker { display: none; }
-
-.notebook summary::before {
-  content: '▸';
-  color: var(--muted);
-  transition: transform 0.15s;
-}
-
-.notebook[open] summary::before { transform: rotate(90deg); }
-
-.notebook summary .notebook-name { flex: 1; }
-
-.notebook summary .count {
-  color: var(--muted);
-  font-size: 0.75rem;
-  font-weight: 400;
-}
-
-.notebook .notebook-add {
-  font-size: 0.74rem;
-  padding: 4px 10px;
-  margin: 2px 0 8px;
-  color: var(--muted);
-}
-
 .notebook-badge {
   font-size: 0.72rem;
   font-weight: 400;
@@ -678,16 +592,6 @@ body.note-open #breadcrumb { display: none; }
   padding: 1px 6px;
   border-radius: 4px;
   white-space: nowrap;
-}
-
-select.note-move {
-  background: var(--surface-2);
-  color: var(--text);
-  border: none;
-  border-radius: 8px;
-  padding: 8px 6px;
-  font-size: 0.78rem;
-  max-width: 130px;
 }
 
 /* ---------- home: search + pinned links ---------- */
@@ -974,20 +878,6 @@ select.note-move {
   padding: 4px 12px;
 }
 
-.home-note-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 0;
-  border-bottom: 1px solid rgba(51, 65, 85, 0.55);
-  font-size: 0.85rem;
-}
-
-.home-note-row:last-child { border-bottom: none; }
-.home-note-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.home-note-meta { color: var(--muted); font-size: 0.72rem; flex-shrink: 0; }
-
 /* ---------- bottom tab bar ---------- */
 #bottom-nav {
   position: fixed;
@@ -1141,8 +1031,714 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 
   /* Mouse-first affordances. */
   .row.bookmark:hover,
-  .row.note:hover,
   .workflow-row:hover { background: var(--surface-2); }
   .home-actions { grid-template-columns: repeat(4, 1fr); }
   .pins-grid { gap: 16px; }
+}
+
+/* ---------- notes screen: library | list | note ---------- */
+/* Same DOM at every width. Below 900px only the pane named by body.pane-*
+   shows and the page itself scrolls; from 900px the panes sit side by side
+   and scroll on their own. renderView sets view-notes and pane-* on body. */
+body.view-notes #breadcrumb { display: none; }
+
+.nv-pane {
+  min-width: 0;
+  scrollbar-color: var(--surface-2) transparent;
+  scrollbar-width: thin;
+}
+
+.nv-ico {
+  flex: none;
+  width: 20px;
+  text-align: center;
+}
+
+.nv-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nv-count {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.nv-chev-r { color: var(--muted); flex: none; }
+
+.nv-text-btn {
+  background: none;
+  padding: 0;
+  color: var(--primary);
+  font-size: inherit;
+}
+
+.nv-text-btn:hover { background: none; text-decoration: underline; }
+
+.nv-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 16px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.nv-empty p { margin: 0; }
+.nv-empty .ghost-block { width: auto; margin: 0; }
+
+/* Library */
+.nv-side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 4px 0 10px;
+}
+
+.nv-side-head h2,
+.nv-list-head h2 {
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.nv-round {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 1.3rem;
+  line-height: 1;
+  color: #fff;
+}
+
+.nv-searchbar {
+  display: block;
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 11px 13px;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--muted);
+}
+
+.nv-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.nv-scope {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  padding: 0 14px;
+  background: none;
+  border-radius: 0;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+  text-align: left;
+}
+
+.nv-scope:last-child { border-bottom: none; }
+
+.nv-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 18px 2px 6px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nv-label-row .nv-text-btn {
+  font-size: 0.8rem;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 500;
+}
+
+.nv-tree-row {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+  padding-left: calc(var(--depth, 0) * 20px);
+  border-bottom: 1px solid rgba(51, 65, 85, 0.45);
+}
+
+.nv-fold,
+.nv-fold-space {
+  flex: none;
+  width: 32px;
+  align-self: stretch;
+}
+
+.nv-fold {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: none;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.nv-fold:hover { background: rgba(255, 255, 255, 0.05); }
+
+/* The arrow turns; the 32px hit area does not. */
+.nv-fold span {
+  display: inline-block;
+  transition: transform 0.15s;
+}
+
+.nv-fold.open span { transform: rotate(90deg); }
+
+.nv-tree-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 6px 0 2px;
+  background: none;
+  border-radius: 0;
+  text-align: left;
+}
+
+.nv-more {
+  flex: none;
+  width: 40px;
+  min-height: 40px;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+}
+
+.nv-tree-row.selected,
+.nv-scope.selected {
+  background: rgba(59, 130, 246, 0.15);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.nv-share { margin-top: 20px; }
+
+/* List */
+.nv-backrow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 44px;
+}
+
+.nv-back {
+  background: none;
+  padding: 8px 6px 8px 0;
+  color: var(--primary);
+  font-size: 0.95rem;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nv-back:hover { background: none; }
+.nv-spacer { flex: 1; }
+
+.nv-icon {
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  background: none;
+  font-size: 1.2rem;
+  color: var(--text);
+}
+
+.nv-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.nv-tools {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 10px;
+}
+
+input.nv-search {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: inherit;
+  font-family: inherit;
+  -webkit-appearance: none;
+}
+
+.nv-sort {
+  flex: none;
+  padding: 0 14px;
+  background: var(--surface-2);
+  border: none;
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: inherit;
+  /* The ▾ is in the label; the native arrow would be a second one. */
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.nv-bucket {
+  margin: 14px 2px 6px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nv-results .nv-bucket:first-child { margin-top: 2px; }
+
+.nv-summary {
+  margin: 2px 2px 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.nv-subnb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  margin-bottom: 6px;
+  padding: 0 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-align: left;
+  font-weight: 600;
+}
+
+.nv-row {
+  margin-bottom: 6px;
+  padding: 11px 13px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.nv-row:active { background: var(--surface-2); }
+
+.nv-row.selected {
+  background: rgba(59, 130, 246, 0.15);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.nv-row-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.nv-row-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nv-row-title.untitled,
+.note-title.untitled,
+.rn-title.untitled {
+  color: var(--muted);
+  font-style: italic;
+  font-weight: 500;
+}
+
+.nv-row-time {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.nv-row-preview {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.nv-row-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.nv-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.nv-pill-bar {
+  width: 28px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(148, 163, 184, 0.25);
+  overflow: hidden;
+}
+
+.nv-pill-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+}
+
+.nv-pill.done { color: var(--success); }
+
+.nv-chip {
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: rgba(14, 165, 233, 0.12);
+  color: #7dd3fc;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nv mark,
+.recent-notes mark {
+  background: rgba(250, 204, 21, 0.28);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* Note */
+.nv-note-empty {
+  padding: 48px 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.note-topbar .nv-back {
+  color: var(--primary);
+  font-size: 0.95rem;
+  padding: 6px 6px 6px 0;
+}
+
+.note-topbar button.note-done {
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  margin-left: 4px;
+}
+
+.nv-crumb {
+  display: inline-block;
+  max-width: 100%;
+  margin: 2px 0 10px;
+  padding: 4px 11px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-page h1.note-title {
+  margin: 0.1em 0 0.15em;
+  font-size: 1.75rem;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.note-meta {
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+#note-menu-pop hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2px 0;
+}
+
+/* Delete is red text behind a confirm, not a red block under Move. */
+#note-menu-pop .menu-item {
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+#note-menu-pop .menu-item:hover { background: var(--surface-2); }
+#note-menu-pop .menu-item.danger { color: var(--danger); }
+
+/* Sheets: Move to… and notebook actions */
+.move-opt,
+.nb-actions button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  margin-bottom: 2px;
+  padding: 0 12px;
+  background: none;
+  border-radius: 8px;
+  text-align: left;
+}
+
+.move-opt { padding-left: calc(12px + var(--depth, 0) * 16px); }
+.move-opt:hover:not(:disabled),
+.nb-actions button:hover { background: rgba(255, 255, 255, 0.05); }
+.move-opt:disabled { opacity: 1; color: var(--muted); }
+.move-opt.current { color: var(--text); }
+.move-opt .tick { color: var(--success); font-weight: 700; flex: none; }
+.nb-actions .danger { color: var(--danger); }
+
+/* Home: pending banner and the Recent notes card */
+.home-pending {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+  padding: 11px 13px;
+  text-align: left;
+  background: rgba(245, 158, 11, 0.07);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: var(--radius);
+  color: #fbbf24;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.home-pending:hover { background: rgba(245, 158, 11, 0.12); }
+
+.home-head-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.home-head-link {
+  background: none;
+  padding: 0;
+  color: var(--primary);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.home-head-link:hover { background: none; text-decoration: underline; }
+
+.recent-note {
+  display: block;
+  width: 100%;
+  padding: 10px 0;
+  background: none;
+  border-radius: 0;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+  text-align: left;
+}
+
+.recent-note:last-child { border-bottom: none; }
+.recent-note:hover { background: none; }
+.recent-note:active .rn-title { color: var(--primary); }
+
+.rn-top,
+.rn-bottom {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rn-bottom { align-items: center; margin-top: 2px; }
+
+.rn-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rn-time {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.rn-preview {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tab bar: pending-proposal badge on Notes */
+#bottom-nav button { position: relative; }
+
+.bn-badge {
+  position: absolute;
+  top: 4px;
+  left: calc(50% + 6px);
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #f59e0b;
+  color: #111827;
+  font-size: 0.6rem;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* Phone: one pane at a time; the topbar 📝 gives way to the tab bar, and so
+   does the inbox button, which the tab bar already has. */
+@media (max-width: 899px) {
+  #notesBtn { display: none; }
+  body.view-notes #inbox-fab { display: none; }
+  body.view-notes:not(.pane-library) .nv-side,
+  body.view-notes:not(.pane-list) .nv-list,
+  body.view-notes:not(.pane-note) .nv-note { display: none; }
+}
+
+/* Desktop: the panes side by side, each scrolling on its own, in a column
+   wider than the 880px one the rest of the app uses. */
+@media (min-width: 900px) {
+  body.view-notes { padding-bottom: 0; }
+  body.view-notes #content {
+    padding-left: max(16px, calc((100vw - 1680px) / 2));
+    padding-right: max(16px, calc((100vw - 1680px) / 2));
+    padding-bottom: 0;
+  }
+
+  #notesBtn.on {
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+  }
+
+  .nv {
+    display: grid;
+    grid-template-columns: 340px minmax(0, 1fr);
+    height: calc(100dvh - var(--topbar-h, 60px) - 24px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .nv-pane {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 14px 24px;
+  }
+
+  .nv-side { background: rgba(0, 0, 0, 0.18); }
+  .nv-side,
+  .nv-list { border-right: 1px solid var(--border); }
+
+  /* 900–1099px: the left column is the library or the list. */
+  body.pane-library .nv-list,
+  body.view-notes:not(.pane-library) .nv-side { display: none; }
+
+  .nv-note { padding: 0; }
+
+  .nv-note .note-page {
+    margin: 0;
+    min-height: 100%;
+    padding: 8px 28px 60px;
+  }
+
+  .nv-note .note-page > * {
+    max-width: 720px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .nv-note .note-page > .nv-crumb { display: block; width: max-content; margin-left: max(0px, calc((100% - 720px) / 2)); }
+
+  /* The note column is always on screen, so its back arrow is not needed. */
+  .note-topbar .nv-back { visibility: hidden; }
+
+  .nv-tree-row,
+  .nv-scope,
+  .nv-subnb { min-height: 40px; }
+
+  .nv-tree-name { min-height: 40px; }
+  .nv-row:hover { background: var(--surface-2); }
+  .nv-row.selected:hover { background: rgba(59, 130, 246, 0.2); }
+  .nv-subnb:hover,
+  .nv-scope:hover:not(.selected),
+  .nv-tree-row:hover:not(.selected) { background: rgba(255, 255, 255, 0.05); }
+
+  /* Drag and drop: the drop target gets a primary outline. */
+  .nv .drop-target {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  /* Notebook rows show their ⋯ on hover. */
+  .nv-more { opacity: 0; }
+  .nv-tree-row:hover .nv-more,
+  .nv-tree-row:focus-within .nv-more { opacity: 1; }
+}
+
+@media (min-width: 1100px) {
+  .nv { grid-template-columns: 260px 360px minmax(0, 1fr); }
+  body.pane-library .nv-list,
+  body.view-notes:not(.pane-library) .nv-side { display: block; }
+  /* Library and list are both on screen: no back row needed. */
+  .nv-list .nv-back { visibility: hidden; }
 }

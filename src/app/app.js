@@ -1,10 +1,12 @@
 // Entry point for the full-screen app page.
 //
-// sidepanel.js is loaded first and still owns every existing view; this only
-// starts the home screen and keeps it in step with those views. Home hides
-// whenever another section opens, which is how the side panel already behaved —
-// one section at a time — just with room to breathe.
+// sidepanel.js is loaded first and still owns most views; Notes has its own
+// module (notesView.js). This starts home and Notes, and keeps home in step
+// with the other views. Home hides whenever another section opens, which is
+// how the side panel already behaved — one section at a time — just with room
+// to breathe.
 import { initHome } from './home.js';
+import { initNotesView, canLeave } from './notesView.js';
 
 const HOME_IDS = ['home-container', 'actions', 'home-recents'];
 // Sections that take over the page when open.
@@ -48,7 +50,11 @@ function watchViews() {
 
 // The wordmark is the way back. Every view is a section sidepanel.js shows by
 // writing style.display, so closing them all is what "go home" means here.
-function goHome() {
+// Leaving Notes with an unsaved note asks first (save, discard, or stay).
+async function goHome() {
+    const notes = document.getElementById('notes-container');
+    const inNotes = notes && notes.style.display !== 'none' && notes.style.display !== '';
+    if (inNotes && !(await canLeave())) return;
     for (const id of VIEW_IDS) {
         const el = document.getElementById(id);
         if (el) el.style.display = 'none';
@@ -61,6 +67,11 @@ function goHome() {
 }
 
 async function boot() {
+    try {
+        initNotesView();
+    } catch (e) {
+        console.error('[TabPaladin] Notes failed to start', e);
+    }
     try {
         await initHome();
     } catch (e) {

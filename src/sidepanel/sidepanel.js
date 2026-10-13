@@ -12,7 +12,6 @@ import { BookmarkOrganizer } from '../utils/bookmarkOrganizer.js';
 import { AIService } from '../utils/aiService.js';
 import { TreeStore } from '../utils/treeStore.js';
 import { ExpandState, OPEN_TABS_KEY, aiGroupKey } from '../utils/expandState.js';
-import { NotesManager } from '../utils/notesManager.js';
 import { resolveServerUrl } from '../utils/config.js';
 
 // Every read and write goes against the local working copy of the synced tree
@@ -111,10 +110,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending = setTimeout(async () => {
                 pending = null;
                 await loadWorkflows();
-                // Keep the notes list in sync too when that view is open.
-                if (document.getElementById('notes-container').style.display === 'block') {
-                    await loadNotes();
-                }
             }, 250);
         };
     })();
@@ -2270,317 +2265,10 @@ document.getElementById('groupTabsBtn').addEventListener('click', async () => {
     await loadCurrentTabs();
 });
 
-// --- Notes Logic ---
-let currentNotes = [];
-let activeNoteId = null;
-
-async function loadNotes() {
-    currentNotes = await NotesManager.listNotes();
-    renderNotesList(document.getElementById('notesSearchInput').value.trim());
-}
-
-function renderNotesList(filter = '') {
-    const list = document.getElementById('notes-list');
-    list.innerHTML = '';
-    const q = filter.toLowerCase();
-    const shown = currentNotes.filter(n =>
-        !q || n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
-
-    if (shown.length === 0) {
-        list.innerHTML = '<li class="empty-state">No notes yet.</li>';
-        return;
-    }
-
-    // Grouped by notebook, because a flat list of every note across every
-    // notebook is only browsable while you have very few. Notes filed directly
-    // in the root have no notebook and lead, since they belong to no group.
-    const groups = new Map();
-    for (const note of shown) {
-        const key = note.notebook || '';
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(note);
-    }
-    const names = [...groups.keys()].sort((a, b) => {
-        if (a === '') return -1;
-        if (b === '') return 1;
-        return a.localeCompare(b);
-    });
-
-    const renderNote = (note) => {
-        const li = document.createElement('li');
-        li.className = 'note-list-item';
-        const snippet = note.content.replace(/\s+/g, ' ').trim().slice(0, 80);
-        // The notebook name is the heading now, so repeating it on every card
-        // would just be noise.
-        li.innerHTML = `
-            <div class="note-item-title">${escapeHtml(note.title)}</div>
-            ${snippet ? `<div class="note-item-snippet">${escapeHtml(snippet)}</div>` : ''}
-        `;
-        li.addEventListener('click', () => openNoteInEditor(note));
-        return li;
-    };
-
-    for (const name of names) {
-        const notes = groups.get(name);
-        // With everything in one notebook, a single heading says nothing.
-        if (names.length > 1) {
-            const head = document.createElement('li');
-            head.className = 'note-group-head';
-            head.innerHTML =
-                `<span>${escapeHtml(name || 'Ungrouped')}</span><span class="note-group-count">${notes.length}</span>`;
-            list.appendChild(head);
-        }
-        for (const note of notes) list.appendChild(renderNote(note));
-    }
-}
-
-// readMode=false for a brand new note: there is nothing to read yet, and you
-// came here to type.
-async function openNoteInEditor(note, readMode = true) {
-    activeNoteId = note.id || null;
-    document.getElementById('noteTitleInput').value = note.title || '';
-    document.getElementById('noteContentInput').value = note.content || '';
-    document.getElementById('note-editor').style.display = 'block';
-    document.getElementById('notes-list').style.display = 'none';
-    document.getElementById('notesSearchInput').style.display = 'none';
-    // Opens as a reading page, not a textarea. Most of the time you are here to
-    // read the note or tick something off, and checkboxes only render in the
-    // preview — landing in raw markdown made the note look like it had no
-    // working tasks at all. "Edit" is one click away.
-    if (readMode) {
-        await renderNotePreview();
-        setNotePreviewMode(true);
-    } else {
-        setNotePreviewMode(false);
-    }
-}
-
-function closeNoteEditor() {
-    activeNoteId = null;
-    document.getElementById('note-editor').style.display = 'none';
-    document.getElementById('notes-list').style.display = 'block';
-    document.getElementById('notesSearchInput').style.display = 'block';
-}
-
-function setNotePreviewMode(previewOn) {
-    document.getElementById('noteContentInput').style.display = previewOn ? 'none' : 'block';
-    document.getElementById('notePreview').style.display = previewOn ? 'block' : 'none';
-    document.getElementById('previewNoteBtn').textContent = previewOn ? 'Edit' : 'Preview';
-}
-
-// Inline markup shared by every line: [[wiki-links]] become clickable chips
-// and bare URLs become links. Takes already-escaped text.
-function renderNoteInlineHtml(escaped) {
-    let html = escaped.replace(/\[\[([^\[\]]+)\]\]/g, (m, t) =>
-        `<span class="note-wikilink" data-target="${t.trim()}">[[${t.trim()}]]</span>`);
-    html = html.replace(/(https?:\/\/[^\s<)&]+)/g,
-        `<a href="$1" class="note-urllink" title="Open in new tab">$1</a>`);
-    return html;
-}
-
-// Inline markdown: **bold**, *italic*, `code`. Applied after escaping, so the
-// patterns only ever see safe text.
-function renderNoteEmphasis(html) {
-    return html
-        .replace(/`([^`]+)`/g, '<code class="note-code">$1</code>')
-        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
-}
-
-// Render note content as HTML.
-//
-// Tasks become real checkboxes carrying their source line number, so toggling
-// one edits exactly that line of the stored markdown. Headings, bullets and
-// emphasis render too — previously everything except tasks and links came out
-// as escaped text, so a note full of "## Meat" and "- 260 g soy sauce" read as
-// raw markdown with only the checkboxes working.
-//
-// `skipTitle` drops a leading "# Heading" that just repeats the note's title,
-// which is otherwise shown twice: once in the title field, once at the top of
-// the body.
-function renderNoteContentHtml(content, skipTitle = '') {
-    const lines = String(content == null ? '' : content).split('\n');
-    const out = [];
-    let inList = false;
-    let titleDropped = false;
-
-    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
-
-    lines.forEach((raw, i) => {
-        const task = NotesManager.parseTaskLine(raw);
-        if (task) {
-            closeList();
-            const label = renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(task.label)));
-            out.push(
-                `<label class="note-task"${task.indent ? ` style="margin-left:${task.indent * 14}px;"` : ''}>` +
-                `<input type="checkbox" class="note-task-box" data-line="${i}"${task.checked ? ' checked' : ''}>` +
-                `<span class="note-task-label${task.checked ? ' done' : ''}">${label}</span>` +
-                `</label>`
-            );
-            return;
-        }
-
-        const heading = raw.match(/^(#{1,4})\s+(.*)$/);
-        if (heading) {
-            closeList();
-            const text = heading[2].trim();
-            // A leading H1 echoing the title is noise, not content.
-            if (!titleDropped && heading[1].length === 1 && skipTitle
-                && text.toLowerCase() === skipTitle.toLowerCase()) {
-                titleDropped = true;
-                return;
-            }
-            const level = Math.min(heading[1].length + 1, 5); // h1 -> h2, so page structure stays sane
-            out.push(`<h${level} class="note-h">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(text)))}</h${level}>`);
-            return;
-        }
-
-        const bullet = raw.match(/^(\s*)[-*]\s+(.*)$/);
-        if (bullet) {
-            if (!inList) { out.push('<ul class="note-list">'); inList = true; }
-            out.push(`<li>${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(bullet[2])))}</li>`);
-            return;
-        }
-
-        closeList();
-        if (raw.trim() === '') { out.push('<div class="note-gap"></div>'); return; }
-        out.push(`<p class="note-p">${renderNoteEmphasis(renderNoteInlineHtml(escapeHtml(raw)))}</p>`);
-    });
-
-    closeList();
-    return out.join('');
-}
-
-async function renderNotePreview() {
-    const preview = document.getElementById('notePreview');
-    const title = document.getElementById('noteTitleInput').value.trim();
-    const content = document.getElementById('noteContentInput').value;
-
-    let html = `<div class="note-preview-body">${renderNoteContentHtml(content, title) || '<span style="color:var(--text-muted);">Empty note.</span>'}</div>`;
-
-    if (title) {
-        const backlinks = await NotesManager.getBacklinks(title, activeNoteId);
-        if (backlinks.length > 0) {
-            const items = backlinks.map(n =>
-                `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title)}</span>`
-            ).join(' ');
-            html += `<div class="note-backlinks"><span style="color:var(--text-muted);">Linked from:</span> ${items}</div>`;
-        }
-    }
-    preview.innerHTML = html;
-}
-
-document.getElementById('viewNotesBtn').addEventListener('click', async () => {
-    // Switch Views
-    document.getElementById('organizer-source-container').style.display = 'none';
-    document.getElementById('organizer-container').style.display = 'none';
-    document.getElementById('settings-container').style.display = 'none';
-    document.getElementById('groups-container').style.display = 'none';
-    document.getElementById('workflows-container').style.display = 'none';
-    document.getElementById('notes-container').style.display = 'block';
-    closeNoteEditor();
-
-    await loadNotes();
-});
-
-document.getElementById('notesSearchInput').addEventListener('input', (e) => {
-    renderNotesList(e.target.value.trim());
-});
-
-document.getElementById('newNoteBtn').addEventListener('click', () => {
-    openNoteInEditor({ id: null, title: '', content: '' }, false);
-    document.getElementById('noteTitleInput').focus();
-});
-
-document.getElementById('saveNoteBtn').addEventListener('click', async () => {
-    const title = document.getElementById('noteTitleInput').value.trim() || 'Untitled';
-    const content = document.getElementById('noteContentInput').value;
-    try {
-        if (activeNoteId) {
-            await NotesManager.updateNote(activeNoteId, { title, content });
-        } else {
-            const created = await NotesManager.createNote(title, content);
-            activeNoteId = created.id;
-        }
-        await loadNotes();
-        if (document.getElementById('notePreview').style.display === 'block') {
-            await renderNotePreview();
-        }
-    } catch (err) {
-        console.error('Save note error:', err);
-        alert('Error saving note: ' + err.message);
-    }
-});
-
-document.getElementById('deleteNoteBtn').addEventListener('click', async () => {
-    if (!activeNoteId) { closeNoteEditor(); return; }
-    const title = document.getElementById('noteTitleInput').value.trim() || 'Untitled';
-    if (!confirm(`Delete note "${title}"?`)) return;
-    try {
-        await NotesManager.deleteNote(activeNoteId);
-        closeNoteEditor();
-        await loadNotes();
-    } catch (err) {
-        console.error('Delete note error:', err);
-        alert('Error deleting note: ' + err.message);
-    }
-});
-
-document.getElementById('previewNoteBtn').addEventListener('click', async () => {
-    const turningOn = document.getElementById('notePreview').style.display !== 'block';
-    if (turningOn) await renderNotePreview();
-    setNotePreviewMode(turningOn);
-});
-
-document.getElementById('closeNoteEditorBtn').addEventListener('click', async () => {
-    closeNoteEditor();
-    await loadNotes();
-});
-
-// Clicks inside the preview: task checkboxes toggle, wiki-links navigate
-// between notes, URLs open tabs.
-document.getElementById('notePreview').addEventListener('click', async (e) => {
-    const box = e.target.closest('.note-task-box');
-    if (box) {
-        const textarea = document.getElementById('noteContentInput');
-        const updated = NotesManager.toggleTaskAtLine(textarea.value, Number(box.dataset.line));
-        if (updated === textarea.value) return;
-        textarea.value = updated;
-        try {
-            // A note that hasn't been saved yet just updates in place; the
-            // user's Save writes it. An existing note persists immediately,
-            // the way ticking a box in a notes app should behave.
-            if (activeNoteId) {
-                await NotesManager.updateNote(activeNoteId, { content: updated });
-                await loadNotes();
-            }
-            await renderNotePreview();
-        } catch (err) {
-            console.error('Toggle task error:', err);
-            alert('Error updating task: ' + err.message);
-        }
-        return;
-    }
-
-    const urlLink = e.target.closest('.note-urllink');
-    if (urlLink) {
-        e.preventDefault();
-        await chrome.tabs.create({ url: urlLink.getAttribute('href') });
-        return;
-    }
-    const wiki = e.target.closest('.note-wikilink');
-    if (!wiki) return;
-    // dataset.target is entity-decoded by the HTML parser, so it holds the raw title.
-    const target = wiki.dataset.target;
-    const note = currentNotes.find(n => n.title === target);
-    if (note) {
-        openNoteInEditor(note);
-        await renderNotePreview();
-        setNotePreviewMode(true);
-    } else if (confirm(`Note "${target}" doesn't exist. Create it?`)) {
-        openNoteInEditor({ id: null, title: target, content: '' });
-    }
-});
+// --- Notes ---
+// The notes view lives in src/app/notesView.js; app.js starts it. The view
+// switchers here only hide #notes-container, the same way they hide every
+// other section.
 
 // AI Grouping for TABS
 document.getElementById('aiGroupTabsBtn').addEventListener('click', async () => {
@@ -4087,10 +3775,12 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     });
 
     document.getElementById('backend-push-btn').addEventListener('click', async () => {
+        await beforeSync('push');
         writeBackendStatus(await doPush() || '');
     });
 
     document.getElementById('backend-pull-btn').addEventListener('click', async () => {
+        await beforeSync('pull');
         writeBackendStatus(await doPull() || '');
     });
 
@@ -4838,12 +4528,27 @@ async function doPull({ skipConfirm = false } = {}) {
     }
 }
 
+// Give open editors a say before a sync. The notes view offers to save a
+// dirty note before a push, so the push carries it; before a pull it saves
+// nothing, since the pull would replace that save, and keeps the draft open.
+// Listeners call event.detail.waitUntil(promise); the sync waits for all of
+// them, and a listener that fails never blocks it.
+async function beforeSync(kind) {
+    const pending = [];
+    window.dispatchEvent(new CustomEvent('tabpaladin:before-sync', {
+        detail: { kind, waitUntil: (p) => pending.push(Promise.resolve(p)) }
+    }));
+    await Promise.allSettled(pending);
+}
+
 document.getElementById('mainPushBtn').addEventListener('click', async () => {
+    await beforeSync('push');
     _updateMainStatus('Pushing…');
     _updateMainStatus(await doPush());
 });
 
 document.getElementById('mainPullBtn').addEventListener('click', async () => {
+    await beforeSync('pull');
     _updateMainStatus('Pulling…');
     _updateMainStatus(await doPull());
     await loadWorkflows();

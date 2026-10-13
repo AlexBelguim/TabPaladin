@@ -22,6 +22,7 @@ const SHELL = [
     '/app.js?v=28',
     '/bookmarksHtml.js',
     '/pendingShares.js',
+    '/notesModel.js',
     '/manifest.webmanifest',
     '/icons/icon192.png'
 ];

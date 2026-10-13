@@ -388,6 +388,49 @@ body.tp-app #actions .primary-btn {
     font-size: 0.84rem;
 }
 
+/* Recent notes open the note, so each row is a button. */
+.home-row-btn {
+    width: 100%;
+    background: none;
+    border: none;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+    border-radius: 0;
+    color: inherit;
+    font: inherit;
+    font-size: 0.86rem;
+    text-align: left;
+    cursor: pointer;
+}
+
+.home-row-btn:hover .home-row-text { color: var(--primary-color); }
+
+.home-row-btn:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.home-row-nb {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+}
+
+.home-row-btn .home-row-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.home-head-link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--primary-color);
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+.home-head-link:hover { text-decoration: underline; }
+
 /* ---------- shared field ---------- */
 body.tp-app .tp-field {
     width: 100%;
@@ -416,98 +459,826 @@ body.tp-app .tp-danger {
     color: var(--danger-color);
 }
 
-/* ---------- notes: list beside editor, editor beside preview ---------- */
-.notes-split {
-    display: grid;
-    grid-template-columns: 260px minmax(0, 1fr);
-    gap: 16px;
-    align-items: start;
+/* ---------- notes: library | list | note ---------- */
+/* notesView.js sets every layout class here — .nv-cols-3/2/1, .nv-pane-*,
+   .nv-can-split, .is-read/.is-edit/.is-split. Nothing matches inline style
+   strings or uses :has(): the old grid keyed on [style*="display:none"], so
+   one inline display:block from the script and it never applied at all. */
+
+/* Full bleed, like #groups-container: three panes need more than the 1180px
+   measure the home screen is built for. */
+body.tp-app #notes-container {
+    width: min(calc(100vw - 48px), 1680px);
+    max-width: none;
+    margin-left: calc(50% - min(calc(50vw - 24px), 840px));
+    margin-bottom: 0;
+    animation: none;
 }
 
-body.tp-app #notes-list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    max-height: 70vh;
+/* The panes scroll on their own, so the page itself should not. */
+body.tp-app.tp-notes-open .container { padding-bottom: 0; }
+
+#notes-container [hidden] { display: none !important; }
+
+.nv {
+    display: grid;
+    grid-template-columns: 260px 360px minmax(0, 1fr);
+    height: calc(100vh - var(--nv-top, 96px) - 16px);
+    min-height: 420px;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--bg-color);
+}
+
+.nv-side,
+.nv-list,
+.nv-note {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+.nv-side {
+    background: rgba(0, 0, 0, 0.18);
+    border-right: 1px solid var(--border-color);
+    padding: 12px 10px 10px;
     overflow-y: auto;
 }
 
-/* Browse mode. With no note open the editor is hidden, which left a 260px
-   column of notes beside three-quarters of empty page. Give the list the whole
-   width as a card grid; it collapses back to a sidebar the moment a note is
-   opened for editing. */
-.notes-split:has(#note-editor[style*="display:none"]),
-.notes-split:has(#note-editor[style*="display: none"]) {
-    grid-template-columns: minmax(0, 1fr);
+.nv-list { border-right: 1px solid var(--border-color); }
+
+/* 760–1199px: two columns, the left one switching library <-> list. */
+.nv.nv-cols-2 { grid-template-columns: 340px minmax(0, 1fr); }
+.nv.nv-cols-2.nv-pane-side .nv-list,
+.nv.nv-cols-2:not(.nv-pane-side) .nv-side { display: none; }
+
+/* Below 760px: one pane at a time. */
+.nv.nv-cols-1 { grid-template-columns: minmax(0, 1fr); }
+.nv.nv-cols-1:not(.nv-pane-side) .nv-side,
+.nv.nv-cols-1:not(.nv-pane-list) .nv-list,
+.nv.nv-cols-1:not(.nv-pane-note) .nv-note { display: none; }
+.nv.nv-cols-1 .nv-side,
+.nv.nv-cols-1 .nv-list { border-right: none; }
+
+/* Back buttons only where the pane they lead to is off screen. */
+.nv.nv-cols-3 .nv-to-side,
+.nv:not(.nv-cols-1) .nv-to-list { display: none; }
+
+.nv-muted {
+    color: var(--text-muted);
+    font-size: 0.78rem;
 }
 
-.notes-split:has(#note-editor[style*="display:none"]) #notes-list,
-.notes-split:has(#note-editor[style*="display: none"]) #notes-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    gap: 10px;
-    max-height: none;
-    overflow-y: visible;
+.nv-ico {
+    flex: none;
+    width: 18px;
+    text-align: center;
+    font-size: 0.85rem;
 }
 
-/* Notebook headings own their row rather than sitting in the flow as a card. */
-.note-group-head {
-    grid-column: 1 / -1;
+.nv-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-count {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.nv-icon-btn {
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--text-muted);
+    padding: 2px 8px;
+    font-size: 0.95rem;
+    line-height: 1.4;
+}
+
+.nv-icon-btn:hover {
+    color: var(--text-color);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.nv-link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--primary-color);
+    font-size: inherit;
+}
+
+.nv-link-btn:hover { text-decoration: underline; }
+
+.nv-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+    color: var(--text-color);
+    padding: 6px 12px;
+    font-size: 0.82rem;
+}
+
+.nv-btn:hover { border-color: var(--primary-color); }
+
+/* Library */
+body.tp-app .nv-new {
+    padding: 9px 12px;
+    font-size: 0.88rem;
+    margin-bottom: 12px;
+}
+
+.nv-scopes {
     display: flex;
-    align-items: baseline;
+    flex-direction: column;
+    gap: 1px;
+    margin-bottom: 16px;
+}
+
+.nv-scope,
+.nv-tree-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 8px;
+    border-radius: 6px;
+    color: var(--text-color);
+    font-size: 0.86rem;
+}
+
+.nv-scope {
+    width: 100%;
+    background: none;
+    border: none;
+    text-align: left;
+}
+
+.nv-scope:hover,
+.nv-tree-row:hover { background: rgba(255, 255, 255, 0.05); }
+
+/* Selection: a tint and a 3px primary bar, drawn inset so nothing shifts. */
+.nv-scope.is-selected,
+.nv-tree-row.is-selected {
+    background: rgba(59, 130, 246, 0.15);
+    box-shadow: inset 3px 0 0 var(--primary-color);
+}
+
+.nv-tree-head {
+    display: flex;
+    align-items: center;
     justify-content: space-between;
-    gap: 10px;
-    margin: 14px 0 2px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid var(--border-color);
-    font-size: 0.72rem;
+    padding: 0 4px 4px 8px;
+    font-size: 0.7rem;
     letter-spacing: 0.09em;
     text-transform: uppercase;
     color: var(--text-muted);
     font-weight: 600;
 }
 
-.note-group-head:first-child { margin-top: 0; }
-
-.note-group-count {
-    letter-spacing: 0;
-    font-weight: 500;
-    color: var(--text-muted);
+.nv-tree {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    flex: 1;
 }
 
-/* Editing. openNoteInEditor hides the list, which left the grid holding an
-   empty 260px column and an editor squeezed beside it — the note ended up in a
-   narrow strip with most of the page blank. With the list gone the editor
-   takes the whole width. */
-.notes-split:has(#notes-list[style*="display:none"]),
-.notes-split:has(#notes-list[style*="display: none"]) {
-    grid-template-columns: minmax(0, 1fr);
+.nv-tree-row { padding-left: calc(4px + var(--depth, 0) * 16px); }
+
+.nv-chev,
+.nv-chev-space {
+    flex: none;
+    width: 16px;
+    height: 16px;
 }
 
-body.tp-app #note-editor { width: 100%; }
-
-/* Fallback where :has() is unavailable — a wider column still beats a narrow
-   one stranded beside nothing. */
-@supports not selector(:has(*)) {
-    .notes-split { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); }
-}
-
-.note-panes {
+.nv-chev {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 12px;
+    place-items: center;
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    border-radius: 4px;
+    transition: transform 0.12s ease;
+}
+
+.nv-chev:hover { color: var(--text-color); }
+.nv-chev.is-open { transform: rotate(90deg); }
+
+.nv-tree-name {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    padding: 0;
+    color: inherit;
+    font-size: inherit;
+    text-align: left;
+}
+
+.nv-more {
+    flex: none;
+    background: none;
+    border: none;
+    border-radius: 5px;
+    color: var(--text-muted);
+    padding: 0 5px;
+    line-height: 1.5;
+    opacity: 0;
+}
+
+.nv-more:hover {
+    color: var(--text-color);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.nv-tree-row:hover .nv-more,
+.nv-tree-row:focus-within .nv-more { opacity: 1; }
+
+.nv-tree-empty {
+    margin: 4px 8px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
+.nv-sync {
+    margin-top: 12px;
+    padding: 7px 8px;
+    background: none;
+    border: none;
+    border-top: 1px solid var(--border-color);
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    text-align: left;
+}
+
+.nv-sync.is-dirty { color: var(--warning-color); }
+.nv-sync.is-dirty:hover { text-decoration: underline; }
+.nv-sync:disabled { cursor: default; }
+
+/* List */
+.nv-list-head {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.nv-to-side {
+    align-self: flex-start;
+    font-size: 0.8rem;
+}
+
+.nv-list-title {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+body.tp-app .nv-list-title h2 {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    text-transform: none;
+    color: var(--text-color);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-list-tools {
+    display: flex;
+    gap: 8px;
+}
+
+body.tp-app input.nv-search {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 10px;
+    font-size: 0.84rem;
+    border-radius: 7px;
+}
+
+.nv-sort {
+    flex: none;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+    color: var(--text-color);
+    font-size: 0.8rem;
+    padding: 0 6px;
+}
+
+.nv-rows {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 24px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.nv-bucket {
+    padding: 14px 14px 4px;
+    font-size: 0.66rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.nv-row {
+    min-height: 76px;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+    cursor: pointer;
+}
+
+.nv-row:hover { background: rgba(255, 255, 255, 0.03); }
+
+.nv-row.is-selected {
+    background: var(--surface-hover);
+    box-shadow: inset 3px 0 0 var(--primary-color);
+}
+
+.nv-row-top {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.nv-row-title {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    font-size: 0.9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-row-title.is-untitled,
+.home-row-untitled {
+    color: var(--text-muted);
+    font-style: italic;
+    font-weight: 500;
+}
+
+.nv-row-time {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+}
+
+.nv-row-preview {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.nv-row-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.nv-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.nv-pill-bar {
+    width: 28px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(148, 163, 184, 0.25);
+    overflow: hidden;
+}
+
+.nv-pill-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--primary-color);
+}
+
+.nv-pill.is-done { color: var(--success-color); }
+
+.nv-chip {
+    max-width: 100%;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(14, 165, 233, 0.12);
+    color: #7dd3fc;
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-subnb {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 14px;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+    font-weight: 600;
+    font-size: 0.88rem;
+    cursor: pointer;
+}
+
+.nv-subnb:hover { background: rgba(255, 255, 255, 0.03); }
+.nv-chev-r { color: var(--text-muted); }
+
+.nv-summary {
+    padding: 8px 14px;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+}
+
+.nv-empty {
+    padding: 32px 18px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.86rem;
+}
+
+.nv-empty p { margin: 0 0 12px; }
+
+.nv-empty-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+}
+
+/* Drag and drop: the drop target gets a primary outline. */
+.nv .is-drop {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -2px;
+    background: rgba(59, 130, 246, 0.12);
+}
+
+.nv-row[draggable="true"],
+.nv-tree-row[draggable="true"] { -webkit-user-drag: element; }
+
+.nv mark {
+    background: rgba(250, 204, 21, 0.28);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
+/* Note */
+.nv-note-empty {
+    margin: auto;
+    padding: 40px 24px;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    text-align: center;
+}
+
+.nv-note-main {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.nv-note-head {
+    flex: none;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.nv-to-list { font-size: 0.82rem; }
+
+.nv-crumb {
+    max-width: 40%;
+    padding: 3px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-muted);
+    font-size: 0.76rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-crumb:hover:not(:disabled) {
+    color: var(--text-color);
+    border-color: var(--primary-color);
+}
+
+.nv-note-status {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.nv-note-status.is-unsaved { color: #fbbf24; }
+
+.nv-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #fbbf24;
+}
+
+.nv-seg {
+    flex: none;
+    display: inline-flex;
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+    overflow: hidden;
+}
+
+.nv-seg button {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.76rem;
+    padding: 4px 10px;
+}
+
+.nv-seg button + button { border-left: 1px solid var(--border-color); }
+.nv-seg button:hover { color: var(--text-color); }
+
+.nv-seg button[aria-pressed="true"] {
+    background: rgba(59, 130, 246, 0.18);
+    color: var(--text-color);
+}
+
+.nv:not(.nv-can-split) .nv-split-btn { display: none; }
+
+body.tp-app .nv-save {
+    flex: none;
+    width: auto;
+    padding: 5px 14px;
+    font-size: 0.8rem;
+    border-radius: 7px;
+}
+
+.nv-menu-wrap { position: relative; }
+
+.nv-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 60;
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    padding: 5px;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+/* The notebook ⋯ menu is placed by script next to the row that opened it. */
+.nv-menu.nv-popup {
+    position: fixed;
+    right: auto;
+    top: 0;
+    left: 0;
+}
+
+.nv-menu button {
+    background: none;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-color);
+    text-align: left;
+    padding: 7px 10px;
+    font-size: 0.84rem;
+}
+
+.nv-menu button:hover:not(:disabled) { background: var(--surface-hover); }
+
+.nv-menu button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.nv-menu .nv-danger { color: var(--danger-color); }
+
+.nv-menu hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 4px 2px;
+}
+
+.nv-removed {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: rgba(245, 158, 11, 0.07);
+    border-bottom: 1px solid rgba(245, 158, 11, 0.4);
+    color: #fbbf24;
+    font-size: 0.82rem;
+}
+
+.nv-removed span {
+    flex: 1;
+    min-width: 200px;
+}
+
+.nv-note-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.nv-note-inner {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 22px 28px 64px;
+}
+
+.nv-note.is-split .nv-note-inner { max-width: none; }
+
+body.tp-app input.nv-title {
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    background: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    color: var(--text-color);
+    font-size: 1.6rem;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+}
+
+body.tp-app input.nv-title:focus {
+    background: none;
+    box-shadow: none;
+}
+
+body.tp-app input.nv-title[readonly] { cursor: default; }
+
+.nv-meta {
+    margin: 4px 0 18px;
+    min-height: 1em;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+}
+
+.nv-panes {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
     align-items: start;
 }
 
-/* Only one pane is ever visible, so the grid must collapse either way. The
-   earlier rule only handled a hidden preview; in reading mode it is the
-   textarea that is hidden, which left the note rendering into half the width
-   with an empty column beside it. */
-.note-panes:has(#notePreview[style*="display:none"]),
-.note-panes:has(#notePreview[style*="display: none"]),
-.note-panes:has(#noteContentInput[style*="display:none"]),
-.note-panes:has(#noteContentInput[style*="display: none"]) {
-    grid-template-columns: minmax(0, 1fr);
+.nv-note.is-split .nv-panes { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+
+.nv-note.is-read .nv-text,
+.nv-note.is-edit .nv-preview { display: none; }
+
+/* Read mode is the page itself, not a box on it. */
+body.tp-app .nv-note.is-read .nv-preview {
+    padding: 0;
+    background: none;
+    border: none;
+}
+
+body.tp-app #noteContentInput {
+    width: 100%;
+    min-height: 60vh;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
+    border-radius: 8px;
+    font-size: 0.9rem;
+    resize: vertical;
+    font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+    line-height: 1.7;
+}
+
+body.tp-app #noteContentInput:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+/* Move to… */
+.nv-dialog {
+    width: min(440px, calc(100vw - 32px));
+    max-height: min(70vh, 640px);
+    padding: 0;
+    background: var(--surface-color);
+    color: var(--text-color);
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+.nv-dialog[open] {
+    display: flex;
+    flex-direction: column;
+}
+
+.nv-dialog::backdrop { background: rgba(2, 6, 23, 0.6); }
+
+.nv-dialog-head,
+.nv-dialog-foot {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 14px;
+}
+
+.nv-dialog-head { border-bottom: 1px solid var(--border-color); }
+.nv-dialog-foot { border-top: 1px solid var(--border-color); }
+
+.nv-move-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.nv-move-opt {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    padding: 0 10px 0 calc(10px + var(--depth, 0) * 16px);
+    background: none;
+    border: none;
+    border-radius: 7px;
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: 0.86rem;
+    text-align: left;
+}
+
+.nv-move-opt:hover:not(:disabled) { background: var(--surface-hover); }
+
+.nv-move-opt:disabled {
+    cursor: default;
+    color: var(--text-muted);
+}
+
+.nv-move-opt.is-current { color: var(--text-color); }
+
+.nv-tick {
+    flex: none;
+    color: var(--success-color);
+    font-weight: 700;
 }
 
 /* ---------- rendered note ---------- */
@@ -612,35 +1383,6 @@ body.tp-app .note-preview {
     color: var(--text-muted);
 }
 
-body.tp-app #noteContentInput {
-    width: 100%;
-    padding: 12px;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid var(--border-color);
-    color: var(--text-color);
-    border-radius: 8px;
-    font-size: 0.9rem;
-    resize: vertical;
-    font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
-    line-height: 1.7;
-}
-
-body.tp-app .tp-note-title {
-    font-size: 1rem;
-    font-weight: 600;
-}
-
-.note-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 10px;
-}
-
-.note-actions .sm-btn {
-    flex: 1;
-    padding: 8px;
-}
-
 body.tp-app #settings-folder-list {
     margin-bottom: 12px;
     max-height: 320px;
@@ -654,8 +1396,6 @@ body.tp-app #settings-folder-list {
 @media (max-width: 1000px) {
     .pins-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     body.tp-app #actions.action-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .notes-split { grid-template-columns: minmax(0, 1fr); }
-    .note-panes { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 680px) {

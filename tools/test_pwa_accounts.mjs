@@ -61,7 +61,7 @@ function classList() {
 function makeElement(id = null, tag = 'div') {
     const listeners = {};
     const el = {
-        id, tagName: tag.toUpperCase(), style: {}, dataset: {}, children: [], value: '', textContent: '', innerHTML: '',
+        id, tagName: tag.toUpperCase(), style: { setProperty() {}, removeProperty() {}, getPropertyValue() { return ''; } }, dataset: {}, children: [], value: '', textContent: '', innerHTML: '',
         checked: false, disabled: false, title: '', href: '', open: false, offsetHeight: 0, scrollTop: 0, className: '',
         classList: classList(),
         addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
@@ -80,6 +80,8 @@ function makeElement(id = null, tag = 'div') {
         closest() { return makeElement(); },
         setAttribute() {}, getAttribute() { return null; }, removeAttribute() {}, hasAttribute() { return false; },
         scrollIntoView() {}, focus() {}, select() {}, blur() {}, click() { return el.fire('click'); },
+        matches() { return false; }, toggleAttribute() { return false; }, cloneNode() { return makeElement(); }, after() {}, before() {},
+        setSelectionRange() {}, scrollTo() {},
         contains() { return false; },
         getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
     };
@@ -140,6 +142,17 @@ Object.assign(globalThis, {
     open() {}
 });
 globalThis.addEventListener = (ev, fn) => { (windowListeners[ev] = windowListeners[ev] || []).push(fn); };
+// The notes screen watches sheets to sync the bottom bar and keeps its own
+// history entries; neither matters to the account flows tested here.
+globalThis.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+globalThis.history.pushState = (a, b, url) => { if (url) currentUrl = new URL(url, currentUrl); };
+globalThis.history.back = () => {};
+globalThis.history.state = null;
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
+globalThis.cancelAnimationFrame = globalThis.cancelAnimationFrame || ((id) => clearTimeout(id));
+globalThis.innerWidth = 375;
+globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
 Object.defineProperty(globalThis, 'navigator', { value: { clipboard: null }, configurable: true });
 
 // Every request the app makes, so the test can tell a pull from no pull.
