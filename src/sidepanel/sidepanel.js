@@ -3681,8 +3681,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
 
             // The working copy here may belong to someone else — on this
             // server, or the same id on another one. It is never pushed into
-            // this account and never discarded: it is set aside. With
-            // unpushed edits in it, say so first — Cancel signs nothing in.
+            // this account and never discarded: it is set aside. A copy made
+            // while nobody was signed in becomes this account's. Either way,
+            // with unpushed edits in it, say so first — Cancel signs nothing in.
             const st = TreeStore.status();
             const edits = `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}`;
             let question = null;
@@ -3698,6 +3699,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                     + `Signing in as ${name} here sets it aside: it stays in this browser (Settings › Set-aside copies) `
                     + `and comes back when you sign in as ${oldName || "the server's owner"}${where ? ' there' : ''}.`
                     + (maybeMoved ? `\n\nIf ${base} is the same server at a new address, restore it from Set-aside copies once signed in.` : '');
+            } else if (known && st.dirty && !st.owner && st.origin === 'local') {
+                question = `This browser holds ${edits} made while nobody was signed in.\n\n`
+                    + `Signing in as ${name} makes them ${name}'s working copy.`;
             }
             if (question && !confirm(question)) {
                 fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
@@ -3718,6 +3722,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 const switched = await TreeStore.switchAccount({ ...account, previousUsername: previousName });
                 if (switched.setAside) note = 'Signed in. The previous working copy is set aside below.';
                 if (switched.action === 'restored') note = `Signed in. Your working copy from before is back.`;
+                if (switched.action === 'claimed' && !TreeStore.status().isEmpty) note = 'Signed in. What you made while signed out is in your working copy.';
                 if (TreeStore.status().isEmpty) {
                     try {
                         await TreeStore.sync.pull(getBackendConfig());
@@ -4295,7 +4300,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             : st.match === 'moved' ? 'title="Made at another address of this server — restoring asks first"' : '';
         list.innerHTML = stashes.map(st => `
             <div data-stash-key="${escapeHtml(st.key)}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
-                <div style="color:#ddd;"><strong>${escapeHtml(st.username || (st.userId === null ? 'An older copy' : 'account #' + st.userId))}</strong>
+                <div style="color:#ddd;"><strong>${escapeHtml(st.username || (st.userId === null ? (st.origin === 'local' ? 'Made while signed out' : 'An older copy') : 'account #' + st.userId))}</strong>
                     <span style="color:var(--text-muted);">@ ${escapeHtml(st.url || '')}</span></div>
                 <div style="font-size:0.72rem; color:var(--text-muted); margin-top:3px;">
                     ${st.editCount ? `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}` : 'no unpushed edits'} · ${fmtN(st.items)} items

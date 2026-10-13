@@ -28,6 +28,11 @@
 // never discards it: switchAccount sets it aside (tpTreeStash:<url>|<userId>,
 // with the per-account state that travels with it) and brings back the new
 // account's own set-aside copy, if this browser has one.
+//
+// A copy with no stamp is one of two things, and `origin` says which: one
+// from before accounts ('pre-accounts', the server owner's), or one made in
+// this browser while nobody was signed in ('local', claimed by the first
+// account to sign in).
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
@@ -72,7 +77,8 @@ const state = {
     dirty: false,
     lastSyncAt: null,
     lastSyncKind: null,
-    owner: null,        // {url, userId, username, serverId} of the account this copy belongs to; null = from before accounts
+    owner: null,        // {url, userId, username, serverId} of the account this copy belongs to; null = unstamped
+    origin: null,       // for an unstamped copy: 'pre-accounts' (older version) or 'local' (made while signed out)
     editCount: 0,       // local edits since the last pull or push, for "N unpushed edits"
     rev: null           // stamp of the last write, to recognise our own storage events
 };
@@ -140,8 +146,13 @@ async function ensureLoaded() {
                 state.lastSyncAt = stored.lastSyncAt || null;
                 state.lastSyncKind = stored.lastSyncKind || null;
                 state.owner = stored.owner || null;
+                state.origin = originOf(stored);
                 state.editCount = Number(stored.editCount) || (state.dirty ? 1 : 0);
                 state.rev = stored.rev || null;
+            } else {
+                // Nothing here yet: whatever is made before someone signs in
+                // belongs to nobody so far.
+                state.origin = 'local';
             }
             reindex();
             state.loaded = true;
@@ -171,6 +182,7 @@ async function persistNow() {
                 lastSyncAt: state.lastSyncAt,
                 lastSyncKind: state.lastSyncKind,
                 owner: state.owner,
+                origin: state.owner ? null : state.origin,
                 editCount: state.editCount,
                 rev: state.rev
             }
@@ -197,6 +209,7 @@ if (api.storage && api.storage.onChanged) {
         state.lastSyncAt = next.lastSyncAt || null;
         state.lastSyncKind = next.lastSyncKind || null;
         state.owner = next.owner || null;
+        state.origin = originOf(next);
         state.editCount = Number(next.editCount) || 0;
         state.rev = next.rev || null;
         state.loaded = true;
@@ -377,6 +390,12 @@ async function apiFetch(config, path, opts = {}) {
 
 // --- Accounts -----------------------------------------------------------------
 
+// An unstamped copy (or set-aside copy) as stored. Versions before accounts
+// never wrote `origin`, so its absence means the copy is from then.
+function originOf(stored) {
+    return stored && stored.owner ? null : (stored && stored.origin) || 'pre-accounts';
+}
+
 function ownerFrom(config, userId, serverId = null) {
     if (userId === undefined || userId === null) return state.owner;
     const prev = state.owner && Number(state.owner.userId) === Number(userId) ? state.owner : null;
@@ -413,7 +432,8 @@ function movedServer(a, b) {
 // May `account` restore this set-aside copy? 'same' for its own, 'moved' for
 // its own on what looks like the same server at a new address (the caller
 // confirms first), null otherwise. An unstamped copy from before accounts is
-// the server owner's, on the server it was set aside from.
+// the server owner's, on the server it was set aside from; one made while
+// nobody was signed in may be claimed by whoever is.
 function stashMatch(stash, account) {
     if (!stash || !account || account.userId === undefined || account.userId === null) return null;
     const target = accountOf(account);
@@ -421,6 +441,7 @@ function stashMatch(stash, account) {
         if (sameAccount(stash.owner, target)) return 'same';
         return movedServer(stash.owner, target) ? 'moved' : null;
     }
+    if (originOf(stash) === 'local') return 'same';
     return account.tenancyOwner && sameUrl(stash.url, target.url) ? 'same' : null;
 }
 
@@ -470,6 +491,7 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
             editCount: state.editCount,
             lastSyncAt: state.lastSyncAt,
             owner,
+            origin: owner ? null : state.origin,
             url: trim(owner ? owner.url : fallbackUrl),
             username: owner ? owner.username : username,
             setAsideAt: new Date().toISOString(),
@@ -505,7 +527,7 @@ async function takeStashFor(target, { legacy = false } = {}) {
     const key = keys.find(k => {
         const s = data[k];
         if (!s) return false;
-        if (legacy) return !s.owner && sameUrl(s.url, target.url);
+        if (legacy) return !s.owner && originOf(s) === 'pre-accounts' && sameUrl(s.url, target.url);
         return Boolean(s.owner) && sameAccount(s.owner, target);
     });
     return key ? takeStash(key) : null;
@@ -521,6 +543,7 @@ async function loadCopy(stash, owner) {
     state.lastSyncAt = stash ? stash.lastSyncAt || null : null;
     state.lastSyncKind = null;
     state.owner = owner;
+    state.origin = null;
     reindex();
     const settings = await readSettings();
     const next = { ...settings, focusedFolderIds: stash ? stash.focusedFolderIds || [] : [] };
@@ -676,6 +699,7 @@ export const TreeStore = {
             lastSyncAt: state.lastSyncAt,
             lastSyncKind: state.lastSyncKind,
             owner: state.owner ? { ...state.owner } : null,
+            origin: state.owner ? null : state.origin,
             isEmpty: state.roots.length === 0
         };
     },
@@ -683,19 +707,23 @@ export const TreeStore = {
     // --- Accounts ---------------------------------------------------------
 
     // Would signing in as {url, userId, serverId, tenancyOwner} set this copy
-    // aside? An unstamped copy predates accounts and is the owner's.
+    // aside? An unstamped copy from before accounts is the owner's; one made
+    // here while nobody was signed in is claimed instead (see switchAccount).
     wouldSetAside({ url, userId, username = null, serverId = null, tenancyOwner = false }) {
         const target = accountOf({ url, userId, username, serverId });
         if (state.owner) return !sameAccount(state.owner, target);
+        if (state.origin === 'local') return false;
         return !tenancyOwner && (state.roots.length > 0 || state.dirty);
     },
 
     // Make the working copy the one for this account. In order: queued
-    // tab-close removals are applied to the copy they belong to; an unstamped
-    // copy is adopted when this account is the server's tenancy owner;
-    // otherwise the copy is set aside (never discarded) and this account's own
-    // set-aside copy comes back, or an empty one ready to pull.
-    // Returns {action: 'same'|'adopted'|'restored'|'fresh', setAside}.
+    // tab-close removals are applied to the copy they belong to; a copy made
+    // here while nobody was signed in is claimed by this account (doSignIn
+    // asks first when it holds edits); a copy from before accounts is adopted
+    // when this account is the server's tenancy owner; otherwise the copy is
+    // set aside (never discarded) and this account's own set-aside copy comes
+    // back, or an empty one ready to pull.
+    // Returns {action: 'same'|'claimed'|'adopted'|'restored'|'fresh', setAside}.
     async switchAccount({ url, userId, username = null, serverId = null, tenancyOwner = false, previousUsername = null }) {
         await ensureLoaded();
         await applyPendingRemovals();
@@ -712,10 +740,12 @@ export const TreeStore = {
             }
             return { action: 'same', setAside: null };
         }
-        if (!state.owner && tenancyOwner) {
+        if (!state.owner && (state.origin === 'local' || tenancyOwner)) {
+            const action = state.origin === 'local' ? 'claimed' : 'adopted';
             state.owner = target;
+            state.origin = null;
             await persistNow();
-            return { action: 'adopted', setAside: null };
+            return { action, setAside: null };
         }
         const setAside = await stashCurrent({ fallbackUrl: target.url, username: previousUsername });
         const restored = await takeStashFor(target)
@@ -749,6 +779,7 @@ export const TreeStore = {
                 url: s.url,
                 userId: s.owner ? s.owner.userId : null,
                 username: s.username || (s.owner && s.owner.username) || null,
+                origin: originOf(s),
                 dirty: Boolean(s.dirty),
                 editCount: s.dirty ? Math.max(1, Number(s.editCount) || 0) : 0,
                 items: countItems(s.roots),

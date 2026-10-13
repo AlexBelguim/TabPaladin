@@ -20,6 +20,8 @@
 //      server (or a rebuilt one at the same address) is someone else, and a
 //      server reached at a new address gets its copy back only when the user
 //      says it is the same server.
+//   7. A copy made in this browser while nobody was signed in goes to the
+//      first account that signs in, never to the server's owner by default.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -530,6 +532,60 @@ console.log('\n10. The same id and name on another server is another account');
         TreeStore.status().owner.url === MOVED && TreeStore.status().owner.serverId === 'srv-main' && TreeStore.status().dirty);
     await TreeStore.sync.push({ url: MOVED, token: 'tok' });
     check('  and pushes there as the same account', server.pushedRoots.some(r => r.title === 'NAS-only edit') && !TreeStore.status().dirty);
+}
+
+console.log('\n11. A copy made while nobody was signed in');
+{
+    await clearStashes();
+    // As a fresh install writes it once something is saved before sign-in.
+    await chrome.storage.local.set({ tpTree: {
+        baseVersion: 0, dirty: true, editCount: 1, owner: null, origin: 'local', rev: 'fresh-install',
+        roots: [{ id: 'sam-private', kind: 'folder', title: 'Workflow', children: [
+            { id: 'sam-private-1', kind: 'bookmark', title: 'Clinic', url: 'https://sam-private.example/medical' }
+        ] }]
+    } });
+    check('it is unstamped and says it was made here', TreeStore.status().owner === null && TreeStore.status().origin === 'local');
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    check('it would not be set aside for whoever signs in first', TreeStore.wouldSetAside(sam) === false);
+    const claimed = await TreeStore.switchAccount({ ...sam });
+    check('sam, signing in first, claims it as his working copy',
+        claimed.action === 'claimed' && TreeStore.status().owner.userId === 2 && (await TreeStore.getNode('sam-private')) !== null);
+    check('  nothing went into a set-aside copy for the server owner', (await TreeStore.listStashes()).length === 0);
+    const ownerLater = await TreeStore.switchAccount({ ...alex });
+    check('the owner signing in later on this browser does not get it',
+        ownerLater.action !== 'adopted' && ownerLater.action !== 'claimed' && (await TreeStore.getNode('sam-private')) === null);
+    const samsCopy = (await TreeStore.listStashes(sam)).find(st => st.userId === 2);
+    check('  it waits, set aside as sam\'s, for sam', samsCopy && samsCopy.dirty && samsCopy.match === 'same');
+    check('  and the owner cannot restore it', (await TreeStore.listStashes(alex)).find(st => st.key === samsCopy.key).match === null);
+    const samBack = await TreeStore.switchAccount({ ...sam });
+    check('sam gets it back when he signs in again', samBack.action === 'restored' && (await TreeStore.getNode('sam-private')) !== null);
+
+    // A copy from before accounts is still the owner's, but only on the
+    // server it was set aside from.
+    await clearStashes();
+    await chrome.storage.local.set({ tpTree: { baseVersion: 5, roots: [{ id: 'old2', kind: 'folder', title: 'Old copy', children: [] }], dirty: true, rev: 'legacy-3' } });
+    check('a stored copy with no origin is from before accounts', TreeStore.status().origin === 'pre-accounts');
+    await TreeStore.switchAccount({ ...sam });
+    const legacyStash = (await TreeStore.listStashes()).find(st => st.userId === null);
+    check('  sam sets it aside', legacyStash && legacyStash.origin === 'pre-accounts');
+    check('  the owner may restore it on that server, not on another',
+        (await TreeStore.listStashes(alex)).find(st => st.key === legacyStash.key).match === 'same'
+        && (await TreeStore.listStashes({ url: OTHER, userId: 1, serverId: 'srv-other', tenancyOwner: true })).find(st => st.key === legacyStash.key).match === null);
+
+    // How a fresh install and an upgraded one first load: a separate module
+    // instance, so ensureLoaded runs again against what is in storage.
+    storageData.delete('tpTree');
+    const { TreeStore: FreshInstall } = await import('../src/utils/treeStore.js?fresh-install');
+    await FreshInstall.load();
+    check('a fresh install starts with a copy made here', FreshInstall.status().origin === 'local' && FreshInstall.status().owner === null);
+    await FreshInstall.createNode({ parentId: null, kind: 'folder', title: 'Saved before sign-in' });
+    await FreshInstall.flush();
+    check('  and stores it as such', storageData.get('tpTree').origin === 'local' && storageData.get('tpTree').owner === null);
+    storageData.set('tpTree', { baseVersion: 3, roots: [{ id: 'upg', kind: 'folder', title: 'Upgraded', children: [] }], dirty: false });
+    const { TreeStore: Upgraded } = await import('../src/utils/treeStore.js?upgraded');
+    await Upgraded.load();
+    check('an install upgraded from before accounts loads its copy as the owner\'s', Upgraded.status().origin === 'pre-accounts');
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
