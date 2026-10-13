@@ -1601,10 +1601,25 @@ function renderFolderCard(sub, depth = 0) {
     // Drill — push breadcrumb and re-render at that folder (only for non-workflow cards).
     const drillBtn = header.querySelector('.drill-btn');
     if (drillBtn) {
-        drillBtn.addEventListener('click', (e) => {
+        drillBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            currentNavStack.push({ id: sub.id, title: sub.title });
-            renderSourceGrid(sub.id);
+            const organize = document.getElementById('organizer-source-container');
+            if (organize.style.display !== 'none' && organize.style.display !== '') {
+                currentNavStack.push({ id: sub.id, title: sub.title });
+                renderSourceGrid(sub.id);
+                return;
+            }
+            // Outside Organize the grid renders into a hidden section, which
+            // made this button look dead. Open Organize at this folder
+            // instead, with Back leading to Sources.
+            currentNavStack = [{ id: VIRTUAL_ROOT_ID, title: 'Sources' }, { id: sub.id, title: sub.title }];
+            await renderSourceGrid(sub.id);
+            document.getElementById('groups-container').style.display = 'none';
+            document.getElementById('workflows-container').style.display = 'none';
+            document.getElementById('organizer-container').style.display = 'none';
+            document.getElementById('notes-container').style.display = 'none';
+            organize.style.display = 'block';
+            window.scrollTo(0, 0);
         });
     }
 
