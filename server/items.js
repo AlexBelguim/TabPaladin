@@ -768,13 +768,14 @@ function makeUserStore(db, userId, { maxSnapshots }) {
 
         const writableParent = (parentId) => madeHere.has(parentId) || folderTarget(parentId).ok;
 
-        // {ok, id} or {ok:false, reason}
+        // {ok, id} or {ok:false, reason}. No parent: a top-level folder,
+        // which only a folder the client made itself at the top level is.
         const ensureFolder = (spec, { undoable }) => {
             const id = spec && typeof spec.id === 'string' ? spec.id.trim() : '';
             const title = spec && typeof spec.title === 'string' ? spec.title.trim().slice(0, 200) : '';
-            const parentId = spec && typeof spec.parentId === 'string' ? spec.parentId : '';
+            const parentId = spec && typeof spec.parentId === 'string' && spec.parentId ? spec.parentId : null;
             if (!CLIENT_ID_RE.test(id) || !title) return { ok: false, reason: 'invalid' };
-            if (!parentId || !writableParent(parentId)) return { ok: false, reason: 'missing' };
+            if (parentId !== null && !writableParent(parentId)) return { ok: false, reason: 'missing' };
             const row = own.get(userId, id);
             if (row) {
                 if (row.kind === 'folder' && row.title === title && row.parent_id === parentId) {

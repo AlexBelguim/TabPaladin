@@ -498,6 +498,18 @@ console.log('\n8. Appends from the share sheet, and the ops log');
     check('  logged as an unappend, still a complete gap', opsRows().at(-1).kind === 'unappend' && items.opsSince(v0).complete
         && items.opsSince(v0).ops.length === 4);
 
+    const top = items.appendToFolders({
+        targets: [{ newFolder: { id: 'bbbbbbbbbbbbbbbb', title: 'Made at the top on the phone', parentId: '' }, existing: true }],
+        bookmark: { title: 'Top', url: 'https://top.example/' }
+    });
+    const topRoots = items.readTree().roots;
+    check('a folder a client made at the top level goes there, its link in it, and is not undone with the link',
+        top.created.map(n => n.kind).join() === 'folder,bookmark' && topRoots.at(-1).id === 'bbbbbbbbbbbbbbbb'
+        && topRoots.at(-1).children[0].url === 'https://top.example/' && top.filed[0].createdFolderIds.length === 0);
+    check('  a new folder whose parent is not a folder of this tree is refused',
+        items.appendToFolders({ targets: [{ newFolder: { id: 'cccccccccccccccc', title: 'x', parentId: 'nowhere' } }], bookmark: { title: 'x', url: 'https://x.example/3' } }).failed[0].reason === 'missing'
+        && items.appendToFolders({ targets: [{ newFolder: { id: 'cccccccccccccccc', title: 'x', parentId: 'nb' } }], bookmark: { title: 'x', url: 'https://x.example/3' } }).failed[0].reason === 'missing');
+
     // A whole-tree change in the gap makes it incomplete, raises the floor
     // and forgets the log below it.
     for (const [what, change] of [
