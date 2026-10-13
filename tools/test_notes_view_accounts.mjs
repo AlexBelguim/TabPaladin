@@ -49,7 +49,9 @@
 //      storage (tpLiveDraft, per page) half a second after the last key, at
 //      once on pagehide and when an update asks (saveLiveDraft), stamped with
 //      its copy; saving, discarding or typing back to the saved text clears
-//      it.
+//      it — a save only once the stored working copy has the text (Save
+//      writes it at once), so a page closed right after Save loses nothing,
+//      and one storage refused keeps the live draft until it is written.
 //  14. The live drafts of pages that are gone (their lock is free) are parked
 //      and mirrored (tpParkedMirror), the living page's left alone, and come
 //      back into the editor only for their own copy; one that says what its
@@ -1014,6 +1016,58 @@ console.log('\n13. The live draft: unsaved text outlives the page');
     await $('saveNoteBtn').fire('click');
     await sleep(50);
     check('Save clears it', mine().length === 0, JSON.stringify(live()));
+
+    // Save, then the page closes at once (Ctrl+S, Ctrl+W): the text is in
+    // the live draft until the stored working copy has it, never only in
+    // this page's memory while TreeStore's debounce runs.
+    const treeHas = (text) => JSON.stringify((storageData.get('tpTree') || {}).roots || []).includes(text);
+    const realSet = chrome.storage.local.set;
+    const realRemove = chrome.storage.local.remove;
+    let drops = [];
+    const watchDrop = (text) => {
+        drops = [];
+        const seen = (entries) => {
+            if (!entries.some(d => String((d && d.content) || '').includes(text))) drops.push({ treeHadIt: treeHas(text) });
+        };
+        chrome.storage.local.set = async (obj) => { if (obj.tpLiveDraft) seen(Object.values(obj.tpLiveDraft)); return realSet(obj); };
+        chrome.storage.local.remove = async (k) => { if ([].concat(k).includes('tpLiveDraft')) seen([]); return realRemove(k); };
+    };
+    const unwatch = () => { chrome.storage.local.set = realSet; chrome.storage.local.remove = realRemove; };
+    await settle(); // past the redraw after the save above
+    await type('noteContentInput', '# Diary\nSAVED THEN CLOSED');
+    await sleep(700);
+    check('(the live draft holds the text)', mine().some(d => d.content.includes('SAVED THEN CLOSED')), JSON.stringify(live()));
+    watchDrop('SAVED THEN CLOSED');
+    await $('saveNoteBtn').fire('click');
+    await sleep(50);
+    unwatch();
+    check('Save lets the live draft go only once the stored working copy has the text',
+        drops.length === 1 && drops[0].treeHadIt, JSON.stringify(drops));
+    check('…which Save writes at once, not after the debounce', !NV.isDirty() && treeHas('SAVED THEN CLOSED') && mine().length === 0,
+        JSON.stringify(live()));
+
+    // Storage refuses the working copy: the save is only in memory, so the
+    // live draft keeps the text until it is written.
+    await settle();
+    await type('noteContentInput', '# Diary\nSAVED BUT NOT WRITTEN');
+    await sleep(700);
+    chrome.storage.local.set = async (obj) => {
+        if (obj.tpTree) throw new Error('QUOTA_BYTES quota exceeded');
+        return realSet(obj);
+    };
+    const warn = console.warn;
+    const warned = [];
+    console.warn = (...a) => warned.push(String(a[0]));
+    await $('saveNoteBtn').fire('click');
+    await sleep(300);
+    chrome.storage.local.set = realSet;
+    console.warn = warn;
+    check('(the working copy was refused, and the page said so)', warned.some(w => w.includes('Failed to persist tree')), JSON.stringify(warned));
+    check('a save the working copy could not take yet keeps the live draft', !NV.isDirty() && !treeHas('SAVED BUT NOT WRITTEN')
+        && mine().length === 1 && mine()[0].content === '# Diary\nSAVED BUT NOT WRITTEN', JSON.stringify(live()));
+    await NV.saveLiveDraft();
+    check('…and lets it go once the working copy is written', treeHas('SAVED BUT NOT WRITTEN') && mine().length === 0,
+        JSON.stringify(live()));
 
     await type('noteContentInput', '# Diary\nLIVE TWO');
     firePagehide();

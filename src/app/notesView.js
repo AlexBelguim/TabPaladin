@@ -340,8 +340,9 @@ export async function restoreParkedFromMirror() {
 }
 
 // Read, change and write the shared live-draft map, one page at a time.
-// `fn` returns false to write nothing.
-function updateLiveDrafts(fn) {
+// `fn` returns false to write nothing. `before`, when given, runs first, in
+// turn, outside the lock; when it throws, nothing is written.
+function updateLiveDrafts(fn, before = null) {
     const run = async () => {
         const data = await api.storage.local.get(LIVE_DRAFT_KEY);
         const stored = data && data[LIVE_DRAFT_KEY];
@@ -351,13 +352,26 @@ function updateLiveDrafts(fn) {
         else await api.storage.local.remove(LIVE_DRAFT_KEY);
     };
     const locks = webLocks();
-    const p = liveChain.then(() => (locks ? locks.request(LIVE_DRAFT_LOCK, run) : run()));
+    const p = liveChain.then(async () => {
+        if (before) await before();
+        return locks ? locks.request(LIVE_DRAFT_LOCK, run) : run();
+    });
     liveChain = p.catch(() => {});
     return p;
 }
 
+// The editor is clean: whatever made it so is in storage before the live
+// draft lets go of the text — a save in the working copy (not only in this
+// page's memory, waiting out TreeStore's debounce), a draft parked into the
+// mirror. Throws while the working copy is not written.
+async function cleanEditorWritten() {
+    const [written] = await Promise.all([TreeStore.flush(), mirrorChain]);
+    if (written === false) throw new Error('The working copy is not written yet');
+}
+
 // Write this page's live draft now: the editor's text while it is unsaved,
-// nothing (the entry goes) once it is not.
+// nothing (the entry goes) once it is not — and what it was saved into, or
+// parked as, is written.
 function writeLiveDraft() {
     clearTimeout(liveTimer);
     liveTimer = null;
@@ -378,9 +392,9 @@ function writeLiveDraft() {
         if (!(pageId in map)) return false;
         delete map[pageId];
         return true;
-    }).catch((e) => {
+    }, draft ? null : cleanEditorWritten).catch((e) => {
         liveWritten = undefined; // written again next time
-        console.warn('[TabPaladin] Could not keep the unsaved note', e);
+        console.warn(draft ? '[TabPaladin] Could not keep the unsaved note' : '[TabPaladin] The unsaved note is kept for now', e);
     });
 }
 
@@ -1154,6 +1168,10 @@ async function saveNote() {
         titleInput.value = result.title;
         if (textarea.value !== result.content) textarea.value = result.content;
         savePrefs();
+        // Into storage now, not after TreeStore's debounce: a page closed
+        // right after Save keeps it. (Until it is written, the live draft
+        // keeps the text too.)
+        await TreeStore.flush().catch((e) => console.warn('[TabPaladin] Could not write the working copy yet', e));
         await refresh();
         return true;
     } catch (e) {

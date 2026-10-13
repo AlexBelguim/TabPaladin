@@ -1200,10 +1200,15 @@ export const TreeStore = {
     // Write the working copy to storage now instead of on the debounce.
     // Anything about to close this page (saving a workflow closes its own
     // tab along with the rest) must await this first, or the edit dies with
-    // the page before the timer fires.
+    // the page before the timer fires. Resolves true once every edit this
+    // page made is in storage; false when storage refused the write (the
+    // edits wait in memory for the next one).
     async flush() {
         await ensureLoaded();
-        await withCopyLock(reconcile);
+        return withCopyLock(async () => {
+            await reconcile();
+            return !pendingOps.length;
+        });
     },
 
     // The working copy as it is in storage now, with this page's edits
