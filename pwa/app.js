@@ -809,7 +809,9 @@ async function refreshProposals() {
         }
         // Signed out or switched while it was asked: not this account's.
         if (accountKey() !== account) return;
-        const sig = (l) => l.map(p => `${p.id}:${p.status || ''}`).join(',');
+        // Redrawn when anything shown changed, not only the status: a
+        // suggestion's lines are planned again against the tree each time.
+        const sig = (l) => JSON.stringify(l.map(p => [p.id, changeShown(p)]));
         const before = sig(state.proposals) + '|' + sig(state.changes);
         state.proposals = list.filter(p => p.kind !== 'tree');
         state.changes = list.filter(p => p.kind === 'tree');
@@ -3193,6 +3195,13 @@ function renderChangesBlock() {
     return block;
 }
 
+// What a suggestion shows the user. When it reads otherwise than what was
+// drawn, the user has not seen what Approve would do now.
+function changeShown(p) {
+    return JSON.stringify([p.status || '', p.title || '', Boolean(p.danger), p.reviewKey || '',
+        (p.preview || []).map(l => [l.op || '', l.text || '']), p.stale || []]);
+}
+
 function changeSourceLabel(p) {
     if (p.source === 'mcp') return p.tokenName ? `MCP · ${p.tokenName}` : 'MCP (token revoked)';
     return 'Share link';
@@ -3265,14 +3274,39 @@ async function resolveChange(p, approve) {
         askToPushBeforeApproving();
         return;
     }
+    const account = accountKey();
+    if (approve) {
+        // Asked again first: the tree may have changed since this was drawn
+        // (a push from here or another device, a filed link), and what is
+        // approved must be what the user was shown and asked about.
+        await refreshProposals();
+        if (accountKey() !== account) return;
+        const now = state.changes.find(x => x.id === p.id);
+        if (!now) {
+            showToast('This suggestion is no longer waiting.');
+            renderView();
+            return;
+        }
+        if (changeShown(now) !== changeShown(p)) {
+            renderView();
+            showToast(now.status === 'stale'
+                ? 'This suggestion is out of date now — reject it and ask the chat again.'
+                : 'This suggestion changed since it was shown — look at it again, then approve.');
+            return;
+        }
+        p = now;
+    }
     if (approve && p.danger) {
+        // Every deletion: the server never leaves a DELETE line out.
         const lines = (p.preview || []).filter(l => l.danger).map(l => '• ' + l.text).join('\n');
         if (!confirm(`This suggestion DELETES:\n\n${lines}\n\nA history version is kept on the server. Approve it?`)) return;
     }
-    const account = accountKey();
     try {
         setStatus(approve ? 'Approving…' : 'Rejecting…');
-        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+        // The preview approved: the server refuses if it now reads otherwise.
+        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, {
+            method: 'POST', ...(approve && p.reviewKey ? { body: JSON.stringify({ reviewed: p.reviewKey }) } : {})
+        });
         setStatus('');
         if (approve) {
             const done = 'Suggested changes applied';
@@ -3296,6 +3330,12 @@ async function resolveChange(p, approve) {
         if (e.status === 409 && e.code === 'stale') {
             const why = (e.body && e.body.stale && e.body.stale[0]) || 'the bookmarks changed since.';
             showToast(`Out of date, nothing was applied: ${why}`);
+            await refreshProposals();
+            renderView();
+            return;
+        }
+        if (e.status === 409 && e.code === 'changed') {
+            showToast('This suggestion changed since it was shown, so nothing was applied — look at it again.');
             await refreshProposals();
             renderView();
             return;
@@ -3641,6 +3681,9 @@ async function pushNow() {
         const n = lastFold ? lastFold.applied : 0;
         showToast(n ? `Pushed — included ${n} filed link${n === 1 ? '' : 's'} from another device.` : 'Pushed.');
         renderView();
+        // Suggestions are planned against the server's tree, which this push
+        // just changed: their lines may read otherwise now.
+        refreshProposals();
         return true;
     } catch (err) {
         setStatus('Push failed: ' + err.message);
@@ -5775,5 +5818,7 @@ window.addEventListener('focus', async () => {
     if (configured() && state.snapshot) {
         await refreshInbox();
         await checkUnfiledLinks();
+        // Another device may have changed what a suggestion would do.
+        await refreshProposals();
     }
 });

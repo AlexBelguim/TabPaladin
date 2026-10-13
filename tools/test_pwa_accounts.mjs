@@ -64,7 +64,11 @@
 //      preview, where they came from and why; approving one follows the same
 //      push-first rule and pulls; one gone out of date can only be rejected;
 //      a delete is flagged and asked about; a #changes= review link is filed
-//      as a suggestion only after a yes, and applies nothing.
+//      as a suggestion only after a yes, and applies nothing. Approve asks
+//      the server again first and applies only what was drawn: a delete whose
+//      folder another device filled since is shown out of date, one whose
+//      lines read otherwise is redrawn, and the approval names the preview it
+//      approved; a push, and coming back to the app, redraw what changed.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -254,6 +258,8 @@ new Function('self', fs.readFileSync(path.join(REPO, 'pwa', 'shareCore.js'), 'ut
 // Every request the app makes, so the test can tell a pull from no pull. One
 // can be made to fail as if the phone were offline.
 const requests = [];
+// Each request's body, at the same index as its line in `requests`.
+const requestBodies = [];
 const realFetch = globalThis.fetch;
 let inFlight = 0;
 let lastActivity = Date.now();
@@ -263,6 +269,7 @@ let holdNext = null;
 globalThis.fetch = async (url, opts = {}) => {
     const line = `${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`;
     requests.push(line);
+    requestBodies.push(typeof opts.body === 'string' ? opts.body : null);
     if (failNext && line.startsWith(failNext)) {
         failNext = null;
         throw new TypeError('Failed to fetch');
@@ -1242,8 +1249,12 @@ try {
         /^Push your changes first, then approve\./.test(dialogs.confirm[dialogs.confirm.length - 1] || '') && approvals() === approvals15
         && (await review()).length === 1);
     answers.confirm.push(true); // OK = ⬆️ Push now
+    const pushMark15 = requests.length;
     await changeButton(c15.id, 'proposal-approve').fire('click');
     await settle();
+    check('  OK pushes, and asks for the suggestions again after the push',
+        requests.slice(pushMark15).includes('PUT /api/tree') && requests.slice(requests.indexOf('PUT /api/tree', pushMark15)).includes('GET /api/proposals/review')
+        && approvals() === approvals15, requests.slice(pushMark15).join(' | '));
     const pulls15 = pulls();
     await changeButton(c15.id, 'proposal-approve').fire('click');
     await settle();
@@ -1289,6 +1300,80 @@ try {
         && JSON.stringify(await alexTree()).includes('Renamed on the laptop'), dialogs.confirm.slice(asked15).join(' | '));
     await changeButton(c15.id, 'proposal-reject').fire('click');
     await settle();
+
+    // Approve applies what was drawn, nothing else: it asks the server again first.
+    const find15 = (roots, id) => { for (const n of roots) { if (n.id === id) return n; const h = find15(n.children || [], id); if (h) return h; } return null; };
+    const push15 = async (change) => {
+        const t = await alexTree();
+        change(t.roots, t.roots.find(r => r.role === 'bookmarks'));
+        const r = await api('/api/tree', { method: 'PUT', token: alexTok, body: { roots: t.roots, baseVersion: t.version } });
+        if (r.status !== 200) throw new Error('push: ' + JSON.stringify(r.json));
+    };
+    await push15((roots, bm) => bm.children.push(
+        { id: 'f15-empty', kind: 'folder', title: 'Drawn empty', children: [] },
+        { id: 'f15-gp', kind: 'folder', title: 'Grandparent', children: [{ id: 'f15-parent', kind: 'folder', title: 'Parent before', children: [
+            { id: 'f15-dest', kind: 'folder', title: 'Dest', children: [] }] }] },
+        { id: 'b15-mover', kind: 'bookmark', title: 'Mover', url: 'https://mover.example/' }));
+    await propose(alexTok, { action: 'delete', ids: ['f15-empty'] });
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    [c15] = await review();
+    const drawnEmpty = drawnSince(0, 'DELETE folder “Drawn empty” from Bookmarks (empty)');
+    await push15((roots) => find15(roots, 'f15-empty').children.push({ id: 'b15-late', kind: 'bookmark', title: 'From the laptop', url: 'https://laptop.example/late' }));
+    let approvalsMark = approvals();
+    let asksMark = dialogs.confirm.length;
+    let toastsMark = toastCount();
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('a delete drawn as empty that another device filled since: Approve asks the server, deletes nothing, asks nothing, shows it out of date',
+        drawnEmpty && approvals() === approvalsMark && dialogs.confirm.length === asksMark
+        && toastsSince(toastsMark).some(t => /out of date now/.test(t)) && /\bstale\b/.test(changeItem(c15.id).className)
+        && drawnSince(0, 'What is in the folder “Drawn empty” changed since') && JSON.stringify(await alexTree()).includes('laptop.example/late'),
+        toastsSince(toastsMark).join(' | '));
+    await changeButton(c15.id, 'proposal-reject').fire('click');
+    await settle();
+
+    await propose(alexTok, { action: 'move', ids: ['b15-mover'], toFolderId: 'f15-dest' });
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    [c15] = await review();
+    const drawnBefore = drawnSince(0, 'Move bookmark “Mover” from Bookmarks to Bookmarks / Grandparent / Parent before / Dest');
+    await push15((roots) => { find15(roots, 'f15-parent').title = 'Parent after'; });
+    let drawnMark = created.length;
+    approvalsMark = approvals();
+    toastsMark = toastCount();
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('a suggestion whose lines read otherwise since (a folder above renamed): Approve redraws it, says so and sends nothing',
+        drawnBefore && approvals() === approvalsMark && toastsSince(toastsMark).some(t => /changed since it was shown/.test(t))
+        && drawnSince(drawnMark, 'to Bookmarks / Grandparent / Parent after / Dest') && !/\bstale\b/.test(changeItem(c15.id).className),
+        toastsSince(toastsMark).join(' | '));
+    const shown15 = (await review()).find(p => p.id === c15.id);
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    const approveAt = requests.lastIndexOf(`POST /api/proposals/${c15.id}/approve`);
+    check('  tapped again, it approves what is shown now, naming that preview to the server',
+        approvals() === approvalsMark + 1 && approveAt >= 0 && JSON.parse(requestBodies[approveAt] || '{}').reviewed === shown15.reviewKey
+        && find15((await alexTree()).roots, 'f15-dest').children.some(c => c.id === 'b15-mover'), requestBodies[approveAt]);
+
+    // A redraw when only the lines changed: coming back to the app asks again.
+    await propose(alexTok, { action: 'move', ids: ['b15-mover'], toFolderId: 'f15-gp' });
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    [c15] = await review();
+    // Where it comes from reads otherwise; nothing it names changed.
+    await push15((roots) => { find15(roots, 'f15-parent').title = 'Parent again'; });
+    drawnMark = created.length;
+    approvalsMark = approvals();
+    fireWindow('focus');
+    await settle();
+    const redrawn = drawnSince(drawnMark, 'Move bookmark “Mover” from Bookmarks / Grandparent / Parent again / Dest to Bookmarks / Grandparent');
+    toastsMark = toastCount();
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('a suggestion whose lines changed but not its status is redrawn when the app comes back, and then approves at once',
+        redrawn && approvals() === approvalsMark + 1 && !toastsSince(toastsMark).some(t => /changed since/.test(t))
+        && (await review()).length === 0, toastsSince(toastsMark).join(' | '));
 
     // A review link from a chat that cannot POST: offered, then filed as a suggestion.
     const link15 = '#changes=' + encodeURIComponent(JSON.stringify({ reason: 'Via a link', changes: [{ op: 'create_folder', parentId: bm15.id, path: 'Linked folder' }] }));
