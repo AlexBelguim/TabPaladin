@@ -433,6 +433,23 @@ if (api.storage && api.storage.onChanged) {
     });
 }
 
+// A page that is hidden or going away writes its edits now rather than on the
+// debounce: closing the tab, the browser discarding it, or an extension
+// update reloading every page can come before the timer does. Hidden first,
+// because pagehide is not always the page's last chance to run anything.
+function flushOnHide() {
+    if (!pendingOps.length && !persistTimer) return;
+    withCopyLock(reconcile).catch((e) => console.warn('[TabPaladin] Failed to persist tree', e));
+}
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') flushOnHide();
+    });
+}
+if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', flushOnHide);
+}
+
 // --- Edits, kept as steps until written ----------------------------------------
 //
 // Each edit is made at once, and also kept as a step that makes it again on
