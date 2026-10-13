@@ -407,6 +407,11 @@ try {
     for (const fn of documentListeners.keydown || []) fn(enterOnUndo);
     await settle();
     check('Enter on a focused button does what that button does: the sheet does not close as Done', sheetOpen());
+    byId('settings-sheet').classList.remove('hidden');
+    for (const fn of documentListeners.keydown || []) fn({ key: 'Escape', target: byId('cfg-username'), preventDefault() {}, stopImmediatePropagation() {} });
+    await settle();
+    check('  and keys go to a sheet opened over it: Esc there leaves the share sheet open', sheetOpen());
+    byId('settings-sheet').classList.add('hidden');
     mark = created.length;
     await chip('f-fun').fire('click');
     await settle();

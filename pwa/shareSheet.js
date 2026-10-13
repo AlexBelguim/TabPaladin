@@ -1020,6 +1020,13 @@ export function createShareSheet(ctx) {
 
     function onKey(e) {
         if (!isOpen()) return false;
+        // A sheet opened over it (Settings, the Inbox, a user's) has the keys:
+        // Esc closes that one, typing goes into its fields.
+        const over = ['settings-sheet', 'inbox-sheet', 'user-sheet'].some((id) => {
+            const el = document.getElementById(id);
+            return el && el.classList && !el.classList.contains('hidden');
+        });
+        if (over) return false;
         const typing = e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT');
         if (e.key === 'Escape') {
             e.preventDefault();

@@ -3765,6 +3765,9 @@ async function flushShares(sids = null) {
     if (res.stopped === 'auth') {
         try { await api('/api/auth/me'); } catch (e) { /* api() has said so */ }
     }
+    // The server says this session is not the account the share was kept
+    // for: learn again who it is (nothing was sent or changed).
+    if (res.stopped === 'account') await refreshWhoAmI();
     if (res.stopped === 'network') registerShareSync();
     return res;
 }
