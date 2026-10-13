@@ -3880,17 +3880,16 @@ async function restoreTreeCache() {
     if (Array.isArray(rec.importIds) && rec.importIds.length) state.snapshot._importIds = rec.importIds.slice();
     const path = [rootId, ...(Array.isArray(rec.pathIds) ? rec.pathIds : [])];
     state.pathIds = findNodeByPath(path) ? path : [rootId];
-    if (rec.keptDraft) state.keptDraft = rec.keptDraft;
-    if (rec.nv && rec.nv.editing) {
-        if (signedIn) {
-            state.view = 'notes';
-            state.nv = { ...freshNv(), ...rec.nv };
-            navDepth++;
-            history.pushState(nvHistoryState(), '', location.pathname);
-        } else if (!state.keptDraft) {
-            // Set aside for its account, as a sign-out would have.
-            state.keptDraft = { ...freshNv(), ...rec.nv };
-        }
+    // The note being written (or set aside by a sign-out): back in its
+    // editor when its account is the one signed in, else set aside for it.
+    const draft = rec.nv && rec.nv.editing ? rec.nv : rec.keptDraft && rec.keptDraft.editing ? rec.keptDraft : null;
+    if (draft && signedIn) {
+        state.view = 'notes';
+        state.nv = { ...freshNv(), ...draft };
+        navDepth++;
+        history.pushState(nvHistoryState(), '', location.pathname);
+    } else if (draft) {
+        state.keptDraft = { ...freshNv(), ...draft };
     }
     renderView();
     const d = new Date(rec.savedAt);
@@ -4070,6 +4069,7 @@ function makeShareSheet() {
         copy: shareCopy,
         flush: (sids) => flushShares(sids),
         api,
+        applyFiled,
         applyUnfiled,
         prefs: { get: () => sharePrefs.value, update: updateSharePrefs },
         stats: () => shareStats,

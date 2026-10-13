@@ -25,6 +25,10 @@
 //      server's prefs.
 //   9. The Inbox lists what waits, the same link shared twice as one row,
 //      and a share a forced push erased with its note.
+//  10. The copy kept on the phone is its account's: kept over a sign-out with
+//      unpushed edits (and brought back for that account only, nobody else
+//      signing in over it), gone with a clean sign-out, never shown to the
+//      next account.
 //
 // Run: node tools/test_share_pwa.mjs [--port 18986]
 
@@ -313,6 +317,16 @@ async function signInStorage(username, password) {
 
 const accountOf = (login) => ({ url: BASE, userId: login.user.id, username: login.username, serverId: login.serverId });
 
+// Signing in through Settings, as a person would.
+async function signIn(username, password) {
+    byId('cfg-url').value = BASE;
+    byId('cfg-username').value = username;
+    byId('cfg-password').value = password;
+    byId('auth-error').textContent = '';
+    await byId('auth-submit').fire('click');
+    await settle();
+}
+
 try {
     for (let i = 0; i < 100; i++) {
         try { if ((await realFetch(BASE + '/api/health')).ok) break; } catch (e) { /* not yet */ }
@@ -490,12 +504,16 @@ try {
     await settle();
     await button('Done', mark).fire('click');
     await settle();
+    // ✓ Done on the note, which saves it and pushes the copy with it.
+    const tDone = { dataset: { nv: 'done' }, closest: (sel) => (sel === '[data-nv]' ? tDone : null) };
+    await byId('content').fire('click', { target: tDone });
+    await settle();
     await byId('pushBtn').fire('click');
     await settle();
     t = await tree(A);
     const into6 = find(t.roots, n => n.id === chip6.dataset.folderId);
-    check('  then the link files and the restored edit pushes, both kept', Boolean(byTitle(t.roots, 'Unpushed when shared'))
-        && into6 && into6.children.some(c => c.url === 'https://example.com/while-writing'),
+    check('  then the link files, and the restored edit and note push, all kept', Boolean(byTitle(t.roots, 'Unpushed when shared'))
+        && into6 && into6.children.some(c => c.url === 'https://example.com/while-writing') && JSON.stringify(t.roots).includes('HALF WRITTEN'),
         JSON.stringify({ unpushed: Boolean(byTitle(t.roots, 'Unpushed when shared')), into: into6 && into6.children.map(c => c.url),
             req: requests.slice(-12), confirms: dialogs.confirm.slice(-3), status: byId('status').textContent, toast: lastToast() }));
 
@@ -557,6 +575,50 @@ try {
     check('a share captured as sam waits, offered to alex', rowText.some(s => s.includes('sams link') && /Shared as sam/.test(s)), rowText.join(' || ').slice(0, 800));
     const badge = Number(byId('inbox-count').textContent || 0);
     check('the Inbox counts what waits', badge >= 3, String(badge));
+
+    console.log('\n10. The copy kept on the phone is its account\'s');
+    byId('inbox-sheet').classList.add('hidden');
+    // Up to date first: section 9 changed the tree behind the phone's back.
+    await byId('pullBtn').fire('click');
+    await settle();
+    offline = /^PUT \/api\/tree$/;
+    answers.prompt.push('Kept for alex');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    offline = null;
+    answers.confirm.push(true); // "Sign out anyway?" — the edit stays for alex
+    await byId('auth-signout').fire('click');
+    await settle();
+    const keptOut = await kept();
+    check('signing out with an unpushed edit keeps the copy on the phone, as alex\'s', keptOut && keptOut.dirty
+        && keptOut.account.username === 'alex' && JSON.stringify(keptOut.roots).includes('Kept for alex'));
+    const pulls10 = requests.filter(r => r === 'GET /api/tree').length;
+    await coldStart(`${BASE}/`);
+    check('the next start, signed out, brings it back for alex without showing it', /Restored unpushed changes .* sign in as alex/.test(byId('status').textContent)
+        && /Signed out/.test(byId('content').innerHTML), byId('status').textContent);
+    await signIn('sam', 'sam-password-1');
+    check('sam cannot sign in over it', /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent)
+        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    await signIn('alex', PASSWORD);
+    await byId('pushBtn').fire('click');
+    await settle();
+    // The sign-out above ended the session the test held; a fresh one.
+    const A10 = (await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token;
+    check('alex signs in to it, nothing pulled over it, and pushes it', requests.filter(r => r === 'GET /api/tree').length === pulls10
+        && Boolean(byTitle((await tree(A10)).roots, 'Kept for alex')), byId('status').textContent);
+    const outAt = new Date().toISOString();
+    await byId('auth-signout').fire('click');
+    await settle();
+    const left10 = await kept();
+    check('a clean sign-out leaves no copy on the phone', !left10,
+        JSON.stringify({ outAt, savedAt: left10 && left10.savedAt, dirty: left10 && left10.dirty, status: byId('status').textContent, confirms: dialogs.confirm.slice(-2) }));
+    await signIn('sam', 'sam-password-1');
+    const mark10 = created.length;
+    await coldStart(`${BASE}/`);
+    const samKept = await kept();
+    check('so sam\'s next start shows none of alex\'s tree, and keeps only his own',
+        !drawnText('Kept for alex', mark10) && !drawnText('Phone folder', mark10)
+        && (!samKept || (samKept.account.username === 'sam' && !JSON.stringify(samKept.roots).includes('Kept for alex'))), JSON.stringify(samKept && samKept.account));
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog.slice(-2000));

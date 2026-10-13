@@ -914,7 +914,7 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 
 /* ---------- bottom sheets clear the tab bar ---------- */
 /* The sheets are pinned to bottom:0 at a lower z-index than #bottom-nav, so
-   the bar covered their footer — the Drop here button sat underneath it. Lift
+   the bar covered their footer — a sheet's buttons sat underneath it. Lift
    them by the bar's height instead of raising their z-index, because the bar
    should stay reachable while a sheet is open. */
 :root { --bottom-nav-h: 58px; }

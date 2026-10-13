@@ -16,12 +16,14 @@
 //   flush(sids) -> flushOutbox result                      uploads and files; the app
 //                                                          folds filed links into its copy
 //   api(path, opts)                                        the app's fetch with auth
-//   applyUnfiled(result)
-//   prefs: {get() -> value|null, update(fn) -> Promise}    the 'share' pref
+//   applyFiled(result), applyUnfiled(result)               a filing or undo into the copy
+//   registerSync()                                         Background Sync, where there is one
+//   prefs: {get() -> value|null, update(fn, app) -> Promise}  the 'share' pref
 //   stats() -> {apps} | null
-//   clipboardLinks() -> [{url,title}], forgetClipboardLink(url)
-//   toast(msg), openSettings(), saveAsNote(text), openFolder(folderId),
-//   done({label}), onClose(), onInboxCount(n), isDesktop(), newId()
+//   clipboardLinks() -> [{url,title}], forgetClipboardLink(url), dismissClipboardLink(url)
+//   toast(msg), toastUndo(msg, undo), openSettings(), saveAsNote(text),
+//   openFolder(folderId), done({label, fromShare}), onClose(),
+//   onInboxCount(n), isDesktop(), newId()
 // }
 //
 // The DOM is built with createElement and listeners on what was built, never
@@ -116,14 +118,15 @@ export function createShareSheet(ctx) {
             lastLabels: [], message: null, picker: null, menu: null
         };
         (s.share && s.share.filings || []).forEach(f => s.saved.set(f.folderId, { bookmarkId: f.bookmarkId, already: true, label: f.folderTitle || '' }));
+        // A choice made offline, still waiting with the share.
+        (entry.file && entry.file.targets || []).forEach(t => s.queued.add(t.folderId || (t.newFolder && t.newFolder.id)));
         root.classList.remove('hidden');
         document.body.classList.add('share-open');
         computeChips();
         render();
         // The worker uploads a share as it arrives; a pasted link, or one
         // shared while the worker was not in charge, goes up from here.
-        if (entry.url && accountOk() && !entry.uploaded) upload();
-        else if (accountOk() && entry.uploaded) watchArchived();
+        if (entry.url && accountOk() && (!entry.uploaded || entry.file)) upload();
         return true;
     }
 
@@ -134,11 +137,11 @@ export function createShareSheet(ctx) {
         if (!s || s.sid !== sid) return;
         const e = await ctx.outbox.get(sid).catch(() => null);
         if (e) { s.entry = e; if (e.share) s.share = e.share; }
+        const done = res && res.filed.find(f => f.sid === sid);
+        if (done) took(done.result, [...s.queued], []);
         if (res && res.stopped === 'network') s.offline = true;
         render();
     }
-
-    function watchArchived() { /* the share came with its status; nothing to fetch */ }
 
     async function openForSid(sid) {
         let entry = await ctx.outbox.get(sid).catch(() => null);
@@ -251,11 +254,13 @@ export function createShareSheet(ctx) {
         const c = ctx.copy();
         const body = { targets: [], folders: [] };
         const keys = [];
+        const refused = [];
         for (const t of targets) {
             if (t.folderId && c.ready && !c.serverIds.has(t.folderId)) {
                 const chain = localChain(t.folderId, c);
                 if (!chain || !chain.length) {
                     s.failed.set(t.folderId, 'unpushed');
+                    refused.push({ folderId: t.folderId, reason: 'unpushed' });
                     continue;
                 }
                 for (const f of chain.slice(0, -1)) if (!body.folders.some(x => x.id === f.id)) body.folders.push(f);
@@ -266,7 +271,11 @@ export function createShareSheet(ctx) {
                 keys.push(t.folderId || (t.newFolder && t.newFolder.id));
             }
         }
-        if (!body.targets.length) { render(); return; }
+        if (!body.targets.length) {
+            s.message = failedMessage(refused, 0);
+            render();
+            return;
+        }
         keys.forEach(k => { s.pending.add(k); s.failed.delete(k); });
         s.message = null;
         render();
@@ -279,31 +288,31 @@ export function createShareSheet(ctx) {
             entry = await ctx.outbox.put({ ...s.entry, uploaded: Boolean(s.share) || s.entry.uploaded, share: s.share, file: intent, later: false }).catch(() => null);
         }
         let res = null;
-        try { res = await ctx.flush([sid]); } catch (e) { res = null; }
+        if (entry) {
+            try { res = await ctx.flush([sid]); } catch (e) { res = null; }
+        } else if (s.share) {
+            // Nowhere on the phone to keep the choice (storage refused it):
+            // straight to the server, or not at all.
+            try {
+                const r = await ctx.api(`/api/shares/${encodeURIComponent(ref())}/file`, {
+                    method: 'POST', body: JSON.stringify({ ...intent, labels: undefined, at: undefined, app: s.app || undefined })
+                });
+                ctx.applyFiled(r);
+                res = { filed: [{ sid, result: r }] };
+            } catch (e) {
+                if (s && s.sid === sid) s.message = `Couldn't save: ${(e.body && e.body.error) || e.message}`;
+            }
+        }
         if (!s || s.sid !== sid) return;
         keys.forEach(k => s.pending.delete(k));
         const done = res && res.filed.find(f => f.sid === sid);
         if (done) {
-            const r = done.result;
-            s.share = r.share || s.share;
-            const savedLabels = [];
-            for (const n of r.created || []) {
-                if (n.kind !== 'bookmark') continue;
-                const key = keys.find(k => k === n.parentId) || n.parentId;
-                const name = (c.ready && c.index.folders.get(n.parentId) && c.index.folders.get(n.parentId).title) || labelFor(body.targets, n.parentId);
-                s.saved.set(key, { bookmarkId: n.id, already: false, label: name });
-                savedLabels.push(name);
-            }
-            for (const a of r.already || []) {
-                if (!s.saved.has(a.folderId)) s.saved.set(a.folderId, { bookmarkId: a.bookmarkId, already: true, label: labelFor(body.targets, a.folderId) });
-            }
-            for (const f of r.failed || []) s.failed.set(f.folderId || f.newFolderId, f.reason);
-            if (savedLabels.length) {
-                s.lastLabels = savedLabels;
-                if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) { /* not on this device */ } }
-            }
-            s.message = failedMessage(r.failed || [], savedLabels.length);
-            s.queued.clear();
+            took(done.result, keys, body.targets);
+        } else if (!ctx.signedIn()) {
+            // The session ended on the way: kept with the share, filed after
+            // the next sign-in.
+            keys.forEach(k => s.queued.add(k));
+            s.message = 'Your session ended — sign in again, and it is saved then.';
         } else {
             const e = await ctx.outbox.get(sid).catch(() => null);
             if (e && e.lastError && e.lastError.failed) {
@@ -321,6 +330,36 @@ export function createShareSheet(ctx) {
         refreshInbox();
     }
 
+    // What a filing's answer means for the sheet: chips saved (or already
+    // there, or failed), the bar, and a new folder kept on screen as a chip.
+    function took(r, keys, targets) {
+        const c = ctx.copy();
+        s.share = r.share || s.share;
+        const savedLabels = [];
+        for (const n of r.created || []) {
+            if (n.kind === 'folder') {
+                if (s.chips && c.ready && !s.chips.some(x => x.folderId === n.id) && targets.some(t => t.newFolder && t.newFolder.id === n.id)) {
+                    s.chips.push({ folderId: n.id, reason: 'new' });
+                }
+                continue;
+            }
+            const key = keys.find(k => k === n.parentId) || n.parentId;
+            const name = (c.ready && c.index.folders.get(n.parentId) && c.index.folders.get(n.parentId).title) || labelFor(targets, n.parentId);
+            s.saved.set(key, { bookmarkId: n.id, already: false, label: name });
+            savedLabels.push(name);
+        }
+        for (const a of r.already || []) {
+            if (!s.saved.has(a.folderId)) s.saved.set(a.folderId, { bookmarkId: a.bookmarkId, already: true, label: labelFor(targets, a.folderId) });
+        }
+        for (const f of r.failed || []) s.failed.set(f.folderId || f.newFolderId, f.reason);
+        if (savedLabels.length) {
+            s.lastLabels = savedLabels;
+            if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) { /* not on this device */ } }
+        }
+        s.message = failedMessage(r.failed || [], savedLabels.length);
+        s.queued.clear();
+    }
+
     function labelFor(targets, folderId) {
         const t = targets.find(x => (x.folderId || (x.newFolder && x.newFolder.id)) === folderId);
         return (t && t.newFolder && t.newFolder.title) || folderId;
@@ -334,7 +373,8 @@ export function createShareSheet(ctx) {
             const folder = c.ready ? c.index.folders.get(id) : null;
             const why = f.reason === 'missing' ? 'deleted on another device'
                 : f.reason === 'read-only' ? 'not a bookmark folder'
-                    : f.reason === 'conflict' ? 'a different folder has that id' : f.reason;
+                    : f.reason === 'conflict' ? 'a different folder has that id'
+                        : f.reason === 'unpushed' ? 'push first: the server has not seen it' : f.reason;
             return `${folder ? folder.title : 'a folder'} (${why})`;
         });
         return `Couldn't save to ${names.join(', ')}.` + (savedCount ? ` Saved to the other ${savedCount}.` : '');
