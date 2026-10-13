@@ -7,23 +7,24 @@
 (function () {
     'use strict';
 
-    // Registered at runtime by the background script, only while the
-    // "Scroll to seek" setting is on. Pages opened before it was switched off
-    // keep this script until they reload, so it also watches the setting.
+    // Registered at runtime by the background script, only while "Scroll to
+    // seek" is on: the registration is the switch. This script runs on every
+    // site, so it reads no extension storage at all (that holds the sync
+    // session) and never messages the extension.
+    //
+    // Pages opened before it was switched off keep this script until they
+    // reload; the background tells them, best effort, and only it can.
     if (window.__tpVideoSeek) return;
     window.__tpVideoSeek = true;
     const ext = typeof browser !== 'undefined' ? browser : chrome;
     let enabled = true;
     try {
-        ext.storage.local.get('settings').then((d) => {
-            enabled = Boolean(d && d.settings && d.settings.videoSeek);
-        }).catch(() => {});
-        ext.storage.onChanged.addListener((changes, area) => {
-            if (area === 'local' && changes.settings) {
-                enabled = Boolean(changes.settings.newValue && changes.settings.newValue.videoSeek);
-            }
+        ext.runtime.onMessage.addListener((msg, sender) => {
+            if (!sender || sender.id !== ext.runtime.id || sender.tab) return;
+            if (msg && msg.type === 'tp-video-seek-off') enabled = false;
+            else if (msg && msg.type === 'tp-video-seek-on') enabled = true;
         });
-    } catch (e) { /* storage unavailable — stay enabled while registered */ }
+    } catch (e) { /* no messages: stays on until the page reloads */ }
 
     let lastScrollTime = 0;
     let scrollAccumulator = 0;

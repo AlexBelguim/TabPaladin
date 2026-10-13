@@ -221,14 +221,48 @@ api.tabs.onRemoved.addListener((tabId, removeInfo) => {
 // site, which is not something to ask for at install for a side feature, so
 // the host permission is optional and the script is registered only while
 // Settings has it switched on and the permission is granted.
+//
+// The switch is its own key, tpVideoSeek, rather than a field of `settings`:
+// the content script reads no storage at all, and this script reads
+// `settings` only once, to carry an earlier version's choice over.
 const VIDEO_SEEK_ID = 'tp-video-seek';
+const VIDEO_SEEK_KEY = 'tpVideoSeek';
 const ALL_SITES = { origins: ['<all_urls>'] };
 
-async function syncVideoSeek() {
+async function videoSeekWanted() {
+    const data = await api.storage.local.get([VIDEO_SEEK_KEY, 'settings']);
+    if (typeof data[VIDEO_SEEK_KEY] === 'boolean') return data[VIDEO_SEEK_KEY];
+    const wanted = Boolean(data.settings && data.settings.videoSeek);
+    await api.storage.local.set({ [VIDEO_SEEK_KEY]: wanted });
+    return wanted;
+}
+
+// Pages that loaded the script before it was switched off keep it until
+// they reload: tell them. Best effort; a tab without it just says no.
+async function tellOpenTabs(type) {
+    let tabs = [];
+    try { tabs = await api.tabs.query({}); } catch (e) { return; }
+    for (const t of tabs) {
+        if (!t || t.id === undefined || !/^(https?|file):/.test(String(t.url || ''))) continue;
+        try {
+            const sent = api.tabs.sendMessage(t.id, { type });
+            if (sent && typeof sent.catch === 'function') sent.catch(() => {});
+        } catch (e) { /* no script there */ }
+    }
+}
+
+// One at a time: a wake, a permission change and the switch itself can all
+// ask at once, and two registrations of the same id fail.
+let videoSeekRun = Promise.resolve();
+function syncVideoSeek() {
+    videoSeekRun = videoSeekRun.then(syncVideoSeekNow, syncVideoSeekNow);
+    return videoSeekRun;
+}
+
+async function syncVideoSeekNow() {
     if (!api.scripting || !api.scripting.registerContentScripts) return;
     try {
-        const data = await api.storage.local.get('settings');
-        const wanted = Boolean(data && data.settings && data.settings.videoSeek);
+        const wanted = await videoSeekWanted();
         const granted = await api.permissions.contains(ALL_SITES);
         const existing = await api.scripting.getRegisteredContentScripts({ ids: [VIDEO_SEEK_ID] });
         if (wanted && granted && !existing.length) {
@@ -245,8 +279,10 @@ async function syncVideoSeek() {
                 // background wake, so a session-only registration is enough.
                 await api.scripting.registerContentScripts([script]);
             }
+            await tellOpenTabs('tp-video-seek-on');
         } else if ((!wanted || !granted) && existing.length) {
             await api.scripting.unregisterContentScripts({ ids: [VIDEO_SEEK_ID] });
+            await tellOpenTabs('tp-video-seek-off');
         }
     } catch (e) {
         console.warn('TabPaladin: could not update video seek', e);
@@ -255,7 +291,7 @@ async function syncVideoSeek() {
 
 syncVideoSeek();
 api.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.settings) syncVideoSeek();
+    if (area === 'local' && changes[VIDEO_SEEK_KEY]) syncVideoSeek();
 });
 if (api.permissions && api.permissions.onAdded) {
     api.permissions.onAdded.addListener(syncVideoSeek);

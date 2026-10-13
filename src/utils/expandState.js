@@ -7,8 +7,7 @@
 //
 // UI state only, and per device by nature, so it lives under its own
 // storage.local key rather than in `settings`: that object is read in full and
-// written back from several places (toggle writes would race them), and the
-// background re-registers content scripts on every settings change.
+// written back from several places (toggle writes would race them).
 //
 // Stored shape:
 //   { v: 1, cards: { "<key>": { o: 1|0, t: <ms last touched> } } }

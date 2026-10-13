@@ -2942,6 +2942,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     // Fetch Data
     const settings = await StorageManager.getSettings();
     const folders = await BookmarkOrganizer.getStructure();
+    const videoSeekOn = await StorageManager.getVideoSeek();
 
     // -- Render UI --
     container.innerHTML = `
@@ -3051,7 +3052,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Video</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
                 <label style="display:flex; align-items:center; cursor:pointer;">
-                    <input type="checkbox" id="video-seek-toggle" ${settings.videoSeek ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
+                    <input type="checkbox" id="video-seek-toggle" ${videoSeekOn ? 'checked' : ''} style="margin-right:10px; transform:scale(1.2);">
                     <span style="font-weight:bold;">Scroll to seek in fullscreen videos</span>
                 </label>
                 <div style="font-size:0.75rem; color:#666; margin-top:6px;">
@@ -3566,8 +3567,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             alert('Could not enable video seek: ' + err.message);
         }
         box.checked = on;
-        const current = await StorageManager.getSettings();
-        await StorageManager.saveSettings({ ...current, videoSeek: on });
+        await StorageManager.setVideoSeek(on);
     });
 
     // Backend sync buttons

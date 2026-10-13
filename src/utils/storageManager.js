@@ -12,6 +12,8 @@ import { TreeStore } from './treeStore.js';
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
+const VIDEO_SEEK_KEY = 'tpVideoSeek';
+
 function hydrateWorkflow(folderNode) {
     const tabs = [];
     for (const c of folderNode.children || []) {
@@ -213,6 +215,22 @@ export const StorageManager = {
         return (data && data.settings) || {
             focusedFolderIds: []
         };
+    },
+
+    /**
+     * Video scroll-seek's switch. Its own key (tpVideoSeek), which the
+     * background registers the content script by; settings.videoSeek, where
+     * it lived before, is still written so an older version finds it set.
+     */
+    getVideoSeek: async () => {
+        const data = await api.storage.local.get([VIDEO_SEEK_KEY, 'settings']) || {};
+        if (typeof data[VIDEO_SEEK_KEY] === 'boolean') return data[VIDEO_SEEK_KEY];
+        return Boolean(data.settings && data.settings.videoSeek);
+    },
+
+    setVideoSeek: async (on) => {
+        const current = await StorageManager.getSettings();
+        await api.storage.local.set({ [VIDEO_SEEK_KEY]: Boolean(on), settings: { ...current, videoSeek: Boolean(on) } });
     },
 
     /**
