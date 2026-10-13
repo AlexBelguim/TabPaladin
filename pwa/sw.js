@@ -39,9 +39,18 @@ const Share = self.TPShare;
 let workerOutbox = null;
 const outbox = () => (workerOutbox = workerOutbox || Share.cacheOutbox(caches));
 
+// The shell is filled from the network into a cache made new here, never into
+// one already stored under this release's name: the next name is easy to
+// guess, and script that once ran on this origin (the old note XSS, say)
+// could have filled it in advance. Adopted, its entries would outlive the
+// release wherever an add() below fails, and be served as this release's own.
 // One SHELL file failing (a 404 mid-deploy) must not leave nothing cached.
 self.addEventListener('install', (event) => {
-    event.waitUntil(caches.open(SHELL_CACHE).then(c => Promise.allSettled(SHELL.map(u => c.add(u)))));
+    event.waitUntil(
+        caches.delete(SHELL_CACHE)
+            .then(() => caches.open(SHELL_CACHE))
+            .then(c => Promise.allSettled(SHELL.map(u => c.add(u))))
+    );
     self.skipWaiting();
 });
 

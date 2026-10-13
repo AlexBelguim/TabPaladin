@@ -19,10 +19,11 @@
 //      account is never uploaded as another.
 //   5. The shell: a navigation is cached under '/' only, never under its
 //      query; a share navigation is served from cache first; install survives
-//      one shell file failing; activate removes older shells and any other
-//      unknown tp- cache, never tp-config, tp-outbox or tp-data; the app's
-//      files are network-first, and offline come from this release's shell
-//      cache only.
+//      one shell file failing, and never adopts a cache already stored under
+//      its name (planted ahead of the release); activate removes older
+//      shells and any other unknown tp- cache, never tp-config, tp-outbox or
+//      tp-data; the app's files are network-first, and offline come from
+//      this release's shell cache only.
 //
 // Run: node tools/test_share_sw.mjs
 
@@ -323,6 +324,48 @@ async function main() {
         check('activate removes every other tp- cache (older shells, unknown ones), keeping tp-config, tp-outbox and tp-data',
             JSON.stringify([...caches.stores.keys()].sort()) === JSON.stringify(['other-app-cache', 'tp-config', 'tp-data', 'tp-outbox', SHELL_NAME]),
             JSON.stringify([...caches.stores.keys()]));
+    }
+    {
+        // The next release's shell name is easy to guess, so script that once
+        // ran on this origin (the old note XSS) could have made that cache
+        // ahead of it. Install must not adopt it: nothing planted there
+        // survives, not even where the network fails for that very file.
+        const caches = makeCaches();
+        const appUrl = `/app.js?v=${V}`;
+        const planted = await caches.open(SHELL_NAME);
+        await planted.put(appUrl, new Response('evil()', { headers: { 'Content-Type': 'application/javascript' } }));
+        await planted.put('/', new Response('<script>evil()</script>', { headers: { 'Content-Type': 'text/html' } }));
+        await planted.put('/planted.js', new Response('evil()'));
+        caches.fetchForAdd = async (u) => {
+            if (u === appUrl || u === '/') throw new TypeError('Failed to fetch');
+            return new Response(`<html>fresh ${u}</html>`, { status: 200 });
+        };
+        let online = true;
+        const fetchImpl = async () => {
+            if (!online) throw new TypeError('Failed to fetch');
+            return new Response('<html>from the network</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+        };
+        const w = loadWorker({ caches, fetchImpl });
+        const ext = [];
+        w.listeners.install({ waitUntil: (p) => ext.push(p) });
+        await Promise.all(ext);
+        const ext2 = [];
+        w.listeners.activate({ waitUntil: (p) => ext2.push(p) });
+        await Promise.all(ext2);
+        const shell = caches.stores.get(SHELL_NAME) || new Map();
+        const bodies = await Promise.all([...shell.values()].map(r => r.clone().text()));
+        check('install starts a shell cache already stored under its name afresh: nothing planted there is kept',
+            !bodies.some(b => b.includes('evil')) && !shell.has(appUrl) && !shell.has('/') && !shell.has('/planted.js')
+            && shell.has('/index.html') && shell.has(`/shareCore.js?v=${V}`), JSON.stringify([...shell.keys()]));
+        online = false;
+        const { res: nav } = await dispatchFetch(w, new Request(ORIGIN + '/'), { mode: 'navigate' });
+        check('  offline, a navigation gets the shell install fetched, not the planted page', (await nav.text()) === '<html>fresh /index.html</html>');
+        const { res: app } = await dispatchFetch(w, new Request(ORIGIN + appUrl));
+        const { res: other } = await dispatchFetch(w, new Request(ORIGIN + '/planted.js'));
+        check('  and the planted scripts are gone, not served', app && app.type === 'error' && other && other.type === 'error');
+        online = true;
+        const { res: share } = await dispatchFetch(w, new Request(ORIGIN + '/?share=AbCdEfGhIjKlMnOpQrStUv'), { mode: 'navigate' });
+        check('  a share navigation, served from cache first, is not the planted page either', !(await share.text()).includes('evil'));
     }
     {
         // A file of the app is fetched network-first, and offline it comes
