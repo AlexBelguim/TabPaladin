@@ -3357,7 +3357,8 @@ async function offerPendingChanges() {
         drop();
         showToast('Added to Suggested changes — review it on Home.');
         await refreshProposals();
-        if (state.view !== 'home') goHome();
+        // To Home, unless a note is open: that stays where it is.
+        if (state.view !== 'home' && !editorOpen()) goHome();
         else renderView();
     } catch (e) {
         if (e.status === 401) return; // kept for the next sign-in
