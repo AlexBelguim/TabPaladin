@@ -449,6 +449,14 @@ await local.set({
                     id: `big${i}`, kind: 'folder', title: `Big ${i}`, children: bmk(`big${i}`, 300)
                 }))
             ]},
+            // One open folder whose open subfolders alone would use up a
+            // whole budget, next to a sibling that is open too.
+            { id: 'deep', kind: 'folder', title: 'Deep', children: [
+                { id: 'd1', kind: 'folder', title: 'D1', children: Array.from({ length: 10 }, (_, i) => ({
+                    id: `d1s${i}`, kind: 'folder', title: `D1 ${i}`, children: bmk(`d1s${i}`, 300)
+                }))},
+                { id: 'd2', kind: 'folder', title: 'D2', children: bmk('d2', 250) }
+            ]},
             { id: 'wf', kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [] }
         ]
     }
@@ -465,11 +473,20 @@ const cardCode = [
     ...['BODY_ROW_CAP', 'SHOW_MORE_STEP', 'RESTORE_ROW_BUDGET', 'RESTORE_SKIPPED_TIP', 'IMPORTS_ROOT_TITLE',
         'TP_META_TITLE', 'TP_ROOT_MARKER_TITLE', 'cardControls'].map(liftConst),
     ...['tabDomain', 'escapeHtml', 'isInternalBookmark', 'isVisibleBookmark', 'newRestoreBudget', 'folderStatsText',
-        'buildFolderCard', 'renderFolderCard', 'buildFolderBody',
+        'buildFolderCard', 'restoreQueued', 'renderFolderCard', 'buildFolderBody',
         'appendDomainGroups', 'appendDomainGroup', 'buildBookmarkRow'].map(lift),
-    'return { buildFolderCard, renderFolderCard, newRestoreBudget, cardControls };'
+    'return { buildFolderCard, restoreQueued, renderFolderCard, newRestoreBudget, cardControls };'
 ].join('\n\n');
 const cards = new Function(...Object.keys(cardEnv), cardCode)(...Object.values(cardEnv));
+
+// One render pass the way the views run it: build the columns, then reopen
+// what was open, then attach.
+async function renderPass(...subs) {
+    const budget = cards.newRestoreBudget();
+    const built = subs.map(s => cards.buildFolderCard(s, 0, budget));
+    await cards.restoreQueued(budget);
+    return built;
+}
 
 const settle = async () => { for (let i = 0; i < 20; i++) await flushMicrotasks(); };
 const headerOf = (card) => card.childNodes.find(c => c instanceof Element && c.classList.contains('source-folder-header'));
@@ -485,7 +502,7 @@ ExpandState.set('bm', true);
 ExpandState.set('fA', true);
 ExpandState.set('fA1', true);
 ExpandState.set('fB', false);
-let root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+let [root] = await renderPass(rootSub);
 check('a remembered-open column comes back open, fully built before it is attached',
     isShownOpen(root) && root.parentNode === null && subCards(root).length === 2 + BIG);
 let fA = subCard(root, 'fA');
@@ -506,7 +523,7 @@ check('re-opening the parent brings its open subfolders back', isShownOpen(fA) &
 
 console.log('restore budget');
 for (let i = 0; i < BIG; i++) ExpandState.set(`big${i}`, true);
-root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+[root] = await renderPass(rootSub);
 const bigs = subCards(root).filter(c => c.dataset.id.startsWith('big'));
 const opened = bigs.filter(c => c.dataset.open === '1');
 const skipped = bigs.filter(c => c.classList.contains('restore-skipped'));
@@ -526,13 +543,33 @@ check('one click opens it normally and clears the marker',
     isShownOpen(sk) && !sk.classList.contains('restore-skipped') && headerOf(sk).title === '');
 for (let i = 0; i < BIG; i++) ExpandState.set(`big${i}`, false);
 
+// The budget goes level by level. Spent depth-first, Deep's ten open
+// subfolders (2000 rows) used it up before its sibling D2 or the next column
+// were reached, and those came back closed after every drop.
+for (const id of ['deep', 'd1', 'd2', 'big0', ...Array.from({ length: 10 }, (_, i) => `d1s${i}`)]) {
+    ExpandState.set(id, true);
+}
+const [deep, col2] = await renderPass(
+    { id: 'deep', title: 'Deep', folderCount: 2, fileCount: 0 },
+    { id: 'big0', title: 'Big 0', folderCount: 0, fileCount: 300 });
+const d1Subs = subCards(subCard(deep, 'd1'));
+const deepRows = deep.querySelectorAll('.src-tab-row').length + col2.querySelectorAll('.src-tab-row').length;
+check('a later column is not given up for an earlier column\'s nested folders', isShownOpen(col2));
+check('…nor a folder for its sibling\'s open subtree', isShownOpen(subCard(deep, 'd2')));
+check('the deepest level gets what is left, and the pass stays in budget',
+    d1Subs.some(c => c.classList.contains('restore-skipped')) && d1Subs.some(c => c.dataset.open === '1')
+    && deepRows <= 2000, `${deepRows} rows`);
+for (const id of ['deep', 'd1', 'd2', 'big0', ...Array.from({ length: 10 }, (_, i) => `d1s${i}`)]) {
+    ExpandState.set(id, false);
+}
+
 console.log('drag-hover and overlapping builds');
 const fB = subCard(root, 'fB');
 await cards.cardControls.get(fB).springOpen();
 check('drag-hover opens a closed folder', isShownOpen(fB));
 await ExpandState.flush();
 check('…without saving it', stored().fB && stored().fB.o === 0);
-root = await cards.buildFolderCard(rootSub, 0, cards.newRestoreBudget());
+[root] = await renderPass(rootSub);
 check('…and it stays open through the re-render after the drop', isShownOpen(subCard(root, 'fB')));
 
 const race = cards.renderFolderCard({ id: 'fA', title: 'A', folderCount: 2, fileCount: 3 }, 0);

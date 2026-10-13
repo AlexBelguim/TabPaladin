@@ -593,7 +593,7 @@ async function renderMainView({ regroup = true } = {}) {
         try {
             const c = await BookmarkOrganizer.getDirectoryContents(r.id);
             if (!c) continue;
-            grid.appendChild(await buildFolderCard({
+            grid.appendChild(buildFolderCard({
                 id: c.id,
                 title: c.title,
                 folderCount: c.subfolders.length,
@@ -604,6 +604,7 @@ async function renderMainView({ regroup = true } = {}) {
             console.warn("Could not load root", r.id, e);
         }
     }
+    await restoreQueued(budget);
 
     if (seq !== mainRenderSeq) return;
     swapKeepingColumnScroll(container, headerBar, grid);
@@ -945,7 +946,7 @@ async function renderWorkflows() {
     // List items become non-list divs since the folder-card UI doesn't fit <li> semantics.
     for (const wf of wfFolders) {
         const wfChildren = await Tree.getChildren(wf.id);
-        const card = await buildFolderCard({
+        const card = buildFolderCard({
             id: wf.id,
             title: wf.title,
             parentId: wfRoot.id,
@@ -959,6 +960,7 @@ async function renderWorkflows() {
         li.appendChild(card);
         frag.appendChild(li);
     }
+    await restoreQueued(budget);
 
     if (seq !== workflowsRenderSeq) return;
     if (wfFolders.length === 0) {
@@ -1123,16 +1125,17 @@ async function renderSourceGrid(folderId) {
     const seq = ++sourceRenderSeq;
     const sourceList = document.getElementById('source-list');
     const frag = document.createDocumentFragment();
-    await buildSourceGrid(frag, folderId);
+    const budget = newRestoreBudget();
+    await buildSourceGrid(frag, folderId, budget);
+    await restoreQueued(budget);
     if (seq !== sourceRenderSeq) return;
     sourceList.className = 'source-folder-list';
     swapKeepingColumnScroll(sourceList, frag);
 }
 
 // The Organize grid for one level, built into `out` (a detached fragment).
-async function buildSourceGrid(out, folderId) {
-    const budget = newRestoreBudget();
-
+// Remembered-open cards are queued on `budget` for the caller to reopen.
+async function buildSourceGrid(out, folderId, budget) {
     // Virtual root: TabPaladin Workflows + focused folders (if any), laid out side-by-side.
     if (folderId === VIRTUAL_ROOT_ID) {
         const settings = await StorageManager.getSettings();
@@ -1170,7 +1173,7 @@ async function buildSourceGrid(out, folderId) {
             try {
                 const c = await BookmarkOrganizer.getDirectoryContents(r.id);
                 if (!c) continue;
-                grid.appendChild(await buildFolderCard({
+                grid.appendChild(buildFolderCard({
                     id: c.id,
                     title: c.title,
                     folderCount: c.subfolders.length,
@@ -1202,7 +1205,7 @@ async function buildSourceGrid(out, folderId) {
 
     for (const sub of content.subfolders) {
         // Pass parentId so refresh-on-drop knows where to update.
-        out.appendChild(await buildFolderCard({ ...sub, parentId: content.id }, 0, budget));
+        out.appendChild(buildFolderCard({ ...sub, parentId: content.id }, 0, budget));
     }
 }
 
@@ -1288,29 +1291,44 @@ const SHOW_MORE_STEP = 500;
 const RESTORE_ROW_BUDGET = 2000;
 const RESTORE_SKIPPED_TIP = 'Open last time — not reopened automatically to keep the page fast. Click to open.';
 
+// `queue` holds the remembered-open cards built in this pass and not yet
+// reopened; restoreQueued works through it.
 function newRestoreBudget() {
-    return { rows: RESTORE_ROW_BUDGET };
+    return { rows: RESTORE_ROW_BUDGET, queue: [] };
 }
 
 // Folder card element -> its open/close controller (see renderFolderCard).
 const cardControls = new WeakMap();
 
-// A folder card ready to attach: reopened — with its own remembered-open
-// subfolders — when the user left it open and the pass's budget allows it,
-// otherwise closed, with a hollow caret saying why.
-async function buildFolderCard(sub, depth, budget) {
+// A folder card, built closed. When the user left it open it is queued on the
+// pass's budget, and the pass's restoreQueued reopens it before the view is
+// attached.
+function buildFolderCard(sub, depth, budget) {
     const card = renderFolderCard(sub, depth);
-    if (ExpandState.isOpen(sub.id)) {
-        const ctl = cardControls.get(card);
-        const cost = (sub.folderCount || 0) + Math.min(sub.fileCount || 0, BODY_ROW_CAP);
-        if (cost <= budget.rows) {
-            budget.rows -= cost;
-            await ctl.restore(budget);
-        } else {
-            ctl.markSkipped();
-        }
-    }
+    if (ExpandState.isOpen(sub.id)) budget.queue.push({ card, sub });
     return card;
+}
+
+// Reopens the queued cards one level at a time. Every card on a level is
+// charged before any of their bodies is built, and those bodies queue their
+// own remembered-open subfolders for the next level. So a top-level column is
+// never given up for a grandchild in another column, nor a folder for a
+// sibling's deep subtree. Past the budget: left closed, marked as open last
+// time.
+async function restoreQueued(budget) {
+    while (budget.queue.length) {
+        const opening = [];
+        for (const { card, sub } of budget.queue.splice(0)) {
+            const cost = (sub.folderCount || 0) + Math.min(sub.fileCount || 0, BODY_ROW_CAP);
+            if (cost <= budget.rows) {
+                budget.rows -= cost;
+                opening.push(card);
+            } else {
+                cardControls.get(card).markSkipped();
+            }
+        }
+        for (const card of opening) await cardControls.get(card).restore(budget);
+    }
 }
 
 function folderStatsText(folderCount, fileCount) {
@@ -1395,11 +1413,15 @@ function renderFolderCard(sub, depth = 0) {
     // second click, a refresh racing a click) is dropped rather than landing
     // on top, which used to append the subfolders twice.
     let bodySeq = 0;
-    const showBody = async (budget) => {
+    // A body opened on its own (a click, a refresh) is its own restore pass:
+    // its remembered-open subfolders are reopened before it is shown. Inside
+    // a bigger pass (restore), that pass's restoreQueued does it.
+    const showBody = async (budget, ownPass = false) => {
         card.dataset.open = '1';
         caret.textContent = '▼';
         const seq = ++bodySeq;
         const frag = await buildFolderBody(sub.id, depth, isImports, budget);
+        if (ownPass) await restoreQueued(budget);
         if (seq !== bodySeq || card.dataset.open !== '1') return;
         body.replaceChildren(frag);
         body.style.display = 'block';
@@ -1420,16 +1442,17 @@ function renderFolderCard(sub, depth = 0) {
         async setOpen(open) {
             clearSkipped();
             ExpandState.set(sub.id, open);
-            if (open) await showBody(newRestoreBudget());
+            if (open) await showBody(newRestoreBudget(), true);
             else hideBody();
         },
         // Drag-hover: open for the rest of this page session, never saved.
         async springOpen() {
             clearSkipped();
             ExpandState.openForSession(sub.id);
-            await showBody(newRestoreBudget());
+            await showBody(newRestoreBudget(), true);
         },
-        // Rebuilding a view: reopen as remembered, writing nothing.
+        // Rebuilding a view: reopen as remembered, writing nothing. Called by
+        // restoreQueued, which then reopens this body's own queued cards.
         restore(budget) {
             return showBody(budget);
         },
@@ -1441,7 +1464,7 @@ function renderFolderCard(sub, depth = 0) {
         },
         // The folder's contents changed: rebuild the body if it is showing.
         async refresh() {
-            if (card.dataset.open === '1') await showBody(newRestoreBudget());
+            if (card.dataset.open === '1') await showBody(newRestoreBudget(), true);
         }
     };
     cardControls.set(card, ctl);
@@ -1985,10 +2008,10 @@ function buildBookmarkRow(b, d, parentFolderId, onDeleted) {
 }
 
 // The body of an open folder card, built detached: subfolders first as nested
-// cards (each reopened as remembered, against `budget`), then the loose
-// bookmarks by domain. inImports rides down the recursion so the whole archive
-// subtree is locked, not just its root.
-async function buildFolderBody(folderId, depth = 0, inImports = false, budget = newRestoreBudget()) {
+// cards (the remembered-open ones queued on `budget` for the pass's
+// restoreQueued), then the loose bookmarks by domain. inImports rides down the
+// recursion so the whole archive subtree is locked, not just its root.
+async function buildFolderBody(folderId, depth, inImports, budget) {
     const frag = document.createDocumentFragment();
     const note = (text) => {
         frag.replaceChildren();
@@ -2017,7 +2040,7 @@ async function buildFolderBody(folderId, depth = 0, inImports = false, budget = 
         // Subfolders first — each as a nested expandable card.
         for (const sf of subfolders) {
             const sfChildren = await Tree.getChildren(sf.id);
-            frag.appendChild(await buildFolderCard({
+            frag.appendChild(buildFolderCard({
                 id: sf.id,
                 title: sf.title,
                 parentId: folderId,
