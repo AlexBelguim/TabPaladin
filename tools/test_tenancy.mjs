@@ -823,12 +823,13 @@ async function endToEnd() {
         check('with the owner deleted the server still starts and skips its boot steps',
             /owner account no longer exists; skipping/.test(srv.log()) && /AUTH_TOKEN is set but the account it acts as no longer exists/.test(srv.log()), srv.log());
         check('and the legacy token gets 401', (await http(srv.base, '/api/tree', { token: TOKEN })).status === 401);
-        // kim is now the only admin, and not the owner: the last-admin rule
-        // is what stops her demoting herself.
+        // kim is now the only admin, and not the owner. Nobody changes their
+        // own role, so she cannot leave the server without an admin.
         const kimTok = (await http(srv.base, '/api/login', { method: 'POST', body: { username: 'kim', password: 'kim-password-1' } })).json.token;
         const lastAdmin = await http(srv.base, `/api/users/${kim.id}`, { method: 'PUT', token: kimTok,
             body: { role: 'user', currentPassword: 'kim-password-1' } });
-        check('the last admin cannot be demoted', lastAdmin.status === 409 && lastAdmin.json.code === 'last-admin', JSON.stringify(lastAdmin.json));
+        check('the last admin cannot demote herself', lastAdmin.status === 400 && lastAdmin.json.code === 'self'
+            && (await http(srv.base, '/api/auth/me', { token: kimTok })).json.user.role === 'admin', JSON.stringify(lastAdmin.json));
         await srv.stop();
         const raw6 = new Database(path.join(dataDir, 'sync.db'), { readonly: true });
         check('no rows were written for the missing owner', !ownersOf(raw6).includes(1));

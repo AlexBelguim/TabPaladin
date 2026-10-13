@@ -12,9 +12,10 @@
 // origins, body size limits, the OAuth callback escaping what it echoes;
 // accounts: who may manage them and how the owner is protected, two accounts
 // never reaching each other's tree, history, inbox, notes, proposals, imports
-// or prefs, a reset signing an account out, and a delete removing exactly that
-// account; and — last, because it locks this IP out — the login rate limit
-// (expects AUTH_MAX_FAILURES <= 20).
+// or prefs, a reset signing an account out (sign-ins racing it included), an
+// admin change decided by who is acting when it lands, and a delete removing
+// exactly that account; and — last, because it locks this IP out — the login
+// rate limit (expects AUTH_MAX_FAILURES between 8 and 20).
 
 const arg = (n, d = null) => {
     const i = process.argv.indexOf('--' + n);
@@ -238,8 +239,27 @@ check("sam cannot read the owner's prefs", (await call('/api/prefs/share.targets
 // Managing accounts, and protecting the owner.
 const ownerBefore = JSON.stringify([(await call('/api/tree', { token })).json, (await call('/api/shared', { token })).json,
     (await call('/api/history', { token })).json, (await call('/api/prefs', { token })).json]);
+// Sign-ins with the old password racing the reset: each loop signs in until
+// the password stops working (one failure each, under AUTH_MAX_FAILURES). No
+// session they got may outlive the reset — not even one whose password check
+// began before the reset and finished after it.
+const raced = [];
+const racer = async () => {
+    for (let i = 0; i < 200; i++) {
+        const r = await call('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } });
+        if (r.status !== 200) return;
+        raced.push(r.json.token);
+    }
+};
+const racers = Array.from({ length: 6 }, racer);
+await new Promise(r => setTimeout(r, 150));
 const reset = await call(`/api/users/${SAM_ID}`, { method: 'PUT', token, body: { password: 'sam-password-2', currentPassword: NEWPASS } });
+await Promise.all(racers);
 check('a reset signs that account out', reset.status === 200 && (await call('/api/tree', { token: samTok })).status === 401);
+let survivors = 0;
+for (const t of raced) if ((await call('/api/auth/me', { token: t })).status === 200) survivors++;
+check('no sign-in with the old password outlives the reset, even one racing it', raced.length > 0 && survivors === 0,
+    `${survivors} of ${raced.length} still signed in`);
 for (const [what, path, method, body] of [
     ['demoting', `/api/users/${OWNER_ID}`, 'PUT', { role: 'user', currentPassword: 'kim-password-1' }],
     ['resetting', `/api/users/${OWNER_ID}`, 'PUT', { password: 'taken-over-1', currentPassword: 'kim-password-1' }],
@@ -252,6 +272,8 @@ const selfDelete = await call(`/api/users/${KIM_ID}/delete`, { method: 'POST', t
 check('deleting yourself is refused', selfDelete.status === 400 && selfDelete.json?.code === 'self');
 const selfReset = await call(`/api/users/${KIM_ID}`, { method: 'PUT', token: kimTok, body: { password: 'whatever-1', currentPassword: 'kim-password-1' } });
 check('resetting your own password here is refused (use Change password)', selfReset.status === 400);
+const selfRole = await call(`/api/users/${KIM_ID}`, { method: 'PUT', token: kimTok, body: { role: 'user', currentPassword: 'kim-password-1' } });
+check('changing your own role is refused', selfRole.status === 400 && selfRole.json?.code === 'self', JSON.stringify(selfRole.json));
 const wrongConfirm = await call(`/api/users/${SAM_ID}/delete`, { method: 'POST', token, body: { confirm: 'Sam', currentPassword: NEWPASS } });
 check('a delete with the wrong confirmation is refused', wrongConfirm.status === 400 && wrongConfirm.json?.code === 'confirm');
 const deleted = await call(`/api/users/${SAM_ID}/delete`, { method: 'POST', token, body: { confirm: 'sam', currentPassword: NEWPASS } });
@@ -270,7 +292,7 @@ check('a deleted name cannot be registered again',
 // limits are per IP and username, so the owner is not locked out by it.
 let adminLimited = null;
 for (let i = 0; i < 25 && adminLimited === null; i++) {
-    const r = await call(`/api/users/${KIM_ID}`, { method: 'PUT', token: kimTok, body: { role: 'user', currentPassword: 'wrong wrong' } });
+    const r = await call('/api/users', { method: 'POST', token: kimTok, body: { username: 'lee', password: 'lee-password-1', currentPassword: 'wrong wrong' } });
     if (r.status === 429) adminLimited = i;
 }
 check('wrong current passwords are rate-limited like sign-ins', adminLimited !== null, 'never limited');

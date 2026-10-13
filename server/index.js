@@ -370,6 +370,15 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
     res.json({ ok: true, user: userFor(req.user) });
 });
 
+// The caller as things stand now. requireAuth looked before the handler's
+// awaits (scrypt), and a reset, a delete or a sign-out everywhere may have
+// landed in between. Call it in the same synchronous step as the write it
+// guards, so nothing else can land between the check and the write.
+const stillSignedIn = (req) => {
+    const now = identify(db, AUTH_TOKEN, presentedToken(req));
+    return Boolean(now && now.id === req.user.id);
+};
+
 // A real hash to check against when the username is unknown, so a missing
 // account and a wrong password cost the same and can't be told apart.
 const DUMMY_HASH = await hashPassword(crypto.randomBytes(16).toString('hex'));
@@ -382,13 +391,19 @@ app.post('/api/login', async (req, res) => {
 
         const row = userByName(db, String(username).trim());
         const ok = await verifyPassword(password, row ? row.password_hash : DUMMY_HASH);
-        if (!row || !ok) {
+        // The account as it is after the await, not as it was before: a reset
+        // or a delete that landed meanwhile signed it out everywhere, and a
+        // sign-in with the password it replaced must not outlive it. Checked
+        // and issued in one transaction, so neither can land in between.
+        const session = row && ok ? db.transaction(() => {
+            const now = userByName(db, row.username);
+            return now && now.password_hash === row.password_hash ? issueSession(now.username) : null;
+        })() : null;
+        if (!session) {
             authFailed(req, username);
             return res.status(401).json({ error: 'Wrong username or password.' });
         }
         authOk(req, username);
-
-        const session = issueSession(row.username);
         res.json({ ok: true, username: row.username, user: userFor(row), ...session });
     } catch (e) {
         console.error('[TabPaladin] Login failed:', e);
@@ -417,9 +432,16 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
             return res.status(401).json({ error: 'Current password is wrong.' });
         }
         const hash = await hashPassword(newPassword);
-        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
-        db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
-        const session = issueSession(row.username);
+        // Same rule as a sign-in: an admin reset, a delete or a sign-out that
+        // landed during the awaits wins, rather than being overwritten here.
+        const session = db.transaction(() => {
+            const now = userByName(db, row.username);
+            if (!now || now.password_hash !== row.password_hash || !stillSignedIn(req)) return null;
+            db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
+            db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+            return issueSession(row.username);
+        })();
+        if (!session) return res.status(401).json({ error: 'Your password or session changed meanwhile. Sign in again.' });
         res.json({ ok: true, ...session });
     } catch (e) {
         console.error('[TabPaladin] Password change failed:', e);

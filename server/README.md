@@ -103,19 +103,23 @@ Account management is deliberately harder to reach than the rest:
 - only an admin, in a signed-in session — the legacy `AUTH_TOKEN` keeps the
   data access it always had but cannot manage accounts;
 - every change asks for the acting admin's own password again (counted like a
-  failed sign-in);
+  failed sign-in), and is checked again as it is written: an admin demoted,
+  deleted or signed out in the meantime changes nothing;
 - the **server owner** — the account holding the data from before accounts
   were separated — cannot be deleted, demoted or reset over HTTP at all, not
   even by another admin;
-- the last admin cannot be demoted or deleted, nor can you delete yourself,
-  nor the account `AUTH_TOKEN` acts as while it is set;
+- the last admin cannot be demoted or deleted, nor can you delete yourself or
+  change your own role, nor delete the account `AUTH_TOKEN` acts as while it
+  is set;
 - a new name that differs from an existing or deleted one only by case
   ("Alex" next to "alex") is refused;
 - deleting an account signs it out everywhere, takes a `predelete` backup
   (and deletes nothing if that fails), then removes everything the account
   owns in one transaction. Its id is never handed out again.
 
-A password reset signs that account out on every device. Unpushed edits on its
+A password reset signs that account out on every device, including a sign-in
+with the old password that was still being checked when the reset landed.
+Unpushed edits on its
 devices stay there; the clients never discard a working copy because of an
 account change — they set it aside instead.
 

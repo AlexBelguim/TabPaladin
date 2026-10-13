@@ -16,6 +16,10 @@
 //      are not repeated within the interval and are pruned to `keep`.
 //   5. Account ids are never reused, names that differ only by case are
 //      refused (against deleted accounts too), and password bounds hold.
+//   6. An admin change is decided by who the acting admin is when it is
+//      written, not when the request arrived: demoted, deleted or signed out
+//      during the password check's await, the change is refused. And nobody
+//      changes their own role.
 //
 // Run: node tools/test_users.mjs
 
@@ -25,10 +29,13 @@ import path from 'node:path';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import {
     migrateUsers, bootstrapAdmin, identify, backupDatabase, setSchemaVersion, createUser, SCHEMA_VERSION,
-    validatePassword, listBackups
+    validatePassword, listBackups, presentedToken
 } from '../server/users.js';
 import { migrateOwnership, deleteUserData } from '../server/tenancy.js';
 import { verifyPassword } from '../server/security.js';
+import { attachUserAdmin } from '../server/admin.js';
+import { makeItemsStore } from '../server/items.js';
+import { initSchema as initImportsSchema } from '../server/imports/store.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -228,6 +235,122 @@ console.log('ids, names, passwords');
     check('8-character password accepted', validatePassword('12345678').password === '12345678');
     check('256-character password accepted', !validatePassword('x'.repeat(256)).error);
     check('257-character password refused', Boolean(validatePassword('x'.repeat(257)).error));
+}
+
+// --- 6. Admin changes and the acting admin ---
+console.log('admin changes re-check who is acting');
+{
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-admin-'));
+    const file = path.join(dir, 'sync.db');
+    const db = legacyDb(file);
+    // The rest of the server's tables, as index.js creates them, for the
+    // account stats each answer carries.
+    db.exec(`
+        CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, device_id TEXT, json TEXT NOT NULL);
+        CREATE TABLE shared_links (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, title TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE share_tokens (token TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+        CREATE TABLE note_proposals (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+    `);
+    migrateUsers(db);
+    initImportsSchema(db);
+    makeItemsStore(db);
+    await bootstrapAdmin(db, { ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: 'alex-password' });
+    migrateOwnership(db, { env: {} });
+    const kim = await createUser(db, { username: 'kim', password: 'kim-password', role: 'admin' });
+    const pat = await createUser(db, { username: 'pat', password: 'pat-password' });
+    const now = new Date().toISOString();
+    const session = (token, username) => db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?)').run(token, username, now, future);
+
+    // The routes as admin.js registers them, run without a network: the
+    // guards, then the handler. The handler runs synchronously up to its
+    // first await (the password check's scrypt), so whatever `during` does
+    // lands exactly in that window — the race, made deterministic.
+    const routes = {};
+    const fakeApp = {};
+    for (const m of ['get', 'post', 'put']) fakeApp[m] = (p, ...handlers) => { routes[`${m.toUpperCase()} ${p}`] = handlers; };
+    const requireAuth = (req, res, next) => {
+        const user = identify(db, '', presentedToken(req));
+        if (!user) return res.status(401).json({ error: 'Unauthorized' });
+        req.user = user;
+        next();
+    };
+    attachUserAdmin(fakeApp, { db, requireAuth, dbPath: file, authToken: '', limiter: { limited: () => false, fail() {}, ok() {} } });
+    async function call(route, { token, params = {}, body = {}, during = null }) {
+        let done;
+        const finished = new Promise(r => { done = r; });
+        const res = {
+            statusCode: 200,
+            status(c) { this.statusCode = c; return this; },
+            json(b) { this.body = b; done(); return this; },
+            set() { return this; }
+        };
+        const req = { params, body, headers: { authorization: 'Bearer ' + token }, ip: '127.0.0.1' };
+        const handlers = routes[route];
+        let i = 0;
+        const next = () => handlers[i++](req, res, next);
+        next();
+        if (during) during();
+        await finished;
+        return res;
+    }
+    const roleOf = (id) => db.prepare('SELECT role FROM users WHERE id = ?').get(id)?.role;
+
+    session('kim-1', 'kim');
+    const demotedMeanwhile = await call('PUT /api/users/:id', {
+        token: 'kim-1', params: { id: String(pat.id) }, body: { role: 'admin', currentPassword: 'kim-password' },
+        during: () => db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(kim.id)
+    });
+    check('kim, demoted while her password was checked, cannot make pat an admin',
+        demotedMeanwhile.statusCode === 403 && demotedMeanwhile.body.code === 'not-admin' && roleOf(pat.id) === 'user',
+        JSON.stringify(demotedMeanwhile.body));
+    db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(kim.id);
+
+    const signedOutMeanwhile = await call('POST /api/users', {
+        token: 'kim-1', body: { username: 'zed', password: 'zed-password', role: 'admin', currentPassword: 'kim-password' },
+        during: () => db.prepare("DELETE FROM sessions WHERE token = 'kim-1'").run()
+    });
+    check('kim, signed out meanwhile, cannot create an admin',
+        signedOutMeanwhile.statusCode === 403 && !db.prepare("SELECT 1 FROM users WHERE username = 'zed'").get(),
+        JSON.stringify(signedOutMeanwhile.body));
+
+    session('kim-2', 'kim');
+    const resetMeanwhile = await call('PUT /api/users/:id', {
+        token: 'kim-2', params: { id: String(pat.id) }, body: { password: 'taken-over-1', currentPassword: 'kim-password' },
+        during: () => db.prepare("DELETE FROM sessions WHERE username = 'kim'").run()
+    });
+    check('nor reset pat\'s password', resetMeanwhile.statusCode === 403
+        && await verifyPassword('pat-password', db.prepare('SELECT password_hash FROM users WHERE id = ?').get(pat.id).password_hash));
+
+    session('kim-3', 'kim');
+    const deletedMeanwhile = await call('POST /api/users/:id/delete', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { confirm: 'pat', currentPassword: 'kim-password' },
+        during: () => db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(kim.id)
+    });
+    check('nor delete pat', deletedMeanwhile.statusCode === 403 && roleOf(pat.id) === 'user'
+        && listBackups(file, 'predelete-').length === 0, JSON.stringify(deletedMeanwhile.body));
+    db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(kim.id);
+
+    const selfPromote = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(kim.id) }, body: { role: 'admin', currentPassword: 'kim-password' }
+    });
+    const selfDemote = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(kim.id) }, body: { role: 'user', currentPassword: 'kim-password' }
+    });
+    check('nobody changes their own role', selfPromote.statusCode === 400 && selfPromote.body.code === 'self'
+        && selfDemote.statusCode === 400 && roleOf(kim.id) === 'admin');
+
+    const fine = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { role: 'admin', currentPassword: 'kim-password' }
+    });
+    check('with nothing in the way, the same change goes through', fine.statusCode === 200 && roleOf(pat.id) === 'admin',
+        JSON.stringify(fine.body));
+    const removed = await call('POST /api/users/:id/delete', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { confirm: 'pat', currentPassword: 'kim-password' }
+    });
+    check('and so does a delete', removed.statusCode === 200 && !roleOf(pat.id) && removed.body.deleted.users === 1,
+        JSON.stringify(removed.body));
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? '\nAll users tests passed.\n' : `\n${failures} test(s) failed.\n`);

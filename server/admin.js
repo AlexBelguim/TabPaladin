@@ -14,13 +14,15 @@
 //
 // Handlers are async (scrypt) and this is Express 4, so each catches its own
 // errors. Passwords are hashed before any synchronous transaction, and every
-// rule is checked again inside it.
+// rule is checked again inside it — the acting admin included: requireAuth and
+// requireAdmin looked before the awaits, and in between that admin may have
+// been demoted, deleted or signed out.
 
 import path from 'node:path';
 import { hashPassword, verifyPassword } from './security.js';
 import {
     validateUsername, validatePassword, insertUser, userById, usernameClash,
-    tenancyOwnerId, legacyTokenUserId, backupNow
+    tenancyOwnerId, legacyTokenUserId, backupNow, identify, presentedToken
 } from './users.js';
 import { userStats, deleteUserData } from './tenancy.js';
 
@@ -72,6 +74,14 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
 
     const fail = (res, status, error, code) => res.status(status).json({ error, ...(code ? { code } : {}) });
 
+    // Still an admin, in a live session, as the same account? Re-read from
+    // the database inside each change's transaction, after every await.
+    const NOT_ADMIN = [403, 'You are no longer signed in as an admin.', 'not-admin'];
+    const actorStillAdmin = (req) => {
+        const now = identify(db, authToken, presentedToken(req));
+        return Boolean(now && now.via === 'session' && now.id === req.user.id && now.role === 'admin');
+    };
+
     function deleteRefusal(target, req) {
         if (target.id === req.user.id) return [400, 'You cannot delete your own account.', 'self'];
         if (target.id === tenancyOwnerId(db)) {
@@ -108,7 +118,9 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
             }
             if (!(await confirmActor(req, res))) return;
             const passwordHash = await hashPassword(pw.password);
-            const user = insertUser(db, { username: name.username, passwordHash, role });
+            const user = db.transaction(() => (actorStillAdmin(req)
+                ? insertUser(db, { username: name.username, passwordHash, role }) : null))();
+            if (!user) return fail(res, ...NOT_ADMIN);
             res.json({ ok: true, user: describe(accountRow(user.id), req) });
         } catch (e) {
             if (e && e.code === 'name-clash') return fail(res, 409, e.message, 'name-clash');
@@ -118,7 +130,8 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
     });
 
     // {role?, password?, currentPassword}. A password reset signs that account
-    // out everywhere.
+    // out everywhere. Not for your own account: your password has its own
+    // route, and your role is another admin's call.
     app.put('/api/users/:id', ...guard, async (req, res) => {
         try {
             const id = Number(req.params.id);
@@ -131,7 +144,10 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
             const wantsRole = body.role !== undefined;
             const wantsPassword = body.password !== undefined;
             if (!wantsRole && !wantsPassword) return fail(res, 400, 'Nothing to change.');
-            if (wantsPassword && id === req.user.id) return fail(res, 400, 'Use Change password for your own account.', 'self');
+            if (id === req.user.id) {
+                return fail(res, 400, wantsPassword ? 'Use Change password for your own account.'
+                    : 'Another admin has to change your role.', 'self');
+            }
             if (wantsRole && !ROLES.has(body.role)) return fail(res, 400, 'Role must be user or admin.', 'role');
             if (wantsPassword) {
                 const pw = validatePassword(body.password);
@@ -141,6 +157,7 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
             const hash = wantsPassword ? await hashPassword(body.password) : null;
 
             const result = db.transaction(() => {
+                if (!actorStillAdmin(req)) return NOT_ADMIN;
                 const cur = accountRow(id);
                 if (!cur) return [404, 'No such account.'];
                 if (id === tenancyOwnerId(db)) return [403, 'Server owner.', 'owner'];
@@ -181,6 +198,7 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
             if (!(await confirmActor(req, res))) return;
 
             const signedOut = db.transaction(() => {
+                if (!actorStillAdmin(req)) return NOT_ADMIN;
                 const cur = accountRow(id);
                 if (!cur) return [404, 'No such account.'];
                 const again = deleteRefusal(cur, req);
@@ -196,7 +214,15 @@ export function attachUserAdmin(app, { db, requireAuth, dbPath, authToken, limit
                 console.error(`[TabPaladin] Backup before deleting ${target.username} failed:`, e);
                 return fail(res, 500, `Backup failed — ${target.username} is signed out but nothing was deleted.`, 'backup-failed');
             }
-            const deleted = deleteUserData(db, id, { deletedBy: req.user.id });
+            // Nothing awaited since the checks above, but they are repeated with
+            // the delete itself so no later change can slip an await between.
+            const deleted = db.transaction(() => {
+                if (!actorStillAdmin(req)) return NOT_ADMIN;
+                const cur = accountRow(id);
+                if (!cur) return [404, 'No such account.'];
+                return deleteRefusal(cur, req) || deleteUserData(db, id, { deletedBy: req.user.id });
+            })();
+            if (Array.isArray(deleted)) return fail(res, ...deleted);
             console.log(`[TabPaladin] ${req.user.username} deleted account ${target.username} (#${id}); backup ${path.basename(backup)}.`);
             res.json({ ok: true, deleted, backup: path.basename(backup) });
         } catch (e) {
