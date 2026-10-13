@@ -163,6 +163,110 @@ const groceries = (await NotesManager.listNotes()).find(n => n.title === 'Grocer
 check('rename rewrote [[wikilinks]] in other notes',
     groceries.content.includes('[[Pasta Carbonara]]'), groceries.content);
 
+// Notebooks at any depth. Every operation is a local tree edit; none pushes.
+const tick = () => new Promise(r => setTimeout(r, 5));
+const pushesBefore = serverLog.filter(l => l.startsWith('PUT')).length;
+const lib0 = await NotesManager.getLibrary();
+check('library sees the existing notebook', lib0.notebooks.has('nb1') && lib0.notebooks.get('nb1').totalCount === 1);
+const nbWork = await NotesManager.createNotebook('Work');
+const nbMeet = await NotesManager.createNotebook('Meetings', nbWork.id);
+await tick();
+const q4 = await NotesManager.createNote('Q4 planning', '# Q4 planning\n- [ ] budget', { parentId: nbMeet.id });
+check('createNote files into a nested notebook', (await TreeStore.getNode(nbMeet.id)).children.some(c => c.id === q4.id));
+let listed = await NotesManager.listNotes();
+const q4row = listed.find(n => n.id === q4.id);
+check('nested notes are listed, tagged with their immediate notebook (back-compat)', q4row && q4row.notebook === 'Meetings');
+check('listNotes adds notebookId and notebookPath',
+    q4row.notebookId === nbMeet.id && JSON.stringify(q4row.notebookPath) === '["Work","Meetings"]');
+check('listNotes is still newest first', listed[0].id === q4.id, listed.map(n => n.title).join(', '));
+check('root notes have no notebook', listed.find(n => n.title === 'Groceries').notebookId === null);
+const nbRecipesMeet = await NotesManager.createNotebook('Meetings', 'nb1');
+const lib1 = await NotesManager.getLibrary();
+check('same-named notebooks under different parents stay apart',
+    nbRecipesMeet.id !== nbMeet.id
+    && JSON.stringify(lib1.notebooks.get(nbRecipesMeet.id).path) === '["Recipes","Meetings"]'
+    && lib1.notebooks.get(nbWork.id).totalCount === 1);
+
+let refusedOp = null;
+try { await NotesManager.createNotebook('work'); } catch (e) { refusedOp = e; }
+check('a duplicate sibling notebook name is refused, ignoring case', refusedOp !== null);
+refusedOp = null;
+try { await NotesManager.createNotebook('   '); } catch (e) { refusedOp = e; }
+check('a blank notebook name is refused', refusedOp !== null);
+refusedOp = null;
+try { await NotesManager.renameNotebook(nbWork.id, 'RECIPES'); } catch (e) { refusedOp = e; }
+check('a rename onto a sibling name is refused', refusedOp !== null && (await TreeStore.getNode(nbWork.id)).title === 'Work');
+await NotesManager.renameNotebook(nbWork.id, 'Work');
+check('renaming a notebook to its own name is fine', (await TreeStore.getNode(nbWork.id)).title === 'Work');
+refusedOp = null;
+try { await NotesManager.createNote('Stray', '', { parentId: 'f1' }); } catch (e) { refusedOp = e; }
+check('createNote refuses a parent outside the notes root', refusedOp !== null);
+
+const q4Stamp = (await TreeStore.getNode(q4.id)).payload.updatedAt;
+await tick();
+await NotesManager.moveNote(q4.id, null);
+check('moveNote to Unfiled re-parents', (await NotesManager.getLibrary()).notes.find(n => n.id === q4.id).notebookId === null);
+check('moveNote leaves updatedAt unchanged', (await TreeStore.getNode(q4.id)).payload.updatedAt === q4Stamp);
+await NotesManager.moveNote(q4.id, nbMeet.id);
+check('moveNote back into the notebook', (await NotesManager.getLibrary()).notes.find(n => n.id === q4.id).notebookId === nbMeet.id);
+refusedOp = null;
+try { await NotesManager.moveNote(q4.id, 'f1'); } catch (e) { refusedOp = e; }
+check('moveNote refuses a target outside the notes root', refusedOp !== null);
+
+refusedOp = null;
+try { await NotesManager.moveNotebook(nbWork.id, nbMeet.id); } catch (e) { refusedOp = e; }
+check('moving a notebook into its descendant is refused', refusedOp !== null);
+refusedOp = null;
+try { await NotesManager.moveNotebook(nbWork.id, nbWork.id); } catch (e) { refusedOp = e; }
+check('moving a notebook into itself is refused', refusedOp !== null);
+refusedOp = null;
+try { await NotesManager.moveNotebook(nbMeet.id, 'f1'); } catch (e) { refusedOp = e; }
+check('moving a notebook outside the notes root is refused', refusedOp !== null);
+refusedOp = null;
+try { await NotesManager.moveNotebook(nbRecipesMeet.id, nbWork.id); } catch (e) { refusedOp = e; }
+check('moving next to a same-named notebook is refused', refusedOp !== null);
+await NotesManager.moveNotebook(nbRecipesMeet.id, null);
+check('a notebook can move to the top level',
+    JSON.stringify((await NotesManager.getLibrary()).notebooks.get(nbRecipesMeet.id).path) === '["Meetings"]');
+await NotesManager.moveNotebook(nbRecipesMeet.id, 'nb1');
+
+// Lift-delete: Work holds [Meetings (Q4 planning), Standup].
+const standup = await NotesManager.createNote('Standup', 'daily', { parentId: nbWork.id });
+const notesRootNode = await NotesManager.findNotesRoot();
+const beforeIds = notesRootNode.children.map(c => c.id);
+const workIndex = beforeIds.indexOf(nbWork.id);
+const noteCount = (await NotesManager.listNotes()).length;
+const lift = await NotesManager.deleteNotebook(nbWork.id);
+const afterIds = (await NotesManager.findNotesRoot()).children.map(c => c.id);
+check('deleteNotebook reports what moved', lift.moved === 2);
+check('deleteNotebook lifts its children into its place, in order',
+    JSON.stringify(afterIds) === JSON.stringify([
+        ...beforeIds.slice(0, workIndex), nbMeet.id, standup.id, ...beforeIds.slice(workIndex + 1)
+    ]), afterIds.join(','));
+check('deleteNotebook keeps every note and id', (await NotesManager.listNotes()).length === noteCount
+    && (await TreeStore.getNode(q4.id)) !== null && (await TreeStore.getNode(standup.id)) !== null
+    && (await TreeStore.getNode(nbWork.id)) === null);
+check('the lifted sub-notebook keeps its notes', (await TreeStore.getNode(nbMeet.id)).children.some(c => c.id === q4.id));
+
+// Payload merge and rename side effects.
+const q4Node = await TreeStore.getNode(q4.id);
+await TreeStore.updateNode(q4.id, { payload: { ...q4Node.payload, pinned: true } });
+await NotesManager.updateNote(q4.id, { content: '# Q4 planning\n- [x] budget' });
+check('an unknown payload field survives an edit', (await TreeStore.getNode(q4.id)).payload.pinned === true);
+check('the edit itself landed', (await TreeStore.getNode(q4.id)).payload.content.includes('[x] budget'));
+const linker = await NotesManager.createNote('Linker', 'see [[Q4 planning]]');
+const linkerNode = await TreeStore.getNode(linker.id);
+await TreeStore.updateNode(linker.id, { payload: { ...linkerNode.payload, pinned: true } });
+const linkerStamp = (await TreeStore.getNode(linker.id)).payload.updatedAt;
+await tick();
+await NotesManager.updateNote(q4.id, { title: 'Q4 plan' });
+const linkerAfter = await TreeStore.getNode(linker.id);
+check('a rename rewrites the link in the linking note', linkerAfter.payload.content === 'see [[Q4 plan]]', linkerAfter.payload.content);
+check("a rename leaves the linking note's updatedAt unchanged", linkerAfter.payload.updatedAt === linkerStamp);
+check("a rename keeps the linking note's other payload fields", linkerAfter.payload.pinned === true);
+check('notebook and note operations never pushed', serverLog.filter(l => l.startsWith('PUT')).length === pushesBefore);
+check('they left the working copy dirty for an explicit push', TreeStore.status().dirty === true);
+
 check('no pins root yet -> empty list', (await PinsManager.list()).length === 0);
 await PinsManager.add('github.com', 'GitHub');
 const pins = await PinsManager.list();
