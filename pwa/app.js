@@ -3488,12 +3488,17 @@ function localAdapter(wrapper) {
 // into that copy as it was, and only with what the server says of this copy's
 // own account.
 async function rebaseOntoServer(copy, base) {
+    // A filing from this phone (applyFiled) moved the same copy on while the
+    // push was on its way: nothing to fold, only push again from there.
+    const movedOn = () => state.snapshot === copy && (state.treeVersion || 0) !== base;
+    if (movedOn()) return { applied: 0, relocated: 0 };
     let ops;
     try {
         ops = await api('/api/tree/ops?since=' + encodeURIComponent(base));
     } catch (e) {
         return null;
     }
+    if (movedOn()) return { applied: 0, relocated: 0 };
     if (state.snapshot !== copy || (state.treeVersion || 0) !== base || !ops || !ops.complete) return null;
     if (ops.userId !== undefined && state.snapshotUserId != null && Number(ops.userId) !== Number(state.snapshotUserId)) return null;
     if (ops.serverId && state.snapshotServerId && ops.serverId !== state.snapshotServerId) return null;
