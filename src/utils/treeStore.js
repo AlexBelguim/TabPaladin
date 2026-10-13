@@ -61,6 +61,12 @@
 // about one copy pass that copy along (`expect`), so the answer is never
 // applied to another.
 //
+// A link filed from the phone's share sheet goes straight into the server's
+// tree as a small append. A push that meets a 409 because of such links only
+// folds them into this copy and goes again (sync.pushFolding), under the same
+// lock and copy checks as a pull; any other conflict is the caller's to ask
+// about, as before.
+//
 // Edits stay instant and in memory and are written on a short debounce,
 // under the same lock. Until written, each is also kept as a step that can be
 // applied again: when another page wrote this copy first (an edit, a pull, a
@@ -998,6 +1004,60 @@ function bookmarksHtml(roots) {
     return lines.join('\n') + '\n';
 }
 
+// --- Links filed from a share sheet, folded into the copy -------------------
+//
+// The phone files a shared link straight into the server's tree, as a small
+// append, without pushing its copy; the server logs it (GET /api/tree/ops).
+// When a push here meets a 409 and that log says everything the server gained
+// since this copy's base is such appends (or their undo), they are added to
+// this copy and the push goes again — no conflict prompt for a link filed on
+// the phone. The rules are shareCore.js's applyOps (the PWA's), restated here
+// because the extension cannot load from pwa/: a node already here is
+// skipped; one whose folder is gone here goes to the end of the Bookmarks
+// root (counted as relocated) rather than being dropped by the next push; an
+// undo removes a bookmark only while it still has that URL, a folder only
+// while it is empty. Not an edit of this copy's own: nothing is marked dirty.
+function applyServerOps(ops) {
+    const out = { applied: 0, relocated: 0, removed: 0, skipped: 0 };
+    const bookmarksRoot = () => {
+        for (const [, e] of index) if (e.node.kind === 'folder' && e.node.role === 'bookmarks' && !inVirtual(e.node.id)) return e.node;
+        return null;
+    };
+    for (const op of ops || []) {
+        if (op.kind === 'append') {
+            for (const n of (op.payload && op.payload.nodes) || []) {
+                if (!n || !n.id || index.has(String(n.id))) { out.skipped++; continue; }
+                let parent = n.parentId ? index.get(String(n.parentId)) : null;
+                parent = parent && parent.node.kind === 'folder' && !inVirtual(parent.node.id) ? parent.node : null;
+                if (!parent) {
+                    parent = bookmarksRoot();
+                    out.relocated++;
+                }
+                const node = n.kind === 'folder'
+                    ? { id: String(n.id), kind: 'folder', title: String(n.title || ''), children: [] }
+                    : { id: String(n.id), kind: 'bookmark', title: String(n.title || ''), url: String(n.url || '') };
+                const siblings = parent ? (parent.children = parent.children || []) : state.roots;
+                siblings.push(node);
+                reindex();
+                out.applied++;
+            }
+        } else if (op.kind === 'unappend') {
+            for (const it of (op.payload && op.payload.items) || []) {
+                const e = it && it.id ? index.get(String(it.id)) : null;
+                if (!e || inVirtual(e.node.id)) continue;
+                const same = it.kind === 'bookmark'
+                    ? e.node.kind === 'bookmark' && e.node.url === it.url
+                    : e.node.kind === 'folder' && (e.node.children || []).length === 0;
+                if (!same) continue;
+                detach(e.node.id);
+                reindex();
+                out.removed++;
+            }
+        }
+    }
+    return out;
+}
+
 function stripVirtual(roots) {
     const clean = (node) => {
         if (isVirtualNode(node)) return null;
@@ -1493,6 +1553,83 @@ export const TreeStore = {
                 emit('push');
                 return { version: state.baseVersion, copy: copyToken(), left: null, message: null };
             });
+        },
+
+        // What a copy based on `since` missed, when that was only links
+        // filed from a share sheet: {version, complete, ops, userId, serverId}.
+        async opsSince(config, since) {
+            return apiFetch(config, '/api/tree/ops?since=' + encodeURIComponent(since));
+        },
+
+        // After a push refused with a 409: fold the server's logged appends
+        // into the copy that was refused (`expect`, the error's copy) and base
+        // it on the server's version, so the push can go again. Only when the
+        // log is complete (nothing but appends since this copy's base), only
+        // for this copy's own account, and only while the copy is still the
+        // one refused and still based where it was — another page's pull or
+        // push meanwhile, or another copy brought in, and nothing is folded.
+        // Returns {applied, relocated, removed, version, copy}, or null when
+        // there is nothing to fold (the caller asks as it always has).
+        async rebaseOnto(config, { expect = null } = {}) {
+            await ensureLoaded();
+            const started = await withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (expect && !sameCopy(now, expect)) throw stopped('account-changed', 'Account changed — nothing was pushed.');
+                return now;
+            });
+            let body;
+            try {
+                body = await apiFetch(config, '/api/tree/ops?since=' + encodeURIComponent(started.baseVersion));
+            } catch (e) {
+                // A server from before the ops log: nothing to fold.
+                if (e.status === 404) return null;
+                throw e;
+            }
+            if (!body || body.complete !== true) return null;
+            if (started.owner && body.userId !== undefined && body.userId !== null
+                && !sameAccount(started.owner, ownerFrom(config, body.userId, body.serverId, started.owner))) return null;
+            return withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (!sameCopy(now, started)) throw stopped('account-changed', 'Account changed — nothing was pushed.');
+                if (now.baseVersion !== started.baseVersion || now.baseId !== started.baseId) return null;
+                const result = applyServerOps(body.ops || []);
+                state.baseVersion = Number(body.version) || state.baseVersion;
+                state.baseId = newId();
+                await writeCopy();
+                emit('pull');
+                return { ...result, version: state.baseVersion, copy: copyToken() };
+            });
+        },
+
+        // push, but a 409 whose gap is only links filed from a share sheet
+        // folds them in and pushes again (up to three times) before the
+        // caller sees it. Returns push's result plus {folded, relocated}: how
+        // many filed links came in, and how many of those went to the
+        // Bookmarks root because their folder is gone here. Any other 409
+        // (another device pushed) is thrown as before, with its copy.
+        async pushFolding(config, { force = false, expect = null } = {}) {
+            let copy = expect;
+            let folded = 0;
+            let relocated = 0;
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    const pushed = await TreeStore.sync.push(config, { force, expect: copy });
+                    return { ...pushed, folded, relocated };
+                } catch (e) {
+                    if (e.status !== 409 || force || attempt >= 3) throw e;
+                    // Folding is only ever a way past the 409: when it cannot
+                    // be done (another copy came in meanwhile, the server is
+                    // unreachable), the caller gets the 409 as it always did.
+                    let r = null;
+                    try { r = await TreeStore.sync.rebaseOnto(config, { expect: e.copy || copy }); } catch (e2) { r = null; }
+                    if (!r) throw e;
+                    folded += r.applied;
+                    relocated += r.relocated;
+                    copy = r.copy;
+                }
+            }
         }
     },
 

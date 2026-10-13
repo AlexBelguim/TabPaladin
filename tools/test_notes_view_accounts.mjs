@@ -259,7 +259,8 @@ const doPull = new Function('TreeStore', 'StorageManager', 'getSyncConfig', 'per
 );
 // And doPush, with the answers to a refused push it gives (setAsideAndPull,
 // and doPull for "pull the server's tree").
-const pushSrc = [lift('signedInAccount'), lift('setAsideAndPull'), lift('doPush'), lift('doPull')];
+const liftPlain = (name) => (sidepanel.match(new RegExp(`\\nfunction ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}\\n`)) || [])[0];
+const pushSrc = [lift('signedInAccount'), lift('setAsideAndPull'), lift('doPush'), lift('doPull'), liftPlain('relocatedNote')];
 check('sidepanel.js has setAsideAndPull and doPush', pushSrc.every(Boolean));
 const doPush = new Function('TreeStore', 'StorageManager', 'getSyncConfig', 'persistSyncStamp', 'Tree', 'pruneStaleExpandState', 'beforeAccountSwitch',
     `${pushSrc.join('\n')}\nreturn doPush;`)(

@@ -244,9 +244,11 @@ function setupEventListeners() {
         const cfg = await getSyncConfig();
         if (!cfg.token) return 'Not signed in, so it is only on this computer — sign in and Push.';
         try {
-            const pushed = await TreeStore.sync.push(cfg, { expect: before });
+            // Links filed from the phone since the last pull are folded in,
+            // not a conflict (see TreeStore.sync.pushFolding).
+            const pushed = await TreeStore.sync.pushFolding(cfg, { expect: before });
             await persistSyncStamp('push');
-            return pushed.left ? `Synced to the server. ${pushed.message}` : 'Synced to the server.';
+            return (pushed.left ? `Synced to the server. ${pushed.message}` : 'Synced to the server.') + foldedNote(pushed);
         } catch (e) {
             if (e.code === 'account-changed') {
                 return 'Kept on this computer, with the working copy it was saved in — another account’s copy came in before it could be pushed.';
@@ -4540,6 +4542,18 @@ async function persistSyncStamp(kind) {
     });
 }
 
+// What a folding push brought in, for its status line: links filed from the
+// phone, and those put in Bookmarks because their folder is gone here.
+function relocatedNote(pushed) {
+    const n = pushed && pushed.relocated;
+    return n ? ` ${n} of them went into Bookmarks: the folder they were filed into is gone here.` : '';
+}
+
+function foldedNote(pushed) {
+    const n = pushed && pushed.folded;
+    return n ? ` Included ${n} link${n === 1 ? '' : 's'} filed from your phone.${relocatedNote(pushed)}` : '';
+}
+
 // Returns a status string for the caller to display.
 async function doPush() {
     const cfg = await getSyncConfig();
@@ -4561,9 +4575,14 @@ async function doPush() {
         }
     }
     try {
-        const pushed = await TreeStore.sync.push(cfg, { expect: copy });
+        // A 409 that is only links filed from the phone since the last pull
+        // folds them in and pushes again, without asking; any other conflict
+        // gets the questions below.
+        const pushed = await TreeStore.sync.pushFolding(cfg, { expect: copy });
         await persistSyncStamp('push');
-        return pushed.left ? `Pushed (v${pushed.version}). ${pushed.message}` : `Pushed (v${pushed.version}).`;
+        const included = pushed.folded ? `: included ${pushed.folded} link${pushed.folded === 1 ? '' : 's'} filed from your phone` : '';
+        return (pushed.left ? `Pushed (v${pushed.version})${included}. ${pushed.message}` : `Pushed (v${pushed.version})${included}.`)
+            + relocatedNote(pushed);
     } catch (e) {
         if (e.code === 'account-changed') return e.message;
         if (e.status === 412) return setAsideAndPull(cfg, e);

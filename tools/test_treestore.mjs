@@ -44,6 +44,12 @@
 //      write is made again on top of it; two switches at once run one after
 //      the other; and a set-aside copy is discarded only if it is still the
 //      one listed.
+//  11. A push whose 409 is only links filed from the phone (the server's
+//      ops log is complete) folds them in — skipping what is here already,
+//      putting what lost its folder in Bookmarks, not counting them as edits —
+//      and pushes again without asking. A gap with another device's push in
+//      it, a server without the log, another account's ops, or another copy
+//      brought in meanwhile folds nothing, and the 409 comes through as before.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -190,6 +196,22 @@ globalThis.fetch = async (url, opts = {}) => {
         return json({ ok: true, user: { id, username: id === 2 ? 'sam' : 'alex', role: 'admin', tenancyOwner: id === 1 && serverId === 'srv-main' }, serverId });
     }
     if (u.endsWith('/api/tree/version')) return json({ ok: true, version: srv.version, userId: who, serverId });
+    // The ops log, as the server keeps it: complete only for a chain of
+    // logged appends from `since` to the current version.
+    if (/\/api\/tree\/ops\?since=/.test(u) && method === 'GET') {
+        if (srv.noOpsRoute) return { ok: false, status: 404, statusText: 'Not Found', json: async () => { throw new Error('html'); }, text: async () => '<html>' };
+        const since = Number(new URL(u).searchParams.get('since'));
+        const ops = [];
+        let at = since;
+        let complete = since <= srv.version;
+        for (const op of (srv.opsLog || []).filter(o => o.version > since).sort((a, b) => a.version - b.version)) {
+            if (op.base !== at) { complete = false; break; }
+            ops.push({ version: op.version, kind: op.kind, payload: op.payload });
+            at = op.version;
+        }
+        if (at !== srv.version) complete = false;
+        return json({ ok: true, version: srv.version, floor: 0, complete, ops: complete ? ops : [], userId: who, serverId });
+    }
     if (u.endsWith('/api/tree') && method === 'GET') {
         return json({ ok: true, version: srv.version, roots: JSON.parse(JSON.stringify(srv.roots)), userId: who, serverId });
     }
@@ -1220,6 +1242,125 @@ console.log('\n14. One lock for the working copy, in every page');
     await flushing;
     check('every page writes the copy only holding the one lock, "tp-working-copy"', waited && written && has(stored().roots, 'WAITS FOR THE LOCK'),
         JSON.stringify({ waited, written }));
+}
+
+console.log('\n15. A push that meets links filed from the phone folds them in');
+{
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const asAlex = { url: MAIN, token: 'tok' };
+    const stored = () => storageData.get('tpTree');
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    const find = (nodes, id) => {
+        for (const n of nodes || []) {
+            if (n.id === id) return n;
+            const hit = find(n.children, id);
+            if (hit) return hit;
+        }
+        return null;
+    };
+    // The phone files a link on the server: an append, logged.
+    const fileOnServer = (nodes, kind = 'append') => {
+        const base = server.version;
+        server.version += 1;
+        for (const n of kind === 'append' ? nodes : []) {
+            const parent = find(server.roots, n.parentId);
+            const node = n.kind === 'folder' ? { id: n.id, kind: 'folder', title: n.title, children: [] } : { id: n.id, kind: 'bookmark', title: n.title, url: n.url };
+            (parent ? (parent.children = parent.children || []) : server.roots).push(node);
+        }
+        server.opsLog = [...(server.opsLog || []), { version: server.version, base, kind, payload: kind === 'append' ? { nodes } : { items: nodes } }];
+    };
+    const fresh = async () => {
+        await clearStashes();
+        await TreeStore.switchAccount({ ...alex });
+        server.opsLog = [];
+        server.noOpsRoute = false;
+        server.roots = [{ id: 'bm-root', kind: 'folder', role: 'bookmarks', title: 'Bookmarks', children: [
+            { id: 'ai', kind: 'folder', title: 'AI', children: [] },
+            { id: 'gone-here', kind: 'folder', title: 'Deleted on the computer', children: [] }
+        ] }];
+        await TreeStore.sync.pull(asAlex);
+    };
+
+    await fresh();
+    await TreeStore.removeNode('gone-here');
+    await TreeStore.createNode({ parentId: 'ai', kind: 'bookmark', title: 'Computer edit', url: 'https://computer.example/' });
+    await TreeStore.flush();
+    const before = TreeStore.status();
+    fileOnServer([{ id: 'phone-b1', parentId: 'ai', kind: 'bookmark', title: 'From the phone', url: 'https://phone.example/1' }]);
+    fileOnServer([
+        { id: 'phone-f', parentId: 'bm-root', kind: 'folder', title: 'Talks' },
+        { id: 'phone-b2', parentId: 'phone-f', kind: 'bookmark', title: 'Talk', url: 'https://youtu.be/t' },
+        { id: 'phone-b3', parentId: 'gone-here', kind: 'bookmark', title: 'Into a folder deleted here', url: 'https://phone.example/3' }
+    ]);
+    const putsBefore = serverLog.filter(l => l.startsWith('PUT')).length;
+    const pushed = await TreeStore.sync.pushFolding(asAlex, { expect: await TreeStore.currentCopy() });
+    check('a push whose 409 is only the phone\'s filed links folds them in and goes again, asking nothing',
+        pushed.version === server.version && pushed.folded === 4 && serverLog.filter(l => l.startsWith('PUT')).length === putsBefore + 2
+        && has(server.pushedRoots, 'Computer edit') && has(server.pushedRoots, 'phone-b1') && has(server.pushedRoots, 'phone-b2'), JSON.stringify(pushed));
+    check('  each filed link where it was filed, the computer\'s edit kept on top',
+        find(server.pushedRoots, 'ai').children.map(c => c.title).join() === 'Computer edit,From the phone'
+        && find(server.pushedRoots, 'phone-f').children[0].id === 'phone-b2');
+    check('  one whose folder was deleted here goes to Bookmarks, not lost, and the push says so',
+        pushed.relocated === 1 && find(server.pushedRoots, 'bm-root').children.some(c => c.id === 'phone-b3') && !find(server.pushedRoots, 'gone-here'));
+    check('  the copy is clean, based on the pushed version', !TreeStore.status().dirty && TreeStore.status().baseVersion === server.version
+        && TreeStore.status().copyId === before.copyId && stored().baseVersion === server.version);
+
+    // rebaseOnto on its own: what it folds, what it skips, what it refuses.
+    await fresh();
+    await TreeStore.createNode({ parentId: 'ai', kind: 'bookmark', title: 'Already here', url: 'https://same.example/' });
+    await TreeStore.flush();
+    const here = (await TreeStore.getNode('ai')).children[0].id;
+    fileOnServer([{ id: here, parentId: 'ai', kind: 'bookmark', title: 'Already here', url: 'https://same.example/' },
+        { id: 'new-one', parentId: 'ai', kind: 'bookmark', title: 'New', url: 'https://new.example/' }]);
+    const editsBefore = TreeStore.status().editCount;
+    const r = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
+    check('rebaseOnto skips an id already here, adds the rest, and is no edit of the copy\'s own',
+        r && r.applied === 1 && r.skipped === 1 && (await TreeStore.getNode('ai')).children.length === 2
+        && TreeStore.status().editCount === editsBefore && TreeStore.status().baseVersion === server.version, JSON.stringify(r));
+    fileOnServer([{ id: 'new-one', kind: 'bookmark', url: 'https://new.example/' }], 'unappend');
+    const un = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
+    check('an undo on the phone takes the link back out here too', un && un.removed === 1 && !(await TreeStore.getNode('new-one')));
+
+    await fresh();
+    await TreeStore.createNode({ parentId: 'ai', kind: 'bookmark', title: 'Mine', url: 'https://mine.example/' });
+    await TreeStore.flush();
+    fileOnServer([{ id: 'phone-x', parentId: 'ai', kind: 'bookmark', title: 'x', url: 'https://x.example/' }]);
+    server.version += 1; // the laptop pushed too: not in the log
+    const copyNow = await TreeStore.currentCopy();
+    check('a gap with another device\'s push in it is not folded', (await TreeStore.sync.rebaseOnto(asAlex, { expect: copyNow })) === null
+        && !(await TreeStore.getNode('phone-x')) && TreeStore.status().baseVersion === copyNow.baseVersion);
+    let conflict15 = null;
+    try { await TreeStore.sync.pushFolding(asAlex, { expect: copyNow }); } catch (e) { conflict15 = e; }
+    check('  so the push meets the 409 as before, with its copy, for the usual questions', conflict15 && conflict15.status === 409
+        && TreeStore.sameCopy(conflict15.copy, copyNow) && TreeStore.status().dirty);
+    server.noOpsRoute = true;
+    let old = null;
+    try { await TreeStore.sync.pushFolding(asAlex, { expect: copyNow }); } catch (e) { old = e; }
+    check('a server without the ops log: the 409 comes through unchanged', old && old.status === 409);
+
+    // Only the copy that was refused, and only its own account's ops.
+    await fresh();
+    await TreeStore.createNode({ parentId: 'ai', kind: 'bookmark', title: 'Alex edit', url: 'https://alex.example/' });
+    await TreeStore.flush();
+    fileOnServer([{ id: 'phone-y', parentId: 'ai', kind: 'bookmark', title: 'y', url: 'https://y.example/' }]);
+    const refusedCopy = await TreeStore.currentCopy();
+    await TreeStore.switchAccount({ url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false });
+    let changed = null;
+    try { await TreeStore.sync.rebaseOnto(asAlex, { expect: refusedCopy }); } catch (e) { changed = e; }
+    check('folding into a copy another account\'s replaced meanwhile stops, changing nothing', changed && changed.code === 'account-changed'
+        && !has(stored().roots, 'phone-y') && stored().owner.userId === 2);
+    await TreeStore.switchAccount({ ...alex });
+    // A session that turns out to be sam's, whose log happens to start at
+    // alex's base and append something.
+    const alexBase = TreeStore.status().baseVersion;
+    const samSaved = { version: serverB.version, opsLog: serverB.opsLog };
+    serverB.version = alexBase + 1;
+    serverB.opsLog = [{ version: alexBase + 1, base: alexBase, kind: 'append', payload: { nodes: [{ id: 'sam-filed', parentId: 'ai', kind: 'bookmark', title: 'Sam', url: 'https://sam.example/filed' }] } }];
+    const samOps = await TreeStore.sync.rebaseOnto({ url: MAIN, token: 'tok-b' }, { expect: await TreeStore.currentCopy() });
+    check('ops the server gives for another account are never folded into alex\'s copy', samOps === null && !(await TreeStore.getNode('sam-filed'))
+        && TreeStore.status().baseVersion === alexBase);
+    Object.assign(serverB, samSaved);
+    await clearStashes();
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
