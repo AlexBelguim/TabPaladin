@@ -8,27 +8,45 @@
 //      holding links from that app, never notes, workflows or the archive.
 //   2. One tap files the link there at once (on the server, and in the copy,
 //      which moves to the filing's version); a second chip files it into a
-//      second folder; Undo takes both back; Done closes the sheet.
+//      second folder; Undo takes both back; Done closes the sheet; Enter on
+//      a focused button is that button's, not Done. A folder the worker
+//      filed the share into first is this tap's: saved, with Undo.
 //   3. A link filed elsewhere meanwhile is folded into a push instead of a
-//      conflict prompt; the phone's own edits go up with it.
-//   4. Offline, a tap is queued with the share (the amber line), and coming
-//      back online files it.
+//      conflict prompt; the phone's own edits go up with it; a push whose
+//      copy the phone's own filing moved on meanwhile goes again, asking
+//      nothing.
+//   4. Offline, a tap is queued with the share (the amber line), a second
+//      tap adds to it, and coming back online files both, the open sheet
+//      saying so. Two taps online, the second while the first is on its
+//      way, are both filed.
 //   5. A folder made on the phone and never pushed can be filed into: it goes
 //      up with its own id, and the next push matches it rather than
-//      duplicating it.
+//      duplicating it; so can a new folder made inside it in the picker.
 //   6. The copy and a half-written note are kept when the app goes to the
 //      background: a share that reloads the window brings them back, says so,
 //      and does not pull over unpushed edits.
 //   7. A share captured as another account is shown, never filed or sent
-//      without a yes; nobody's folders are offered for it.
+//      without a yes; nobody's folders are offered for it, and it is never
+//      offered at a start as shared while signed out. A window still on
+//      alex's session when another signs in as sam sends none of sam's
+//      shares with alex's token, and writes nothing over sam's session.
 //   8. Pins saved from the sheet come first next time, and reach the
 //      server's prefs.
 //   9. The Inbox lists what waits, the same link shared twice as one row,
-//      and a share a forced push erased with its note.
+//      and a share a forced push erased with its note; a share both
+//      uploaded and still on the phone is listed and counted once.
 //  10. The copy kept on the phone is its account's: kept over a sign-out with
 //      unpushed edits (and brought back for that account only, nobody else
 //      signing in over it), gone with a clean sign-out, never shown to the
 //      next account.
+//  11. Sheets opened over the share sheet (Sign in, Settings, the Inbox)
+//      are drawn over it.
+//  12. Save as note signed out keeps the text on the phone and on screen.
+//  13. Unpushed changes kept for another account survive a clean sign-out
+//      of the account signed in, and come back when theirs signs in.
+//  14. Number keys pick the chips as drawn, the starter first.
+//  15. A filing answered after another account signed in goes into the
+//      first account's tree only, never into the second's copy.
 //
 // Run: node tools/test_share_pwa.mjs [--port 18986]
 
@@ -210,13 +228,23 @@ const realFetch = globalThis.fetch;
 let inFlight = 0;
 let lastActivity = Date.now();
 let offline = null; // a RegExp over 'METHOD /path'
+// One request matching `re` waits for `fn` before it goes (holdRequest), or
+// is answered only once `fn` is done (holdAnswer): what happens meanwhile
+// is the test.
+let holdRequest = null;
+let holdAnswer = null;
 globalThis.fetch = async (url, opts = {}) => {
     const line = `${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`;
     requests.push(line);
     if (offline && offline.test(line)) throw new TypeError('Failed to fetch');
+    if (holdRequest && holdRequest.re.test(line)) { const h = holdRequest; holdRequest = null; await h.fn(); }
     inFlight++;
-    try { return await realFetch(url, opts); } finally { inFlight--; lastActivity = Date.now(); }
+    let res;
+    try { res = await realFetch(url, opts); } finally { inFlight--; lastActivity = Date.now(); }
+    if (holdAnswer && holdAnswer.re.test(line)) { const h = holdAnswer; holdAnswer = null; await h.fn(); }
+    return res;
 };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function settle() {
     for (let i = 0; i < 100; i++) {
         await new Promise(r => setTimeout(r, 40));
@@ -374,6 +402,11 @@ try {
         JSON.stringify(byTitle(t.roots, 'AI').children.at(-1)));
     check('  the chip says saved, with Undo', /\bsaved\b/.test(chip('f-ai', mark).className) && drawnText('✓ Saved to AI', mark) && Boolean(button('Undo', mark)));
     check('  the share is filed', (await api(`/api/shares/${s1.sid}`, { token: A })).json.share.status === 'filed');
+    // A desktop keyboard: Enter on the focused Undo is that button's, not Done.
+    const enterOnUndo = { key: 'Enter', target: button('Undo', mark), preventDefault() {}, stopImmediatePropagation() {} };
+    for (const fn of documentListeners.keydown || []) fn(enterOnUndo);
+    await settle();
+    check('Enter on a focused button does what that button does: the sheet does not close as Done', sheetOpen());
     mark = created.length;
     await chip('f-fun').fire('click');
     await settle();
@@ -398,6 +431,21 @@ try {
         JSON.stringify({ open: sheetOpen(), toast: lastToast(), filed: JSON.stringify((await tree(A)).roots).includes('nasa/status/42'), req: requests.slice(-8) }));
     check('  the share is off the phone', !(await outbox.get(s1.sid)));
 
+    console.log('\n2b. The worker filed it first');
+    const s2b = await shareFromWorker({ text: 'https://x.com/first/status/77' }, accountOf(alexLogin));
+    mark = created.length;
+    await coldStart(`${BASE}/?share=${s2b.sid}`);
+    // The worker's request for the same tap lands first.
+    await api(`/api/shares/${s2b.sid}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'f-fun' }] } });
+    mark = created.length;
+    await chip('f-fun').fire('click');
+    await settle();
+    check('a folder this share was just filed into by the worker is saved by this tap, with Undo and Done, not "already here"',
+        /\bsaved\b/.test(chip('f-fun', mark).className) && Boolean(button('Undo', mark)) && Boolean(button('Done', mark)) && !drawnText('✓ already here', mark),
+        JSON.stringify({ cls: chip('f-fun', mark) && chip('f-fun', mark).className, done: Boolean(button('Done', mark)) }));
+    await button('Done', mark).fire('click');
+    await settle();
+
     console.log('\n3. A push after a link was filed elsewhere');
     // The copy moved with each filing, so a push now goes straight through.
     answers.prompt.push('Phone folder');
@@ -419,6 +467,30 @@ try {
         Boolean(byTitle(t.roots, 'Second phone folder')) && byTitle(t.roots, 'Misc').children.some(c => c.url === 'https://example.com/from-laptop')
         && dialogs.confirm.length === confirms3 && requests.some(r => r.startsWith('GET /api/tree/ops?since=')), dialogs.confirm.slice(confirms3).join(' | '));
 
+    console.log('\n3b. A push that meets the phone\'s own filing on its way');
+    // A choice made offline goes up when the network is back, while a push
+    // of an edit is on its way: the filing moves the copy on before the push
+    // hears its 409.
+    const s3b = Share.makeEntry({ fields: { text: 'https://example.com/during-a-push' }, account: accountOf(alexLogin) });
+    await outbox.put({ ...s3b, file: Share.makeIntent([{ folderId: 'f-misc', label: 'Misc' }], [], { at: new Date().toISOString() }) });
+    const confirms3b = dialogs.confirm.length;
+    holdRequest = {
+        re: /^PUT \/api\/tree$/,
+        fn: async () => {
+            fireWindow('online');
+            for (let i = 0; i < 100 && (await outbox.get(s3b.sid)); i++) await sleep(40);
+            await sleep(150);
+        }
+    };
+    answers.prompt.push('Pushed during a filing');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    t = await tree(A);
+    check('the push goes again from where the filing moved the copy, asking nothing',
+        dialogs.confirm.length === confirms3b && Boolean(byTitle(t.roots, 'Pushed during a filing'))
+        && byTitle(t.roots, 'Misc').children.some(c => c.url === 'https://example.com/during-a-push') && !holdRequest,
+        JSON.stringify({ confirms: dialogs.confirm.slice(confirms3b), status: byId('status').textContent, toast: lastToast() }));
+
     console.log('\n4. Offline');
     offline = /\/api\/shares/;
     const s4 = await shareFromWorker({ title: 'Offline read', text: 'https://blog.example/offline-read', url: '' }, accountOf(alexLogin));
@@ -431,12 +503,46 @@ try {
     const queued = await outbox.get(s4.sid);
     check('a tap is kept with the share, and the sheet says when it goes', queued && queued.file && queued.file.targets[0].folderId === 'f-ai'
         && drawnText("Will save to AI when you're back online", mark) && !JSON.stringify((await tree(A)).roots).includes('offline-read'));
+    mark = created.length;
+    await chip('f-fun').fire('click');
+    await settle();
+    const queued2 = await outbox.get(s4.sid);
+    check('  a second tap adds its folder to the first, kept and said', JSON.stringify(Share.intentKeys(queued2.file)) === '["f-ai","f-fun"]'
+        && drawnText("Will save to AI, Fun when you're back online", mark), JSON.stringify(queued2 && queued2.file));
     offline = null;
+    mark = created.length;
     fireWindow('online');
     await settle();
-    check('back online, it is filed and leaves the phone', JSON.stringify((await tree(A)).roots).includes('offline-read') && !(await outbox.get(s4.sid))
-        && (await api(`/api/shares/${s4.sid}`, { token: A })).json.share.status === 'filed');
-    await button('Done').fire('click');
+    const t4 = await tree(A);
+    check('back online, both are filed and it leaves the phone', byTitle(t4.roots, 'AI').children.some(c => c.url === 'https://blog.example/offline-read')
+        && byTitle(t4.roots, 'Fun').children.some(c => c.url === 'https://blog.example/offline-read') && !(await outbox.get(s4.sid))
+        && (await api(`/api/shares/${s4.sid}`, { token: A })).json.share.filings.length === 2);
+    check('  and the open sheet says so: saved, with Undo and Done, nothing waiting', Boolean(button('Done', mark)) && Boolean(button('Undo', mark))
+        && /\bsaved\b/.test(chip('f-ai', mark).className) && /\bsaved\b/.test(chip('f-fun', mark).className) && !drawnText('Will save to', mark));
+    await button('Done', mark).fire('click');
+    await settle();
+
+    console.log('\n4b. Two taps while the first is on its way');
+    const s4b = await shareFromWorker({ text: 'https://blog.example/two-quick-taps' }, accountOf(alexLogin));
+    await coldStart(`${BASE}/?share=${s4b.sid}`);
+    let releaseA = null;
+    holdRequest = { re: /\/file$/, fn: () => new Promise(r => { releaseA = r; }) };
+    mark = created.length;
+    const tapA = chip('f-ai').fire('click');
+    await sleep(200);
+    const tapB = chip('f-fun').fire('click');
+    await sleep(200);
+    releaseA();
+    await Promise.all([tapA, tapB]);
+    await settle();
+    const t4b = await tree(A);
+    check('the second tap, made while the first was on its way, is filed too',
+        byTitle(t4b.roots, 'AI').children.some(c => c.url === 'https://blog.example/two-quick-taps')
+        && byTitle(t4b.roots, 'Fun').children.some(c => c.url === 'https://blog.example/two-quick-taps') && !(await outbox.get(s4b.sid)),
+        JSON.stringify(requests.filter(r => /two|file/.test(r)).slice(-6)));
+    check('  and both chips say saved', /\bsaved\b/.test(chip('f-ai', mark).className) && /\bsaved\b/.test(chip('f-fun', mark).className),
+        JSON.stringify([chip('f-ai', mark)?.className, chip('f-fun', mark)?.className]));
+    await button('Done', mark).fire('click');
     await settle();
 
     console.log('\n5. A folder made on the phone and never pushed');
@@ -473,6 +579,42 @@ try {
     t = await tree(A);
     check('  and the phone\'s next push matches it instead of making a second one',
         JSON.stringify(t.roots).split('"Made offline"').length === 2 && byTitle(t.roots, 'Made offline').children.length === 1, JSON.stringify(t.roots).slice(0, 300));
+
+    console.log('\n5b. A new folder made in the picker inside a folder never pushed');
+    offline = /^PUT \/api\/tree$/;
+    answers.prompt.push('Recipes');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    offline = null;
+    const s5b = await shareFromWorker({ text: 'https://example.com/soup' }, accountOf(alexLogin));
+    visibility = 'hidden';
+    fireDocument('visibilitychange');
+    await settle();
+    visibility = 'visible';
+    const mark5b = created.length;
+    await coldStart(`${BASE}/?share=${s5b.sid}`);
+    await button('Other folder or several…').fire('click');
+    const search5b = [...created].reverse().find(e => e.className === 'share-search');
+    search5b.value = 'Soups';
+    await search5b.fire('input');
+    const parentSelect = [...created].reverse().find(e => e.className === 'share-parent');
+    const recipesOption = parentSelect && parentSelect.children.find(o => /Recipes/.test(o.textContent));
+    parentSelect.value = recipesOption ? recipesOption.value : parentSelect.value;
+    await button('+ Create "Soups" in').fire('click');
+    await button('Save to 1 folder').fire('click');
+    await settle();
+    t = await tree(A);
+    const recipes = byTitle(t.roots, 'Recipes');
+    const soups = recipes && recipes.children.find(c => c.title === 'Soups');
+    check('it is made where it was asked for, with the folder it sits in, and the link filed into it',
+        Boolean(recipesOption) && soups && soups.children.some(c => c.url === 'https://example.com/soup') && !drawnText('deleted on another device', mark5b),
+        JSON.stringify({ recipes: recipes && recipes.children.map(c => c.title), message: [...created].reverse().find(e => e.className === 'share-message')?.textContent }));
+    await button('Done').fire('click');
+    await settle();
+    await byId('pushBtn').fire('click');
+    await settle();
+    t = await tree(A);
+    check('  and the next push keeps one of each', JSON.stringify(t.roots).split('"Recipes"').length === 2 && JSON.stringify(t.roots).split('"Soups"').length === 2);
 
     console.log('\n6. A share reloads the window over unpushed edits and a half-written note');
     offline = /^PUT \/api\/tree$/;
@@ -531,7 +673,30 @@ try {
     await settle();
     check('Later leaves it on the phone, still sam\'s', (await outbox.get(s7.sid))?.account.username === 'sam');
 
+    console.log('\n7b. Another window signs in as sam while this one is still alex\'s');
+    // The other window writes sam's session to the shared localStorage; this
+    // page still holds alex's token in memory.
+    const samSession = (await api('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json;
+    const alexStored = Object.fromEntries(['tp_pwa_token', 'tp_pwa_user', 'tp_pwa_userid', 'tp_pwa_serverid'].map(k => [k, localStorageShim.getItem(k)]));
+    localStorageShim.setItem('tp_pwa_token', samSession.token);
+    localStorageShim.setItem('tp_pwa_user', 'sam');
+    localStorageShim.setItem('tp_pwa_userid', String(samSession.user.id));
+    fireWindow('online');
+    await settle();
+    check('coming online, this page sends none of sam\'s shares with alex\'s token: nothing lands in either inbox',
+        (await api(`/api/shares/${s7.sid}`, { token: A })).status === 404 && (await api(`/api/shares/${s7.sid}`, { token: samSession.token })).status === 404
+        && (await outbox.get(s7.sid))?.uploaded === false);
+    await byId('settingsBtn').fire('click');
+    await settle();
+    check('  and asking the server who it is writes nothing over the other window\'s session',
+        localStorageShim.getItem('tp_pwa_userid') === String(samSession.user.id) && localStorageShim.getItem('tp_pwa_token') === samSession.token,
+        JSON.stringify([localStorageShim.getItem('tp_pwa_userid'), localStorageShim.getItem('tp_pwa_user')]));
+    byId('settings-sheet').classList.add('hidden');
+    for (const [k, v] of Object.entries(alexStored)) localStorageShim.setItem(k, v);
+    await api('/api/logout', { method: 'POST', token: samSession.token });
+
     console.log('\n8. Pins');
+    const confirms8 = dialogs.confirm.length;
     const s8 = await shareFromWorker({ text: 'https://x.com/a/status/8' }, accountOf(alexLogin));
     mark = created.length;
     await coldStart(`${BASE}/?share=${s8.sid}`);
@@ -555,6 +720,9 @@ try {
     check('  and the pinned folder is the first chip next time', chipsDrawn(mark)[0]?.dataset.folderId === pinned, JSON.stringify(chipsDrawn(mark).map(c => c.dataset.folderId)));
     await button('Later').fire('click');
     await settle();
+    check('a share kept for sam is never offered to alex at a start as "shared while signed out"',
+        !dialogs.confirm.slice(confirms8).some(m => /shared while signed out/.test(m)) && (await outbox.get(s7.sid))?.account.username === 'sam',
+        dialogs.confirm.slice(confirms8).join(' | '));
 
     console.log('\n9. The Inbox');
     for (const sid of ['twin-share-00000000001', 'twin-share-00000000002']) {
@@ -575,6 +743,21 @@ try {
     check('a share captured as sam waits, offered to alex', rowText.some(s => s.includes('sams link') && /Shared as sam/.test(s)), rowText.join(' || ').slice(0, 800));
     const badge = Number(byId('inbox-count').textContent || 0);
     check('the Inbox counts what waits', badge >= 3, String(badge));
+    // A share the worker uploaded, the app left without Later: on the server
+    // and still on the phone. The Inbox lists it once, and counts it once.
+    await api('/api/shares', { method: 'POST', token: A, body: { sid: 'left-on-phone-00000001', url: 'https://example.com/left-on-phone' } });
+    const left9 = Share.makeEntry({ fields: { url: 'https://example.com/left-on-phone' }, account: accountOf(alexLogin), sid: 'left-on-phone-00000001' });
+    await outbox.put({ ...left9, uploaded: true, uploadedAt: new Date().toISOString(), share: { sid: left9.sid } });
+    await byId('bottom-nav').fire('click', { target: { closest: () => ({ dataset: { nav: 'inbox' } }) } });
+    await settle();
+    const withEntry = Number(byId('inbox-count').textContent || 0);
+    const listed9 = byId('inbox-list').children.filter(r => r.className === 'inbox-row').map(textOf).filter(x => /left.on.phone/.test(x)).length;
+    await outbox.remove(left9.sid);
+    await byId('bottom-nav').fire('click', { target: { closest: () => ({ dataset: { nav: 'inbox' } }) } });
+    await settle();
+    const withoutEntry = Number(byId('inbox-count').textContent || 0);
+    check('  a share both uploaded and still on the phone is listed once and counted once', listed9 === 1 && withEntry === withoutEntry && withEntry > 0,
+        JSON.stringify({ withEntry, withoutEntry, listed9 }));
 
     console.log('\n10. The copy kept on the phone is its account\'s');
     byId('inbox-sheet').classList.add('hidden');
@@ -619,6 +802,100 @@ try {
     check('so sam\'s next start shows none of alex\'s tree, and keeps only his own',
         !drawnText('Kept for alex', mark10) && !drawnText('Phone folder', mark10)
         && (!samKept || (samKept.account.username === 'sam' && !JSON.stringify(samKept.roots).includes('Kept for alex'))), JSON.stringify(samKept && samKept.account));
+
+    console.log('\n11. Sheets opened over the share sheet');
+    const css = fs.readFileSync(path.join(REPO, 'pwa', 'app.css'), 'utf8');
+    const zOf = (selector) => {
+        const m = css.match(new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\{[^}]*?z-index:\\s*(\\d+)'));
+        return m ? Number(m[1]) : null;
+    };
+    const zShare = zOf('.share-sheet');
+    const zOver = zOf('body.share-open .sheet:not(.share-sheet)');
+    check('Settings, the Inbox and every other sheet open over the share sheet, still under the tab bar',
+        zShare !== null && zOver !== null && zOver > zShare && zOver < 40, JSON.stringify({ zShare, zOver }));
+
+    console.log('\n12. Save as note with nobody signed in');
+    await byId('auth-signout').fire('click');
+    await settle();
+    const s13 = await shareFromWorker({ title: '', text: 'A thought with no link in it', url: '' }, null);
+    mark = created.length;
+    await coldStart(`${BASE}/?share=${s13.sid}`);
+    check('signed out, a share with no link offers Save as note', sheetOpen() && drawnText('No link in what you shared', mark));
+    mark = created.length;
+    await button('Save as note').fire('click');
+    await settle();
+    check('  which keeps the text, on the phone and on screen, when the note cannot open',
+        Boolean(await outbox.get(s13.sid)) && sheetOpen() && drawnText('Not saved as a note yet', mark), lastToast());
+    answers.confirm.push(true);
+    await button('Discard').fire('click');
+    await settle();
+
+    console.log('\n13. Unpushed changes kept for another account');
+    // Another window of alex's left his copy on the phone with an edit in it.
+    const alexNow = (await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json;
+    const alexTree = await tree(alexNow.token);
+    const idsIn = (nodes, out = []) => { for (const n of nodes || []) { out.push(n.id); idsIn(n.children, out); } return out; };
+    const alexRoots = JSON.parse(JSON.stringify(alexTree.roots));
+    alexRoots.find(r => r.role === 'bookmarks').children.push({ id: 'aaaaaaaaaaaaaa14', kind: 'folder', title: 'Alex unpushed elsewhere', children: [] });
+    await (await cachesShim.open('tp-data')).put('/__tp_tree', new Response(JSON.stringify({
+        v: 1, savedAt: new Date().toISOString(), account: accountOf(alexNow), roots: alexRoots, version: alexTree.version,
+        dirty: true, editCount: 1, importIds: [], serverIds: idsIn(alexTree.roots), nv: null, keptDraft: null, pathIds: []
+    }), { headers: { 'Content-Type': 'application/json' } }));
+    await signInStorage('sam', 'sam-password-1');
+    const toasts14 = document.body.children.length;
+    await coldStart(`${BASE}/`);
+    check('sam\'s start says the phone keeps alex\'s unpushed changes', document.body.children.slice(toasts14)
+        .some(c => c.id === 'tp-toast' && /keeps unpushed changes for alex/.test(c.textContent)));
+    await byId('auth-signout').fire('click');
+    await settle();
+    const kept14 = await kept();
+    check('  sam\'s clean sign-out leaves them on the phone', kept14 && kept14.dirty && kept14.account.username === 'alex'
+        && JSON.stringify(kept14.roots).includes('Alex unpushed elsewhere'), JSON.stringify(kept14 && kept14.account));
+    await signIn('alex', PASSWORD);
+    check('  and alex signing in has them back, saying so', /Restored unpushed changes/.test(byId('status').textContent), byId('status').textContent);
+    await byId('pushBtn').fire('click');
+    await settle();
+    const alexAfter = await tree((await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token);
+    check('  to push them', Boolean(byTitle(alexAfter.roots, 'Alex unpushed elsewhere')), byId('status').textContent);
+
+    console.log('\n14. Number keys follow the chips as drawn');
+    const s11 = await shareFromWorker({ text: 'https://github.com/someone/project' }, accountOf(alexNow));
+    mark = created.length;
+    await coldStart(`${BASE}/?share=${s11.sid}`);
+    const first11 = chipsDrawn(mark)[0];
+    check('a first GitHub link: the starter is drawn first, numbered 1', first11 && /share-chip-new/.test(first11.className) && first11.dataset.n === '1',
+        JSON.stringify(chipsDrawn(mark).map(c => [c.className, c.dataset.n])));
+    const key1 = { key: '1', target: document.body, preventDefault() {}, stopImmediatePropagation() {} };
+    for (const fn of documentListeners.keydown || []) fn(key1);
+    await settle();
+    const keysTree = await tree((await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token);
+    const gh = byTitle(keysTree.roots, 'GitHub');
+    check('  and 1 makes the GitHub folder with the link in it', gh && gh.children.some(c => c.url === 'https://github.com/someone/project'),
+        JSON.stringify(keysTree.roots).slice(0, 400));
+    await button('Done').fire('click');
+    await settle();
+
+    console.log('\n15. A filing answered after another account signed in');
+    const s15 = Share.makeEntry({ fields: { text: 'https://example.com/alex-filed-late' }, account: { ...accountOf(alexNow) } });
+    await outbox.put({ ...s15, file: Share.makeIntent([{ folderId: 'f-misc', label: 'Misc' }], [], { at: new Date().toISOString() }) });
+    holdAnswer = {
+        re: /\/file$/,
+        fn: async () => {
+            await byId('auth-signout').fire('click');
+            await settle();
+            await signIn('sam', 'sam-password-1');
+        }
+    };
+    fireWindow('online');
+    await settle();
+    await settle();
+    const samKept15 = await kept();
+    const alexFiled = await tree((await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token);
+    check('alex\'s filing went into alex\'s tree, and none of it into sam\'s copy',
+        !holdAnswer && byTitle(alexFiled.roots, 'Misc').children.some(c => c.url === 'https://example.com/alex-filed-late')
+        && localStorageShim.getItem('tp_pwa_user') === 'sam' && samKept15 && samKept15.account.username === 'sam'
+        && !JSON.stringify(samKept15.roots).includes('alex-filed-late'),
+        JSON.stringify({ held: Boolean(holdAnswer), who: localStorageShim.getItem('tp_pwa_user'), kept: samKept15 && samKept15.account }));
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog.slice(-2000));
