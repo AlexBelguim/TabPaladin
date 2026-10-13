@@ -1438,7 +1438,8 @@ function noteRowHtml(note, { chip = false, titleRanges = null, snippet = null, n
         : '';
     const chips = taskPillHtml(note.tasks) + pathChip;
     const selected = state.nv.noteId === note.id && !state.nv.isNew;
-    return `<div class="nv-row${selected ? ' selected' : ''}" data-nv="open-note" data-id="${escapeHtml(note.id)}" role="button" tabindex="0">`
+    return `<div class="nv-row${selected ? ' selected' : ''}" data-nv="open-note" data-id="${escapeHtml(note.id)}" role="button" tabindex="0"`
+        + `${isDesktop() ? ' draggable="true"' : ''}>`
         + `<div class="nv-row-top"><span class="nv-row-title${untitled ? ' untitled' : ''}">${title}</span>`
         + `<span class="nv-row-time">${escapeHtml(NM.relativeTime(note.updatedAt, now))}</span></div>`
         + (preview ? `<div class="nv-row-preview">${preview}</div>` : '')
@@ -1487,6 +1488,7 @@ function renderNvSide(lib) {
 
     const tree = nvEl('div', 'nv-tree');
     const rows = [];
+    const drag = isDesktop() ? ' draggable="true"' : '';
     const walk = (books) => {
         for (const b of books) {
             const kids = b.children.length > 0;
@@ -1494,7 +1496,7 @@ function renderNvSide(lib) {
             const id = escapeHtml(b.id);
             const name = escapeHtml(b.title || '(unnamed)');
             rows.push(
-                `<div class="nv-tree-row${state.nv.scope === 'nb:' + b.id ? ' selected' : ''}" style="--depth:${b.depth}">`
+                `<div class="nv-tree-row${state.nv.scope === 'nb:' + b.id ? ' selected' : ''}" style="--depth:${b.depth}" data-id="${id}"${drag}>`
                 + (kids
                     ? `<button type="button" class="nv-fold${open ? ' open' : ''}" data-nv="fold" data-id="${id}" aria-expanded="${open}" aria-label="${open ? 'Collapse' : 'Expand'} ${name}"><span aria-hidden="true">▸</span></button>`
                     : '<span class="nv-fold-space"></span>')
@@ -2239,6 +2241,81 @@ function onNotesClick(e) {
         default:
             break;
     }
+}
+
+// Desktop drag and drop: a note row dropped on a notebook (or on Unfiled)
+// moves it; a notebook dropped on another notebook (or on the Notebooks
+// label, for the top level) moves that — never into itself or below.
+let nvDragging = null; // { kind: 'note' | 'notebook', id }
+
+function nvDropTarget(el) {
+    if (!el || !el.closest) return null;
+    const row = el.closest('.nv-tree-row[data-id]');
+    if (row) return { kind: 'notebook', id: row.dataset.id, el: row };
+    const unfiled = el.closest('.nv-scope[data-scope="unfiled"]');
+    if (unfiled) return { kind: 'unfiled', id: null, el: unfiled };
+    const label = el.closest('.nv-label-row');
+    if (label) return { kind: 'top', id: null, el: label };
+    return null;
+}
+
+function nvCanDrop(target) {
+    if (!nvDragging || !target) return false;
+    const lib = notesLibrary();
+    if (nvDragging.kind === 'note') {
+        const note = lib.notes.find(n => n.id === nvDragging.id);
+        return Boolean(note) && target.kind !== 'top' && (target.id || null) !== note.notebookId;
+    }
+    const nb = lib.notebooks.get(nvDragging.id);
+    if (!nb || target.kind === 'unfiled') return false;
+    if (target.kind === 'top') return nb.parentId !== null;
+    const t = lib.notebooks.get(target.id);
+    return Boolean(t) && !t.pathIds.includes(nb.id) && t.id !== nb.parentId;
+}
+
+function clearNvDropMarks() {
+    for (const el of document.querySelectorAll('.nv .drop-target')) el.classList.remove('drop-target');
+}
+
+function wireNotesDragAndDrop(root) {
+    root.addEventListener('dragstart', (e) => {
+        if (state.view !== 'notes') return;
+        const row = e.target.closest && e.target.closest('.nv-row[data-id]');
+        const nbRow = !row && e.target.closest && e.target.closest('.nv-tree-row[data-id]');
+        if (row) nvDragging = { kind: 'note', id: row.dataset.id };
+        else if (nbRow) nvDragging = { kind: 'notebook', id: nbRow.dataset.id };
+        else return;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', nvDragging.id);
+    });
+    root.addEventListener('dragover', (e) => {
+        const target = nvDropTarget(e.target);
+        if (!nvCanDrop(target)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        if (!target.el.classList.contains('drop-target')) {
+            clearNvDropMarks();
+            target.el.classList.add('drop-target');
+        }
+    });
+    root.addEventListener('dragleave', (e) => {
+        const target = nvDropTarget(e.target);
+        if (target && !target.el.contains(e.relatedTarget)) target.el.classList.remove('drop-target');
+    });
+    root.addEventListener('drop', async (e) => {
+        const target = nvDropTarget(e.target);
+        clearNvDropMarks();
+        if (!nvCanDrop(target)) return;
+        e.preventDefault();
+        const d = nvDragging;
+        nvDragging = null;
+        if (d.kind === 'note') await moveNoteTo(d.id, target.id);
+        else await moveNotebookTo(d.id, target.id);
+    });
+    root.addEventListener('dragend', () => {
+        nvDragging = null;
+        clearNvDropMarks();
+    });
 }
 
 function onNotesInput(e) {
@@ -3553,6 +3630,7 @@ window.addEventListener('DOMContentLoaded', () => {
         content.addEventListener('click', onNotesClick);
         content.addEventListener('input', onNotesInput);
         content.addEventListener('change', onNotesChange);
+        wireNotesDragAndDrop(content);
         content.addEventListener('keydown', (e) => {
             if (e.key !== 'Enter' || state.view !== 'notes') return;
             const row = e.target.closest && e.target.closest('.nv-row[data-id]');

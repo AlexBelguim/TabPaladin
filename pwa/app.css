@@ -1685,6 +1685,13 @@ input.nv-search {
   .nv-scope:hover:not(.selected),
   .nv-tree-row:hover:not(.selected) { background: rgba(255, 255, 255, 0.05); }
 
+  /* Drag and drop: the drop target gets a primary outline. */
+  .nv .drop-target {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    background: rgba(59, 130, 246, 0.12);
+  }
+
   /* Notebook rows show their ⋯ on hover. */
   .nv-more { opacity: 0; }
   .nv-tree-row:hover .nv-more,

@@ -267,7 +267,7 @@ function renderSidebar() {
             const name = escapeHtml(b.title || '(unnamed)');
             rows.push(
                 `<div class="nv-tree-row${view.scope === 'nb:' + b.id ? ' is-selected' : ''}" style="--depth:${b.depth}"`
-                + ` role="treeitem"${hasKids ? ` aria-expanded="${open}"` : ''} data-nb="${id}">`
+                + ` role="treeitem"${hasKids ? ` aria-expanded="${open}"` : ''} data-nb="${id}" draggable="true">`
                 + (hasKids
                     ? `<button type="button" class="nv-chev${open ? ' is-open' : ''}" data-fold="${id}"`
                         + ` aria-label="${open ? 'Collapse' : 'Expand'} ${name}">▸</button>`
@@ -319,7 +319,7 @@ function noteRowHtml(note, { chip = false, titleRanges = null, snippet = null, n
         : escapeHtml(note.preview);
     const chips = taskPillHtml(note.tasks) + (chip ? pathChipHtml(note) : '');
     const selected = !view.isNew && note.id === view.noteId;
-    return `<li class="nv-row${selected ? ' is-selected' : ''}" data-note="${escapeHtml(note.id)}"`
+    return `<li class="nv-row${selected ? ' is-selected' : ''}" data-note="${escapeHtml(note.id)}" draggable="true"`
         + `${selected ? ' aria-current="true"' : ''}>`
         + `<div class="nv-row-top"><span class="nv-row-title${untitled ? ' is-untitled' : ''}">${title}</span>`
         + `<span class="nv-row-time">${escapeHtml(NM.relativeTime(note.updatedAt, now))}</span></div>`
@@ -920,6 +920,81 @@ async function notebookAction(act, id) {
     }
 }
 
+// --- drag and drop ------------------------------------------------------------------------
+// A note row dropped on a notebook (or on Unfiled) moves it; a notebook
+// dropped on another notebook (or on the Notebooks heading, for the top
+// level) moves that. Same rules as Move to…: never into itself or below.
+
+let dragging = null; // { kind: 'note' | 'notebook', id }
+
+function dropTargetOf(el) {
+    if (!el || !el.closest) return null;
+    const row = el.closest('.nv-tree-row[data-nb]');
+    if (row) return { kind: 'notebook', id: row.dataset.nb, el: row };
+    const unfiled = el.closest('.nv-scope[data-scope="unfiled"]');
+    if (unfiled) return { kind: 'unfiled', id: null, el: unfiled };
+    const head = el.closest('.nv-tree-head');
+    if (head) return { kind: 'top', id: null, el: head };
+    return null;
+}
+
+function canDrop(target) {
+    if (!dragging || !target) return false;
+    if (dragging.kind === 'note') {
+        const note = view.lib.notes.find(n => n.id === dragging.id);
+        return Boolean(note) && target.kind !== 'top' && (target.id || null) !== note.notebookId;
+    }
+    const nb = view.lib.notebooks.get(dragging.id);
+    if (!nb || target.kind === 'unfiled') return false;
+    if (target.kind === 'top') return nb.parentId !== null;
+    const t = view.lib.notebooks.get(target.id);
+    return Boolean(t) && !t.pathIds.includes(nb.id) && t.id !== nb.parentId;
+}
+
+function clearDropMarks() {
+    for (const el of document.querySelectorAll('#nv .is-drop')) el.classList.remove('is-drop');
+}
+
+function wireDragAndDrop(root) {
+    root.addEventListener('dragstart', (e) => {
+        const row = e.target.closest && e.target.closest('.nv-row[data-note]');
+        const nbRow = !row && e.target.closest && e.target.closest('.nv-tree-row[data-nb]');
+        if (row) dragging = { kind: 'note', id: row.dataset.note };
+        else if (nbRow) dragging = { kind: 'notebook', id: nbRow.dataset.nb };
+        else return;
+        e.dataTransfer.effectAllowed = 'move';
+        // Firefox starts no drag without some data on it.
+        e.dataTransfer.setData('text/plain', dragging.id);
+    });
+    root.addEventListener('dragover', (e) => {
+        const target = dropTargetOf(e.target);
+        if (!canDrop(target)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        if (!target.el.classList.contains('is-drop')) {
+            clearDropMarks();
+            target.el.classList.add('is-drop');
+        }
+    });
+    root.addEventListener('dragleave', (e) => {
+        const target = dropTargetOf(e.target);
+        if (target && !target.el.contains(e.relatedTarget)) target.el.classList.remove('is-drop');
+    });
+    root.addEventListener('drop', async (e) => {
+        const target = dropTargetOf(e.target);
+        clearDropMarks();
+        if (!canDrop(target)) return;
+        e.preventDefault();
+        moveCtx = { kind: dragging.kind, id: dragging.id };
+        dragging = null;
+        await moveTo(target.id || '');
+    });
+    root.addEventListener('dragend', () => {
+        dragging = null;
+        clearDropMarks();
+    });
+}
+
 // --- scope, sort, search ------------------------------------------------------------------
 
 async function setScope(scope) {
@@ -1036,6 +1111,8 @@ export function initNotesView() {
     loadPrefs();
 
     $('viewNotesBtn')?.addEventListener('click', () => { openNotes(); });
+
+    wireDragAndDrop($('nv'));
 
     // Library.
     $('newNoteBtn').addEventListener('click', () => { newNote(); });

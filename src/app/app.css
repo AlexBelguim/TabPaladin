@@ -942,6 +942,16 @@ body.tp-app input.nv-search {
     gap: 8px;
 }
 
+/* Drag and drop: the drop target gets a primary outline. */
+.nv .is-drop {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -2px;
+    background: rgba(59, 130, 246, 0.12);
+}
+
+.nv-row[draggable="true"],
+.nv-tree-row[draggable="true"] { -webkit-user-drag: element; }
+
 .nv mark {
     background: rgba(250, 204, 21, 0.28);
     color: inherit;
