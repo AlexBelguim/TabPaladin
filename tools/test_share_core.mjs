@@ -34,7 +34,8 @@
 //      leaves it as it was.
 //   7. applyOps: an append inserts, an id already there is skipped, a node
 //      whose parent is gone goes to the Bookmarks root, a folder with no
-//      parent at the top level, and an unappend removes only an unchanged
+//      parent at the top level, a node's payload (a saved workflow's
+//      {createdAt}) comes along, and an unappend removes only an unchanged
 //      bookmark or an empty folder.
 //
 // Run: node tools/test_share_core.mjs
@@ -548,6 +549,20 @@ const r2 = S.applyOps([{ version: 11, kind: 'unappend', payload: { items: [
 ] } }], a);
 check('an unappend removes only the unchanged bookmark, never a changed one or a folder with something in it',
     r2.removed === 1 && !find('nb1') && find('nb2') && find('nf') && find('nf').children.length === 1);
+// A workflow saved on the server (POST /api/workflows): its folder carries
+// payload {createdAt}, which a copy must keep or its next push erases it.
+const wfOp = [{ version: 12, kind: 'append', payload: { nodes: [
+    { id: 'wf-1', parentId: 'ai', kind: 'folder', title: 'Research', payload: { createdAt: '2026-10-01T09:30:00.000Z' } },
+    { id: 'wf-1-t', parentId: 'wf-1', kind: 'bookmark', title: 'One', url: 'https://one.example/' }
+] } }];
+const r3 = S.applyOps(wfOp, a);
+check('an appended folder keeps its payload {createdAt}; a bookmark without one gets none',
+    r3.applied === 2 && find('wf-1').payload && find('wf-1').payload.createdAt === '2026-10-01T09:30:00.000Z'
+    && find('wf-1').children[0].id === 'wf-1-t' && !('payload' in find('wf-1-t')), JSON.stringify(find('wf-1')));
+wfOp[0].payload.nodes[0].payload.createdAt = 'changed later';
+check('  as its own copy, not the op\'s object', find('wf-1').payload.createdAt === '2026-10-01T09:30:00.000Z');
+const r4 = S.applyOps(wfOp, a);
+check('  and the same op again (the client that saved it) skips every id', r4.applied === 0 && r4.skipped === 2);
 
 console.log(failures === 0 ? '\nAll share-core tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exitCode = failures === 0 ? 0 : 1;

@@ -1040,6 +1040,10 @@ function applyServerOps(ops) {
                 const node = n.kind === 'folder'
                     ? { id: String(n.id), kind: 'folder', title: String(n.title || ''), children: [] }
                     : { id: String(n.id), kind: 'bookmark', title: String(n.title || ''), url: String(n.url || '') };
+                // A workflow saved on the server (POST /api/workflows) comes
+                // with its folder's {createdAt}: kept, or the next push from
+                // here would erase it for every device.
+                if (n.payload && typeof n.payload === 'object' && !Array.isArray(n.payload)) node.payload = clone(n.payload);
                 const siblings = parent ? (parent.children = parent.children || []) : state.roots;
                 siblings.push(node);
                 reindex();

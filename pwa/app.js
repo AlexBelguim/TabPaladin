@@ -3519,6 +3519,8 @@ function localAdapter(wrapper) {
             const node = spec.kind === 'folder'
                 ? { type: 'folder', title: spec.title, _pwaId: spec.id, children: [] }
                 : { type: 'bookmark', title: spec.title, url: spec.url, _pwaId: spec.id };
+            // Carried like a pulled node's (fromWire), so a push keeps it.
+            if (spec.payload) node._payload = spec.payload;
             const into = parent || wrapper;
             (into.children = into.children || []).push(node);
             nodes.set(String(spec.id), node);

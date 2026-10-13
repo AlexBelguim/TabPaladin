@@ -50,6 +50,9 @@
 //      and pushes again without asking. A gap with another device's push in
 //      it, a server without the log, another account's ops, or another copy
 //      brought in meanwhile folds nothing, and the 409 comes through as before.
+//  12. A workflow appended on the server (POST /api/workflows) folds in with
+//      its folder's payload {createdAt}; the copy that already holds it skips
+//      every id.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -1369,6 +1372,51 @@ console.log('\n15. A push that meets links filed from the phone folds them in');
     check('ops the server gives for another account are never folded into alex\'s copy', samOps === null && !(await TreeStore.getNode('sam-filed'))
         && TreeStore.status().baseVersion === alexBase);
     Object.assign(serverB, samSaved);
+    await clearStashes();
+}
+
+console.log('\n16. A workflow saved on the server folds in with its createdAt');
+{
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const asAlex = { url: MAIN, token: 'tok' };
+    await clearStashes();
+    await TreeStore.switchAccount({ ...alex });
+    server.opsLog = [];
+    server.noOpsRoute = false;
+    server.roots = [
+        { id: 'bm-root', kind: 'folder', role: 'bookmarks', title: 'Bookmarks', children: [] },
+        { id: 'wf-root', kind: 'folder', role: 'workflows', title: 'TabPaladin Workflows', children: [] }
+    ];
+    await TreeStore.sync.pull(asAlex);
+    // What POST /api/workflows logs: the folder with its payload, then its tabs.
+    const base = server.version;
+    server.version += 1;
+    const nodes = [
+        { id: 'wf-new-0001', parentId: 'wf-root', kind: 'folder', title: 'Research', payload: { createdAt: '2026-10-01T09:30:00.000Z' } },
+        { id: 'wf-tab-0001', parentId: 'wf-new-0001', kind: 'bookmark', title: 'One', url: 'https://one.example/' },
+        { id: 'wf-tab-0002', parentId: 'wf-new-0001', kind: 'bookmark', title: 'Two', url: 'https://two.example/' }
+    ];
+    server.roots[1].children.push({ id: 'wf-new-0001', kind: 'folder', title: 'Research', payload: { createdAt: '2026-10-01T09:30:00.000Z' }, children: [
+        { id: 'wf-tab-0001', kind: 'bookmark', title: 'One', url: 'https://one.example/' },
+        { id: 'wf-tab-0002', kind: 'bookmark', title: 'Two', url: 'https://two.example/' }
+    ] });
+    server.opsLog = [{ version: server.version, base, kind: 'append', payload: { nodes } }];
+    const folded = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
+    const wf = await TreeStore.getNode('wf-new-0001');
+    check('the workflow folder comes in with payload {createdAt}, its tabs inside, and is no edit here',
+        folded && folded.applied === 3 && wf && wf.payload && wf.payload.createdAt === '2026-10-01T09:30:00.000Z'
+        && wf.children.map(c => c.id).join() === 'wf-tab-0001,wf-tab-0002' && !wf.children.some(c => c.payload)
+        && !TreeStore.status().dirty, JSON.stringify({ folded, wf }));
+    const saved = (await StorageManager.getWorkflows()).find(w => w.id === 'wf-new-0001');
+    check('  so the workflow shows the date it was saved, not today', saved && saved.createdAt === '2026-10-01T09:30:00.000Z' && saved.tabs.length === 2);
+    // The client that saved it holds every id already: the same op again.
+    const before = server.version;
+    server.version += 1;
+    server.opsLog = [{ version: server.version, base: before, kind: 'append', payload: { nodes } }];
+    const again = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
+    check('  on the copy that already holds it, every id is skipped and the copy moves to the new version',
+        again && again.applied === 0 && again.skipped === 3 && TreeStore.status().baseVersion === server.version
+        && (await TreeStore.getNode('wf-new-0001')).children.length === 2, JSON.stringify(again));
     await clearStashes();
 }
 
