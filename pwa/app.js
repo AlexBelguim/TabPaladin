@@ -525,7 +525,12 @@ function renderContent() {
     }
     const node = findNodeByPath(state.pathIds);
     if (!node) {
-        root.innerHTML = '<div class="empty">Folder not found.</div>';
+        // No snapshot yet (offline start, failed pull): Home is reachable
+        // from Notes all the same, so say what is missing.
+        const why = state.snapshot ? 'Folder not found.'
+            : configured() ? 'Nothing loaded yet — use ⬇️ Pull once the server is reachable.'
+                : 'Open Settings (⚙) to configure your sync server.';
+        root.innerHTML = `<div class="empty">${why}</div>`;
         return;
     }
     // A path into the notes folder (left over from before Notes had a screen
@@ -1332,11 +1337,12 @@ function enterNotes() {
 }
 
 function goHome() {
-    if (!state.snapshot) return;
     if (!confirmDiscardEdit()) return;
     stopEditing();
     closeNotesSheets();
-    state.pathIds = [state.snapshot._pwaId];
+    // Notes opens without a snapshot too (offline start, failed pull), so
+    // Home must work without one; there is just no folder path to reset.
+    if (state.snapshot) state.pathIds = [state.snapshot._pwaId];
     if (state.view === 'notes' && navDepth > 0) {
         // Unwind to the Home entry so back from Home leaves the app, as it should.
         skipNavGuardOnce = true;
