@@ -538,12 +538,15 @@ posts to `/share`, which the **service worker** answers:
    folders, new ones and pins are a tap away.
 
 Offline, signed out, a session that expired, a server that refuses or never
-answers: the share stays in the outbox, a folder chosen offline is filed when
-the phone is back online (Background Sync where there is one, otherwise the
-next start), and the Inbox lists what waits. A share captured as one account
-is never uploaded to another without a yes. The worker cannot read
-`localStorage`, so the app mirrors the server URL, session token and account
-into a `tp-config` Cache Storage entry, cleared on sign-out.
+answers: the share stays in the outbox, every folder chosen meanwhile (each
+tap adds to the last, never replacing it) is filed when the phone is back
+online (Background Sync where there is one, otherwise coming back to the app
+or the next start), and the Inbox lists what waits. A share captured as one
+account is never uploaded to another without a yes: each request names the
+account it was kept for, and the server refuses it for any other. The worker
+cannot read `localStorage`, so the app window holding the session mirrors
+the server URL, session token and account into a `tp-config` Cache Storage
+entry, cleared on sign-out.
 
 The share reloads the app's window, so the app keeps its working copy and a
 half-written note in Cache Storage (`tp-data`) whenever it goes to the

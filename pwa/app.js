@@ -51,14 +51,34 @@ function forgetUser() {
     for (const k of [LS.token, LS.username, LS.userId, LS.role, LS.owner, LS.serverId]) localStorage.removeItem(k);
 }
 
-// The account signed in now, as an outbox entry records it, or null.
-function shareAccount() {
-    if (!configured() || accountChanging) return null;
+// Who this page's session is, as localStorage says it when the page takes
+// its token from there (at load) or puts one there (a sign-in).
+function storedIdentity() {
     return {
-        url: state.config.url.replace(/\/+$/, ''),
         userId: currentUserId(),
         username: localStorage.getItem(LS.username) || null,
         serverId: localStorage.getItem(LS.serverId) || null
+    };
+}
+
+// Is the session in localStorage this page's own? Another window of the app
+// may have signed in as someone else since this one took its token.
+function holdsStoredSession() {
+    return (localStorage.getItem(LS.token) || '') === (state.config.token || '');
+}
+
+// The account signed in now, as an outbox entry records it, or null: this
+// page's identity, kept with its token (state.identity), never what another
+// window wrote to localStorage since — shares are recorded and sent only as
+// the account this page's token is.
+function shareAccount() {
+    if (!configured() || accountChanging) return null;
+    const id = state.identity || {};
+    return {
+        url: state.config.url.replace(/\/+$/, ''),
+        userId: id.userId === undefined ? null : id.userId,
+        username: id.username || null,
+        serverId: id.serverId || null
     };
 }
 
@@ -82,6 +102,7 @@ const state = {
             || ((location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : ''),
         token: localStorage.getItem(LS.token) || ''
     },
+    identity: storedIdentity(),   // who that token is: see shareAccount
     snapshot: null,           // wrapper { type:'root', children: [...] } around the server's top-level folders
     snapshotUserId: null,     // the account that snapshot belongs to (from the pull)
     snapshotUsername: null,   // its name, kept for the sign-in guard after a sign-out
@@ -140,6 +161,9 @@ const SW_CONFIG_KEY = '/__tp_config';
 
 async function mirrorConfigToSW() {
     if (!('caches' in window)) return;
+    // Only the window holding the session localStorage has: a window still on
+    // an older one never points the worker at its account, or signs it out.
+    if (!holdsStoredSession()) return;
     try {
         const cache = await caches.open(SW_CONFIG_CACHE);
         const cfg = shareConfig();
@@ -213,11 +237,12 @@ function signedOutRefuses(message = 'Sign in first — changes go into your acco
 
 async function api(path, opts = {}) {
     if (!configured()) throw new Error('Server not configured. Open Settings.');
+    const used = state.config.token;
     const res = await fetch(state.config.url.replace(/\/$/, '') + path, {
         ...opts,
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + state.config.token,
+            'Authorization': 'Bearer ' + used,
             ...(opts.headers || {})
         }
     });
@@ -225,12 +250,19 @@ async function api(path, opts = {}) {
         // The session expired or was revoked — say so plainly and send the user
         // to sign in, rather than surfacing a bare 401 from somewhere deep in
         // the app. The worker's copy of the token goes too, or it would keep
-        // posting shares with a dead one. Unpushed edits stay in memory.
-        state.config.token = '';
-        localStorage.removeItem(LS.token);
-        mirrorConfigToSW();
-        setStatus('Session expired — sign in again.');
-        try { refreshAuthUi(); show($('settings-sheet')); } catch (e) { /* pre-DOM */ }
+        // posting shares with a dead one. Unpushed edits stay in memory. Only
+        // that session: a request still on its way from before a sign-out
+        // and another sign-in leaves the new one alone.
+        if (state.config.token === used) {
+            const stored = holdsStoredSession();
+            state.config.token = '';
+            if (stored) {
+                localStorage.removeItem(LS.token);
+                mirrorConfigToSW();
+            }
+            setStatus('Session expired — sign in again.');
+            try { refreshAuthUi(); show($('settings-sheet')); } catch (e) { /* pre-DOM */ }
+        }
         const err = new Error('Signed out');
         err.status = 401;
         throw err;
@@ -269,7 +301,9 @@ async function bootstrap() {
     // On the first start of this page: the working copy kept when the app
     // last went to the background, so a share that reloaded the window, or
     // the phone closing the app, loses no unpushed edit or half-written note.
-    const restored = booted ? null : await restoreTreeCache();
+    // Later, after a sign-in: a copy with work in it kept for another
+    // account, which has it back once that account is the one signing in.
+    const restored = !booted || (foreignKeptCopy && configured()) ? await restoreTreeCache() : null;
     booted = true;
 
     // The sheet's pins and statistics as kept on the phone, before it draws:
@@ -3488,6 +3522,10 @@ function applyUnfiled(res) {
 
 function applyFiling(res, kind, list) {
     if (!res || !state.snapshot || !configured() || !copyIsMine()) return;
+    // A filing names the account and server whose tree it changed: never
+    // folded into another's copy (an answer that arrived after a sign-in).
+    if (res.userId !== undefined && res.userId !== null && state.snapshotUserId != null && Number(res.userId) !== Number(state.snapshotUserId)) return;
+    if (res.serverId && state.snapshotServerId && res.serverId !== state.snapshotServerId) return;
     const copy = state.snapshot;
     Share.applyOps([{ kind, payload: kind === 'append' ? { nodes: list } : { items: list } }], localAdapter(copy));
     for (const n of list) {
@@ -3713,6 +3751,9 @@ async function flushShares(sids = null) {
     } catch (e) {
         return null;
     }
+    // What it filed went into the tree of the account it flushed as; signed
+    // out, or in as someone else, by now, none of it is this copy's.
+    if (!stillSignedInAs(cfg)) return res;
     for (const f of res.filed) applyFiled(f.result);
     if (res.filed.length) loadShareStats();
     if (shareSheet) shareSheet.onFlushed(res);
@@ -3723,6 +3764,13 @@ async function flushShares(sids = null) {
     return res;
 }
 
+// Is the account something was started for (a flush, a fetch) still the one
+// signed in? Its answer is dropped otherwise.
+function stillSignedInAs(account) {
+    const now = shareConfig();
+    return Boolean(account && now) && Share.sameAccount(Share.accountOf({ ...account, token: account.token || 'x' }), now);
+}
+
 function registerShareSync() {
     try {
         if (!('serviceWorker' in navigator) || !navigator.serviceWorker || !navigator.serviceWorker.ready) return;
@@ -3730,22 +3778,23 @@ function registerShareSync() {
     } catch (e) { /* no Background Sync: the next start or 'online' sends it */ }
 }
 
-// Shares made while nobody, or another account, was signed in: offered to
-// the account signing in now, never sent on its own. (The share sheet asks
-// for the one it shows.)
+// Shares made while nobody was signed in: offered to the account signing in
+// now, never sent on their own. (The share sheet asks for the one it shows.)
+// One kept for another account is not offered here: it is that account's,
+// and waits in the Inbox under its name, with Upload to <you> for a yes.
 async function offerUnclaimedShares() {
     const me = shareConfig();
     if (!me) return;
     let list = [];
     try { list = await outbox.list(); } catch (e) { return; }
-    const others = list.filter(e => e.url && !Share.sameAccount(e.account, me) && !(shareSheet && shareSheet.current() === e.sid));
+    const others = list.filter(e => e.url && !e.account && !e.uploaded && !(shareSheet && shareSheet.current() === e.sid));
     if (!others.length) return;
     const n = others.length;
-    const who = localStorage.getItem(LS.username) || 'this account';
+    const who = me.username || 'this account';
     if (confirm(`${n} link${n === 1 ? ' was' : 's were'} shared while signed out — add ${n === 1 ? 'it' : 'them'} to ${who}'s inbox?`)) {
         const account = shareAccount();
         // Into the inbox: once uploaded they leave the phone.
-        for (const e of others) await outbox.update(e.sid, (c) => ({ ...c, account, later: true })).catch(() => {});
+        for (const e of others) await outbox.update(e.sid, (c) => (c.account ? null : { ...Share.claimEntry(c, account), later: true })).catch(() => {});
         const res = await flushShares(others.map(e => e.sid));
         if (res && res.uploaded.length) showToast(`${res.uploaded.length} shared link${res.uploaded.length === 1 ? '' : 's'} added`);
         return;
@@ -3845,8 +3894,11 @@ function saveTreeCache() {
     return treeCacheWrite;
 }
 
+// The copy kept on the phone goes — the copy of the account signing in or
+// out. One kept for another account with work in it (foreignKeptCopy) is not
+// that copy: it stays until its own account signs in and has it back.
 function clearTreeCache() {
-    foreignKeptCopy = null;
+    if (foreignKeptCopy) return treeCacheWrite;
     treeCacheWrite = treeCacheWrite.then(() => writeData(TREE_KEY, null));
     return treeCacheWrite;
 }
@@ -3866,6 +3918,8 @@ async function restoreTreeCache() {
     }
     // A clean copy waits for nobody: signed out, there is nothing to keep it for.
     if (!signedIn && !holdsWork) return null;
+    // Its own account (or, signed out, the one it waits for) has it back.
+    if (signedIn) foreignKeptCopy = null;
     const acct = rec.account || {};
     state.snapshot = { type: 'root', title: '', children: rec.roots.map(fromWire) };
     const rootId = getRootId(state.snapshot);
@@ -3926,8 +3980,11 @@ async function loadKeptShareData() {
 async function loadShareStats() {
     await loadKeptShareData();
     if (!configured()) return;
+    const asked = shareConfig();
     try {
         const r = await api('/api/shares/stats');
+        // Another account signed in while it was asked: not theirs.
+        if (!stillSignedInAs(asked)) return;
         shareStats = { apps: r.apps || {} };
         writeData(STATS_KEY, { account: shareAccount(), stats: shareStats, fetchedAt: new Date().toISOString() });
         if (shareSheet) shareSheet.refresh();
@@ -3952,12 +4009,14 @@ function keepSharePrefs() {
 async function loadSharePrefs() {
     await loadKeptShareData();
     if (!configured()) return;
+    const asked = shareConfig();
     try {
         const r = await api('/api/prefs/share');
+        if (!stillSignedInAs(asked)) return;
         sharePrefs.value = mergeSharePrefs(r.value, sharePrefs.value, sharePrefs.dirty);
         sharePrefs.updatedAt = r.updatedAt || null;
     } catch (e) {
-        if (e.status !== 404) return; // offline: what is kept stands
+        if (e.status !== 404 || !stillSignedInAs(asked)) return; // offline: what is kept stands
     }
     if (sharePrefs.dirty.length) await pushSharePrefs();
     keepSharePrefs();
@@ -4066,7 +4125,7 @@ function makeShareSheet() {
         outbox,
         signedIn: () => configured() && !accountChanging,
         account: shareAccount,
-        username: () => localStorage.getItem(LS.username) || 'this account',
+        username: () => (state.identity && state.identity.username) || localStorage.getItem(LS.username) || 'this account',
         copy: shareCopy,
         flush: (sids) => flushShares(sids),
         api,
@@ -4134,11 +4193,26 @@ function openSettings() {
 // accounts never learned it at sign-in.
 async function refreshWhoAmI() {
     if (!configured()) return null;
+    const token = state.config.token;
     try {
         const data = await api('/api/auth/me');
-        rememberUser(data.user, undefined, data.serverId);
-        // The worker records shares under this account: tell it who it is.
-        mirrorConfigToSW();
+        // Signed out, or in as someone else, while it was asked.
+        if (state.config.token !== token) return null;
+        const user = data.user || {};
+        if (holdsStoredSession()) {
+            rememberUser(user, undefined, data.serverId);
+            state.identity = storedIdentity();
+            // The worker records shares under this account: tell it who it is.
+            mirrorConfigToSW();
+        } else {
+            // Another window has signed in since: localStorage is its session.
+            // This page learns who its own token is, and writes nothing there.
+            state.identity = {
+                userId: user.id === undefined || user.id === null ? null : Number(user.id),
+                username: user.username || (state.identity && state.identity.username) || null,
+                serverId: data.serverId || null
+            };
+        }
         return data.user;
     } catch (e) {
         return null;
@@ -4481,6 +4555,7 @@ async function submitAuth() {
         localStorage.setItem(LS.username, name);
         if (!sameAccount) localStorage.removeItem(LS.serverId);
         rememberUser(user, name, data.serverId);
+        state.identity = storedIdentity();
         mirrorConfigToSW();
         if (!sameAccount) {
             // A clean copy of someone else's: nothing of theirs is lost, and
@@ -4580,6 +4655,7 @@ async function signOut() {
     } catch (e) { waiting = 0; }
     state.config.token = '';
     forgetUser();
+    state.identity = null;
     mirrorConfigToSW();
     state.keptDraft = keepDraft ? { ...state.nv } : null;
     if (!kept) {
@@ -5172,6 +5248,8 @@ window.addEventListener('DOMContentLoaded', () => {
         navigator.serviceWorker.addEventListener('message', (e) => {
             const data = e.data || {};
             if (data.type !== 'tp-outbox' || !data.result) return;
+            // Only what it did as the account this page is signed in as.
+            if (data.account && !stillSignedInAs(data.account)) return;
             for (const f of data.result.filed || []) applyFiled(f.result);
             if (shareSheet) shareSheet.onFlushed(data.result);
             refreshInbox();
