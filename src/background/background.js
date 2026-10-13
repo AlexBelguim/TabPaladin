@@ -8,6 +8,23 @@ const TRACK_STORE_KEY = 'tpOpenWorkflowTabs'; // { [tabId]: { workflowId, bookma
 const APP_PAGE = 'src/app/app.html';
 
 
+// --- Who may talk to this script ---
+//
+// Only this extension's own pages: the sender is this extension, and the
+// message comes from a page on the extension's own origin. A content script
+// is this extension too, but it runs inside a web page, so its sender.url is
+// that page's address and it is refused here — nothing a web page can make
+// a content script say reaches tracking.
+//
+// Not !sender.tab: the app page (src/app/app.html) runs in a tab, so its
+// messages carry one.
+function fromExtensionPage(sender) {
+    if (!sender || sender.id !== api.runtime.id) return false;
+    const base = api.runtime.getURL('');
+    return typeof sender.url === 'string' && sender.url.startsWith(base);
+}
+
+
 // --- Opening the app ---
 //
 // The toolbar icon opens a full browser tab. This used to call
@@ -42,51 +59,112 @@ if (api.action && api.action.onClicked) {
     api.browserAction.onClicked.addListener(openApp);
 }
 
-api.runtime.onInstalled.addListener(() => {
-    // Clear stale tracking from previous session
-    api.storage.local.remove(TRACK_STORE_KEY).catch(() => {});
+
+// --- One writer for tracking and the removal queue ---
+//
+// Every write to the tracking map and to the removal queue goes through this
+// one chain. Closing several tracked tabs at once fires onRemoved for each of
+// them together; when each handler read the map and the queue, changed them
+// and wrote them back on its own, they overwrote one another and entries were
+// lost.
+//
+// The queue is also read by the extension pages (TreeStore applies and
+// clears it), so appending to it additionally holds the 'tp-pending-removals'
+// lock that TreeStore takes to read and clear it: an id appended while a page
+// takes the queue is never cleared with it unapplied.
+let chain = Promise.resolve();
+function serialized(fn) {
+    const run = chain.then(() => fn());
+    chain = run.catch(() => {});
+    return run;
+}
+
+const REMOVALS_LOCK = 'tp-pending-removals';
+function withRemovalsLock(fn) {
+    const locks = typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
+        ? navigator.locks : null;
+    return locks ? locks.request(REMOVALS_LOCK, () => fn()) : fn();
+}
+
+// Tab ids seen closing while this script ran, so pruning (below) never takes
+// an entry its onRemoved handler is still about to deal with.
+const seenRemoved = new Set();
+
+api.runtime.onInstalled.addListener((details) => {
+    // Only a fresh install starts from nothing. An update keeps the map: the
+    // tabs of open workflow windows keep their ids across it, and clearing it
+    // silently stopped auto-sync for every workflow window open at the time.
+    if (details && details.reason === 'install') {
+        serialized(() => api.storage.local.remove(TRACK_STORE_KEY)).catch(() => {});
+    }
+    syncVideoSeek();
 });
 
 if (api.runtime.onStartup) {
+    // A browser restart gives every tab a new id: the old entries name nothing.
     api.runtime.onStartup.addListener(() => {
-        api.storage.local.remove(TRACK_STORE_KEY).catch(() => {});
+        serialized(() => api.storage.local.remove(TRACK_STORE_KEY)).catch(() => {});
     });
 }
 
 // --- Workflow tab tracking ---
 async function getTrackMap() {
     const data = await api.storage.local.get(TRACK_STORE_KEY);
-    return data[TRACK_STORE_KEY] || {};
+    return (data && data[TRACK_STORE_KEY]) || {};
 }
 
 async function setTrackMap(map) {
     await api.storage.local.set({ [TRACK_STORE_KEY]: map });
 }
 
+// Entries whose tab is gone are dropped on each wake. A tab can close while
+// nothing here listens (the update itself, a crash); dropping its entry only
+// ever keeps a bookmark in its workflow, never removes one.
+async function pruneGoneTabs() {
+    const map = await getTrackMap();
+    const ids = Object.keys(map);
+    if (!ids.length) return;
+    let open;
+    try {
+        open = new Set((await api.tabs.query({})).map(t => String(t.id)));
+    } catch (e) {
+        return;
+    }
+    let changed = false;
+    for (const id of ids) {
+        if (open.has(id) || seenRemoved.has(Number(id))) continue;
+        delete map[id];
+        changed = true;
+    }
+    if (changed) await setTrackMap(map);
+}
+// After the event that woke this script has been handed to its listener.
+setTimeout(() => { serialized(pruneGoneTabs).catch(() => {}); }, 1000);
+
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || !msg.type) return;
+    if (!msg || typeof msg.type !== 'string') return;
+    if (!fromExtensionPage(sender)) return;
 
     if (msg.type === 'TP_TRACK_WORKFLOW_TABS') {
-        (async () => {
+        serialized(async () => {
             const map = await getTrackMap();
-            for (const e of msg.entries || []) {
-                map[e.tabId] = { workflowId: msg.workflowId, bookmarkId: e.bookmarkId };
+            for (const e of Array.isArray(msg.entries) ? msg.entries : []) {
+                if (!e || e.tabId === undefined || e.tabId === null || !e.bookmarkId) continue;
+                map[e.tabId] = { workflowId: msg.workflowId, bookmarkId: String(e.bookmarkId) };
             }
             await setTrackMap(map);
-            sendResponse({ ok: true });
-        })();
+        }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
         return true; // async response
     }
 
     if (msg.type === 'TP_UNTRACK_WORKFLOW') {
-        (async () => {
+        serialized(async () => {
             const map = await getTrackMap();
             for (const tabId of Object.keys(map)) {
                 if (map[tabId].workflowId === msg.workflowId) delete map[tabId];
             }
             await setTrackMap(map);
-            sendResponse({ ok: true });
-        })();
+        }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
         return true;
     }
 });
@@ -102,31 +180,40 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 const PENDING_REMOVALS_KEY = 'tpPendingRemovals';
 
 async function queueTreeRemoval(id) {
-    const data = await api.storage.local.get(PENDING_REMOVALS_KEY);
-    const list = (data && data[PENDING_REMOVALS_KEY]) || [];
-    if (!list.includes(id)) list.push(id);
-    await api.storage.local.set({ [PENDING_REMOVALS_KEY]: list });
+    await withRemovalsLock(async () => {
+        const data = await api.storage.local.get(PENDING_REMOVALS_KEY);
+        const list = (data && data[PENDING_REMOVALS_KEY]) || [];
+        if (!list.includes(id)) list.push(id);
+        await api.storage.local.set({ [PENDING_REMOVALS_KEY]: list });
+    });
 }
 
-// Auto-sync: when a tracked tab closes, remove its bookmark from the workflow
-api.tabs.onRemoved.addListener(async (tabId) => {
-    try {
-        const map = await getTrackMap();
-        const entry = map[tabId];
-        if (!entry) return;
+// Closing a whole workflow window keeps its tabs in the workflow; closing
+// single tabs still removes them. (Owner decision; the helper in a later
+// release makes this a setting.)
+const WINDOW_CLOSE_POLICY = 'keep';
 
-        try {
-            await queueTreeRemoval(entry.bookmarkId);
-        } catch (e) {
-            // Bookmark already gone — fine
-        }
-
-        delete map[tabId];
-        await setTrackMap(map);
-    } catch (e) {
-        console.warn("TabPaladin autosync error:", e);
+// Auto-sync: when a tracked tab closes, remove its bookmark from the workflow.
+// The removal is queued before the entry is untracked: stopped in between, the
+// same id is queued again at worst, which is harmless.
+async function untrackClosedTab(tabId, removeInfo) {
+    const map = await getTrackMap();
+    const entry = map[tabId];
+    if (!entry) return;
+    const windowClosing = Boolean(removeInfo && removeInfo.isWindowClosing);
+    if (!(windowClosing && WINDOW_CLOSE_POLICY === 'keep')) {
+        await queueTreeRemoval(entry.bookmarkId);
     }
+    delete map[tabId];
+    await setTrackMap(map);
+}
+
+api.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    seenRemoved.add(tabId);
+    serialized(() => untrackClosedTab(tabId, removeInfo))
+        .catch((e) => console.warn('TabPaladin autosync error:', e));
 });
+
 
 // --- Video scroll-seek (opt-in) ---
 //

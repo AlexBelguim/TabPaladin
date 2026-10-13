@@ -161,19 +161,33 @@ function emit(kind) {
 // context owns a live working copy applies them against its own current state.
 const PENDING_REMOVALS_KEY = 'tpPendingRemovals';
 
+// The background appends to the queue holding this lock, and every page takes
+// and clears it holding it too, so an id appended while a page takes the
+// queue is never cleared with it unapplied. Never asked for while held, and
+// never held while asking for the working-copy lock.
+const REMOVALS_LOCK = 'tp-pending-removals';
+function withRemovalsLock(fn) {
+    const locks = typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
+        ? navigator.locks : null;
+    return locks ? locks.request(REMOVALS_LOCK, () => fn()) : fn();
+}
+
 async function applyPendingRemovals() {
-    let list = [];
+    let step = null;
+    let removed = false;
     try {
-        const data = await api.storage.local.get(PENDING_REMOVALS_KEY);
-        list = (data && data[PENDING_REMOVALS_KEY]) || [];
+        await withRemovalsLock(async () => {
+            const data = await api.storage.local.get(PENDING_REMOVALS_KEY);
+            const list = (data && data[PENDING_REMOVALS_KEY]) || [];
+            if (!list.length) return;
+            step = removeStep(list.map(String));
+            removed = step();
+            try { await api.storage.local.remove(PENDING_REMOVALS_KEY); } catch (e) { /* retried next load */ }
+        });
     } catch (e) {
         return;
     }
-    if (!list.length) return;
-    const step = removeStep(list.map(String));
-    const removed = step();
-    try { await api.storage.local.remove(PENDING_REMOVALS_KEY); } catch (e) { /* retried next load */ }
-    if (removed) {
+    if (step && removed) {
         recordEdit(step);
         emit('removed');
     }
@@ -857,17 +871,21 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
     if (pendingOps.length) await writeCopy();
     if (!state.roots.length && !state.dirty) return null;
     const settings = await readSettings();
-    let pendingRemovals = [];
-    try {
-        pendingRemovals = ((await api.storage.local.get(PENDING_REMOVALS_KEY)) || {})[PENDING_REMOVALS_KEY] || [];
-    } catch (e) { /* nothing queued */ }
     let expanded = {};
     try { expanded = await ExpandState.entriesFor((id) => index.has(id)); } catch (e) { /* UI state only */ }
-    const key = await writeStash(record(), {
-        fallbackUrl, username, focusedFolderIds: settings.focusedFolderIds || [], expanded, pendingRemovals
+    // The queue goes with the copy, taken and cleared in one go (see
+    // withRemovalsLock), so nothing the background appends meanwhile is lost.
+    return withRemovalsLock(async () => {
+        let pendingRemovals = [];
+        try {
+            pendingRemovals = ((await api.storage.local.get(PENDING_REMOVALS_KEY)) || {})[PENDING_REMOVALS_KEY] || [];
+        } catch (e) { /* nothing queued */ }
+        const key = await writeStash(record(), {
+            fallbackUrl, username, focusedFolderIds: settings.focusedFolderIds || [], expanded, pendingRemovals
+        });
+        if (pendingRemovals.length) await api.storage.local.remove(PENDING_REMOVALS_KEY);
+        return key;
     });
-    if (pendingRemovals.length) await api.storage.local.remove(PENDING_REMOVALS_KEY);
-    return key;
 }
 
 // A set-aside copy of `copy` (as record() gives it). It says which copy it was
@@ -963,7 +981,12 @@ async function loadCopy(stash, owner) {
         try { await ExpandState.restore(stash.expanded); } catch (e) { /* UI state only */ }
     }
     if (stash && (stash.pendingRemovals || []).length) {
-        await api.storage.local.set({ [PENDING_REMOVALS_KEY]: stash.pendingRemovals });
+        // Added to whatever the background queued meanwhile, not over it.
+        await withRemovalsLock(async () => {
+            const queued = ((await api.storage.local.get(PENDING_REMOVALS_KEY)) || {})[PENDING_REMOVALS_KEY] || [];
+            const merged = [...queued, ...stash.pendingRemovals.filter(id => !queued.includes(id))];
+            await api.storage.local.set({ [PENDING_REMOVALS_KEY]: merged });
+        });
         await applyPendingRemovals();
     }
     await writeCopy();
