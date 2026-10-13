@@ -21,6 +21,7 @@ import {
 } from './tenancy.js';
 import { attachPrefs } from './prefs.js';
 import { loadOrCreateIdentity, attachIdentity, IDENTITY_APP, IDENTITY_FILE } from './identity.js';
+import { attachWorkflowRoutes } from './workflows.js';
 import { attachUserAdmin } from './admin.js';
 import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
 
@@ -314,10 +315,13 @@ app.use(cors((req, cb) => {
     });
 }));
 
-// Small bodies everywhere except a tree push, which carries the whole tree.
+// Small bodies everywhere except a tree push, which carries the whole tree,
+// and a saved workflow, which may carry 500 long URLs (its route parses it).
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
-app.use((req, res, next) => (req.method === 'PUT' && req.path === '/api/tree' ? next() : jsonSmall(req, res, next)));
+const ownBodyParser = (req) => (req.method === 'PUT' && req.path === '/api/tree')
+    || (req.method === 'POST' && req.path === '/api/workflows');
+app.use((req, res, next) => (ownBodyParser(req) ? next() : jsonSmall(req, res, next)));
 
 // Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
 app.use('/api', (req, res, next) => {
@@ -517,6 +521,11 @@ const { store: importsStore } = attachImports(app, {
 // After the importers, because X and Instagram shares go to their archive.
 const shares = makeSharesStore(db, { items, importsStore, maxPending: MAX_INBOX_PER_USER });
 attachShareRoutes(app, { store: shares, items, requireAuth, serverId: SERVER_ID });
+
+// --- Saved workflows ---
+// One workflow appended under the account's workflows root, without the rest
+// of the client's copy (workflows.js). Logged in the same ops log.
+attachWorkflowRoutes(app, { items, requireAuth, serverId: SERVER_ID });
 
 // --- The tree ---
 //
