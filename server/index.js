@@ -5,16 +5,22 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { attachImports } from './imports/index.js';
+import { attachImports, initSchema as initImportsSchema } from './imports/index.js';
 import { buildImportsTree } from './imports/project.js';
-import { makeItemsStore } from './items.js';
+import { makeItemsStore, ForeignIdError } from './items.js';
 import {
     authTokenProblem, hashPassword, verifyPassword, makeRateLimiter
 } from './security.js';
 import {
-    backupDatabase, migrateUsers, setSchemaVersion, bootstrapAdmin, userCount as countUsers,
-    userByName, publicUser, presentedToken, identify, MIN_PASSWORD_LENGTH
+    backupDatabase, backupNow, latestBackup, migrateUsers, setSchemaVersion, bootstrapAdmin,
+    userCount as countUsers, userById, userByName, publicUser, presentedToken, identify,
+    tenancyOwnerId, legacyTokenUserId, MIN_PASSWORD_LENGTH, SCHEMA_VERSION
 } from './users.js';
+import {
+    initTenancySchema, migrateOwnership, preflight, writeRefusal, checkOwnership, serverId
+} from './tenancy.js';
+import { attachPrefs } from './prefs.js';
+import { attachUserAdmin } from './admin.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,6 +29,10 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PWA_DIR = process.env.PWA_DIR || path.resolve(__dirname, '..', 'pwa');
 const MAX_SNAPSHOTS = Number(process.env.MAX_SNAPSHOTS || 200);
+// Per-account caps. They refuse new rows and never prune existing ones: one
+// account filling the disk would otherwise make everyone's pushes fail.
+const MAX_INBOX_PER_USER = Math.max(1, Number(process.env.MAX_INBOX_PER_USER || 5000));
+const MAX_PROPOSALS_PER_USER = Math.max(1, Number(process.env.MAX_PROPOSALS_PER_USER || 200));
 
 // Refuse to run with a guessable legacy token: real deployments are reachable
 // from the internet, and "authenticated" with a published value is worse than
@@ -54,11 +64,36 @@ const DB_PATH = path.join(DATA_DIR, 'sync.db');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
-// Before any migration below touches the data: a consistent copy next to it,
-// sync.db.bak-<timestamp>. Taken whenever the schema is about to change and
-// otherwise at most daily; the newest BACKUP_KEEP are kept.
-const backup = backupDatabase(db, DB_PATH, { keep: Math.max(1, Number(process.env.BACKUP_KEEP || 7)) });
-if (backup) console.log(`[TabPaladin] Backed up the database to ${backup}`);
+// --- Boot ---
+//
+// The order matters and each step says why:
+//   1. preflight, before anything is written — a database from a newer build,
+//      a migration refused on an earlier boot, or too little disk all stop
+//      here, without taking yet another backup;
+//   2. the boot backup;
+//   3. the schema: CREATE IF NOT EXISTS and additive ALTERs only;
+//   4. the first admin, so a token-only database has an owner to migrate to;
+//   5. the ownership migration, one transaction, refused rather than guessed;
+//   6. the schema version and, the first time, a post-migration copy;
+//   7. ownership warnings, then the owner's own boot steps;
+//   8. routes and the import scheduler, then listen.
+const pre = preflight(db, DB_PATH, { schemaVersion: SCHEMA_VERSION });
+if (!pre.ok) {
+    console.error(`[TabPaladin] Refusing to start: ${pre.error}`);
+    process.exit(1);
+}
+
+// Before any migration below touches the data: a consistent copy next to it.
+// sync.db.pre-v<N>-<timestamp> before a schema step (kept, never rotated), and
+// otherwise sync.db.bak-<timestamp> at most daily, the newest BACKUP_KEEP kept.
+try {
+    const backup = backupDatabase(db, DB_PATH, { keep: Math.max(1, Number(process.env.BACKUP_KEEP || 7)) });
+    if (backup) console.log(`[TabPaladin] Backed up the database to ${backup}`);
+} catch (e) {
+    console.error(`[TabPaladin] Refusing to start: the boot backup failed (${e.message}). Nothing was changed.`);
+    process.exit(1);
+}
+const schemaBackup = latestBackup(DB_PATH, `pre-v${SCHEMA_VERSION}-`);
 
 db.exec(`
     -- History of the tree. Rows written before the items table existed hold
@@ -116,29 +151,11 @@ db.exec(`
 try { db.prepare('ALTER TABLE note_proposals ADD COLUMN notebook TEXT').run(); } catch (e) { /* column already exists */ }
 try { db.prepare("ALTER TABLE note_proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'").run(); } catch (e) { /* column already exists */ }
 migrateUsers(db);
-
-// The canonical tree. On the first boot after the upgrade this converts the
-// newest browser-tree snapshot into rows, so nothing is lost switching over.
+initTenancySchema(db);
+initImportsSchema(db);
+// The canonical tree. CREATE TABLE only here; everything that reads or writes
+// it goes through items.forUser(id).
 const items = makeItemsStore(db, { maxSnapshots: MAX_SNAPSHOTS });
-const migration = items.migrateFromLatestSnapshotIfNeeded();
-if (migration.migrated) {
-    console.log(`[TabPaladin] Migrated latest snapshot into the items table (${migration.nodes} nodes).`);
-}
-
-const healed = items.healDuplicateRoles();
-if (healed.healed) {
-    console.log(`[TabPaladin] Merged duplicate role folders: ${healed.roles.join(', ')}.`);
-}
-
-// One bookmarks folder, called Bookmarks, holding everything else. Idempotent:
-// a tree that already has one is left exactly as the user arranged it.
-const bookmarksRoot = items.ensureBookmarksRoot();
-if (bookmarksRoot.created) {
-    console.log('[TabPaladin] Created the Bookmarks root.');
-} else if (bookmarksRoot.renamedFrom) {
-    console.log(`[TabPaladin] Designated "${bookmarksRoot.renamedFrom}" as the Bookmarks root`
-        + (bookmarksRoot.moved ? ` and moved ${bookmarksRoot.moved} top-level folder(s) into it.` : '.'));
-}
 
 // --- Accounts ---
 //
@@ -157,7 +174,81 @@ if (boot.created) {
     console.log(`[TabPaladin] Created admin account "${boot.created.username}"`
         + (boot.fromToken ? ' with AUTH_TOKEN as its password (no ADMIN_PASSWORD was set).' : ' from ADMIN_PASSWORD.'));
 }
+
+// --- Ownership ---
+//
+// Every row names the account it belongs to. The first boot of this version
+// assigns everything to the one account that existed (or to TENANCY_OWNER),
+// proves nothing else changed, and is refused — rolled back, marker written,
+// server stopped — rather than guessing. See tenancy.js.
+let tenancy;
+try {
+    tenancy = migrateOwnership(db, {
+        env: process.env,
+        bootstrappedUserIds: boot.created ? [boot.created.id] : []
+    });
+} catch (e) {
+    const marker = writeRefusal(DATA_DIR, e, schemaBackup);
+    console.error(`[TabPaladin] Tenancy migration refused, nothing changed, backup at ${schemaBackup || '(none)'}: ${e.message}`);
+    console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
+    process.exit(1);
+}
 setSchemaVersion(db);
+if (tenancy.migrated) {
+    // A frozen copy of the database right after the migration, before any
+    // client can push: verify_tenancy.js compares it with the pre-v3 copy.
+    // A brand-new database had nothing to compare, so it gets none.
+    let postCopy = '(none)';
+    if (schemaBackup) {
+        try {
+            postCopy = backupNow(db, DB_PATH, `post-v${SCHEMA_VERSION}`);
+        } catch (e) {
+            console.warn(`[TabPaladin] Could not write the post-migration copy: ${e.message}`);
+        }
+    }
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    console.log(`[TabPaladin] Tenancy migration: assigned ${tenancy.total} rows to ${tenancy.owner.username} (#${tenancy.owner.id}); `
+        + `recovered ${tenancy.recovered} removed import source(s); `
+        + `pre-upgrade copy ${schemaBackup ? path.basename(schemaBackup) : '(none)'}; post-upgrade copy ${path.basename(postCopy)}`);
+} else if (tenancy.adoptedTotal) {
+    console.warn(`[TabPaladin] Adopted ${tenancy.adoptedTotal} unowned row(s) as ${tenancy.adoptedTo.username}'s: `
+        + Object.entries(tenancy.adopted).map(([t, n]) => `${t} ${n}`).join(', '));
+}
+for (const warning of checkOwnership(db)) console.warn(`[TabPaladin] Ownership: ${warning}`);
+// Sent with every sign-in and tree response, so a client can tell this
+// server's accounts from another server's with the same ids (see tenancy.js).
+const SERVER_ID = serverId(db);
+
+// The owner's boot steps, only while the owner exists: rows for an account
+// that is gone would be refused by the guards anyway.
+const ownerId = tenancyOwnerId(db);
+if (ownerId !== null && userById(db, ownerId)) {
+    const ownerItems = items.forUser(ownerId);
+    // On the first boot after the items table arrived, this converts the
+    // newest browser-tree snapshot into rows, so nothing is lost switching over.
+    const migration = ownerItems.migrateFromLatestSnapshotIfNeeded();
+    if (migration.migrated) {
+        console.log(`[TabPaladin] Migrated latest snapshot into the items table (${migration.nodes} nodes).`);
+    }
+    // One bookmarks folder, called Bookmarks, holding everything else.
+    // Idempotent: a tree that already has one is left exactly as arranged.
+    const bookmarksRoot = ownerItems.ensureBookmarksRoot();
+    if (bookmarksRoot.created) {
+        console.log('[TabPaladin] Created the Bookmarks root.');
+    } else if (bookmarksRoot.renamedFrom) {
+        console.log(`[TabPaladin] Designated "${bookmarksRoot.renamedFrom}" as the Bookmarks root`
+            + (bookmarksRoot.moved ? ` and moved ${bookmarksRoot.moved} top-level folder(s) into it.` : '.'));
+    }
+} else {
+    console.warn('[TabPaladin] The tenancy owner account no longer exists; skipping its boot steps.');
+}
+const healed = items.healAllUsers();
+for (const h of healed.users) {
+    console.log(`[TabPaladin] Merged duplicate role folders for account #${h.userId}: ${h.roles.join(', ')}.`);
+}
+if (AUTH_TOKEN && legacyTokenUserId(db) !== null && !userById(db, legacyTokenUserId(db))) {
+    console.warn('[TabPaladin] AUTH_TOKEN is set but the account it acts as no longer exists; requests with it get 401.');
+}
 
 const app = express();
 // So req.protocol and req.ip reflect X-Forwarded-* behind a reverse proxy. Not
@@ -203,19 +294,31 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-// Failed sign-in attempts per client IP.
-const authLimiter = makeRateLimiter({
-    max: Number(process.env.AUTH_MAX_FAILURES || 10),
-    windowMs: Number(process.env.AUTH_WINDOW_MINUTES || 15) * 60 * 1000
+// Failed sign-in attempts per client IP and username, so a household behind
+// one NAT does not share a single budget — one person's typos must not lock
+// out everyone else — plus a looser ceiling per IP against a guesser cycling
+// through usernames.
+const AUTH_MAX_FAILURES = Number(process.env.AUTH_MAX_FAILURES || 10);
+const AUTH_WINDOW_MS = Number(process.env.AUTH_WINDOW_MINUTES || 15) * 60 * 1000;
+const authLimiter = makeRateLimiter({ max: AUTH_MAX_FAILURES, windowMs: AUTH_WINDOW_MS });
+const ipLimiter = makeRateLimiter({
+    max: Number(process.env.AUTH_IP_MAX_FAILURES || AUTH_MAX_FAILURES * 5),
+    windowMs: AUTH_WINDOW_MS
 });
+const limiterKey = (req, username) => `${req.ip}:${String(username || '').trim().toLowerCase()}`;
 
-function rateLimited(req, res) {
-    const wait = authLimiter.retryAfter(req.ip);
+function rateLimited(req, res, username) {
+    const wait = Math.max(authLimiter.retryAfter(limiterKey(req, username)), ipLimiter.retryAfter(req.ip));
     if (!wait) return false;
     res.set('Retry-After', String(wait));
     res.status(429).json({ error: `Too many failed attempts. Try again in ${Math.ceil(wait / 60)} minute(s).` });
     return true;
 }
+function authFailed(req, username) {
+    authLimiter.fail(limiterKey(req, username));
+    ipLimiter.fail(req.ip);
+}
+const authOk = (req, username) => authLimiter.reset(limiterKey(req, username));
 
 function issueSession(username) {
     const token = crypto.randomBytes(32).toString('hex');
@@ -231,8 +334,9 @@ function issueSession(username) {
 // --- Auth middleware ---
 //
 // Accepts a session token from /api/login, or the legacy AUTH_TOKEN, which acts
-// as the first admin — for scripts, and so an extension that hasn't signed in
-// yet keeps syncing while you migrate. Sets req.user = { id, username, role }.
+// as the account that owned the data before accounts were separated — for
+// scripts, and so an extension that hasn't signed in yet keeps syncing while
+// you migrate. Sets req.user = { id, username, role, via }.
 // Bearer tokens only, never cookies, so cross-origin requests can't ride on a
 // browser's ambient credentials.
 function requireAuth(req, res, next) {
@@ -260,9 +364,23 @@ app.post('/api/auth/setup', (req, res) => res.status(410).json({
     error: 'Accounts are no longer created from the app. Set ADMIN_USERNAME and ADMIN_PASSWORD in the server\'s .env and restart it, then sign in.'
 }));
 
+// tenancyOwner is about the caller only: whether this account holds the data
+// from before accounts were separated. Clients use it to decide whether an
+// unstamped working copy (or an older per-device list) is this account's.
+const userFor = (u) => ({ ...publicUser(u), tenancyOwner: u.id === tenancyOwnerId(db) });
+
 app.get('/api/auth/me', requireAuth, (req, res) => {
-    res.json({ ok: true, user: publicUser(req.user) });
+    res.json({ ok: true, user: userFor(req.user), serverId: SERVER_ID });
 });
+
+// The caller as things stand now. requireAuth looked before the handler's
+// awaits (scrypt), and a reset, a delete or a sign-out everywhere may have
+// landed in between. Call it in the same synchronous step as the write it
+// guards, so nothing else can land between the check and the write.
+const stillSignedIn = (req) => {
+    const now = identify(db, AUTH_TOKEN, presentedToken(req));
+    return Boolean(now && now.id === req.user.id);
+};
 
 // A real hash to check against when the username is unknown, so a missing
 // account and a wrong password cost the same and can't be told apart.
@@ -270,20 +388,26 @@ const DUMMY_HASH = await hashPassword(crypto.randomBytes(16).toString('hex'));
 
 app.post('/api/login', async (req, res) => {
     try {
-        if (rateLimited(req, res)) return;
         const { username, password } = req.body || {};
+        if (rateLimited(req, res, username)) return;
         if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
 
         const row = userByName(db, String(username).trim());
         const ok = await verifyPassword(password, row ? row.password_hash : DUMMY_HASH);
-        if (!row || !ok) {
-            authLimiter.fail(req.ip);
+        // The account as it is after the await, not as it was before: a reset
+        // or a delete that landed meanwhile signed it out everywhere, and a
+        // sign-in with the password it replaced must not outlive it. Checked
+        // and issued in one transaction, so neither can land in between.
+        const session = row && ok ? db.transaction(() => {
+            const now = userByName(db, row.username);
+            return now && now.password_hash === row.password_hash ? issueSession(now.username) : null;
+        })() : null;
+        if (!session) {
+            authFailed(req, username);
             return res.status(401).json({ error: 'Wrong username or password.' });
         }
-        authLimiter.reset(req.ip);
-
-        const session = issueSession(row.username);
-        res.json({ ok: true, username: row.username, user: publicUser(row), ...session });
+        authOk(req, username);
+        res.json({ ok: true, username: row.username, user: userFor(row), serverId: SERVER_ID, ...session });
     } catch (e) {
         console.error('[TabPaladin] Login failed:', e);
         res.status(500).json({ error: 'Sign in failed.' });
@@ -299,7 +423,7 @@ app.post('/api/logout', requireAuth, (req, res) => {
 
 app.post('/api/auth/password', requireAuth, async (req, res) => {
     try {
-        if (rateLimited(req, res)) return;
+        if (rateLimited(req, res, req.user.username)) return;
         const { currentPassword, newPassword } = req.body || {};
         if (!newPassword || String(newPassword).length < MIN_PASSWORD_LENGTH) {
             return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
@@ -307,13 +431,20 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
         const row = userByName(db, req.user.username);
         if (!row) return res.status(400).json({ error: 'No account to change.' });
         if (!(await verifyPassword(currentPassword, row.password_hash))) {
-            authLimiter.fail(req.ip);
+            authFailed(req, req.user.username);
             return res.status(401).json({ error: 'Current password is wrong.' });
         }
         const hash = await hashPassword(newPassword);
-        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
-        db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
-        const session = issueSession(row.username);
+        // Same rule as a sign-in: an admin reset, a delete or a sign-out that
+        // landed during the awaits wins, rather than being overwritten here.
+        const session = db.transaction(() => {
+            const now = userByName(db, row.username);
+            if (!now || now.password_hash !== row.password_hash || !stillSignedIn(req)) return null;
+            db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
+            db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+            return issueSession(row.username);
+        })();
+        if (!session) return res.status(401).json({ error: 'Your password or session changed meanwhile. Sign in again.' });
         res.json({ ok: true, ...session });
     } catch (e) {
         console.error('[TabPaladin] Password change failed:', e);
@@ -326,28 +457,45 @@ app.get('/api/health', (req, res) => {
     res.json({ ok: true, version: 2, configured: userCount() > 0 });
 });
 
+// --- Accounts and preferences ---
+// Before the static handler, so /api/users and /api/prefs win over the PWA.
+attachUserAdmin(app, {
+    db, requireAuth, dbPath: DB_PATH, authToken: AUTH_TOKEN,
+    limiter: { limited: rateLimited, fail: authFailed, ok: authOk }
+});
+attachPrefs(app, { db, requireAuth });
+
 // --- Importers ---
 // Attached before the tree routes so /api/tree can append the virtual imports
 // subtree, and before the static handler so /api/imports/* wins over the PWA
 // catch-all.
-const { store: importsStore } = attachImports(app, { db, requireAuth });
+const { store: importsStore } = attachImports(app, {
+    db, requireAuth,
+    // The Reddit confirm page names the TabPaladin account receiving the connection.
+    accountName: (id) => (userById(db, id) || {}).username || null
+});
 
 // --- The tree ---
 //
-// GET returns the user's tree plus a virtual, read-only imports subtree that is
-// composed from the archive at read time and never stored. PUT replaces the
-// user's tree wholesale — git-style: the client edits a local working copy and
-// pushes it, and a push whose baseVersion is stale is refused so it cannot
+// GET returns the caller's tree plus a virtual, read-only imports subtree that
+// is composed from the archive at read time and never stored. PUT replaces the
+// caller's tree wholesale — git-style: the client edits a local working copy
+// and pushes it, and a push whose baseVersion is stale is refused so it cannot
 // silently overwrite what another device pushed in between.
+//
+// Both carry userId and serverId, so a client can stamp its working copy with
+// the account it belongs to and never push one account's tree into another's.
 app.get('/api/tree', requireAuth, (req, res) => {
-    const { version, roots } = items.readTree();
-    const importsTree = buildImportsTree(importsStore);
+    const store = items.forUser(req.user.id);
+    const { version, roots } = store.readTree();
+    const importsTree = buildImportsTree(importsStore, req.user.id);
     if (importsTree) {
         // The archive belongs inside Bookmarks, not beside it — it is a
         // collection of bookmarks like any other, and a top-level sibling made
         // it look like a separate account. Falls back to the top level only if
-        // there is somehow no bookmarks root to hold it.
-        const rootId = items.bookmarksRootId();
+        // there is no bookmarks root to hold it (a new account, until it makes
+        // one).
+        const rootId = store.bookmarksRootId();
         const host = rootId ? findNode(roots, rootId) : null;
         if (host) {
             host.children = [...(host.children || []), importsTree];
@@ -355,7 +503,7 @@ app.get('/api/tree', requireAuth, (req, res) => {
             roots.push(importsTree);
         }
     }
-    res.json({ ok: true, version, roots });
+    res.json({ ok: true, version, roots, userId: req.user.id, serverId: SERVER_ID });
 });
 
 function findNode(nodes, id) {
@@ -370,15 +518,30 @@ function findNode(nodes, id) {
 // Cheap freshness probe so clients can show "the server has newer" without
 // downloading the whole tree.
 app.get('/api/tree/version', requireAuth, (req, res) => {
-    res.json({ ok: true, version: items.version() });
+    res.json({ ok: true, version: items.forUser(req.user.id).version(), userId: req.user.id, serverId: SERVER_ID });
 });
 
+// 412, not 409, when the working copy belongs to another account: clients turn
+// a 409 into "pull or force", and both would be wrong here — a pull discards
+// that account's edits, a force writes them into this one. Force does not
+// override it. A copy from another server is another account too, even when
+// the id matches: ids start at 1 everywhere.
+const WRONG_ACCOUNT = 'This working copy belongs to another account.';
+
 app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
-    const { roots, baseVersion, deviceId, force } = req.body || {};
+    const { roots, baseVersion, baseUserId, baseServerId, deviceId, force } = req.body || {};
     if (!Array.isArray(roots)) {
         return res.status(400).json({ error: 'Missing roots (array of top-level nodes).' });
     }
-    const current = items.version();
+    const otherServer = baseServerId !== undefined && baseServerId !== null && String(baseServerId) !== SERVER_ID;
+    if (otherServer || (baseUserId !== undefined && baseUserId !== null && Number(baseUserId) !== req.user.id)) {
+        return res.status(412).json({
+            error: otherServer ? 'This working copy belongs to an account on another server.' : WRONG_ACCOUNT,
+            code: 'wrong-account', userId: req.user.id, serverId: SERVER_ID
+        });
+    }
+    const store = items.forUser(req.user.id);
+    const current = store.version();
     if (!force) {
         if (baseVersion === undefined || baseVersion === null) {
             return res.status(400).json({ error: 'Missing baseVersion — pull first, or pass force:true to overwrite.' });
@@ -390,8 +553,16 @@ app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
             });
         }
     }
-    const version = items.writeTree(roots, { deviceId: deviceId || null });
-    res.json({ ok: true, version });
+    let version;
+    try {
+        version = store.writeTree(roots, { deviceId: deviceId || null });
+    } catch (e) {
+        if (e instanceof ForeignIdError) {
+            return res.status(412).json({ error: WRONG_ACCOUNT, code: 'foreign-ids', count: e.count, userId: req.user.id, serverId: SERVER_ID });
+        }
+        throw e;
+    }
+    res.json({ ok: true, version, userId: req.user.id, serverId: SERVER_ID });
 });
 
 // The old whole-browser-tree sync. Gone for good reason: it required mapping
@@ -404,44 +575,57 @@ app.post('/api/push', requireAuth, goneHandler);
 app.get('/api/pull', requireAuth, goneHandler);
 
 app.get('/api/history', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots ORDER BY timestamp DESC LIMIT 100').all();
+    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT 100')
+        .all(req.user.id);
     res.json({ ok: true, snapshots: rows });
 });
 
 app.get('/api/history/:id', requireAuth, (req, res) => {
-    const row = db.prepare('SELECT timestamp, device_id, json FROM snapshots WHERE id = ?').get(req.params.id);
+    const row = db.prepare('SELECT timestamp, device_id, json FROM snapshots WHERE id = ? AND user_id = ?')
+        .get(req.params.id, req.user.id);
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json({ ok: true, timestamp: row.timestamp, deviceId: row.device_id, snapshot: JSON.parse(row.json) });
 });
 
 // --- Shared links inbox (for PWA "Share to TabPaladin" + manual paste) ---
 app.get('/api/shared', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, url, title, created_at FROM shared_links ORDER BY created_at DESC').all();
+    const rows = db.prepare('SELECT id, url, title, created_at FROM shared_links WHERE user_id = ? ORDER BY created_at DESC')
+        .all(req.user.id);
     res.json({ ok: true, links: rows });
 });
 
 app.post('/api/shared', requireAuth, (req, res) => {
     const { url, title } = req.body || {};
     if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing url' });
+    const held = db.prepare('SELECT COUNT(*) AS n FROM shared_links WHERE user_id = ?').get(req.user.id).n;
+    if (held >= MAX_INBOX_PER_USER) {
+        return res.status(429).json({ error: `Your inbox already holds ${held} links, the most it keeps. File or clear some first.` });
+    }
     const ts = new Date().toISOString();
-    const info = db.prepare('INSERT INTO shared_links (url, title, created_at) VALUES (?, ?, ?)').run(url, title || null, ts);
+    const info = db.prepare('INSERT INTO shared_links (url, title, created_at, user_id) VALUES (?, ?, ?, ?)')
+        .run(url, title || null, ts, req.user.id);
     res.json({ ok: true, id: info.lastInsertRowid, createdAt: ts });
 });
 
 app.delete('/api/shared/:id', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM shared_links WHERE id = ?').run(req.params.id);
+    db.prepare('DELETE FROM shared_links WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
     res.json({ ok: true });
 });
 
+// Clears the caller's inbox only.
 app.delete('/api/shared', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM shared_links').run();
+    db.prepare('DELETE FROM shared_links WHERE user_id = ?').run(req.user.id);
     res.json({ ok: true });
 });
 
 const SHARE_TTL_MS = Math.max(1, Number(process.env.SHARE_TTL_MINUTES || 60)) * 60 * 1000;
 
+// The token and the account it shares. A token whose account was deleted is
+// as dead as an expired one.
 function getValidShareToken(req, res) {
-    const row = db.prepare('SELECT token, expires_at FROM share_tokens WHERE token = ?').get(req.params.token);
+    const row = db.prepare(`
+        SELECT t.token, t.expires_at, t.user_id FROM share_tokens t JOIN users u ON u.id = t.user_id
+        WHERE t.token = ?`).get(req.params.token);
     if (!row || Date.parse(row.expires_at) <= Date.now()) {
         res.status(410).json({ error: 'Share link expired or invalid.' });
         return null;
@@ -454,20 +638,23 @@ function getValidShareToken(req, res) {
 // GET /llm/:token (no auth) serves the notes + instructions as plain text.
 // POST /llm/:token/propose (no auth, also POST /llm/:token) queues a note for human approval.
 app.post('/api/share', requireAuth, (req, res) => {
+    // Every account's expired tokens: they are dead whoever they belonged to.
     db.prepare('DELETE FROM share_tokens WHERE expires_at <= ?').run(new Date().toISOString());
     const token = crypto.randomUUID();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + SHARE_TTL_MS);
-    db.prepare('INSERT INTO share_tokens (token, created_at, expires_at) VALUES (?, ?, ?)')
-        .run(token, now.toISOString(), expiresAt.toISOString());
+    db.prepare('INSERT INTO share_tokens (token, created_at, expires_at, user_id) VALUES (?, ?, ?, ?)')
+        .run(token, now.toISOString(), expiresAt.toISOString(), req.user.id);
     res.json({ ok: true, url: `${req.protocol}://${req.get('host')}/llm/${token}`, expiresAt: expiresAt.toISOString() });
 });
 
 app.get('/llm/:token', (req, res) => {
-    if (!getValidShareToken(req, res)) return;
+    const share = getValidShareToken(req, res);
+    if (!share) return;
     // Straight out of the items table — notes used to be decoded out of a
-    // pushed browser-tree blob here.
-    const notes = items.listNotes();
+    // pushed browser-tree blob here. Only the notes of the account that made
+    // the link.
+    const notes = items.forUser(share.user_id).listNotes();
     // Group notebooks together, loose notes first, keeping each group's order.
     const groupOrder = [];
     const groups = new Map();
@@ -519,8 +706,18 @@ app.get('/llm/:token', (req, res) => {
 });
 
 function handleProposal(req, res) {
-    if (!getValidShareToken(req, res)) return;
+    const share = getValidShareToken(req, res);
+    if (!share) return;
     const { title, content, notebook, action, order } = req.body || {};
+
+    // Anyone holding the link can post here without signing in, so pending
+    // proposals are capped per account. Refused, never pruned.
+    const pending = db.prepare('SELECT COUNT(*) AS n FROM note_proposals WHERE user_id = ?').get(share.user_id).n;
+    if (pending >= MAX_PROPOSALS_PER_USER) {
+        return res.status(429).json({
+            error: `There are already ${pending} proposals waiting for the user's approval. Ask them to review those first.`
+        });
+    }
 
     // Reorder proposal: {"action":"reorder","order":["Title 1","Title 2",...]}
     if (action === 'reorder') {
@@ -528,8 +725,8 @@ function handleProposal(req, res) {
             || !order.every(t => typeof t === 'string' && t.trim() && t.length <= 200)) {
             return res.status(400).json({ error: 'Invalid "order" (array of 1-500 note titles).' });
         }
-        db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at) VALUES (?, ?, ?, ?, ?)')
-            .run('Reorder notes', JSON.stringify(order.map(t => t.trim())), null, 'reorder', new Date().toISOString());
+        db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at, user_id) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('Reorder notes', JSON.stringify(order.map(t => t.trim())), null, 'reorder', new Date().toISOString(), share.user_id);
         return res.json({
             ok: true,
             status: 'pending_approval',
@@ -546,8 +743,8 @@ function handleProposal(req, res) {
     if (notebook != null && (typeof notebook !== 'string' || !notebook.trim() || notebook.length > 100)) {
         return res.status(400).json({ error: 'Invalid "notebook" (string, max 100 chars).' });
     }
-    db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(title.trim(), content, notebook ? notebook.trim() : null, 'note', new Date().toISOString());
+    db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at, user_id) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(title.trim(), content, notebook ? notebook.trim() : null, 'note', new Date().toISOString(), share.user_id);
     res.json({
         ok: true,
         status: 'pending_approval',
@@ -561,21 +758,24 @@ app.post('/llm/:token', express.json({ limit: '1mb' }), handleProposal);
 
 // --- Note proposals (auth, consumed by the PWA) ---
 app.get('/api/proposals', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, title, content, notebook, kind, created_at FROM note_proposals ORDER BY created_at DESC').all();
+    const rows = db.prepare('SELECT id, title, content, notebook, kind, created_at FROM note_proposals WHERE user_id = ? ORDER BY created_at DESC')
+        .all(req.user.id);
     res.json({ ok: true, proposals: rows });
 });
 
 app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
-    const prop = db.prepare('SELECT id, title, content, notebook, kind FROM note_proposals WHERE id = ?').get(req.params.id);
+    const prop = db.prepare('SELECT id, title, content, notebook, kind FROM note_proposals WHERE id = ? AND user_id = ?')
+        .get(req.params.id, req.user.id);
     if (!prop) return res.status(404).json({ error: 'Proposal not found' });
-    const result = items.applyNoteProposal(prop);
+    const store = items.forUser(req.user.id);
+    const result = store.applyNoteProposal(prop);
     if (!result.ok) return res.status(400).json({ error: result.error });
-    db.prepare('DELETE FROM note_proposals WHERE id = ?').run(prop.id);
-    res.json({ ok: true, version: items.version() });
+    db.prepare('DELETE FROM note_proposals WHERE id = ? AND user_id = ?').run(prop.id, req.user.id);
+    res.json({ ok: true, version: store.version() });
 });
 
 app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM note_proposals WHERE id = ?').run(req.params.id);
+    db.prepare('DELETE FROM note_proposals WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
     res.json({ ok: true });
 });
 
@@ -610,10 +810,11 @@ if (fs.existsSync(PWA_DIR)) {
 
 app.listen(PORT, '0.0.0.0', () => {
     const modes = ['login'];
-    if (AUTH_TOKEN) modes.push('AUTH_TOKEN as first admin');
+    const tokenUser = AUTH_TOKEN ? userById(db, legacyTokenUserId(db)) : null;
+    if (AUTH_TOKEN) modes.push(`AUTH_TOKEN as ${tokenUser ? tokenUser.username : 'nobody'}`);
     console.log(`[TabPaladin] Server listening on :${PORT} (${userCount()} account(s); auth: ${modes.join(' + ')})`);
     if (AUTH_TOKEN) {
-        console.log('[TabPaladin] AUTH_TOKEN is on: anyone holding it acts as the first admin. Remove it once every client has signed in, unless scripts need it.');
+        console.log(`[TabPaladin] AUTH_TOKEN is on: anyone holding it acts as ${tokenUser ? tokenUser.username : 'nobody'}. Remove it once every client has signed in, unless scripts need it.`);
     }
     console.log(`[TabPaladin] PWA served from ${PWA_DIR}`);
     console.log(`[TabPaladin] Data dir ${DATA_DIR}`);

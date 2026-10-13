@@ -239,6 +239,8 @@ function setupEventListeners() {
             await persistSyncStamp('push');
             return 'Synced to the server.';
         } catch (e) {
+            // Never pull over or force a copy that belongs to another account.
+            if (e.status === 412) return 'Kept on this computer — this working copy belongs to another account.';
             if (e.status !== 409) return `Kept on this computer — push failed: ${e.message}`;
             if (hadLocalEdits) {
                 return 'Kept on this computer: the server has newer changes and you have other unpushed edits. Push when ready.';
@@ -3030,13 +3032,21 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 <input type="hidden" id="backend-token" value="${escapeHtml((settings.backend && settings.backend.token) || '')}">
 
                 <div id="backend-signed-in" style="display:${(settings.backend && settings.backend.token) ? 'block' : 'none'}; margin-bottom:10px;">
-                    <div style="font-size:0.85rem; color:#ccc;">Signed in as <strong>${(settings.backend && settings.backend.username) || 'unknown'}</strong></div>
+                    <div style="font-size:0.85rem; color:#ccc;">Signed in as <strong id="backend-username-label">${escapeHtml((settings.backend && settings.backend.username) || 'unknown')}</strong><span id="backend-role-label" style="color:var(--text-muted);">${settings.backend && settings.backend.role ? ' · ' + escapeHtml(settings.backend.role) + (settings.backend.tenancyOwner ? ' · owner' : '') : ''}</span></div>
                     <button id="backend-signout-btn" class="sm-btn" style="margin-top:8px; width:100%;">Sign out</button>
+                    <details id="backend-password-box" style="margin-top:8px;">
+                        <summary style="cursor:pointer; font-size:0.8rem; color:#93c5fd;">Change password</summary>
+                        <input type="password" id="backend-pw-current" autocomplete="current-password" placeholder="Current password" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin:8px 0 6px;">
+                        <input type="password" id="backend-pw-new" autocomplete="new-password" placeholder="New password (8+ characters)" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:6px;">
+                        <div style="font-size:0.72rem; color:var(--text-muted); margin-bottom:6px;">Signs you out on every other device.</div>
+                        <div id="backend-pw-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
+                        <button id="backend-pw-save" class="sm-btn" style="width:100%;">Change password</button>
+                    </details>
                 </div>
 
                 <div id="backend-signed-out" style="display:${(settings.backend && settings.backend.token) ? 'none' : 'block'}; margin-bottom:10px;">
                     <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Username</div>
-                    <input type="text" id="backend-username" autocomplete="username" value="${(settings.backend && settings.backend.username) || ''}" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                    <input type="text" id="backend-username" autocomplete="username" value="${escapeHtml((settings.backend && settings.backend.username) || '')}" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
                     <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Password</div>
                     <input type="password" id="backend-password" autocomplete="current-password" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
                     <div id="backend-auth-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
@@ -3061,6 +3071,18 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </button>
             </div>
 
+            <!-- Working copies of other accounts, kept when you switched -->
+            <div id="stash-block" style="display:none;">
+                <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Set-aside working copies</h3>
+                <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                    <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                        Kept when this browser signed in as someone else. Nothing here is ever thrown away unless you discard it.
+                    </div>
+                    <div id="stash-list" style="font-size:0.8rem;"></div>
+                    <div id="stash-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
+                </div>
+            </div>
+
             <!-- Browsing extras -->
             <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Video</h3>
             <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
@@ -3081,6 +3103,9 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 </div>
 
                 <div id="imports-list" style="font-size:0.8rem; color:var(--text-muted);">Loading…</div>
+                <label style="display:flex; align-items:center; gap:6px; margin-top:6px; font-size:0.75rem; color:var(--text-muted); cursor:pointer;">
+                    <input type="checkbox" id="imports-show-removed"> Show removed sources
+                </label>
 
                 <button id="imports-add-btn" class="sm-btn" style="width:100%; margin-top:10px;">+ Connect Reddit</button>
 
@@ -3106,6 +3131,37 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
                 <div id="imports-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
                 <div style="font-size:0.7rem; color:#666; margin-top:6px;">
                     Imported links arrive as bookmarks in <strong>TabPaladin Imports</strong>. Sweeping happens on the server whether or not this panel is open — press <strong>Pull</strong> above to bring new ones into this browser.
+                </div>
+            </div>
+
+            <!-- Users (admins only; hidden for everyone else) -->
+            <div id="users-block" style="display:none;">
+                <h3 style="font-size:0.9rem; color:#aaa; margin-bottom:10px; margin-top:20px; text-transform:uppercase; letter-spacing:0.5px;">Users</h3>
+                <div style="background:var(--card-bg); padding:15px; border-radius:8px; border:1px solid var(--border-color);">
+                    <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                        Every account has its own bookmarks, notes, workflows, inbox and imports. Changes here ask for your password again.
+                    </div>
+                    <div id="users-list" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:8px;"></div>
+                    <button id="users-add-btn" class="sm-btn" style="width:100%; margin-top:10px;">+ Add user</button>
+                    <div id="users-add-form" style="display:none; margin-top:12px; border-top:1px solid var(--border-color); padding-top:12px;">
+                        <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Username</div>
+                        <input type="text" id="users-new-name" autocapitalize="none" spellcheck="false" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                        <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Password</div>
+                        <div style="display:flex; gap:6px; margin-bottom:8px;">
+                            <input type="text" id="users-new-password" autocomplete="off" spellcheck="false" style="flex:1; min-width:0; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px;">
+                            <button class="sm-btn" id="users-new-generate">Generate</button>
+                        </div>
+                        <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Role</div>
+                        <select id="users-new-role" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                            <option value="user" selected>user</option>
+                            <option value="admin">admin</option>
+                        </select>
+                        <div style="font-size:0.85rem; margin-bottom:5px; color:#ccc;">Your password</div>
+                        <input type="password" id="users-new-current" autocomplete="current-password" style="width:100%; padding:8px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:8px;">
+                        <div id="users-add-error" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
+                        <button id="users-add-submit" class="primary-btn" style="width:100%;">Create</button>
+                    </div>
+                    <div id="users-status" style="font-size:0.75rem; color:var(--text-muted); margin-top:8px; min-height:14px;"></div>
                 </div>
             </div>
 
@@ -3574,8 +3630,13 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const outEl = document.getElementById('backend-signed-out');
         if (inEl) inEl.style.display = signedIn ? 'block' : 'none';
         if (outEl) outEl.style.display = signedIn ? 'none' : 'block';
-        const strong = inEl && inEl.querySelector('strong');
-        if (signedIn && strong && username) strong.textContent = username;
+        const label = document.getElementById('backend-username-label');
+        if (signedIn && label && username) label.textContent = username;
+        if (!signedIn) setRoleLabel(null);
+    };
+    const setRoleLabel = (user) => {
+        const el = document.getElementById('backend-role-label');
+        if (el) el.textContent = user && user.role ? ` · ${user.role}${user.tenancyOwner ? ' · owner' : ''}` : '';
     };
 
     const doSignIn = async () => {
@@ -3612,12 +3673,73 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const data = await res.json().catch(() => ({}));
             if (!res.ok) { authError(data.error || `Sign in failed (HTTP ${res.status}).`); return; }
 
+            const name = data.username || username;
+            const user = data.user || {};
+            const serverId = data.serverId || null;
+            const account = { url: base, userId: user.id, username: name, serverId, tenancyOwner: Boolean(user.tenancyOwner) };
+            const known = user.id !== undefined && user.id !== null;
+
+            // The working copy here may belong to someone else — on this
+            // server, or the same id on another one. It is never pushed into
+            // this account and never discarded: it is set aside. A copy made
+            // while nobody was signed in becomes this account's. Either way,
+            // with unpushed edits in it, say so first — Cancel signs nothing in.
+            const st = TreeStore.status();
+            const edits = `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}`;
+            let question = null;
+            if (known && st.dirty && TreeStore.wouldSetAside(account)) {
+                const previous = (await StorageManager.getSettings()).backend || {};
+                const oldName = st.owner ? (st.owner.username || previous.username || `account #${st.owner.userId}`) : null;
+                const where = st.owner && st.owner.url !== base ? ` on ${st.owner.url}` : '';
+                // Same id at another address: maybe this server, moved. Only
+                // the user knows, so it is set aside and offered back from there.
+                const maybeMoved = where && Number(st.owner.userId) === Number(user.id)
+                    && !(st.owner.serverId && serverId && st.owner.serverId !== serverId);
+                question = `This browser holds ${oldName ? oldName + "'s" : 'an older'} working copy${where} (${edits}).\n\n`
+                    + `Signing in as ${name} here sets it aside: it stays in this browser (Settings › Set-aside copies) `
+                    + `and comes back when you sign in as ${oldName || "the server's owner"}${where ? ' there' : ''}.`
+                    + (maybeMoved ? `\n\nIf ${base} is the same server at a new address, restore it from Set-aside copies once signed in.` : '');
+            } else if (known && st.dirty && !st.owner && st.origin === 'local') {
+                question = `This browser holds ${edits} made while nobody was signed in.\n\n`
+                    + `Signing in as ${name} makes them ${name}'s working copy.`;
+            }
+            if (question && !confirm(question)) {
+                fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
+                authError('Sign-in cancelled — nothing changed.');
+                return;
+            }
+
             document.getElementById('backend-token').value = data.token;
             const pw = document.getElementById('backend-password');
             if (pw) pw.value = '';
-            await persistBackendConfig({ username: data.username || username });
-            setSignedInUi(true, data.username || username);
-            writeBackendStatus('Signed in.');
+            const previousName = ((await StorageManager.getSettings()).backend || {}).username || null;
+            await persistBackendConfig({ username: name, userId: known ? user.id : null, role: user.role || null, tenancyOwner: Boolean(user.tenancyOwner), serverId });
+            setSignedInUi(true, name);
+            setRoleLabel(user);
+
+            let note = 'Signed in.';
+            if (known) {
+                const switched = await TreeStore.switchAccount({ ...account, previousUsername: previousName });
+                if (switched.setAside) note = 'Signed in. The previous working copy is set aside below.';
+                if (switched.action === 'restored') note = `Signed in. Your working copy from before is back.`;
+                if (switched.action === 'claimed' && !TreeStore.status().isEmpty) note = 'Signed in. What you made while signed out is in your working copy.';
+                if (TreeStore.status().isEmpty) {
+                    try {
+                        await TreeStore.sync.pull(getBackendConfig());
+                        await persistSyncStamp('pull');
+                    } catch (e) {
+                        note += ` Pull failed: ${e.message}`;
+                    }
+                }
+                // Only now, against this account's copy: pruning before the
+                // switch would have dropped the other account's folders.
+                await pruneStaleFocusedFolders().catch(() => 0);
+                await loadWorkflows();
+            }
+            writeBackendStatus(note);
+            refreshImports();
+            refreshUsers();
+            renderStashes();
         } catch (e) {
             authError('Sign in failed: ' + e.message);
         }
@@ -3634,10 +3756,59 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             });
         } catch (e) { /* ignore */ }
         document.getElementById('backend-token').value = '';
-        await persistBackendConfig({});
+        await persistBackendConfig({ role: null, tenancyOwner: false });
         setSignedInUi(false);
         writeBackendStatus('Signed out.');
+        refreshUsers();
+        renderStashes();
     };
+
+    // Who this session is, fresh from the server each time Settings opens:
+    // the role and owner flag shown above, and what the Users card and the
+    // set-aside copies go by.
+    const refreshWhoAmI = async () => {
+        const cfg = getBackendConfig();
+        if (!cfg.token) return null;
+        try {
+            const res = await fetch(cfg.url.replace(/\/$/, '') + '/api/auth/me', { headers: { Authorization: 'Bearer ' + cfg.token } });
+            if (!res.ok) return null;
+            const me = await res.json();
+            const user = me.user;
+            if (!user) return null;
+            setRoleLabel(user);
+            await persistBackendConfig({ userId: user.id, role: user.role, tenancyOwner: Boolean(user.tenancyOwner), serverId: me.serverId || null });
+            return user;
+        } catch (e) {
+            return null;
+        }
+    };
+
+    document.getElementById('backend-pw-save')?.addEventListener('click', async () => {
+        const err = document.getElementById('backend-pw-error');
+        const cfg = getBackendConfig();
+        const currentPassword = document.getElementById('backend-pw-current').value;
+        const newPassword = document.getElementById('backend-pw-new').value;
+        err.textContent = '';
+        if (!cfg.token) { err.textContent = 'Sign in first.'; return; }
+        try {
+            const res = await fetch(cfg.url.replace(/\/$/, '') + '/api/auth/password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.token },
+                body: JSON.stringify({ currentPassword, newPassword })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { err.textContent = data.error || `HTTP ${res.status}`; return; }
+            // Every session was revoked, this one included; the reply carries its replacement.
+            document.getElementById('backend-token').value = data.token;
+            await persistBackendConfig({});
+            document.getElementById('backend-pw-current').value = '';
+            document.getElementById('backend-pw-new').value = '';
+            document.getElementById('backend-password-box').open = false;
+            writeBackendStatus('Password changed. Other devices need to sign in again.');
+        } catch (e) {
+            err.textContent = e.message;
+        }
+    });
 
     document.getElementById('backend-signin-btn')?.addEventListener('click', doSignIn);
     document.getElementById('backend-signout-btn')?.addEventListener('click', doSignOut);
@@ -3744,7 +3915,19 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             list.innerHTML = '<div style="color:#666;">No importers yet.</div>';
             return;
         }
-        list.innerHTML = sources.map(src => `
+        list.innerHTML = sources.map(src => src.removed ? `
+            <div data-import-id="${src.id}" style="background:rgba(0,0,0,0.12); border:1px dashed var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px; opacity:0.7;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; gap:8px;">
+                    <strong style="color:#aaa;">${escapeHtml(src.label || src.provider)}</strong>
+                    <span style="font-size:0.72rem; color:var(--text-muted); white-space:nowrap;">${src.items} archived</span>
+                </div>
+                <div style="font-size:0.72rem; margin-top:3px; color:var(--text-muted);">Removed${src.removedAt ? ' ' + escapeHtml(new Date(src.removedAt).toLocaleDateString()) : ''} — the archive is kept until you delete it.</div>
+                <div style="display:flex; gap:6px; margin-top:8px;">
+                    <button class="sm-btn" data-import-act="restore" style="flex:1;">Restore</button>
+                    <button class="sm-btn" data-import-act="purge" style="flex:1; color:var(--danger-color);">Delete archive…</button>
+                </div>
+            </div>
+        ` : `
             <div data-import-id="${src.id}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
                 <div style="display:flex; justify-content:space-between; align-items:baseline; gap:8px;">
                     <strong style="color:#ddd;">${escapeHtml(src.label || src.provider)}</strong>
@@ -3774,7 +3957,8 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         const cfg = getBackendConfig();
         if (!cfg.token) { list.innerHTML = '<div style="color:#666;">Sign in above to manage importers.</div>'; return; }
         try {
-            const data = await importsApi('/api/imports');
+            const showRemoved = document.getElementById('imports-show-removed')?.checked;
+            const data = await importsApi('/api/imports' + (showRemoved ? '?includeRemoved=1' : ''));
             renderImports(data.sources || []);
         } catch (e) {
             list.innerHTML = `<div style="color:#666;">${escapeHtml(e.message)}</div>`;
@@ -3792,9 +3976,26 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         if (act === 'delete') {
             // The archive is the only copy of anything Reddit has already
             // dropped, so removing a connection must not quietly bin it.
-            if (!confirm('Remove this importer?\n\nThe archived links stay on the server and the bookmark folder stays where it is.')) return;
+            if (!confirm('Remove this importer?\n\nThe archived links stay on the server: tick "Show removed sources" to restore it or delete the archive.')) return;
             await importsApi('/api/imports/' + id, { method: 'DELETE' });
-            writeImportsStatus('Importer removed.');
+            writeImportsStatus('Importer removed. Its archive is kept.');
+            await refreshImports();
+            return;
+        }
+
+        if (act === 'restore') {
+            await importsApi('/api/imports/' + id + '/restore', { method: 'POST' });
+            writeImportsStatus('Restored. A Reddit source needs authorising again; press Pull to see its archive.');
+            await refreshImports();
+            return;
+        }
+
+        if (act === 'purge') {
+            // Unrecoverable: anything past Reddit's window cannot be fetched again.
+            const typed = prompt('This deletes the archive for good — anything the source no longer lists cannot come back.\n\nType DELETE to confirm.');
+            if (typed !== 'DELETE') return;
+            await importsApi('/api/imports/' + id + '?purge=1', { method: 'DELETE' });
+            writeImportsStatus('Archive deleted.');
             await refreshImports();
             return;
         }
@@ -3871,7 +4072,292 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
         }
     });
 
+    document.getElementById('imports-show-removed')?.addEventListener('change', () => refreshImports());
+
+    // --- Users (admins) ---
+    //
+    // Account management. The server only answers an admin in a signed-in
+    // session, so the card stays hidden for everyone else (a 403) and for the
+    // legacy token. Every change asks for your own password again; the server
+    // checks it, and refuses outright to delete, demote or reset the server's
+    // owner, the last admin, or you.
+    const writeUsersStatus = (msg) => { const el = document.getElementById('users-status'); if (el) el.textContent = msg || ''; };
+
+    const adminApi = async (path, opts = {}) => {
+        const cfg = getBackendConfig();
+        if (!cfg.token) { const e = new Error('Sign in first.'); e.status = 401; throw e; }
+        const res = await fetch(cfg.url.replace(/\/$/, '') + path, {
+            ...opts,
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.token, ...(opts.headers || {}) }
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const e = new Error(body.error || `HTTP ${res.status}`);
+            e.status = res.status;
+            e.code = body.code;
+            throw e;
+        }
+        return body;
+    };
+
+    // 16 characters, no look-alikes, from the platform CSPRNG.
+    const generatePassword = () => {
+        const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, b => alphabet[b % alphabet.length]).join('');
+    };
+    const fmtN = (n) => Number(n || 0).toLocaleString();
+    const statsLine = (st) => [
+        `${fmtN(st.bookmarks)} bookmarks`, `${fmtN(st.notes)} notes`, `${fmtN(st.workflows)} workflows`,
+        `${fmtN(st.imports + st.removedImports)} imports (${fmtN(st.archived)} archived)`, `${fmtN(st.inbox)} inbox`
+    ].join(' · ');
+    const pill = (text, color) =>
+        `<span style="font-size:0.68rem; padding:1px 7px; border-radius:999px; border:1px solid ${color}; color:${color}; margin-left:4px;">${escapeHtml(text)}</span>`;
+    const fieldStyle = 'width:100%; padding:7px; background:#111827; border:1px solid #374151; color:white; border-radius:4px; margin-bottom:6px;';
+
+    let usersCache = [];
+
+    const renderUsers = (users) => {
+        const list = document.getElementById('users-list');
+        if (!list) return;
+        list.innerHTML = users.map(u => {
+            const pills = pill(u.role, u.role === 'admin' ? '#93c5fd' : '#9ca3af') + (u.owner ? pill('owner', '#fbbf24') : '');
+            let actions;
+            if (u.you) {
+                actions = '<a href="#" data-user-act="change-password" style="font-size:0.75rem; color:#93c5fd;">Change password</a>';
+            } else if (u.owner) {
+                actions = '<div style="font-size:0.72rem; color:var(--text-muted);">Server owner: change from the owner\'s own Settings or the server CLI</div>';
+            } else {
+                actions = `
+                    <button class="sm-btn" data-user-act="role" style="flex:1;">${u.role === 'admin' ? 'Make user' : 'Make admin'}</button>
+                    <button class="sm-btn" data-user-act="reset" style="flex:1;">Reset password</button>
+                    <button class="sm-btn" data-user-act="delete" style="flex:1; color:var(--danger-color);"
+                        ${u.legacyToken ? 'disabled title="AUTH_TOKEN acts as this account; remove it from .env first"' : ''}>Delete</button>`;
+            }
+            return `
+                <div data-user-id="${Number(u.id)}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; min-width:0;">
+                    <div style="display:flex; justify-content:space-between; align-items:baseline; gap:6px; flex-wrap:wrap;">
+                        <span><strong style="color:#ddd;">${escapeHtml(u.username)}</strong>${u.you ? ' <span style="color:var(--text-muted); font-size:0.75rem;">(you)</span>' : ''}${pills}</span>
+                        <span style="font-size:0.7rem; color:var(--text-muted);">since ${escapeHtml(new Date(u.createdAt).toLocaleDateString())}</span>
+                    </div>
+                    <div style="font-size:0.72rem; color:var(--text-muted); margin-top:3px;">${escapeHtml(statsLine(u.stats || {}))}</div>
+                    <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">${actions}</div>
+                    <div class="user-action-panel"></div>
+                </div>`;
+        }).join('');
+        list.querySelectorAll('[data-user-act]').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                const row = btn.closest('[data-user-id]');
+                const user = usersCache.find(u => String(u.id) === row.dataset.userId);
+                if (user) openUserAction(user, btn.dataset.userAct, row);
+            });
+        });
+    };
+
+    const refreshUsers = async () => {
+        const block = document.getElementById('users-block');
+        if (!block) return;
+        if (!getBackendConfig().token) { block.style.display = 'none'; return; }
+        try {
+            const data = await adminApi('/api/users');
+            usersCache = data.users || [];
+            block.style.display = 'block';
+            renderUsers(usersCache);
+        } catch (e) {
+            // Not an admin, the legacy token, or an older server: no card.
+            block.style.display = 'none';
+        }
+    };
+
+    // The inline form under one account's row for a role change, a reset or
+    // a delete. Each needs your own password; the server checks it.
+    function openUserAction(user, act, row) {
+        if (act === 'change-password') {
+            const box = document.getElementById('backend-password-box');
+            if (box) { box.open = true; box.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+            return;
+        }
+        const panel = row.querySelector('.user-action-panel');
+        const name = escapeHtml(user.username);
+        const st = user.stats || {};
+        const newRole = user.role === 'admin' ? 'user' : 'admin';
+        let body = '';
+        if (act === 'role') {
+            body = `<div style="font-size:0.78rem; margin-bottom:6px;">Make ${name} ${newRole === 'admin' ? 'an admin' : 'a user'}?</div>`;
+        } else if (act === 'reset') {
+            body = `
+                <div style="display:flex; gap:6px;">
+                    <input type="text" class="ua-new" placeholder="New password" autocomplete="off" spellcheck="false" style="${fieldStyle} flex:1; min-width:0;">
+                    <button class="sm-btn ua-gen" style="margin-bottom:6px;">Generate</button>
+                </div>
+                <div style="font-size:0.72rem; color:var(--text-muted); margin-bottom:6px;">${name} will be signed out on every device; unpushed edits on their phone stay on the phone.</div>`;
+        } else if (act === 'delete') {
+            body = `
+                <div style="font-size:0.78rem; margin-bottom:6px; color:#fca5a5;">
+                    Delete ${name} and everything they hold: ${fmtN(st.bookmarks)} bookmarks, ${fmtN(st.notes)} notes,
+                    ${fmtN(st.workflows)} workflows, ${fmtN(st.inbox)} inbox links,
+                    ${fmtN(st.imports + st.removedImports)} import sources with ${fmtN(st.archived)} archived posts (removed sources included)
+                    and ${fmtN(st.history)} history versions. A backup is taken first.
+                </div>
+                <input type="text" class="ua-confirm" placeholder="Type ${name} to confirm" autocapitalize="none" spellcheck="false" style="${fieldStyle}">`;
+        }
+        panel.innerHTML = `
+            <div style="margin-top:8px; border-top:1px solid var(--border-color); padding-top:8px;">
+                ${body}
+                <input type="password" class="ua-pw" placeholder="Your password" autocomplete="current-password" style="${fieldStyle}">
+                <div class="ua-err" style="font-size:0.75rem; color:var(--danger-color); min-height:14px; margin-bottom:6px;"></div>
+                <div style="display:flex; gap:6px;">
+                    <button class="sm-btn ua-go" style="flex:1; ${act === 'delete' ? 'color:var(--danger-color);' : ''}">${act === 'delete' ? `Delete ${name}` : act === 'reset' ? 'Save' : 'Confirm'}</button>
+                    <button class="sm-btn ua-cancel" style="flex:1;">Cancel</button>
+                </div>
+            </div>`;
+        const q = (sel) => panel.querySelector(sel);
+        q('.ua-cancel').addEventListener('click', () => { panel.innerHTML = ''; });
+        q('.ua-gen')?.addEventListener('click', () => {
+            const input = q('.ua-new');
+            input.value = generatePassword();
+            input.focus();
+            input.select();
+        });
+        q('.ua-go').addEventListener('click', async () => {
+            const err = q('.ua-err');
+            err.textContent = '';
+            const currentPassword = q('.ua-pw').value;
+            try {
+                if (act === 'role') {
+                    await adminApi(`/api/users/${user.id}`, { method: 'PUT', body: JSON.stringify({ role: newRole, currentPassword }) });
+                    writeUsersStatus(`${user.username} is now ${newRole === 'admin' ? 'an admin' : 'a user'}.`);
+                } else if (act === 'reset') {
+                    const password = q('.ua-new').value;
+                    const out = await adminApi(`/api/users/${user.id}`, { method: 'PUT', body: JSON.stringify({ password, currentPassword }) });
+                    writeUsersStatus(`New password saved for ${user.username}; signed out of ${out.signedOut} session(s).`);
+                } else if (act === 'delete') {
+                    const confirmName = q('.ua-confirm').value.trim();
+                    if (confirmName !== user.username) { err.textContent = `Type ${user.username} to confirm.`; return; }
+                    const out = await adminApi(`/api/users/${user.id}/delete`, { method: 'POST', body: JSON.stringify({ confirm: confirmName, currentPassword }) });
+                    writeUsersStatus(`Deleted ${user.username}. Backup: ${out.backup}`);
+                }
+                await refreshUsers();
+            } catch (e) {
+                err.textContent = e.message;
+            }
+        });
+    }
+
+    document.getElementById('users-add-btn')?.addEventListener('click', () => {
+        const form = document.getElementById('users-add-form');
+        form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    });
+    document.getElementById('users-new-generate')?.addEventListener('click', () => {
+        const input = document.getElementById('users-new-password');
+        input.value = generatePassword();
+        input.focus();
+        input.select();
+    });
+    document.getElementById('users-add-submit')?.addEventListener('click', async () => {
+        const err = document.getElementById('users-add-error');
+        err.textContent = '';
+        const username = document.getElementById('users-new-name').value.trim();
+        try {
+            await adminApi('/api/users', {
+                method: 'POST',
+                body: JSON.stringify({
+                    username,
+                    password: document.getElementById('users-new-password').value,
+                    role: document.getElementById('users-new-role').value,
+                    currentPassword: document.getElementById('users-new-current').value
+                })
+            });
+            for (const id of ['users-new-name', 'users-new-password', 'users-new-current']) document.getElementById(id).value = '';
+            document.getElementById('users-add-form').style.display = 'none';
+            writeUsersStatus(`Created ${username}. They start with an empty tree.`);
+            await refreshUsers();
+        } catch (e) {
+            err.textContent = e.message;
+        }
+    });
+
+    // --- Set-aside working copies ---
+    const renderStashes = async () => {
+        const block = document.getElementById('stash-block');
+        const list = document.getElementById('stash-list');
+        if (!block || !list) return;
+        // Which copies the account signed in now may restore is the tree
+        // store's call (TreeStore.listStashes): its own on this server, or
+        // its own at an old address of what looks like the same server.
+        const backend = (await StorageManager.getSettings()).backend || {};
+        const signedIn = Boolean(getBackendConfig().token) && backend.userId !== undefined && backend.userId !== null;
+        const account = signedIn ? {
+            url: getBackendConfig().url, userId: backend.userId, username: backend.username || null,
+            serverId: backend.serverId || null, tenancyOwner: Boolean(backend.tenancyOwner)
+        } : null;
+        const stashes = await TreeStore.listStashes(account).catch(() => []);
+        block.style.display = stashes.length ? 'block' : 'none';
+        if (!stashes.length) return;
+        const restoreAttrs = (st) => !st.match ? 'disabled title="Sign in as this account to restore it"'
+            : st.match === 'moved' ? 'title="Made at another address of this server — restoring asks first"' : '';
+        list.innerHTML = stashes.map(st => `
+            <div data-stash-key="${escapeHtml(st.key)}" style="background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-bottom:8px;">
+                <div style="color:#ddd;"><strong>${escapeHtml(st.username || (st.userId === null ? (st.origin === 'local' ? 'Made while signed out' : 'An older copy') : 'account #' + st.userId))}</strong>
+                    <span style="color:var(--text-muted);">@ ${escapeHtml(st.url || '')}</span></div>
+                <div style="font-size:0.72rem; color:var(--text-muted); margin-top:3px;">
+                    ${st.editCount ? `${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}` : 'no unpushed edits'} · ${fmtN(st.items)} items
+                    · set aside ${escapeHtml(st.setAsideAt ? new Date(st.setAsideAt).toLocaleDateString() : '')}
+                </div>
+                <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
+                    <button class="sm-btn" data-stash-act="restore" style="flex:1;" ${restoreAttrs(st)}>Restore</button>
+                    <button class="sm-btn" data-stash-act="export" style="flex:1;">Export bookmarks.html</button>
+                    <button class="sm-btn" data-stash-act="discard" style="flex:1; color:var(--danger-color);">Discard…</button>
+                </div>
+            </div>
+        `).join('');
+        list.querySelectorAll('[data-stash-act]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const key = btn.closest('[data-stash-key]').dataset.stashKey;
+                const st = stashes.find(x => x.key === key);
+                handleStashAction(st, btn.dataset.stashAct, account)
+                    .catch(e => { const el = document.getElementById('stash-status'); if (el) el.textContent = e.message; });
+            });
+        });
+    };
+
+    async function handleStashAction(st, act, account) {
+        const status = document.getElementById('stash-status');
+        if (act === 'export') {
+            const html = await TreeStore.exportStashHtml(st.key);
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+            a.download = `tabpaladin-${(st.username || 'older-copy').replace(/[^\w.-]+/g, '_')}-set-aside.html`;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            return;
+        }
+        if (act === 'discard') {
+            const word = st.username || 'discard';
+            const typed = prompt(`Discard this working copy for good${st.editCount ? `, with its ${st.editCount} unpushed edit(s)` : ''}?\n\nType ${word} to confirm.`);
+            if (typed !== word) return;
+            await TreeStore.discardStash(st.key);
+            status.textContent = 'Discarded.';
+            await renderStashes();
+            return;
+        }
+        if (act === 'restore') {
+            const moved = st.match === 'moved';
+            if (moved && !confirm(`This copy was made on ${st.url}. Restore it here, on ${account.url}?\n\n`
+                + 'Only if that is the same server at a new address. A copy of the server\'s database reports the same id, '
+                + 'and what you push to a copy never reaches the original.')) return;
+            await TreeStore.restoreStash(st.key, account, { moved });
+            await pruneStaleFocusedFolders().catch(() => 0);
+            await loadWorkflows();
+            status.textContent = 'Restored. Whatever was here before is set aside in its place.';
+            await renderStashes();
+        }
+    }
+
     refreshImports();
+    refreshWhoAmI().then(() => { refreshUsers(); renderStashes(); });
 
     document.getElementById('closeSettingsBtnInternal').addEventListener('click', closeSettings);
 
@@ -3974,6 +4460,35 @@ async function getSyncConfig() {
     return { url, token: url ? (cfg.token || '') : '' };
 }
 
+// The account this browser is signed in as, as Settings last learned it.
+async function signedInAccount(cfg) {
+    const backend = (await StorageManager.getSettings()).backend || {};
+    if (!cfg.token || backend.userId === undefined || backend.userId === null) return null;
+    return {
+        url: cfg.url, userId: Number(backend.userId), username: backend.username || null,
+        serverId: backend.serverId || null, tenancyOwner: Boolean(backend.tenancyOwner)
+    };
+}
+
+// The working copy belongs to another account. Pulling over it would discard
+// that account's edits and forcing would write them into this one, so the
+// only offer is to set it aside (kept, under Settings › Set-aside copies) and
+// pull this account's tree.
+async function setAsideAndPull(cfg, err) {
+    if (!confirm('This working copy belongs to another account.\n\n'
+        + 'OK = Set it aside and pull this account\'s tree. The copy stays in this browser (Settings › Set-aside copies).\n'
+        + 'Cancel = Do nothing.')) {
+        return 'Push cancelled — this working copy belongs to another account.';
+    }
+    const me = await signedInAccount(cfg);
+    const userId = me ? me.userId : err && err.userId;
+    if (userId === undefined || userId === null) return 'Open Settings once so this browser learns which account it is signed in as, then try again.';
+    await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null });
+    const { version } = await TreeStore.sync.pull(cfg);
+    await persistSyncStamp('pull');
+    return `Set the other account's copy aside and pulled (v${version}).`;
+}
+
 async function persistSyncStamp(kind) {
     const settings = await StorageManager.getSettings();
     await StorageManager.saveSettings({
@@ -4002,6 +4517,7 @@ async function doPush() {
         await persistSyncStamp('push');
         return `Pushed (v${version}).`;
     } catch (e) {
+        if (e.status === 412) return setAsideAndPull(cfg, e);
         if (e.status === 409) {
             const takeTheirs = confirm(
                 'The server has changes you have not pulled (another device pushed).\n\n' +
@@ -4029,7 +4545,14 @@ async function doPull({ skipConfirm = false } = {}) {
         return 'Not signed in.';
     }
     const status = TreeStore.status();
-    if (!skipConfirm && status.dirty) {
+    // A copy that belongs to another account (or predates accounts, for
+    // anyone but the server owner) is set aside, never pulled over.
+    const me = await signedInAccount(cfg);
+    let setAside = false;
+    if (me && TreeStore.wouldSetAside(me)) {
+        await TreeStore.setAsideAndReset(me);
+        setAside = true;
+    } else if (!skipConfirm && status.dirty) {
         if (!confirm('You have local edits that were never pushed. Pulling replaces your working copy with the server\'s tree and discards them.\n\nPull anyway?')) {
             return 'Pull cancelled.';
         }
@@ -4044,9 +4567,10 @@ async function doPull({ skipConfirm = false } = {}) {
         let items = 0;
         const walk = (n) => { items++; (n.children || []).forEach(walk); };
         (tree[0].children || []).forEach(walk);
-        return items === 0
+        const aside = setAside ? ' The other account\'s working copy is set aside (Settings).' : '';
+        return (items === 0
             ? `Pulled (v${version}) — but the server's tree is EMPTY.`
-            : `Pulled ${items} item(s) (v${version}).`;
+            : `Pulled ${items} item(s) (v${version}).`) + aside;
     } catch (e) {
         alert('Pull failed: ' + e.message);
         return 'Pull failed: ' + e.message;

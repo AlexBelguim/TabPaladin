@@ -4,6 +4,19 @@
 // already forgotten past its 1000-item listing cap, this table is the only
 // copy. Clients see it as a virtual subtree composed at read time and can only
 // change it through explicit verbs, never by pushing a tree.
+//
+// Sources belong to an account (import_sources.user_id); the archive rows,
+// tombstones and OAuth state belong to a source. That is only sound because a
+// source row is never hard-deleted except by an explicit purge that takes all
+// of those with it — removing a source is a soft delete that keeps its
+// archive, still owned, behind "Show removed sources".
+//
+// Lookups that take a user id return only that account's sources. The ones
+// that take a bare source id (credentials, markRun, the archive itself) are
+// for callers that already resolved the id through getSource(id, userId) or
+// listAllSources(); getSourceUnscoped is for the OAuth callback and confirm
+// pages only, which carry no bearer token and are authenticated by a one-time
+// value instead.
 
 import crypto from 'node:crypto';
 
@@ -125,6 +138,9 @@ export function initSchema(db) {
 }
 
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
+const PENDING_TTL_MS = 15 * 60 * 1000;
+
+const hashNonce = (nonce) => crypto.createHash('sha256').update(String(nonce)).digest('hex');
 
 export function makeStore(db) {
     const rowToSource = (row) => {
@@ -142,31 +158,52 @@ export function makeStore(db) {
             lastStatus: row.last_status,
             lastError: row.last_error,
             createdAt: row.created_at,
+            userId: row.user_id,
+            deletedAt: row.deleted_at || null,
             // Raw, still sealed. Callers that need it use readCredentials.
             credentials: row.credentials
         };
     };
 
     return {
-        listSources() {
-            const rows = db.prepare('SELECT * FROM import_sources ORDER BY id').all();
+        // One account's sources. Removed ones only when asked for, flagged by
+        // deletedAt.
+        listSources(userId, { includeRemoved = false } = {}) {
+            const rows = includeRemoved
+                ? db.prepare('SELECT * FROM import_sources WHERE user_id = ? ORDER BY id').all(userId)
+                : db.prepare('SELECT * FROM import_sources WHERE user_id = ? AND deleted_at IS NULL ORDER BY id').all(userId);
             return rows.map(rowToSource);
         },
 
-        getSource(id) {
+        // Every account's active sources: the scheduler and the boot warning.
+        listAllSources() {
+            return db.prepare('SELECT * FROM import_sources WHERE deleted_at IS NULL ORDER BY id').all().map(rowToSource);
+        },
+
+        // null for another account's source, and for a removed one unless
+        // includeRemoved — both look like "not found" to the routes.
+        getSource(id, userId, { includeRemoved = false } = {}) {
+            const row = includeRemoved
+                ? db.prepare('SELECT * FROM import_sources WHERE id = ? AND user_id = ?').get(id, userId)
+                : db.prepare('SELECT * FROM import_sources WHERE id = ? AND user_id = ? AND deleted_at IS NULL').get(id, userId);
+            return rowToSource(row);
+        },
+
+        getSourceUnscoped(id) {
             return rowToSource(db.prepare('SELECT * FROM import_sources WHERE id = ?').get(id));
         },
 
-        createSource({ provider, label, config = {}, intervalMinutes = 60 }) {
+        createSource({ provider, label, config = {}, intervalMinutes = 60, userId }) {
+            if (!Number.isInteger(Number(userId)) || Number(userId) <= 0) throw new Error('createSource needs the owning userId');
             const info = db.prepare(`
-                INSERT INTO import_sources (provider, label, config, interval_minutes, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            `).run(provider, label || provider, JSON.stringify(config), intervalMinutes, new Date().toISOString());
-            return this.getSource(info.lastInsertRowid);
+                INSERT INTO import_sources (provider, label, config, interval_minutes, created_at, user_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(provider, label || provider, JSON.stringify(config), intervalMinutes, new Date().toISOString(), Number(userId));
+            return this.getSource(info.lastInsertRowid, Number(userId));
         },
 
-        updateSource(id, patch) {
-            const current = this.getSource(id);
+        updateSource(id, userId, patch) {
+            const current = this.getSource(id, userId);
             if (!current) return null;
             const next = {
                 label: patch.label !== undefined ? patch.label : current.label,
@@ -176,15 +213,49 @@ export function makeStore(db) {
             };
             db.prepare(`
                 UPDATE import_sources SET label = ?, config = ?, enabled = ?, interval_minutes = ?
-                WHERE id = ?
-            `).run(next.label, JSON.stringify(next.config), next.enabled, next.intervalMinutes, id);
-            return this.getSource(id);
+                WHERE id = ? AND user_id = ?
+            `).run(next.label, JSON.stringify(next.config), next.enabled, next.intervalMinutes, id, userId);
+            return this.getSource(id, userId);
         },
 
-        deleteSource(id, { purge = false } = {}) {
-            if (purge) db.prepare('DELETE FROM import_items WHERE source_id = ?').run(id);
-            db.prepare('DELETE FROM import_oauth_state WHERE source_id = ?').run(id);
-            db.prepare('DELETE FROM import_sources WHERE id = ?').run(id);
+        // Without purge this only removes the connection: the source is marked
+        // removed and disabled, its credentials, any pending connection and
+        // client secret are dropped, and the archive stays, still this
+        // account's. Removing a source used to delete its row and leave the
+        // archive pointing at nothing. With purge, the archive, its
+        // tombstones, OAuth state and the source row all go. Returns whether
+        // anything of this account's was there to remove.
+        deleteSource(id, userId, { purge = false } = {}) {
+            return db.transaction(() => {
+                const row = db.prepare('SELECT id, config FROM import_sources WHERE id = ? AND user_id = ?').get(id, userId);
+                if (!row) return false;
+                if (purge) {
+                    db.prepare('DELETE FROM import_items WHERE source_id = ? AND source_id IN (SELECT id FROM import_sources WHERE user_id = ?)').run(id, userId);
+                    db.prepare('DELETE FROM import_dismissed WHERE source_id = ? AND source_id IN (SELECT id FROM import_sources WHERE user_id = ?)').run(id, userId);
+                    db.prepare('DELETE FROM import_oauth_state WHERE source_id = ? AND source_id IN (SELECT id FROM import_sources WHERE user_id = ?)').run(id, userId);
+                    db.prepare('DELETE FROM import_sources WHERE id = ? AND user_id = ?').run(id, userId);
+                    return true;
+                }
+                let config = {};
+                try { config = JSON.parse(row.config || '{}'); } catch (e) { /* corrupt config */ }
+                delete config.clientSecret;
+                db.prepare('DELETE FROM import_oauth_state WHERE source_id = ?').run(id);
+                db.prepare(`
+                    UPDATE import_sources
+                    SET deleted_at = COALESCE(deleted_at, ?), enabled = 0, credentials = NULL, config = ?,
+                        pending_credentials = NULL, pending_username = NULL, pending_nonce_hash = NULL
+                    WHERE id = ? AND user_id = ?
+                `).run(new Date().toISOString(), JSON.stringify(config), id, userId);
+                return true;
+            })();
+        },
+
+        // Back from "removed". It comes back disabled and disconnected — a
+        // Reddit source needs authorising again — but with its archive intact.
+        restoreSource(id, userId) {
+            const changed = db.prepare('UPDATE import_sources SET deleted_at = NULL WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL')
+                .run(id, userId).changes;
+            return changed > 0 ? this.getSource(id, userId) : null;
         },
 
         readCredentials(id) {
@@ -201,6 +272,51 @@ export function makeStore(db) {
             return Boolean(row && row.credentials);
         },
 
+        // --- A Reddit connection waiting for its owner's confirm click ---
+        //
+        // The OAuth callback cannot tell who completed Reddit's consent: anyone
+        // can be sent a consent link for someone else's source. So the tokens
+        // it obtains wait here, sealed, until the browser that completed the
+        // flow confirms which TabPaladin account should receive them — with a
+        // one-time nonce only that page holds. Nothing reaches `credentials`,
+        // and so nothing is swept, before that.
+        setPendingCredentials(id, { creds, username, nonce }) {
+            const expiresAt = new Date(Date.now() + PENDING_TTL_MS).toISOString();
+            db.prepare(`
+                UPDATE import_sources SET pending_credentials = ?, pending_username = ?, pending_nonce_hash = ?
+                WHERE id = ? AND deleted_at IS NULL
+            `).run(seal({ creds, expiresAt }), username || null, hashNonce(nonce), id);
+        },
+
+        // The source a confirm nonce belongs to, with its unsealed pending
+        // connection, or null when unknown or expired (an expired one is
+        // cleared on the way).
+        pendingFor(nonce) {
+            if (!nonce) return null;
+            const row = db.prepare('SELECT * FROM import_sources WHERE pending_nonce_hash = ? AND deleted_at IS NULL').get(hashNonce(nonce));
+            if (!row) return null;
+            let pending = {};
+            try { pending = unseal(row.pending_credentials); } catch (e) { pending = {}; }
+            if (!pending.creds || !(Date.parse(pending.expiresAt) > Date.now())) {
+                this.clearPending(row.id);
+                return null;
+            }
+            return { source: rowToSource(row), creds: pending.creds, username: row.pending_username };
+        },
+
+        confirmPending(nonce) {
+            const hit = this.pendingFor(nonce);
+            if (!hit) return null;
+            this.writeCredentials(hit.source.id, hit.creds);
+            this.clearPending(hit.source.id);
+            return hit;
+        },
+
+        clearPending(id) {
+            db.prepare('UPDATE import_sources SET pending_credentials = NULL, pending_username = NULL, pending_nonce_hash = NULL WHERE id = ?')
+                .run(id);
+        },
+
         markRun(id, { status, error = null }) {
             db.prepare('UPDATE import_sources SET last_run = ?, last_status = ?, last_error = ? WHERE id = ?')
                 .run(new Date().toISOString(), status, error, id);
@@ -212,6 +328,12 @@ export function makeStore(db) {
         // listing. Returns true when the row is new.
         upsertItem(sourceId, item) {
             const now = new Date().toISOString();
+
+            // Only into a source that still exists and has not been removed —
+            // a sweep or capture racing a removal must not write into an
+            // archive nobody can see.
+            const live = db.prepare('SELECT 1 FROM import_sources WHERE id = ? AND deleted_at IS NULL').get(sourceId);
+            if (!live) return false;
 
             // Deleted by the user. It is very likely still saved at the source,
             // so without this check every sweep would resurrect it.

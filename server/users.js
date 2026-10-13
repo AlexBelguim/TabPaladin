@@ -9,43 +9,86 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { hashPassword, sameSecret } from './security.js';
+import { initTenancySchema, nextUserId, bumpTreeVersion, getServerMeta } from './tenancy.js';
 
 // Bumped whenever a boot-time migration changes the schema; a database below
-// it is backed up before anything touches it.
-export const SCHEMA_VERSION = 2;
+// it is backed up before anything touches it. 3: every row names its account.
+export const SCHEMA_VERSION = 3;
 
 export const MIN_PASSWORD_LENGTH = 8;
+export const MAX_PASSWORD_LENGTH = 256;
 
 // --- Backup ---
 //
 // VACUUM INTO writes a consistent copy including anything still in the WAL,
-// which a plain file copy of sync.db would miss. One is taken when the schema
-// is about to change, and otherwise at most once per `intervalMs`, so a
-// container stuck restarting can't rotate the pre-upgrade copy away.
-export function backupDatabase(db, dbPath, { keep = 7, intervalMs = 24 * 3600 * 1000, now = new Date() } = {}) {
-    const dir = path.dirname(dbPath);
-    const base = path.basename(dbPath) + '.bak-';
-    const existing = fs.readdirSync(dir).filter(f => f.startsWith(base)).sort(); // timestamps sort lexically
+// which a plain file copy of sync.db would miss.
+//
+// Two kinds, under their own prefixes so neither can rotate the other away:
+//   sync.db.pre-v<N>-<ts>  before a schema step to version N. Never pruned —
+//                          it is the rollback point — and not taken again
+//                          within ten minutes while the step has not
+//                          happened, so a container stuck restarting does not
+//                          pile them up.
+//   sync.db.bak-<ts>       otherwise at most once per `intervalMs`, newest
+//                          `keep` kept. Skipped while a schema step is
+//                          pending, so a crash loop below the new version
+//                          cannot replace every older daily copy with
+//                          identical pre-upgrade ones.
+const SCHEMA_BACKUP_REUSE_MS = 10 * 60 * 1000;
 
+export function backupDatabase(db, dbPath, { keep = 7, intervalMs = 24 * 3600 * 1000, now = new Date() } = {}) {
     const userVersion = db.pragma('user_version', { simple: true });
     const hasData = db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'").get().n > 0;
     if (!hasData) return null; // brand-new database: nothing to lose
 
-    const newest = existing[existing.length - 1];
-    const newestAt = newest ? stampTime(newest.slice(base.length)) : 0;
-    const due = userVersion < SCHEMA_VERSION || now.getTime() - newestAt >= intervalMs;
-    if (!due) return null;
+    if (userVersion < SCHEMA_VERSION) {
+        const label = `pre-v${SCHEMA_VERSION}`;
+        const recent = listBackups(dbPath, label + '-')
+            .some(f => now.getTime() - f.at >= 0 && now.getTime() - f.at < SCHEMA_BACKUP_REUSE_MS);
+        if (recent) return null;
+        return backupNow(db, dbPath, label, { keep: 0, now });
+    }
 
+    const existing = listBackups(dbPath, 'bak-');
+    const newestAt = existing.length ? existing[existing.length - 1].at : 0;
+    if (now.getTime() - newestAt < intervalMs) return null;
+    return backupNow(db, dbPath, 'bak', { keep, now });
+}
+
+// A copy right now, as sync.db.<label>-<timestamp>. With `keep`, prunes the
+// oldest files under `prunePrefix` (default: this label) beyond that many,
+// never the one just written. Throws if the copy cannot be written.
+export function backupNow(db, dbPath, label, { keep = 0, prunePrefix = label + '-', now = new Date() } = {}) {
+    const dir = path.dirname(dbPath);
     const stamp = now.toISOString().replace(/[:.]/g, '-');
-    const target = path.join(dir, base + stamp);
+    const name = `${path.basename(dbPath)}.${label}-${stamp}`;
+    const target = path.join(dir, name);
     db.prepare('VACUUM INTO ?').run(target);
 
-    // Prune the oldest beyond `keep`, never the one just written.
-    const all = [...existing, base + stamp].sort();
-    for (const f of all.slice(0, Math.max(0, all.length - keep))) {
-        try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* already gone */ }
+    if (keep > 0) {
+        const all = listBackups(dbPath, prunePrefix);
+        for (const f of all.slice(0, Math.max(0, all.length - keep))) {
+            if (f.name === name) continue;
+            try { fs.unlinkSync(path.join(dir, f.name)); } catch (e) { /* already gone */ }
+        }
     }
     return target;
+}
+
+// Backups whose name starts with sync.db.<prefix>, oldest first by the
+// timestamp that ends every name.
+export function listBackups(dbPath, prefix) {
+    const dir = path.dirname(dbPath);
+    const base = path.basename(dbPath) + '.' + prefix;
+    return fs.readdirSync(dir)
+        .filter(f => f.startsWith(base))
+        .map(name => ({ name, at: stampTime(name.slice(-24)) }))
+        .sort((a, b) => a.at - b.at || a.name.localeCompare(b.name));
+}
+
+export function latestBackup(dbPath, prefix) {
+    const all = listBackups(dbPath, prefix);
+    return all.length ? path.join(path.dirname(dbPath), all[all.length - 1].name) : null;
 }
 
 // 2026-01-01T00-00-00-000Z -> ms; 0 for anything unparseable, which only makes
@@ -91,11 +134,53 @@ export function validateUsername(name) {
     return { username };
 }
 
+export function validatePassword(value) {
+    const password = String(value ?? '');
+    if (password.length < MIN_PASSWORD_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
+        return { error: `Password: ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.` };
+    }
+    return { password };
+}
+
+// An existing or deleted account whose name differs from this one only by
+// case. Signing in to an empty "Alex" instead of "alex" looks exactly like
+// "all my bookmarks are gone" and invites a force push, so such names are
+// refused. Returns the clashing name, or null.
+export function usernameClash(db, username) {
+    initTenancySchema(db);
+    const want = String(username).normalize('NFKC').toLowerCase();
+    const names = [
+        ...db.prepare('SELECT username FROM users').all(),
+        ...db.prepare('SELECT username FROM deleted_users').all()
+    ].map(r => r.username);
+    return names.find(n => String(n).normalize('NFKC').toLowerCase() === want) || null;
+}
+
 export async function createUser(db, { username, password, role = 'user' }) {
-    const nextId = db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS n FROM users').get().n;
-    db.prepare('INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(nextId, username, await hashPassword(password), role, new Date().toISOString());
-    return userById(db, nextId);
+    return insertUser(db, { username, passwordHash: await hashPassword(password), role });
+}
+
+// Synchronous, so a caller can repeat its own checks in the same transaction.
+// The id comes from a counter that never goes back, so a new account cannot
+// inherit a deleted one's rows or sessions. Once accounts are separated, a new
+// one starts at a fresh tree version from the global sequence.
+export function insertUser(db, { username, passwordHash, role = 'user' }) {
+    initTenancySchema(db);
+    return db.transaction(() => {
+        const clash = usernameClash(db, username);
+        if (clash) {
+            const err = new Error(clash === username
+                ? `"${username}" already exists or belonged to a deleted account.`
+                : `"${username}" is too close to existing "${clash}".`);
+            err.code = 'name-clash';
+            throw err;
+        }
+        const id = nextUserId(db);
+        db.prepare('INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
+            .run(id, username, passwordHash, role, new Date().toISOString());
+        if (getServerMeta(db, 'tenancy_owner_id') !== null) bumpTreeVersion(db, id);
+        return userById(db, id);
+    })();
 }
 
 export const userCount = (db) => db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -106,6 +191,23 @@ export const firstAdmin = (db) =>
     db.prepare("SELECT id, username, role, password_hash FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").get();
 
 export const publicUser = (u) => u && { id: u.id, username: u.username, role: u.role };
+
+// Who held the data before accounts were separated, and who the legacy
+// AUTH_TOKEN acts as. Both are written once, by the ownership migration, and
+// only change by hand (see the README), which needs a restart — so a value,
+// once found, is cached.
+const metaCache = new WeakMap();
+function cachedMeta(db, key) {
+    let cache = metaCache.get(db);
+    if (!cache) metaCache.set(db, cache = new Map());
+    if (cache.has(key)) return cache.get(key);
+    const value = getServerMeta(db, key);
+    if (value === null) return null;
+    cache.set(key, Number(value));
+    return Number(value);
+}
+export const tenancyOwnerId = (db) => cachedMeta(db, 'tenancy_owner_id');
+export const legacyTokenUserId = (db) => cachedMeta(db, 'legacy_token_user_id');
 
 // --- First run ---
 //
@@ -130,9 +232,13 @@ export async function bootstrapAdmin(db, env) {
 
 // --- Who is calling ---
 //
-// A session token from /api/login, or the legacy AUTH_TOKEN acting as the
-// first admin (for scripts and clients that predate logins). Bearer tokens,
-// not cookies: the extension calls cross-origin.
+// A session token from /api/login, or the legacy AUTH_TOKEN (for scripts and
+// clients that predate logins). The token acts as the account the ownership
+// migration pinned it to — the one that owned the data it used to reach — and
+// never moves to whichever admin happens to have the lowest id. If that
+// account is gone the token is refused. Only before the migration has run does
+// it fall back to the first admin. Bearer tokens, not cookies: the extension
+// calls cross-origin.
 export function presentedToken(req) {
     const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/);
     return m ? m[1] : (req.headers['x-api-key'] || null);
@@ -152,8 +258,9 @@ export function identify(db, authToken, token) {
         return { id: row.id, username: row.username, role: row.role, via: 'session' };
     }
     if (authToken && sameSecret(token, authToken)) {
-        const admin = firstAdmin(db);
-        return admin ? { ...publicUser(admin), via: 'token' } : null;
+        const pinned = legacyTokenUserId(db);
+        const user = pinned !== null ? userById(db, pinned) : firstAdmin(db);
+        return user ? { ...publicUser(user), via: 'token' } : null;
     }
     return null;
 }

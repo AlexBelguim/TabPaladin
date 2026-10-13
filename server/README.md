@@ -15,6 +15,11 @@ On the first boot after upgrading, the server converts the newest legacy
 snapshot into the items table automatically — notes, pins, workflows and all.
 Nothing is lost; old history rows stay readable.
 
+**Several people, one server.** Every account has its own tree, notes,
+workflows, inbox, history, LLM share links, import archives and preferences.
+Nothing of one account is ever shown to, or overwritten by, another — see
+[Accounts](#accounts).
+
 ## Run on TrueNAS (or any Docker host)
 
 ```bash
@@ -38,20 +43,34 @@ the network.
 | Variable | Default | |
 |---|---|---|
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / *(required on first start)* | First admin account. Ignored once any account exists. |
-| `TABPALADIN_TOKEN` | *(off)* | Legacy shared token, passed to the server as `AUTH_TOKEN`. Requests bearing it (`Authorization: Bearer` or `X-API-Key`) act as the first admin — for scripts, and for clients that predate logins. At least 32 characters; the old example value from this README is refused. Also the admin password on a first start without `ADMIN_PASSWORD`. |
+| `TABPALADIN_TOKEN` | *(off)* | Legacy shared token, passed to the server as `AUTH_TOKEN`. Requests bearing it (`Authorization: Bearer` or `X-API-Key`) act as the account that owned the data before accounts were separated — for scripts, and for clients that predate logins. It cannot manage accounts. At least 32 characters; the old example value from this README is refused. Also the admin password on a first start without `ADMIN_PASSWORD`. |
+| `TENANCY_OWNER` | *(unset)* | Only for the [upgrade to separate accounts](#upgrading-to-separate-accounts-schema-3), and only when the database already holds more than one account: the username (or id) whose data it all is. |
+| `IMPORTS_SCHEDULER` | *(on)* | `off` stops the import scheduler — for rehearsing on a copy of a real database. |
+| `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the shared-links inbox and on pending LLM proposals. Past them new rows get `429`; nothing is pruned. |
 | `IMPORT_SECRET` | *(off)* | Encrypts importer OAuth refresh tokens at rest. |
 | `TRUST_PROXY` | `loopback, uniquelocal` | Express `trust proxy`: which proxies may set `X-Forwarded-For` / `-Proto`. Set `1` or `true` if your proxy reaches the server from a public address. |
 | `CORS_ORIGIN` | *(off)* | Extra comma-separated origins allowed to call the API cross-origin. The server's own origin and browser-extension origins (`chrome-extension://`, `moz-extension://`) are always allowed. |
-| `AUTH_MAX_FAILURES` / `AUTH_WINDOW_MINUTES` | `10` / `15` | Failed sign-ins allowed per IP per window before `429`. |
+| `AUTH_MAX_FAILURES` / `AUTH_WINDOW_MINUTES` | `10` / `15` | Failed sign-ins allowed per IP and username per window before `429`, so people behind one NAT do not lock each other out. |
+| `AUTH_IP_MAX_FAILURES` | 5 × `AUTH_MAX_FAILURES` | Failed sign-ins allowed per IP across all usernames. |
 | `BACKUP_KEEP` | `7` | Boot-time database backups to keep (see below). |
 | `SESSION_DAYS` | `180` | Session lifetime. |
-| `MAX_SNAPSHOTS` | `200` | Tree history rows kept. |
+| `MAX_SNAPSHOTS` | `200` | Tree history rows kept, per account. |
 | `HOST_PORT` | `18921` | Host port in docker-compose. |
 
 **Backups.** At boot, before any migration touches it, the server writes a
-consistent copy of the database to `data/sync.db.bak-<timestamp>` — whenever
-the schema is about to change, and otherwise at most once a day. The newest
-`BACKUP_KEEP` are kept. To restore, stop the container and copy one over
+consistent copy of the database (`VACUUM INTO`, which includes what is still in
+the WAL — a plain file copy of a running `sync.db` does not):
+
+| file | when | kept |
+|---|---|---|
+| `sync.db.bak-<timestamp>` | at most once a day | the newest `BACKUP_KEEP` |
+| `sync.db.pre-v<N>-<timestamp>` | before a schema upgrade to version N; not again within ten minutes while the upgrade has not happened, so a restart loop cannot pile them up | forever — it is the rollback point |
+| `sync.db.post-v<N>-<timestamp>` | right after that upgrade, before any client can push | forever |
+| `sync.db.predelete-<id>-<timestamp>` | before an admin deletes an account | the newest 10 |
+
+Each kind rotates under its own prefix, so none can push another out. Note
+that pre-upgrade and predelete copies **contain deleted accounts' data**; they
+stay on the server's disk. To restore, stop the container and copy one over
 `sync.db` (deleting `sync.db-wal` and `sync.db-shm`).
 
 ### Upgrading an existing server
@@ -69,10 +88,114 @@ image:
    once every client signs in with an account. If it was never set, the old
    compose file silently used that example value — it now defaults to off.
 
+## Accounts
+
+The first admin comes from `ADMIN_USERNAME` / `ADMIN_PASSWORD`. Admins add
+further accounts from **Settings › Users**, in the extension or the PWA. Each
+account starts with an empty tree and has its own of everything: tree and
+history, notes, workflows, inbox, LLM share links and proposals, Reddit / X /
+Instagram archives, and preferences. Every row in the database names the
+account it belongs to, and the database itself refuses a row whose account
+does not exist, so a forgotten check is an error, not a leak.
+
+Account management is deliberately harder to reach than the rest:
+
+- only an admin, in a signed-in session — the legacy `AUTH_TOKEN` keeps the
+  data access it always had but cannot manage accounts;
+- every change asks for the acting admin's own password again (counted like a
+  failed sign-in), and is checked again as it is written: an admin demoted,
+  deleted or signed out in the meantime changes nothing;
+- the **server owner** — the account holding the data from before accounts
+  were separated — cannot be deleted, demoted or reset over HTTP at all, not
+  even by another admin;
+- the last admin cannot be demoted or deleted, nor can you delete yourself or
+  change your own role, nor delete the account `AUTH_TOKEN` acts as while it
+  is set;
+- a new name that differs from an existing or deleted one only by case
+  ("Alex" next to "alex") is refused;
+- deleting an account signs it out everywhere, takes a `predelete` backup
+  (and deletes nothing if that fails), then removes everything the account
+  owns in one transaction. Its id is never handed out again.
+
+A password reset signs that account out on every device, including a sign-in
+with the old password that was still being checked when the reset landed.
+Unpushed edits on its
+devices stay there; the clients never discard a working copy because of an
+account change — they set it aside instead.
+
+**Moving the owner.** By design this needs shell access. With the container
+stopped:
+
+```bash
+sqlite3 data/sync.db "UPDATE server_meta SET value = '<new owner id>' WHERE key IN ('tenancy_owner_id', 'legacy_token_user_id');"
+```
+
+### Upgrading to separate accounts (schema 3)
+
+The first start of this version assigns every existing row to the account
+that already exists, and nothing else changes: same tree version (so no device
+sees a conflict), same sessions, same history, inbox, proposals and archives.
+The boot log says what it did:
+
+```
+Tenancy migration: assigned 9312 rows to alex (#1); recovered 1 removed import source(s); pre-upgrade copy sync.db.pre-v3-…; post-upgrade copy sync.db.post-v3-…
+```
+
+- Archives of import sources you had removed used to be left behind with no
+  source; they come back as greyed *Removed … source* rows under **Show
+  removed sources**, where they can be restored or purged. Removing a source
+  is now a soft delete that keeps its archive.
+- The migration is one transaction that checks itself before committing:
+  every table that existed before must hash identically (apart from the new
+  columns), every row must have an owner, and the owner's tree version must
+  be the one their devices hold. Anything else rolls it all back.
+- It **refuses** rather than guesses: when the database holds more than one
+  account (set `TENANCY_OWNER=<username>`), when free disk is under 2.5 × the
+  database, or when the database was already upgraded by a newer build. A
+  refusal writes `data/MIGRATION_REFUSED` with the reason and stops; later
+  starts stop at that file without taking more backups, so a restart loop
+  cannot rotate your older backups away. Fix the cause, delete the file,
+  restart.
+
+**Rehearse first.** On a copy taken with `VACUUM INTO` (or any
+`sync.db.bak-*`), or with the container stopped — never a plain copy of a
+running `sync.db`, which misses everything still in the WAL:
+
+```bash
+sqlite3 data/sync.db "VACUUM INTO '/tmp/rehearsal/sync.db'"
+IMPORTS_SCHEDULER=off DATA_DIR=/tmp/rehearsal PORT=18930 node index.js
+```
+
+`IMPORTS_SCHEDULER=off` stops the copy sweeping your real Reddit account.
+A copy of an already upgraded database reports the same `serverId` as the
+original; the clients still treat it as a different server because its address
+differs, so a browser signed in to it sets the real server's working copy
+aside rather than pushing it there.
+
+**Verify.** Compare the frozen copies on either side of the migration — not
+the live database, which your devices are already pushing to:
+
+```bash
+docker compose exec tabpaladin-sync node verify_tenancy.js /data/sync.db.pre-v3-… /data/sync.db.post-v3-…
+```
+
+It prints per-table row counts and hashes for both and exits non-zero on any
+difference. `node verify_tenancy.js --digest /data/sync.db` prints the digest
+the migration recorded at the time.
+
+**Rolling back means restoring `sync.db.pre-v3-*`**, not running the old image
+on the upgraded database: the old image would show every account's bookmarks
+merged together, and its writes are refused by the database. This version
+refuses to start on a database upgraded by a newer one and says which copy to
+restore.
+
 ## The tree
 
-`GET /api/tree` returns `{ version, roots }` — an array of top-level folders,
-no browser roots. Nodes are:
+`GET /api/tree` returns `{ version, roots, userId, serverId }` — an array of
+top-level folders, no browser roots, and the account they belong to on which
+server. `serverId` is random, made on first start and kept in the database:
+account ids start at 1 on every server, so a client tells "admin #1 here" from
+"admin #1 on another server" by it. Nodes are:
 
 ```jsonc
 { "id": "ab12cd34ef56aa00",       // permanent; survives every push/pull
@@ -100,11 +223,20 @@ Importing a browser's bookmarks creates a named folder inside it — "Chrome
 bookmarks", "Firefox bookmarks" — so a second import cannot merge into the
 first.
 
-`PUT /api/tree` replaces the whole tree: `{ roots, baseVersion, deviceId }`.
-If `baseVersion` is not the server's current version — another device pushed in
-between — the push is refused with **409** and the client must pull first (or
-send `force: true`). Every accepted write bumps the version and lands a
-`{format: 2, roots}` row in the history table.
+`PUT /api/tree` replaces the caller's whole tree: `{ roots, baseVersion,
+baseUserId, baseServerId, deviceId }`. If `baseVersion` is not the server's
+current version — another device pushed in between — the push is refused with
+**409** and the client must pull first (or send `force: true`). Every accepted
+write bumps the version and lands a `{format: 2, roots}` row in the history
+table.
+
+A working copy that belongs to another account is refused with **412**, which
+`force` does not override: `code: "wrong-account"` when `baseUserId` names
+someone else or `baseServerId` another server, `code: "foreign-ids"` when the
+pushed tree contains items stored under another account. Clients set such a
+copy aside rather than pull over it. Versions are drawn from one server-wide
+sequence, so no two accounts ever share one; clients only compare them for
+equality.
 
 The response of `GET /api/tree` also carries a **virtual imports subtree**
 (`id: "imports:root"`, flagged `virtual`/`readOnly`) composed at read time from
@@ -113,17 +245,24 @@ can only be changed through the explicit import verbs below.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health` and the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead).
+All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health`, the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead) and the Reddit OAuth callback and confirm pages. Everything acts on the caller's own account.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | server status |
 | GET | `/api/auth/status` | **no auth** — `{ hasAccount, legacyTokenEnabled }` |
-| GET | `/api/auth/me` | `{ user: { id, username, role } }` |
-| POST | `/api/login` | **no auth** — `{ username, password }` → session token; rate-limited per IP |
+| GET | `/api/auth/me` | `{ user: { id, username, role, tenancyOwner }, serverId }` |
+| POST | `/api/login` | **no auth** — `{ username, password }` → session token, `user` and `serverId`; rate-limited per IP and username |
 | POST | `/api/auth/password` | `{ currentPassword, newPassword }`; revokes every session |
-| GET | `/api/tree` | the tree (+ virtual imports subtree) |
-| PUT | `/api/tree` | replace the tree `{ roots, baseVersion, deviceId?, force? }`; 409 on a stale baseVersion |
+| GET | `/api/users` | admin session — every account with role, owner flag and what it holds |
+| POST | `/api/users` | admin session — `{ username, password, role, currentPassword }` |
+| PUT | `/api/users/:id` | admin session — `{ role?, password?, currentPassword }`; a reset signs that account out |
+| POST | `/api/users/:id/delete` | admin session — `{ confirm: '<username>', currentPassword }` → `{ deleted: {table: n}, backup }` |
+| GET | `/api/prefs`, `/api/prefs/:key` | the caller's preferences |
+| PUT | `/api/prefs/:key` | `{ value, baseUpdatedAt? }`; 409 with `current` when stale; 64 KB per value, 100 keys |
+| DELETE | `/api/prefs/:key` | remove one |
+| GET | `/api/tree` | the tree (+ virtual imports subtree), `userId` and `serverId` |
+| PUT | `/api/tree` | replace the tree `{ roots, baseVersion, baseUserId?, baseServerId?, deviceId?, force? }`; 409 on a stale baseVersion, 412 for another account's or server's copy |
 | GET | `/api/tree/version` | cheap freshness probe |
 | GET | `/api/history` | list of past tree versions |
 | GET | `/api/history/:id` | fetch a specific past version |
@@ -138,10 +277,11 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | POST | `/api/proposals/:id/reject` | discard a proposal |
 | GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
 | POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content, notebook? }` for approval |
-| GET | `/api/imports` | list import sources with counts and last-run state |
+| GET | `/api/imports` | list import sources with counts and last-run state; `?includeRemoved=1` adds removed ones |
 | POST | `/api/imports` | create `{ provider, clientId, clientSecret, intervalMinutes? }` |
 | PATCH | `/api/imports/:id` | enable/disable, change interval or credentials |
-| DELETE | `/api/imports/:id` | remove a source; `?purge=1` also deletes its archive |
+| DELETE | `/api/imports/:id` | remove a source, keeping its archive; `?purge=1` deletes the archive too |
+| POST | `/api/imports/:id/restore` | bring a removed source back |
 | GET | `/api/imports/:id/items` | browse the archive (`limit`, `offset`) |
 | POST | `/api/imports/:id/run` | sweep now |
 | POST | `/api/imports/:id/items/delete` | purge `{ externalIds }` from the archive (tombstoned) |
@@ -149,7 +289,8 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | POST | `/api/imports/:id/undismiss` | forget deleted-item tombstones so a sweep may restore them |
 | POST | `/api/imports/capture` | file a shared `{ url, title }` into its archive (X / Instagram) |
 | GET | `/api/imports/:id/authorize` | returns the provider consent URL |
-| GET | `/api/imports/reddit/callback` | **no auth** — OAuth redirect, guarded by a one-shot `state` |
+| GET | `/api/imports/reddit/callback` | **no auth** — OAuth redirect, guarded by a one-shot `state`; asks which account receives the connection |
+| POST | `/api/imports/reddit/confirm` | **no auth** — the confirm page's form, guarded by a one-time nonce |
 | GET | `/` (and other paths) | serves the PWA |
 
 ## LLM share links
@@ -196,6 +337,10 @@ window are stamped as gone from the source and stay in the archive.
    invalidates existing connections.
 5. In the PWA: **Settings → Imports → Connect Reddit**, paste the client ID and
    secret, then authorise.
+6. Back from Reddit, the page asks *Connect Reddit u/… to TabPaladin account
+   …?* Nothing is stored until you press **Connect** — a consent link can be
+   sent to anyone, so the person completing it confirms which account receives
+   their saved posts.
 
 Saved posts and saved comments both appear in every client under:
 
@@ -277,7 +422,9 @@ node tools/test_imports.mjs    # importers: archive, virtual subtree, tombstones
 node tools/test_share_sw.mjs   # PWA service worker share handling
 node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
-ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 DATA_DIR=/tmp/tp node server/index.js &
+node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
+node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block
+ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off MAX_PROPOSALS_PER_USER=3 DATA_DIR=/tmp/tp node server/index.js &
 node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server
 ```
 

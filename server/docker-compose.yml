@@ -19,7 +19,8 @@ services:
       # First admin, created on the first start with no accounts; ignored after.
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
-      # Optional legacy shared token / script key; acts as the first admin.
+      # Optional legacy shared token / script key; acts as the account that
+      # owned the data before accounts were separated.
       # Off unless set; at least 32 characters (openssl rand -hex 32).
       - AUTH_TOKEN=${TABPALADIN_TOKEN:-}
       # Proxies allowed to set X-Forwarded-*; default loopback, uniquelocal.
@@ -34,3 +35,14 @@ services:
       # Changing it later makes existing connections unreadable and they have to
       # be re-authorised.
       - IMPORT_SECRET=${IMPORT_SECRET:-}
+      # Whose data this is, for the one-time upgrade to separate accounts —
+      # only needed when the database already holds more than one account.
+      - TENANCY_OWNER=${TENANCY_OWNER:-}
+      # "off" stops the import scheduler (for a rehearsal on a copy of a real
+      # database, which would otherwise sweep the real Reddit account).
+      - IMPORTS_SCHEDULER=${IMPORTS_SCHEDULER:-}
+      # Failed sign-ins per IP across all usernames (default 5 x AUTH_MAX_FAILURES).
+      - AUTH_IP_MAX_FAILURES=${AUTH_IP_MAX_FAILURES:-}
+      # Per-account caps; they refuse new rows and never prune old ones.
+      - MAX_INBOX_PER_USER=${MAX_INBOX_PER_USER:-5000}
+      - MAX_PROPOSALS_PER_USER=${MAX_PROPOSALS_PER_USER:-200}

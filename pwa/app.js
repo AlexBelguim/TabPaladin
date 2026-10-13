@@ -6,12 +6,39 @@
 // Recent-links modal is appended to the current folder, then pushed.
 
 import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
+import { makePendingShares, PENDING_SHARES_KEY } from './pendingShares.js';
 
 const LS = {
     url: 'tp_pwa_url',
     token: 'tp_pwa_token',   // now a session token from /api/login, not a shared secret
-    username: 'tp_pwa_user'
+    username: 'tp_pwa_user',
+    // Who that session is, as the server said at sign-in (and /api/auth/me
+    // since): the account id, its role, and whether it holds the data from
+    // before accounts were separated ('1').
+    userId: 'tp_pwa_userid',
+    role: 'tp_pwa_role',
+    owner: 'tp_pwa_owner',
+    pendingShares: PENDING_SHARES_KEY
 };
+
+const pendingShares = makePendingShares({ storage: localStorage, key: LS.pendingShares });
+
+function currentUserId() {
+    const v = localStorage.getItem(LS.userId);
+    return v === null || v === '' ? null : Number(v);
+}
+
+function rememberUser(user, username) {
+    if (!user || user.id === undefined || user.id === null) return;
+    localStorage.setItem(LS.userId, String(user.id));
+    localStorage.setItem(LS.role, user.role || '');
+    localStorage.setItem(LS.owner, user.tenancyOwner ? '1' : '0');
+    if (username || user.username) localStorage.setItem(LS.username, username || user.username);
+}
+
+function forgetUser() {
+    for (const k of [LS.token, LS.username, LS.userId, LS.role, LS.owner]) localStorage.removeItem(k);
+}
 
 const state = {
     config: {
@@ -23,10 +50,15 @@ const state = {
         token: localStorage.getItem(LS.token) || ''
     },
     snapshot: null,           // wrapper { type:'root', children: [...] } around the server's top-level folders
+    snapshotUserId: null,     // the account that snapshot belongs to (from the pull)
+    snapshotUsername: null,   // its name, kept for the sign-in guard after a sign-out
+    snapshotUrl: '',          // the server it came from, and that server's id: ids
+    snapshotServerId: null,   // start at 1 on every server, so the id alone is not enough
     treeVersion: 0,           // server tree version this working copy is based on
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
     dirty: false,             // unsaved local edits to the snapshot
+    editCount: 0,             // how many, for "N unpushed edits"
     openNoteId: null,         // _pwaId of the note open in the detail view
     editingNewNote: false,    // detail view is editing a not-yet-created note
     newNotePrefill: null,     // optional pre-filled content for a new note (e.g. from a wikilink)
@@ -37,6 +69,11 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+function markDirty() {
+    state.dirty = true;
+    state.editCount++;
+}
 
 function show(el) { if (el) el.classList.remove('hidden'); }
 function hide(el) { if (el) el.classList.add('hidden'); }
@@ -142,16 +179,23 @@ async function api(path, opts = {}) {
     if (res.status === 401) {
         // The session expired or was revoked — say so plainly and send the user
         // to sign in, rather than surfacing a bare 401 from somewhere deep in
-        // the app.
+        // the app. The worker's copy of the token goes too, or it would keep
+        // posting shares with a dead one. Unpushed edits stay in memory.
         state.config.token = '';
         localStorage.removeItem(LS.token);
+        mirrorConfigToSW();
         setStatus('Session expired — sign in again.');
         try { refreshAuthUi(); show($('settings-sheet')); } catch (e) { /* pre-DOM */ }
-        throw new Error('Signed out');
+        const err = new Error('Signed out');
+        err.status = 401;
+        throw err;
     }
     if (!res.ok) {
         const t = await res.text().catch(() => '');
-        throw new Error(`${res.status} ${res.statusText}: ${t}`);
+        const err = new Error(`${res.status} ${res.statusText}: ${t}`);
+        err.status = res.status;
+        try { err.body = JSON.parse(t); err.code = err.body.code; } catch (e) { /* not JSON */ }
+        throw err;
     }
     return res.json();
 }
@@ -170,7 +214,16 @@ async function bootstrap() {
         setStatus('Open Settings (⚙) to configure your sync server.');
         return;
     }
-    try { await pullSnapshot(); } catch (e) { /* status already set */ }
+    await refreshWhoAmI();
+    // A pull replaces the working copy, so it never runs over unpushed edits
+    // — after a sign-out and back in they are still here, waiting.
+    if (state.dirty && state.snapshot) {
+        renderView();
+        setStatus('You have unpushed edits from before you were signed out — Push to keep them, or Pull to discard.');
+    } else {
+        try { await pullSnapshot(); } catch (e) { /* status already set */ }
+    }
+    await drainPendingShares();
     await refreshInbox();
     await refreshProposals();
     await checkUnfiledLinks();
@@ -253,7 +306,7 @@ async function processImportHashIfAny() {
             assignIds(nb);
             found.node.children = found.node.children || [];
             found.node.children.push(nb);
-            state.dirty = true;
+            markDirty();
             try {
                 setStatus('Saving…');
                 await pushSnapshot();
@@ -337,9 +390,14 @@ async function pullSnapshot() {
         // A wrapper node so the rest of the app keeps its "root with children"
         // navigation model; only its children are real.
         state.snapshot = { type: 'root', title: '', children: (data.roots || []).map(fromWire) };
+        state.snapshotUserId = data.userId ?? currentUserId();
+        state.snapshotUsername = localStorage.getItem(LS.username);
+        state.snapshotUrl = state.config.url.replace(/\/$/, '');
+        state.snapshotServerId = data.serverId || null;
         state.treeVersion = Number(data.version) || 0;
         state.pathIds = [getRootId(state.snapshot)];
         state.dirty = false;
+        state.editCount = 0;
         renderView();
     } catch (e) {
         setStatus('Pull failed: ' + e.message);
@@ -940,7 +998,7 @@ function renderWorkflowsSection(root) {
             e.stopPropagation();
             if (!confirm(`Delete workflow "${wf.title}" (${tabs.length} tabs)?`)) return;
             wfRoot.children = (wfRoot.children || []).filter(c => c !== wf);
-            state.dirty = true;
+            markDirty();
             renderView();
             try {
                 setStatus('Saving…');
@@ -1064,7 +1122,7 @@ async function ensureNotesFolder() {
     assignIds(nb);
     state.snapshot.children = state.snapshot.children || [];
     state.snapshot.children.push(nb);
-    state.dirty = true;
+    markDirty();
     updatePushBtnState();
     return findNotesFolderWithPath();
 }
@@ -1265,7 +1323,7 @@ async function createNotebook() {
     assignIds(nb);
     found.node.children = found.node.children || [];
     found.node.children.push(nb);
-    state.dirty = true;
+    markDirty();
     try {
         setStatus('Saving…');
         await pushSnapshot();
@@ -1426,7 +1484,7 @@ async function applyImportBatch() {
     }
 
     state.importBatch = null;
-    state.dirty = true;
+    markDirty();
     try {
         setStatus('Saving…');
         await pushSnapshot();
@@ -1703,7 +1761,7 @@ function renderNoteDetail(container, folder, note) {
             const now = new Date().toISOString();
             note.url = encodeNoteUrl({ content: updated, createdAt: meta.createdAt || now, updatedAt: now });
             meta.content = updated;
-            state.dirty = true;
+            markDirty();
             try {
                 setStatus('Saving…');
                 await pushSnapshot();
@@ -1756,7 +1814,7 @@ function renderNoteDetail(container, folder, note) {
             target.children = target.children || [];
             target.children.push(note);
             folder = target;
-            state.dirty = true;
+            markDirty();
             try {
                 setStatus('Moving…');
                 await pushSnapshot();
@@ -1803,7 +1861,7 @@ function renderNoteDetail(container, folder, note) {
 
         state.newNoteParentId = null;
 
-        state.dirty = true;
+        markDirty();
         try {
             setStatus('Saving…');
             await pushSnapshot();
@@ -1823,7 +1881,7 @@ function renderNoteDetail(container, folder, note) {
             if (!confirm(`Delete note "${note.title || 'Untitled'}"?`)) return;
             folder.children = (folder.children || []).filter(c => c._pwaId !== note._pwaId);
             state.openNoteId = null;
-            state.dirty = true;
+            markDirty();
             try {
                 setStatus('Saving…');
                 await pushSnapshot();
@@ -1899,7 +1957,7 @@ async function dropHere() {
     for (const link of state.inbox) {
         folder.children.push({ type: 'bookmark', url: link.url, title: link.title || link.url });
     }
-    state.dirty = true;
+    markDirty();
     renderView();
 
     // Push the updated snapshot back to the server (clean of helper fields).
@@ -1927,14 +1985,28 @@ async function pushSnapshot({ force = false } = {}) {
             throw new Error('Push cancelled — tree is empty.');
         }
     }
+    const baseUserId = state.snapshotUserId ?? null;
+    const baseServerId = state.snapshotServerId || null;
     try {
         const data = await api('/api/tree', {
             method: 'PUT',
-            body: JSON.stringify({ roots, baseVersion: state.treeVersion || 0, deviceId: 'pwa', force })
+            body: JSON.stringify({
+                roots, baseVersion: state.treeVersion || 0, deviceId: 'pwa', force,
+                ...(baseUserId !== null ? { baseUserId } : {}),
+                ...(baseServerId ? { baseServerId } : {})
+            })
         });
         state.treeVersion = Number(data.version) || (state.treeVersion || 0) + 1;
+        if (data.userId !== undefined) state.snapshotUserId = data.userId;
+        if (data.serverId) state.snapshotServerId = data.serverId;
         state.dirty = false;
+        state.editCount = 0;
     } catch (e) {
+        // This copy belongs to another account. Forcing would write it into
+        // this one, so there is no offer to — sign in as its account to push.
+        if (e.status === 412) {
+            throw new Error('This working copy belongs to another account — sign in as that account to push it.');
+        }
         // A stale baseVersion means another device pushed since our last pull.
         // Never overwrite that silently — ask.
         if (/^409[\s:]/.test(e.message) || /changed on the server/i.test(e.message)) {
@@ -1947,8 +2019,23 @@ async function pushSnapshot({ force = false } = {}) {
 }
 
 // --- Quick-File Modal (proactive clipboard & inbox filing) ---
+//
+// Both lists are per account (<key>:<userId>): one person's skipped links are
+// not another's. The per-device lists from before accounts are adopted once,
+// by the server's owner only — whose phone they were.
 const DISMISSED_KEY = 'tp_dismissed_urls';
 const SCANNED_CLIPBOARD_KEY = 'tp_scanned_clipboard_links';
+
+function userKey(base) {
+    const id = currentUserId();
+    if (id === null) return base; // not told yet: an older session, which is the owner's
+    const key = `${base}:${id}`;
+    if (localStorage.getItem(key) === null && localStorage.getItem(base) !== null && localStorage.getItem(LS.owner) === '1') {
+        localStorage.setItem(key, localStorage.getItem(base));
+        localStorage.removeItem(base);
+    }
+    return key;
+}
 
 function normalizeUrl(u) {
     try {
@@ -1960,7 +2047,7 @@ function normalizeUrl(u) {
 }
 
 function getDismissedUrls() {
-    try { return JSON.parse(localStorage.getItem(DISMISSED_KEY)) || []; }
+    try { return JSON.parse(localStorage.getItem(userKey(DISMISSED_KEY))) || []; }
     catch (e) { return []; }
 }
 
@@ -1969,12 +2056,12 @@ function dismissUrl(url) {
     const norm = normalizeUrl(url);
     if (!list.includes(norm)) {
         list.push(norm);
-        localStorage.setItem(DISMISSED_KEY, JSON.stringify(list));
+        localStorage.setItem(userKey(DISMISSED_KEY), JSON.stringify(list));
     }
 }
 
 function getScannedClipboardLinks() {
-    try { return JSON.parse(localStorage.getItem(SCANNED_CLIPBOARD_KEY)) || []; }
+    try { return JSON.parse(localStorage.getItem(userKey(SCANNED_CLIPBOARD_KEY))) || []; }
     catch (e) { return []; }
 }
 
@@ -1983,7 +2070,7 @@ function addScannedClipboardLink(url, title) {
     const norm = normalizeUrl(url);
     if (!list.some(item => normalizeUrl(item.url) === norm)) {
         list.push({ url, title, addedAt: Date.now() });
-        localStorage.setItem(SCANNED_CLIPBOARD_KEY, JSON.stringify(list));
+        localStorage.setItem(userKey(SCANNED_CLIPBOARD_KEY), JSON.stringify(list));
     }
 }
 
@@ -1991,7 +2078,7 @@ function removeScannedClipboardLink(url) {
     const list = getScannedClipboardLinks();
     const norm = normalizeUrl(url);
     const filtered = list.filter(item => normalizeUrl(item.url) !== norm);
-    localStorage.setItem(SCANNED_CLIPBOARD_KEY, JSON.stringify(filtered));
+    localStorage.setItem(userKey(SCANNED_CLIPBOARD_KEY), JSON.stringify(filtered));
 }
 
 function isUrlInSnapshot(url, node) {
@@ -2155,7 +2242,7 @@ function renderQuickFileSheet() {
                 // File locally
                 folder.children = folder.children || [];
                 folder.children.push({ type: 'bookmark', url: item.url, title: item.title });
-                state.dirty = true;
+                markDirty();
                 renderView();
 
                 try {
@@ -2204,6 +2291,11 @@ function renderQuickFileSheet() {
 // When the user shares a URL from another mobile app, the browser navigates to
 // /?share=1&title=...&text=...&url=... (configured in manifest). We capture and
 // POST to /api/shared so it lands in the inbox.
+//
+// Whatever stops that — signed out, a revoked session, offline, a full inbox —
+// the share is queued on the phone before the URL is cleaned, and delivered
+// after the next sign-in or start (see pendingShares.js). Losing what you
+// shared is the one unacceptable outcome.
 async function processShareTargetIfAny() {
     const params = new URLSearchParams(location.search);
     // Browsers vary in where they put the URL when share_target action is `/`.
@@ -2214,35 +2306,72 @@ async function processShareTargetIfAny() {
     if (!url) return;
     const shareTitle = title || text;
     try {
-        // Posts shared from X or Instagram go straight into their own archive
-        // rather than the generic inbox — neither can be swept, so sharing is
-        // the only way those archives are ever filled. Anything else falls
-        // through to the inbox exactly as before.
-        let captured = null;
-        try {
-            captured = await api('/api/imports/capture', {
-                method: 'POST',
-                body: JSON.stringify({ url, title: shareTitle })
-            });
-        } catch (e) {
-            // An older server has no capture route; the inbox still works.
-            console.warn('Capture unavailable, falling back to inbox', e);
-        }
-
-        if (captured && captured.captured) {
+        const taken = await pendingShares.take(
+            { url, title: shareTitle, at: new Date().toISOString(), userId: currentUserId() },
+            { canDeliver: configured(), deliver: deliverShare }
+        );
+        const captured = taken.result && taken.result.captured;
+        if (captured) {
             const name = captured.provider === 'x' ? 'X' : 'Instagram';
             showToast(captured.duplicate
                 ? `Already in your ${name} archive.`
                 : `Saved to ${name} — ${captured.items} archived.`);
-        } else {
-            await api('/api/shared', { method: 'POST', body: JSON.stringify({ url, title: shareTitle }) });
+        } else if (taken.queued && configured() && taken.error && taken.error.status && taken.error.status !== 401) {
+            // Signed in, and the server said no — a full inbox (429), say.
+            // Show its reason: "sign in" would not help here.
+            const why = (taken.error.body && taken.error.body.error) || taken.error.message;
+            alert(`The server did not take this link:\n\n${why}\n\nIt is kept on this phone and tried again the next time the app starts.`);
+        } else if (taken.queued && configured()) {
+            showToast('Kept on this phone — the server could not be reached.');
+        } else if (taken.queued) {
+            showToast('Kept on this phone — it is added after you sign in.');
         }
     } catch (e) {
-        console.warn('Share-target push failed', e);
+        console.warn('Share-target handling failed', e);
     } finally {
-        // Clean the URL so reload doesn't double-add.
+        // Clean the URL so reload doesn't double-add. The share is delivered
+        // or queued by now.
         history.replaceState({}, '', location.pathname);
     }
+}
+
+// One share into the account signed in now. Posts shared from X or Instagram
+// go straight into their own archive rather than the generic inbox — neither
+// can be swept, so sharing is the only way those archives are ever filled.
+// Anything else lands in the inbox. Throws when it could not be delivered.
+async function deliverShare(share) {
+    let captured = null;
+    try {
+        captured = await api('/api/imports/capture', {
+            method: 'POST',
+            body: JSON.stringify({ url: share.url, title: share.title })
+        });
+    } catch (e) {
+        if (e.status === 401) throw e;
+        // An older server has no capture route; the inbox still works.
+        console.warn('Capture unavailable, falling back to inbox', e);
+    }
+    if (captured && captured.captured) return { captured };
+    await api('/api/shared', { method: 'POST', body: JSON.stringify({ url: share.url, title: share.title }) });
+    return { captured: null };
+}
+
+// After a sign-in (and on every start): shares queued while they could not be
+// delivered. This account's go in on their own; others are asked about.
+async function drainPendingShares() {
+    if (!configured() || !pendingShares.list().length) return;
+    const who = localStorage.getItem(LS.username) || 'this account';
+    const result = await pendingShares.drain({
+        userId: currentUserId(),
+        deliver: deliverShare,
+        ask: async (shares) => {
+            const n = shares.length;
+            if (confirm(`${n} link${n === 1 ? ' was' : 's were'} shared while signed out — add ${n === 1 ? 'it' : 'them'} to ${who}'s inbox?`)) return 'add';
+            return confirm(`Discard ${n === 1 ? 'that link' : `those ${n} links`}? Cancel keeps ${n === 1 ? 'it' : 'them'} on this phone for later.`)
+                ? 'discard' : 'keep';
+        }
+    });
+    if (result.added) showToast(`${result.added} shared link${result.added === 1 ? '' : 's'} added`);
 }
 
 // --- Settings / sign in ---
@@ -2256,7 +2385,24 @@ function openSettings() {
     if (urlEl) urlEl.value = state.config.url || defaultServerUrl();
     refreshAuthUi();
     show($('settings-sheet'));
-    if (state.config.token) refreshImporters();
+    if (state.config.token) {
+        refreshImporters();
+        refreshWhoAmI().then(() => { refreshAuthUi(); refreshUsers(); });
+    }
+}
+
+// Who this session is, from the server: kept in localStorage for the account
+// label, the per-account lists and queued shares. Sessions from before
+// accounts never learned it at sign-in.
+async function refreshWhoAmI() {
+    if (!configured()) return null;
+    try {
+        const data = await api('/api/auth/me');
+        rememberUser(data.user);
+        return data.user;
+    } catch (e) {
+        return null;
+    }
 }
 
 // The server serves this PWA, so when you opened it you were already talking to
@@ -2312,7 +2458,19 @@ function renderImporters() {
         return;
     }
 
-    list.innerHTML = sources.map(src => `
+    list.innerHTML = sources.map(src => src.removed ? `
+        <div class="import-row removed" data-id="${escapeAttr(src.id)}">
+          <div class="import-head">
+            <span class="import-name">${escapeHtml(src.label || src.provider)}</span>
+            <span class="import-count">${src.items} archived</span>
+          </div>
+          <div class="import-meta">Removed — the archive is kept until you delete it.</div>
+          <div class="import-actions">
+            <button data-act="restore">Restore</button>
+            <button data-act="purge" class="danger">Delete archive</button>
+          </div>
+        </div>
+    ` : `
         <div class="import-row" data-id="${escapeAttr(src.id)}">
           <div class="import-head">
             <span class="import-name">${escapeHtml(src.label || src.provider)}</span>
@@ -2338,7 +2496,8 @@ function renderImporters() {
 async function refreshImporters() {
     if (!configured()) return;
     try {
-        const data = await api('/api/imports');
+        const showRemoved = $('imports-show-removed') && $('imports-show-removed').checked;
+        const data = await api('/api/imports' + (showRemoved ? '?includeRemoved=1' : ''));
         state.importers = data.sources || [];
         renderImporters();
     } catch (e) {
@@ -2361,8 +2520,23 @@ async function runImporterAction(id, act, btn) {
     if (act === 'delete') {
         // Deleting the connection must not silently bin the archive — anything
         // Reddit has already forgotten only exists here.
-        if (!confirm(`Remove "${source.label}"?\n\nThe ${source.items} archived links stay on the server, and the bookmark folder stays where it is.`)) return;
+        if (!confirm(`Remove "${source.label}"?\n\nThe ${source.items} archived links stay on the server — tick "Show removed sources" to restore it or delete the archive.`)) return;
         await api('/api/imports/' + id, { method: 'DELETE' });
+        await refreshImporters();
+        return;
+    }
+
+    if (act === 'restore') {
+        await api('/api/imports/' + id + '/restore', { method: 'POST' });
+        setStatus('Restored. A Reddit source needs authorising again.');
+        await refreshImporters();
+        return;
+    }
+
+    if (act === 'purge') {
+        // Unrecoverable: anything past Reddit's window cannot be fetched again.
+        if (prompt(`Delete the ${source.items} archived links of "${source.label}" for good?\n\nType DELETE to confirm.`) !== 'DELETE') return;
+        await api('/api/imports/' + id + '?purge=1', { method: 'DELETE' });
         await refreshImporters();
         return;
     }
@@ -2454,6 +2628,12 @@ function refreshAuthUi() {
     if (outEl) outEl.classList.toggle('hidden', signedIn);
     const who = $('auth-username-label');
     if (who) who.textContent = localStorage.getItem(LS.username) || '';
+    const role = $('auth-role-label');
+    if (role) {
+        const parts = [localStorage.getItem(LS.role), localStorage.getItem(LS.owner) === '1' ? 'owner' : ''].filter(Boolean);
+        role.textContent = parts.length ? ` (${parts.join(', ')})` : '';
+    }
+    if (!signedIn) hide($('users-block'));
     const setupHint = $('auth-setup-hint');
     if (setupHint) setupHint.classList.add('hidden');
     if (!signedIn) probeAuthStatus();
@@ -2520,13 +2700,54 @@ async function submitAuth() {
         const data = await res.json().catch(() => ({}));
         if (!res.ok) return setErr(data.error || `Sign in failed (HTTP ${res.status}).`);
 
+        // Unpushed edits are never discarded by a sign-in. The same account
+        // keeps them (and bootstrap skips its pull); another account is
+        // refused until they are pushed or deliberately discarded. The same
+        // id on another server is another account: ids start at 1 everywhere.
+        const user = data.user || {};
+        const name = data.username || username;
+        const previousId = state.snapshotUserId ?? currentUserId();
+        const previousName = state.snapshotUsername || localStorage.getItem(LS.username) || 'the previous account';
+        const sameServer = !state.snapshot
+            || ((!state.snapshotUrl || state.snapshotUrl === base)
+                && (!state.snapshotServerId || !data.serverId || state.snapshotServerId === data.serverId));
+        const sameAccount = sameServer && (user.id !== undefined && user.id !== null && previousId !== null
+            ? Number(user.id) === Number(previousId)
+            : (state.snapshotUsername || localStorage.getItem(LS.username) || name) === name);
+        if (state.dirty && state.snapshot && !sameAccount) {
+            fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
+            const n = state.editCount || 1;
+            const where = sameServer ? '' : ` on ${state.snapshotUrl || 'another server'}`;
+            setErr(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${previousName}${where}. Sign in as ${previousName}${where ? ' there' : ''} and push them, or discard them.`);
+            const discard = $('auth-discard');
+            if (discard) {
+                discard.textContent = `Discard ${previousName}'s edits`;
+                discard.dataset.account = previousName;
+                show(discard);
+            }
+            return;
+        }
+
         state.config.url = base;
         state.config.token = data.token;
         localStorage.setItem(LS.url, base);
         localStorage.setItem(LS.token, data.token);
-        localStorage.setItem(LS.username, data.username || username);
+        localStorage.setItem(LS.username, name);
+        rememberUser(user, name);
         mirrorConfigToSW();
+        if (!sameAccount) {
+            // A clean copy of someone else's: nothing of theirs is lost, and
+            // none of it may show up under this account.
+            state.snapshot = null;
+            state.snapshotUserId = null;
+            state.snapshotUsername = null;
+            state.inbox = [];
+            state.proposals = [];
+            state.importers = [];
+            updateInboxFab();
+        }
         if ($('cfg-password')) $('cfg-password').value = '';
+        hide($('auth-discard'));
         refreshAuthUi();
         hide($('settings-sheet'));
         bootstrap();
@@ -2535,8 +2756,42 @@ async function submitAuth() {
     }
 }
 
+// The only way past a blocked sign-in: the previous account's edits, thrown
+// away on purpose, with its name typed in.
+function discardPreviousEdits() {
+    const btn = $('auth-discard');
+    const account = (btn && btn.dataset.account) || '';
+    const typed = prompt(`Discard ${account}'s unpushed edits on this phone? They cannot be recovered.\n\nType ${account} to confirm.`);
+    if (typed === null || typed.trim() !== account) return;
+    state.snapshot = null;
+    state.snapshotUserId = null;
+    state.snapshotUsername = null;
+    state.dirty = false;
+    state.editCount = 0;
+    state.inbox = [];
+    state.proposals = [];
+    state.importers = [];
+    hide(btn);
+    const err = $('auth-error');
+    if (err) { err.textContent = 'Discarded. Sign in again.'; err.classList.remove('hidden'); }
+}
+
+// Unpushed edits are not discarded by a sign-out either. After a yes they stay
+// in memory with the account they belong to, so the next sign-in follows the
+// same rules as after an expired session: that account keeps them, anyone else
+// is refused until they are pushed or discarded by name.
 async function signOut() {
     const base = currentServerUrl();
+    const keepEdits = Boolean(state.dirty && state.snapshot);
+    const n = state.editCount || 1;
+    const who = localStorage.getItem(LS.username) || 'this account';
+    if (keepEdits) {
+        if (!confirm(`This phone has ${n} unpushed edit${n === 1 ? '' : 's'} for ${who}.\n\n`
+            + `Sign out anyway? They stay here until ${who} signs in again and pushes them (closing the app loses them), `
+            + `and nobody else can sign in here until they are pushed or discarded.`)) return;
+        state.snapshotUserId = state.snapshotUserId ?? currentUserId();
+        state.snapshotUsername = state.snapshotUsername || localStorage.getItem(LS.username);
+    }
     // Best effort — the local token is cleared either way, so a server that is
     // unreachable can't leave you stuck signed in on the device.
     try {
@@ -2546,12 +2801,186 @@ async function signOut() {
         });
     } catch (e) { /* ignore */ }
     state.config.token = '';
-    localStorage.removeItem(LS.token);
-    localStorage.removeItem(LS.username);
+    forgetUser();
     mirrorConfigToSW();
-    state.snapshot = null;
+    if (!keepEdits) {
+        state.snapshot = null;
+        state.snapshotUserId = null;
+        state.snapshotUsername = null;
+        state.dirty = false;
+        state.editCount = 0;
+    }
     refreshAuthUi();
-    setStatus('Signed out.');
+    setStatus(keepEdits
+        ? `Signed out. ${n} unpushed edit${n === 1 ? ' for ' + who + ' stays' : 's for ' + who + ' stay'} on this phone until ${who} signs in and pushes.`
+        : 'Signed out.');
+}
+
+// --- Users (admins) ---
+//
+// Account management, for an admin signed in with a real session: the server
+// answers anyone else with 403 and the block stays hidden. Every change asks
+// for your own password again; the server checks it, and refuses to delete,
+// demote or reset the server's owner, the last admin, or you.
+
+let usersCache = [];
+let userSheet = null; // {mode, user}
+
+function generatePassword() {
+    const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => alphabet[b % alphabet.length]).join('');
+}
+
+const fmtN = (n) => Number(n || 0).toLocaleString();
+
+function userStatsLine(st) {
+    return [
+        `${fmtN(st.bookmarks)} bookmarks`, `${fmtN(st.notes)} notes`, `${fmtN(st.workflows)} workflows`,
+        `${fmtN(st.imports + st.removedImports)} imports (${fmtN(st.archived)} archived)`, `${fmtN(st.inbox)} inbox`
+    ].join(' · ');
+}
+
+async function refreshUsers() {
+    const block = $('users-block');
+    if (!block) return;
+    if (!configured()) { hide(block); return; }
+    try {
+        const data = await api('/api/users');
+        usersCache = data.users || [];
+        show(block);
+        renderUsers();
+    } catch (e) {
+        hide(block);
+    }
+}
+
+function renderUsers() {
+    const list = $('users-list');
+    if (!list) return;
+    list.innerHTML = usersCache.map(u => {
+        let actions;
+        if (u.you) {
+            actions = '<button data-uact="self-password">Change password</button>';
+        } else if (u.owner) {
+            actions = `<p class="hint">Server owner: change from the owner's own Settings or the server CLI.</p>`;
+        } else {
+            actions = `
+                <button data-uact="role">${u.role === 'admin' ? 'Make user' : 'Make admin'}</button>
+                <button data-uact="reset">Reset password</button>
+                <button data-uact="delete" class="danger" ${u.legacyToken ? 'disabled title="AUTH_TOKEN acts as this account; remove it from .env first"' : ''}>Delete</button>`;
+        }
+        return `
+            <div class="import-row user-row" data-uid="${escapeAttr(u.id)}">
+              <div class="import-head">
+                <span class="import-name">${escapeHtml(u.username)}${u.you ? ' <span class="hint">(you)</span>' : ''}
+                  <span class="pill ${u.role === 'admin' ? 'admin' : ''}">${escapeHtml(u.role)}</span>${u.owner ? '<span class="pill owner">owner</span>' : ''}</span>
+                <span class="import-count">since ${escapeHtml(new Date(u.createdAt).toLocaleDateString())}</span>
+              </div>
+              <div class="import-meta">${escapeHtml(userStatsLine(u.stats || {}))}</div>
+              <div class="import-actions user-actions">${actions}</div>
+            </div>`;
+    }).join('');
+    list.querySelectorAll('[data-uact]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const id = btn.closest('.user-row').dataset.uid;
+            const user = usersCache.find(u => String(u.id) === String(id));
+            if (user) userAction(user, btn.dataset.uact);
+        });
+    });
+}
+
+function userAction(user, act) {
+    if (act === 'delete') {
+        const st = user.stats || {};
+        if (!confirm(`Delete ${user.username} and everything they hold?\n\n`
+            + `${fmtN(st.bookmarks)} bookmarks, ${fmtN(st.notes)} notes, ${fmtN(st.workflows)} workflows, `
+            + `${fmtN(st.inbox)} inbox links, ${fmtN(st.imports + st.removedImports)} import sources with `
+            + `${fmtN(st.archived)} archived posts (removed sources included) and ${fmtN(st.history)} history versions.\n\n`
+            + 'A backup is taken first.')) return;
+        const typed = prompt(`Type ${user.username} to confirm.`);
+        if (typed === null) return;
+        if (typed.trim() !== user.username) { showToast('The name did not match — nothing was deleted.'); return; }
+        openUserSheet('delete', user, { confirm: typed.trim() });
+        return;
+    }
+    openUserSheet(act, user);
+}
+
+// One sheet for every account change. Each needs your own password.
+function openUserSheet(mode, user = null, extra = {}) {
+    userSheet = { mode, user, ...extra };
+    const name = user ? user.username : '';
+    const titles = {
+        add: 'Add user',
+        reset: `Reset ${name}'s password`,
+        role: user && user.role === 'admin' ? `Make ${name} a user` : `Make ${name} an admin`,
+        delete: `Delete ${name}`,
+        'self-password': 'Change your password'
+    };
+    const hints = {
+        add: 'They start with an empty tree.',
+        reset: `${name} will be signed out on every device; unpushed edits on their phone stay on the phone.`,
+        role: '',
+        delete: `${name} is signed out first, then a backup is taken, then everything they hold is deleted.`,
+        'self-password': 'Signs you out on every other device.'
+    };
+    $('user-sheet-title').textContent = titles[mode];
+    const hint = $('user-sheet-hint');
+    hint.textContent = hints[mode];
+    hint.classList.toggle('hidden', !hints[mode]);
+    $('user-sheet-name-field').classList.toggle('hidden', mode !== 'add');
+    $('user-sheet-role-field').classList.toggle('hidden', mode !== 'add');
+    const wantsPassword = mode === 'add' || mode === 'reset' || mode === 'self-password';
+    $('user-sheet-password-field').classList.toggle('hidden', !wantsPassword);
+    $('user-sheet-generate').classList.toggle('hidden', !wantsPassword);
+    $('user-sheet-current-label').textContent = mode === 'self-password' ? 'Current password' : 'Your password';
+    for (const id of ['user-sheet-name', 'user-sheet-password', 'user-sheet-current']) $(id).value = '';
+    $('user-sheet-role').value = 'user';
+    $('user-sheet-submit').textContent = { add: 'Create', reset: 'Save', role: 'Confirm', delete: `Delete ${name}`, 'self-password': 'Change password' }[mode];
+    $('user-sheet-submit').classList.toggle('danger', mode === 'delete');
+    hide($('user-sheet-error'));
+    show($('user-sheet'));
+}
+
+async function submitUserSheet() {
+    const { mode, user, confirm: confirmName } = userSheet || {};
+    const err = $('user-sheet-error');
+    const fail = (m) => { err.textContent = m; show(err); };
+    const currentPassword = $('user-sheet-current').value;
+    const password = $('user-sheet-password').value;
+    hide(err);
+    try {
+        let done = '';
+        if (mode === 'add') {
+            const username = $('user-sheet-name').value.trim();
+            await api('/api/users', { method: 'POST', body: JSON.stringify({ username, password, role: $('user-sheet-role').value, currentPassword }) });
+            done = `Created ${username}. They start with an empty tree.`;
+        } else if (mode === 'reset') {
+            const out = await api(`/api/users/${user.id}`, { method: 'PUT', body: JSON.stringify({ password, currentPassword }) });
+            done = `New password saved for ${user.username}; signed out of ${out.signedOut} session(s).`;
+        } else if (mode === 'role') {
+            const role = user.role === 'admin' ? 'user' : 'admin';
+            await api(`/api/users/${user.id}`, { method: 'PUT', body: JSON.stringify({ role, currentPassword }) });
+            done = `${user.username} is now ${role === 'admin' ? 'an admin' : 'a user'}.`;
+        } else if (mode === 'delete') {
+            const out = await api(`/api/users/${user.id}/delete`, { method: 'POST', body: JSON.stringify({ confirm: confirmName, currentPassword }) });
+            done = `Deleted ${user.username}. Backup: ${out.backup}`;
+        } else if (mode === 'self-password') {
+            const out = await api('/api/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword: password }) });
+            // Every session was revoked, this one included; the reply carries its replacement.
+            state.config.token = out.token;
+            localStorage.setItem(LS.token, out.token);
+            mirrorConfigToSW();
+            done = 'Password changed. Other devices need to sign in again.';
+        }
+        hide($('user-sheet'));
+        showToast(done);
+        await refreshUsers();
+    } catch (e) {
+        fail((e.body && e.body.error) || e.message);
+    }
 }
 
 function saveSettings() {
@@ -2754,7 +3183,7 @@ window.addEventListener('DOMContentLoaded', () => {
         parentFolder.children = parentFolder.children || [];
         parentFolder.children.push(newFolder);
 
-        state.dirty = true;
+        markDirty();
         renderView();
 
         try {
@@ -2838,7 +3267,7 @@ window.addEventListener('DOMContentLoaded', () => {
         assignIds(folder);
         state.snapshot.children = state.snapshot.children || [];
         state.snapshot.children.push(folder);
-        state.dirty = true;
+        markDirty();
         try {
             setStatus('Saving…');
             await pushSnapshot();
@@ -2857,6 +3286,18 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('import-submit', 'click', submitImporter);
     safeAddListener('auth-submit', 'click', submitAuth);
     safeAddListener('auth-signout', 'click', signOut);
+    safeAddListener('auth-discard', 'click', discardPreviousEdits);
+    safeAddListener('imports-show-removed', 'change', refreshImporters);
+    safeAddListener('users-add', 'click', () => openUserSheet('add'));
+    safeAddListener('auth-change-password', 'click', () => openUserSheet('self-password'));
+    safeAddListener('user-sheet-close', 'click', () => hide($('user-sheet')));
+    safeAddListener('user-sheet-submit', 'click', submitUserSheet);
+    safeAddListener('user-sheet-generate', 'click', () => {
+        const input = $('user-sheet-password');
+        input.value = generatePassword();
+        input.focus();
+        input.select();
+    });
     // Enter in the password field signs in, which is what everyone expects.
     safeAddListener('cfg-password', 'keydown', (e) => {
         if (e.key === 'Enter') { e.preventDefault(); submitAuth(); }
@@ -2919,7 +3360,7 @@ window.addEventListener('DOMContentLoaded', () => {
         // If it was previously dismissed/skipped, allow un-dismissing it on manual entry!
         if (dismissedSet.has(norm)) {
             const updatedDismissed = dismissed.filter(d => normalizeUrl(d) !== norm);
-            localStorage.setItem(DISMISSED_KEY, JSON.stringify(updatedDismissed));
+            localStorage.setItem(userKey(DISMISSED_KEY), JSON.stringify(updatedDismissed));
         }
         
         addScannedClipboardLink(url, url);

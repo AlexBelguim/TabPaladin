@@ -1,15 +1,22 @@
-// Auth tests against a running server, started with the test account:
+// Auth tests against a running server, started with the test account on a
+// fresh data directory:
 //
-//   ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 //     PORT=18999 DATA_DIR=/tmp/x node server/index.js
-//   node tools/test_auth.mjs --url http://127.0.0.1:18999 [--legacy <32+ char token>]
+//   ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off \
+//     MAX_PROPOSALS_PER_USER=3 [AUTH_TOKEN=<32+ char token>] PORT=18999 DATA_DIR=/tmp/x node server/index.js
+//   node tools/test_auth.mjs --url http://127.0.0.1:18999 [--legacy <the same token>]
 //
 // Covers the cases worth getting wrong: the over-the-network setup claim being
 // gone, login, session access, wrong password, unknown user, no credentials,
 // logout revoking the session, password change revoking every other session,
-// the legacy token acting as the admin, CORS for extension and foreign
-// origins, body size limits, the OAuth callback escaping what it echoes, and
-// — last, because it locks this IP out — the login rate limit (expects
-// AUTH_MAX_FAILURES <= 20).
+// the legacy token acting as the data's owner, CORS for extension and foreign
+// origins, body size limits, the OAuth callback escaping what it echoes;
+// accounts: who may manage them and how the owner is protected, two accounts
+// never reaching each other's tree, history, inbox, notes, proposals, imports
+// or prefs, a reset signing an account out (sign-ins racing it included), an
+// admin change decided by who is acting when it lands, a push stamped with
+// another server refused, and a delete removing exactly that account; and —
+// last, because it locks this IP out — the login rate limit (expects
+// AUTH_MAX_FAILURES between 8 and 20).
 
 const arg = (n, d = null) => {
     const i = process.argv.indexOf('--' + n);
@@ -62,6 +69,9 @@ const me = await call('/api/auth/me', { token: setup.json?.token });
 check('/api/auth/me returns id, username and role',
     me.status === 200 && me.json?.user?.username === USER && me.json.user.role === 'admin' && Number.isInteger(me.json.user.id),
     JSON.stringify(me.json));
+const SERVER_ID = stillOurs.json?.serverId;
+check('sign-in and /api/auth/me name this server', typeof SERVER_ID === 'string' && SERVER_ID.length >= 16
+    && me.json?.serverId === SERVER_ID, JSON.stringify([SERVER_ID, me.json?.serverId]));
 
 // 6. The issued session works.
 const withSession = await call('/api/tree', { token: setup.json?.token });
@@ -97,8 +107,8 @@ if (LEGACY) {
     const legacy = await call('/api/tree', { token: LEGACY });
     check('legacy shared token still works', legacy.status === 200, `HTTP ${legacy.status}`);
     const legacyMe = await call('/api/auth/me', { token: LEGACY });
-    check('legacy token acts as the first admin', legacyMe.json?.user?.role === 'admin' && legacyMe.json.user.username === USER,
-        JSON.stringify(legacyMe.json));
+    check('legacy token acts as the owner of the data', legacyMe.json?.user?.role === 'admin' && legacyMe.json.user.username === USER
+        && legacyMe.json.user.tenancyOwner === true, JSON.stringify(legacyMe.json));
 }
 
 // 12. Password change revokes every existing session.
@@ -140,13 +150,171 @@ const bigPush = await call('/api/tree', {
 });
 check('2 MB tree push accepted', bigPush.status === 200, `HTTP ${bigPush.status} ${JSON.stringify(bigPush.json)}`);
 
-// 15. The OAuth callback echoes the provider's error, escaped.
+// 15. Accounts. tester is the admin and the owner of the data.
+const ownerMe = await call('/api/auth/me', { token });
+const OWNER_ID = ownerMe.json?.user?.id;
+check('the env-created admin is the tenancy owner', ownerMe.json?.user?.tenancyOwner === true, JSON.stringify(ownerMe.json));
+const users0 = await call('/api/users', { token });
+check('an admin session lists accounts, marking you and the owner',
+    users0.status === 200 && users0.json.users.some(u => u.username === USER && u.you && u.owner), JSON.stringify(users0.json));
+if (LEGACY) {
+    const viaToken = await call('/api/users', { method: 'POST', token: LEGACY, body: { username: 'tok-made', password: 'long-enough-1', currentPassword: NEWPASS } });
+    check('AUTH_TOKEN cannot manage accounts (403)', viaToken.status === 403, `HTTP ${viaToken.status}`);
+}
+const badPw = await call('/api/users', { method: 'POST', token, body: { username: 'sam', password: 'sam-password-1', currentPassword: 'not my password' } });
+check('a wrong current password is refused (401)', badPw.status === 401, `HTTP ${badPw.status}`);
+const mkSam = await call('/api/users', { method: 'POST', token, body: { username: 'sam', password: 'sam-password-1', role: 'user', currentPassword: NEWPASS } });
+const mkKim = await call('/api/users', { method: 'POST', token, body: { username: 'kim', password: 'kim-password-1', role: 'admin', currentPassword: NEWPASS } });
+check('an admin creates accounts with their own password', mkSam.status === 200 && mkKim.status === 200 && mkSam.json.user.role === 'user',
+    JSON.stringify([mkSam.json, mkKim.json]));
+const SAM_ID = mkSam.json?.user?.id;
+const KIM_ID = mkKim.json?.user?.id;
+const clash = await call('/api/users', { method: 'POST', token, body: { username: 'Sam', password: 'sam-password-1', currentPassword: NEWPASS } });
+check('"Sam" is refused next to "sam"', clash.status === 409 && /too close/.test(clash.json?.error), JSON.stringify(clash.json));
+const samTok = (await call('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json?.token;
+const kimTok = (await call('/api/login', { method: 'POST', body: { username: 'kim', password: 'kim-password-1' } })).json?.token;
+check('a plain user gets 403 on /api/users', (await call('/api/users', { token: samTok })).status === 403);
+
+// Isolation.
+const ownerTree = await call('/api/tree', { token });
+const samTree = await call('/api/tree', { token: samTok });
+check('sam starts with an empty tree at a version of his own',
+    samTree.status === 200 && samTree.json.roots.length === 0 && samTree.json.version !== ownerTree.json.version
+    && samTree.json.userId === SAM_ID, JSON.stringify(samTree.json));
+const foreign = await call('/api/tree', { method: 'PUT', token: samTok,
+    body: { roots: ownerTree.json.roots, baseVersion: samTree.json.version, deviceId: 'sam' } });
+check("sam pushing the owner's ids gets 412 foreign-ids", foreign.status === 412 && foreign.json.code === 'foreign-ids', JSON.stringify(foreign.json));
+const wrongAcct = await call('/api/tree', { method: 'PUT', token: samTok, body: { roots: [], baseUserId: OWNER_ID, force: true } });
+check("a copy stamped with the owner's id gets 412 wrong-account, even forced", wrongAcct.status === 412 && wrongAcct.json.code === 'wrong-account');
+check('the tree names this server', ownerTree.json.serverId === SERVER_ID);
+const otherServer = await call('/api/tree', { method: 'PUT', token,
+    body: { roots: ownerTree.json.roots, baseUserId: OWNER_ID, baseServerId: 'a-different-server', force: true } });
+check("the owner's id stamped by another server gets 412 too, even forced",
+    otherServer.status === 412 && otherServer.json.code === 'wrong-account' && otherServer.json.serverId === SERVER_ID, JSON.stringify(otherServer.json));
+await call('/api/shared', { method: 'POST', token, body: { url: 'https://owner-inbox.example' } });
+const ownerHistory = await call('/api/history', { token });
+check("sam gets 404 on the owner's history entry",
+    (await call(`/api/history/${ownerHistory.json.snapshots[0].id}`, { token: samTok })).status === 404);
+await call('/api/shared', { method: 'DELETE', token: samTok });
+check("sam clearing his inbox leaves the owner's",
+    (await call('/api/shared', { token })).json.links.some(l => l.url === 'https://owner-inbox.example'));
+const ownerShare = await call('/api/share', { method: 'POST', token });
+const ownerLlm = ownerShare.json.url.split('/llm/')[1];
+await call(`/llm/${ownerLlm}/propose`, { method: 'POST', body: { title: 'Owner secret', content: '# Owner secret\nhidden' } });
+check("sam sees none of the owner's proposals", (await call('/api/proposals', { token: samTok })).json.proposals.length === 0);
+const ownerProposal = (await call('/api/proposals', { token })).json.proposals.find(p => p.title === 'Owner secret');
+check("sam cannot approve the owner's proposal", (await call(`/api/proposals/${ownerProposal?.id}/approve`, { method: 'POST', token: samTok })).status === 404);
+await call(`/api/proposals/${ownerProposal?.id}/approve`, { method: 'POST', token });
+const samShare = await call('/api/share', { method: 'POST', token: samTok });
+const samLlm = samShare.json.url.split('/llm/')[1];
+const samPage = await fetch(BASE + `/llm/${samLlm}`).then(r => r.text());
+check("sam's LLM link lists only sam's notes", samPage.includes('Existing notes (0)') && !samPage.includes('Owner secret'));
+let cap = null;
+for (let i = 0; i < 260 && cap === null; i++) {
+    const r = await call(`/llm/${samLlm}/propose`, { method: 'POST', body: { title: `Idea ${i}`, content: 'x' } });
+    if (r.status === 429) cap = i;
+}
+check('proposals beyond MAX_PROPOSALS_PER_USER get 429', cap !== null && cap > 0, `cap=${cap}`);
+check("the owner's proposals were not counted against sam's cap",
+    (await call('/api/proposals', { token: samTok })).json.proposals.length === cap);
+
+const ownerX = await call('/api/imports/capture', { method: 'POST', token, body: { url: 'https://x.com/owner/status/1' } });
+const xId = ownerX.json?.sourceId;
+for (const [method, path] of [['GET', `/api/imports/${xId}/items`], ['POST', `/api/imports/${xId}/run`],
+    ['GET', `/api/imports/${xId}/authorize`], ['DELETE', `/api/imports/${xId}`], ['POST', `/api/imports/${xId}/restore`]]) {
+    const r = await call(path, { method, token: samTok });
+    check(`sam ${method} ${path.replace(String(xId), ':id')} on the owner's source -> 404`, r.status === 404, `HTTP ${r.status}`);
+}
+const samX = await call('/api/imports/capture', { method: 'POST', token: samTok, body: { url: 'https://x.com/owner/status/1' } });
+check("sam's capture of the same post makes his own X source", samX.json?.captured && samX.json.sourceId !== xId && !samX.json.duplicate,
+    JSON.stringify(samX.json));
+
+// Prefs.
+const pref1 = await call('/api/prefs/share.targets', { method: 'PUT', token, body: { value: { v: 1, domains: {} } } });
+check('a pref is stored', pref1.status === 200 && pref1.json.updatedAt, JSON.stringify(pref1.json));
+const prefGet = await call('/api/prefs/share.targets', { token });
+check('and read back', prefGet.json?.value?.v === 1 && prefGet.json.updatedAt === pref1.json.updatedAt);
+const stale = await call('/api/prefs/share.targets', { method: 'PUT', token, body: { value: { v: 2 }, baseUpdatedAt: '2000-01-01T00:00:00.000Z' } });
+check('a stale baseUpdatedAt gets 409 with the current value', stale.status === 409 && stale.json.current?.value?.v === 1);
+const fresh = await call('/api/prefs/share.targets', { method: 'PUT', token, body: { value: { v: 2 }, baseUpdatedAt: pref1.json.updatedAt } });
+check('the current baseUpdatedAt is accepted', fresh.status === 200);
+const tooBig = await call('/api/prefs/big', { method: 'PUT', token, body: { value: 'x'.repeat(70 * 1024) } });
+check('a value over 64 KB is refused', tooBig.status === 413, `HTTP ${tooBig.status}`);
+const badKey = await call('/api/prefs/' + encodeURIComponent('no spaces!'), { method: 'PUT', token, body: { value: 1 } });
+check('a malformed key is refused', badKey.status === 400, `HTTP ${badKey.status}`);
+check("sam cannot read the owner's prefs", (await call('/api/prefs/share.targets', { token: samTok })).status === 404
+    && Object.keys((await call('/api/prefs', { token: samTok })).json.prefs).length === 0);
+
+// Managing accounts, and protecting the owner.
+const ownerBefore = JSON.stringify([(await call('/api/tree', { token })).json, (await call('/api/shared', { token })).json,
+    (await call('/api/history', { token })).json, (await call('/api/prefs', { token })).json]);
+// Sign-ins with the old password racing the reset: each loop signs in until
+// the password stops working (one failure each, under AUTH_MAX_FAILURES). No
+// session they got may outlive the reset — not even one whose password check
+// began before the reset and finished after it.
+const raced = [];
+const racer = async () => {
+    for (let i = 0; i < 200; i++) {
+        const r = await call('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } });
+        if (r.status !== 200) return;
+        raced.push(r.json.token);
+    }
+};
+const racers = Array.from({ length: 6 }, racer);
+await new Promise(r => setTimeout(r, 150));
+const reset = await call(`/api/users/${SAM_ID}`, { method: 'PUT', token, body: { password: 'sam-password-2', currentPassword: NEWPASS } });
+await Promise.all(racers);
+check('a reset signs that account out', reset.status === 200 && (await call('/api/tree', { token: samTok })).status === 401);
+let survivors = 0;
+for (const t of raced) if ((await call('/api/auth/me', { token: t })).status === 200) survivors++;
+check('no sign-in with the old password outlives the reset, even one racing it', raced.length > 0 && survivors === 0,
+    `${survivors} of ${raced.length} still signed in`);
+for (const [what, path, method, body] of [
+    ['demoting', `/api/users/${OWNER_ID}`, 'PUT', { role: 'user', currentPassword: 'kim-password-1' }],
+    ['resetting', `/api/users/${OWNER_ID}`, 'PUT', { password: 'taken-over-1', currentPassword: 'kim-password-1' }],
+    ['deleting', `/api/users/${OWNER_ID}/delete`, 'POST', { confirm: USER, currentPassword: 'kim-password-1' }]
+]) {
+    const r = await call(path, { method, token: kimTok, body });
+    check(`another admin ${what} the owner is refused`, r.status === 403 && r.json?.code === 'owner', JSON.stringify(r.json));
+}
+const selfDelete = await call(`/api/users/${KIM_ID}/delete`, { method: 'POST', token: kimTok, body: { confirm: 'kim', currentPassword: 'kim-password-1' } });
+check('deleting yourself is refused', selfDelete.status === 400 && selfDelete.json?.code === 'self');
+const selfReset = await call(`/api/users/${KIM_ID}`, { method: 'PUT', token: kimTok, body: { password: 'whatever-1', currentPassword: 'kim-password-1' } });
+check('resetting your own password here is refused (use Change password)', selfReset.status === 400);
+const selfRole = await call(`/api/users/${KIM_ID}`, { method: 'PUT', token: kimTok, body: { role: 'user', currentPassword: 'kim-password-1' } });
+check('changing your own role is refused', selfRole.status === 400 && selfRole.json?.code === 'self', JSON.stringify(selfRole.json));
+const wrongConfirm = await call(`/api/users/${SAM_ID}/delete`, { method: 'POST', token, body: { confirm: 'Sam', currentPassword: NEWPASS } });
+check('a delete with the wrong confirmation is refused', wrongConfirm.status === 400 && wrongConfirm.json?.code === 'confirm');
+const deleted = await call(`/api/users/${SAM_ID}/delete`, { method: 'POST', token, body: { confirm: 'sam', currentPassword: NEWPASS } });
+check('a correct delete returns counts and a backup name',
+    deleted.status === 200 && deleted.json.deleted.users === 1 && deleted.json.deleted.import_items >= 1
+    && /^sync\.db\.predelete-\d+-/.test(deleted.json.backup), JSON.stringify(deleted.json));
+check('the deleted account can no longer sign in',
+    (await call('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-2' } })).status === 401);
+const ownerAfter = JSON.stringify([(await call('/api/tree', { token })).json, (await call('/api/shared', { token })).json,
+    (await call('/api/history', { token })).json, (await call('/api/prefs', { token })).json]);
+check("the owner's data is unchanged by all of it", ownerAfter === ownerBefore);
+check('a deleted name cannot be registered again',
+    (await call('/api/users', { method: 'POST', token, body: { username: 'SAM', password: 'sam-password-3', currentPassword: NEWPASS } })).status === 409);
+
+// A wrong current password counts like a failed sign-in. kim's budget only:
+// limits are per IP and username, so the owner is not locked out by it.
+let adminLimited = null;
+for (let i = 0; i < 25 && adminLimited === null; i++) {
+    const r = await call('/api/users', { method: 'POST', token: kimTok, body: { username: 'lee', password: 'lee-password-1', currentPassword: 'wrong wrong' } });
+    if (r.status === 429) adminLimited = i;
+}
+check('wrong current passwords are rate-limited like sign-ins', adminLimited !== null, 'never limited');
+check("and that does not lock out the owner", (await call('/api/users', { token })).status === 200
+    && (await call('/api/login', { method: 'POST', body: { username: USER, password: NEWPASS } })).status === 200);
+
+// 16. The OAuth callback echoes the provider's error, escaped.
 const cb = await fetch(BASE + '/api/imports/reddit/callback?error=' + encodeURIComponent('<script>alert(1)</script>'));
 const cbHtml = await cb.text();
 check('callback error is HTML-escaped',
     !cbHtml.includes('<script>alert(1)') && cbHtml.includes('&lt;script&gt;'), cbHtml.slice(0, 200));
 
-// 16. Rate limit — last, because it locks this client out for the window.
+// 17. Rate limit — last, because it locks this client out for the window.
 let limited = null;
 for (let i = 0; i < 25 && !limited; i++) {
     const r = await call('/api/login', { method: 'POST', body: { username: USER, password: 'wrong wrong wrong' } });

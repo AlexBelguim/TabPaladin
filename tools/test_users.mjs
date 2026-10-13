@@ -8,9 +8,18 @@
 //   2. ADMIN_USERNAME / ADMIN_PASSWORD create the first admin only when there
 //      are no users; the environment is ignored afterwards.
 //   3. A session token resolves to { id, username, role }; the legacy token
-//      acts as the first admin; anything else resolves to nobody.
-//   4. A backup is written before a schema change, not again within the
-//      interval, and pruned to `keep`.
+//      acts as the account the ownership migration pinned it to (the first
+//      admin only before that migration); anything else resolves to nobody.
+//   4. A schema step writes its own sync.db.pre-v<N>-* copy, once, and never
+//      touches the daily sync.db.bak-* rotation — so a crash loop below the
+//      new version cannot rotate the older daily copies away. Daily copies
+//      are not repeated within the interval and are pruned to `keep`.
+//   5. Account ids are never reused, names that differ only by case are
+//      refused (against deleted accounts too), and password bounds hold.
+//   6. An admin change is decided by who the acting admin is when it is
+//      written, not when the request arrived: demoted, deleted or signed out
+//      during the password check's await, the change is refused. And nobody
+//      changes their own role.
 //
 // Run: node tools/test_users.mjs
 
@@ -19,9 +28,14 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import {
-    migrateUsers, bootstrapAdmin, identify, backupDatabase, setSchemaVersion, createUser, SCHEMA_VERSION
+    migrateUsers, bootstrapAdmin, identify, backupDatabase, setSchemaVersion, createUser, SCHEMA_VERSION,
+    validatePassword, listBackups, presentedToken
 } from '../server/users.js';
+import { migrateOwnership, deleteUserData } from '../server/tenancy.js';
 import { verifyPassword } from '../server/security.js';
+import { attachUserAdmin } from '../server/admin.js';
+import { makeItemsStore } from '../server/items.js';
+import { initSchema as initImportsSchema } from '../server/imports/store.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -119,6 +133,24 @@ console.log('identify');
         identify(db, TOKEN, 'old') === null && !db.prepare("SELECT 1 FROM sessions WHERE token = 'old'").get());
 }
 
+console.log('legacy token after the ownership migration');
+{
+    // Two accounts, so the migration has to be told whose data this is.
+    const db = legacyDb();
+    db.prepare("INSERT INTO users VALUES ('first', 'h', '2025-01-01')").run();
+    db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-02-01')").run();
+    migrateUsers(db);
+    migrateOwnership(db, { env: { TENANCY_OWNER: 'alex' } });
+    const alex = db.prepare("SELECT id FROM users WHERE username = 'alex'").get().id;
+    db.prepare("UPDATE users SET role = 'user' WHERE username = 'alex'").run();
+    db.prepare("UPDATE users SET role = 'admin' WHERE username = 'first'").run();
+    const who = identify(db, TOKEN, TOKEN);
+    check('the token acts as the pinned owner, even demoted and with a lower-id admin around',
+        who?.username === 'alex' && who.id === alex && who.via === 'token', JSON.stringify(who));
+    deleteUserData(db, alex);
+    check('a token whose pinned account is gone resolves to nobody', identify(db, TOKEN, TOKEN) === null);
+}
+
 // --- 4. Backup ---
 console.log('backup');
 {
@@ -127,29 +159,196 @@ console.log('backup');
     const db = legacyDb(file);
     db.pragma('journal_mode = WAL');
     db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-01-01')").run();
-    const list = () => fs.readdirSync(dir).filter(f => f.startsWith('sync.db.bak-')).sort();
+    const bak = () => listBackups(file, 'bak-').map(f => f.name);
+    const pre = () => listBackups(file, `pre-v${SCHEMA_VERSION}-`).map(f => f.name);
 
-    const t0 = new Date('2026-01-01T00:00:00Z');
+    // Seven older daily copies, as a server that has been running a while has.
+    const t0 = new Date('2026-01-10T00:00:00Z');
+    setSchemaVersion(db);
+    for (let i = 7; i >= 1; i--) {
+        backupDatabase(db, file, { keep: 7, intervalMs: 0, now: new Date(t0.getTime() - i * 86400000) });
+    }
+    db.pragma('user_version = 2');
+    const daily = bak();
+    check('seven daily copies to start with', daily.length === 7, daily.join(', '));
+
     const first = backupDatabase(db, file, { now: t0 });
-    check('pre-migration backup written', first && list().length === 1);
+    check('a schema step writes sync.db.pre-v3-*', first && path.basename(first).startsWith(`sync.db.pre-v${SCHEMA_VERSION}-`), first);
     const copy = new Database(first, { readonly: true });
-    check('backup holds the data (including WAL contents)',
+    check('the copy holds the data (including WAL contents)',
         copy.prepare('SELECT username FROM users').get()?.username === 'alex');
     copy.close();
 
+    // A container crash-looping below the new version: eight boots, a minute apart.
+    for (let i = 1; i <= 8; i++) {
+        backupDatabase(db, file, { keep: 7, now: new Date(t0.getTime() + i * 60000) });
+    }
+    check('a crash loop keeps every older daily copy', JSON.stringify(bak()) === JSON.stringify(daily), bak().join(', '));
+    check('and does not pile up pre-upgrade copies within ten minutes', pre().length === 1, pre().join(', '));
+    backupDatabase(db, file, { now: new Date(t0.getTime() + 11 * 60000) });
+    check('a later attempt, still below the version, takes a fresh one', pre().length === 2);
+
     setSchemaVersion(db);
     check('schema version recorded', db.pragma('user_version', { simple: true }) === SCHEMA_VERSION);
-    check('no second backup within the interval', backupDatabase(db, file, { now: new Date(t0.getTime() + 1000) }) === null);
-
+    const later = new Date(t0.getTime() + 3600000);
+    check('no daily copy within the interval of the last one',
+        backupDatabase(db, file, { now: new Date(t0.getTime() - 86400000 + 1000) }) === null);
     for (let i = 1; i <= 4; i++) {
-        backupDatabase(db, file, { keep: 3, intervalMs: 0, now: new Date(t0.getTime() + i * 60000) });
+        backupDatabase(db, file, { keep: 3, intervalMs: 0, now: new Date(later.getTime() + i * 60000) });
     }
-    check('pruned to keep', list().length === 3, list().join(', '));
-    check('oldest pruned first', !list().includes(path.basename(first)));
+    check('daily copies pruned to keep', bak().length === 3, bak().join(', '));
+    check('oldest pruned first', !bak().includes(daily[0]) && !bak().includes(daily[6]));
+    check('pruning never touches the pre-upgrade copies', pre().length === 2);
 
     const empty = new Database(path.join(dir, 'fresh.db'));
     check('brand-new database is not backed up', backupDatabase(empty, path.join(dir, 'fresh.db')) === null);
     empty.close();
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 5. Ids, names, passwords ---
+console.log('ids, names, passwords');
+{
+    const db = legacyDb();
+    db.prepare("INSERT INTO users VALUES ('alex', 'h', '2025-01-01')").run();
+    migrateUsers(db);
+    migrateOwnership(db, { env: {} });
+    const sam = await createUser(db, { username: 'sam', password: 'sam-password' });
+    const kim = await createUser(db, { username: 'kim', password: 'kim-password' });
+    deleteUserData(db, kim.id);
+    const lee = await createUser(db, { username: 'lee', password: 'lee-password' });
+    check('the highest id is not reused after its account is deleted', lee.id === kim.id + 1, `${kim.id} -> ${lee.id}`);
+    check('a new account starts at a fresh tree version',
+        Number(db.prepare("SELECT value FROM user_tree_meta WHERE user_id = ? AND key = 'treeVersion'").get(lee.id)?.value) > 0);
+
+    const clash = async (name) => { try { await createUser(db, { username: name, password: 'long-enough' }); return null; } catch (e) { return e; } };
+    const upper = await clash('Alex');
+    check('"Alex" refused when "alex" exists', upper && upper.code === 'name-clash' && /too close to existing "alex"/.test(upper.message),
+        upper && upper.message);
+    check('a deleted account\'s name is refused, in any case', (await clash('KIM'))?.code === 'name-clash' && (await clash('kim'))?.code === 'name-clash');
+    check('the exact same name is refused', (await clash('sam'))?.code === 'name-clash');
+    check('a refused name created nothing', db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 3);
+    void sam;
+
+    check('7-character password refused', Boolean(validatePassword('1234567').error));
+    check('8-character password accepted', validatePassword('12345678').password === '12345678');
+    check('256-character password accepted', !validatePassword('x'.repeat(256)).error);
+    check('257-character password refused', Boolean(validatePassword('x'.repeat(257)).error));
+}
+
+// --- 6. Admin changes and the acting admin ---
+console.log('admin changes re-check who is acting');
+{
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-admin-'));
+    const file = path.join(dir, 'sync.db');
+    const db = legacyDb(file);
+    // The rest of the server's tables, as index.js creates them, for the
+    // account stats each answer carries.
+    db.exec(`
+        CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, device_id TEXT, json TEXT NOT NULL);
+        CREATE TABLE shared_links (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, title TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE share_tokens (token TEXT PRIMARY KEY, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+        CREATE TABLE note_proposals (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+    `);
+    migrateUsers(db);
+    initImportsSchema(db);
+    makeItemsStore(db);
+    await bootstrapAdmin(db, { ADMIN_USERNAME: 'alex', ADMIN_PASSWORD: 'alex-password' });
+    migrateOwnership(db, { env: {} });
+    const kim = await createUser(db, { username: 'kim', password: 'kim-password', role: 'admin' });
+    const pat = await createUser(db, { username: 'pat', password: 'pat-password' });
+    const now = new Date().toISOString();
+    const session = (token, username) => db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?)').run(token, username, now, future);
+
+    // The routes as admin.js registers them, run without a network: the
+    // guards, then the handler. The handler runs synchronously up to its
+    // first await (the password check's scrypt), so whatever `during` does
+    // lands exactly in that window — the race, made deterministic.
+    const routes = {};
+    const fakeApp = {};
+    for (const m of ['get', 'post', 'put']) fakeApp[m] = (p, ...handlers) => { routes[`${m.toUpperCase()} ${p}`] = handlers; };
+    const requireAuth = (req, res, next) => {
+        const user = identify(db, '', presentedToken(req));
+        if (!user) return res.status(401).json({ error: 'Unauthorized' });
+        req.user = user;
+        next();
+    };
+    attachUserAdmin(fakeApp, { db, requireAuth, dbPath: file, authToken: '', limiter: { limited: () => false, fail() {}, ok() {} } });
+    async function call(route, { token, params = {}, body = {}, during = null }) {
+        let done;
+        const finished = new Promise(r => { done = r; });
+        const res = {
+            statusCode: 200,
+            status(c) { this.statusCode = c; return this; },
+            json(b) { this.body = b; done(); return this; },
+            set() { return this; }
+        };
+        const req = { params, body, headers: { authorization: 'Bearer ' + token }, ip: '127.0.0.1' };
+        const handlers = routes[route];
+        let i = 0;
+        const next = () => handlers[i++](req, res, next);
+        next();
+        if (during) during();
+        await finished;
+        return res;
+    }
+    const roleOf = (id) => db.prepare('SELECT role FROM users WHERE id = ?').get(id)?.role;
+
+    session('kim-1', 'kim');
+    const demotedMeanwhile = await call('PUT /api/users/:id', {
+        token: 'kim-1', params: { id: String(pat.id) }, body: { role: 'admin', currentPassword: 'kim-password' },
+        during: () => db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(kim.id)
+    });
+    check('kim, demoted while her password was checked, cannot make pat an admin',
+        demotedMeanwhile.statusCode === 403 && demotedMeanwhile.body.code === 'not-admin' && roleOf(pat.id) === 'user',
+        JSON.stringify(demotedMeanwhile.body));
+    db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(kim.id);
+
+    const signedOutMeanwhile = await call('POST /api/users', {
+        token: 'kim-1', body: { username: 'zed', password: 'zed-password', role: 'admin', currentPassword: 'kim-password' },
+        during: () => db.prepare("DELETE FROM sessions WHERE token = 'kim-1'").run()
+    });
+    check('kim, signed out meanwhile, cannot create an admin',
+        signedOutMeanwhile.statusCode === 403 && !db.prepare("SELECT 1 FROM users WHERE username = 'zed'").get(),
+        JSON.stringify(signedOutMeanwhile.body));
+
+    session('kim-2', 'kim');
+    const resetMeanwhile = await call('PUT /api/users/:id', {
+        token: 'kim-2', params: { id: String(pat.id) }, body: { password: 'taken-over-1', currentPassword: 'kim-password' },
+        during: () => db.prepare("DELETE FROM sessions WHERE username = 'kim'").run()
+    });
+    check('nor reset pat\'s password', resetMeanwhile.statusCode === 403
+        && await verifyPassword('pat-password', db.prepare('SELECT password_hash FROM users WHERE id = ?').get(pat.id).password_hash));
+
+    session('kim-3', 'kim');
+    const deletedMeanwhile = await call('POST /api/users/:id/delete', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { confirm: 'pat', currentPassword: 'kim-password' },
+        during: () => db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(kim.id)
+    });
+    check('nor delete pat', deletedMeanwhile.statusCode === 403 && roleOf(pat.id) === 'user'
+        && listBackups(file, 'predelete-').length === 0, JSON.stringify(deletedMeanwhile.body));
+    db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(kim.id);
+
+    const selfPromote = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(kim.id) }, body: { role: 'admin', currentPassword: 'kim-password' }
+    });
+    const selfDemote = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(kim.id) }, body: { role: 'user', currentPassword: 'kim-password' }
+    });
+    check('nobody changes their own role', selfPromote.statusCode === 400 && selfPromote.body.code === 'self'
+        && selfDemote.statusCode === 400 && roleOf(kim.id) === 'admin');
+
+    const fine = await call('PUT /api/users/:id', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { role: 'admin', currentPassword: 'kim-password' }
+    });
+    check('with nothing in the way, the same change goes through', fine.statusCode === 200 && roleOf(pat.id) === 'admin',
+        JSON.stringify(fine.body));
+    const removed = await call('POST /api/users/:id/delete', {
+        token: 'kim-3', params: { id: String(pat.id) }, body: { confirm: 'pat', currentPassword: 'kim-password' }
+    });
+    check('and so does a delete', removed.statusCode === 200 && !roleOf(pat.id) && removed.body.deleted.users === 1,
+        JSON.stringify(removed.body));
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });
 }

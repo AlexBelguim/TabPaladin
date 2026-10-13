@@ -11,6 +11,17 @@
 //      surfaced instead of silently overwriting, virtual nodes never push.
 //   4. The imports subtree is read-only, with delete/file going through the
 //      explicit server verbs.
+//   5. A working copy belongs to one account: pull and push stamp it, push
+//      names it, switching accounts sets it aside with its focused folders
+//      and queued removals and brings it back later, an unstamped copy is
+//      adopted only by the tenancy owner, and a 412 is answered by setting
+//      the copy aside — never by losing it.
+//   6. An account is an id on one server: the same id and name on another
+//      server (or a rebuilt one at the same address) is someone else, and a
+//      server reached at a new address gets its copy back only when the user
+//      says it is the same server.
+//   7. A copy made in this browser while nobody was signed in goes to the
+//      first account that signs in, never to the server's owner by default.
 //
 // Run: node tools/test_treestore.mjs
 
@@ -97,6 +108,24 @@ const server = {
 };
 const serverLog = [];
 
+// What each address reports as its server id. moved.test is server.test
+// reached at a new address; other.test is another server whose first admin is
+// also #1 'alex'.
+const SERVER_IDS = { 'https://server.test': 'srv-main', 'https://moved.test': 'srv-main', 'https://other.test': 'srv-other' };
+const serverC = {
+    version: 77,
+    roots: [{ id: 'other-root', kind: 'folder', title: 'Other server stuff', children: [] }]
+};
+
+// A second account on the same server, reached with token 'tok-b'.
+const serverB = {
+    version: 1000,
+    roots: [{ id: 'sam-root', kind: 'folder', title: 'Sam stuff', children: [
+        { id: 'sam-b1', kind: 'bookmark', title: 'Sam link', url: 'https://sam.example' }
+    ] }]
+};
+let lastPutBody = null;
+
 globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
     const method = (opts.method || 'GET').toUpperCase();
@@ -105,23 +134,31 @@ globalThis.fetch = async (url, opts = {}) => {
         ok: status < 400, status, statusText: status === 409 ? 'Conflict' : 'OK',
         json: async () => body, text: async () => JSON.stringify(body)
     });
+    const who = ((opts.headers || {}).Authorization || '').endsWith(' tok-b') ? 2 : 1;
+    const serverId = SERVER_IDS[new URL(u).origin];
+    const srv = serverId === 'srv-other' ? serverC : who === 2 ? serverB : server;
 
     if (u.endsWith('/api/health')) return json({ ok: true, version: 2, configured: true });
-    if (u.endsWith('/api/tree/version')) return json({ ok: true, version: server.version });
+    if (u.endsWith('/api/tree/version')) return json({ ok: true, version: srv.version, userId: who, serverId });
     if (u.endsWith('/api/tree') && method === 'GET') {
-        return json({ ok: true, version: server.version, roots: JSON.parse(JSON.stringify(server.roots)) });
+        return json({ ok: true, version: srv.version, roots: JSON.parse(JSON.stringify(srv.roots)), userId: who, serverId });
     }
     if (u.endsWith('/api/tree') && method === 'PUT') {
         const body = JSON.parse(opts.body);
-        if (!body.force && Number(body.baseVersion) !== server.version) {
-            return json({ error: 'The tree changed on the server since your last pull. Pull, then push again.', version: server.version }, 409);
+        lastPutBody = body;
+        if ((body.baseUserId !== undefined && Number(body.baseUserId) !== who)
+            || (body.baseServerId !== undefined && body.baseServerId !== serverId)) {
+            return json({ error: 'This working copy belongs to another account.', code: 'wrong-account', userId: who, serverId }, 412);
         }
-        server.pushedRoots = body.roots;
-        server.version += 1;
+        if (!body.force && Number(body.baseVersion) !== srv.version) {
+            return json({ error: 'The tree changed on the server since your last pull. Pull, then push again.', version: srv.version }, 409);
+        }
+        srv.pushedRoots = body.roots;
+        srv.version += 1;
         // The server keeps the virtual subtree out of storage; mimic by storing
         // user roots and re-serving the virtual one on top.
-        server.roots = [...body.roots, server.roots.find(r => r.id === 'imports:root')].filter(Boolean);
-        return json({ ok: true, version: server.version });
+        srv.roots = [...body.roots, srv.roots.find(r => r.id === 'imports:root')].filter(Boolean);
+        return json({ ok: true, version: srv.version, userId: who, serverId });
     }
     if (/\/api\/imports\/1\/items\/(delete|file)$/.test(u) && method === 'POST') {
         const body = JSON.parse(opts.body);
@@ -328,6 +365,227 @@ console.log('\n8. Saving a workflow survives the page closing right after');
     check('flush writes the new workflow before the debounce fires',
         onDisk.includes('"Research"') && onDisk.includes('b.example'));
     check('saveWorkflow reports every tab', wf.tabs.length === 2);
+}
+
+console.log('\n9. A working copy belongs to one account');
+{
+    const URL_A = 'https://server.test';
+    const cfgB = { url: URL_A, token: 'tok-b' };
+    const settings = async () => (await chrome.storage.local.get('settings')).settings || {};
+
+    await TreeStore.sync.pull(cfg);
+    check('a pull stamps the copy with the account it came from',
+        TreeStore.status().owner && TreeStore.status().owner.userId === 1 && TreeStore.status().owner.url === URL_A,
+        JSON.stringify(TreeStore.status().owner));
+    await Tree.create({ parentId: 'f1', title: 'alex edit', url: 'https://alex-edit.example' });
+    await TreeStore.sync.push(cfg);
+    check('a push names the account it belongs to', lastPutBody && lastPutBody.baseUserId === 1);
+
+    // Alex has unpushed edits, focused folders, and a tab-close removal the
+    // background queued while no page was open.
+    await Tree.create({ parentId: 'f1', title: 'unpushed', url: 'https://unpushed.example' });
+    const doomed = await Tree.create({ parentId: 'f1', title: 'closed tab', url: 'https://closed.example' });
+    await chrome.storage.local.set({ settings: { ...(await settings()), focusedFolderIds: ['f1'], foldState: { f1: true } } });
+    storageData.set('tpPendingRemovals', [doomed.id]); // as the background writes it, no live page to apply it
+    const edits = TreeStore.status().editCount;
+    check('unpushed edits are counted', TreeStore.status().dirty && edits >= 2, String(edits));
+
+    check('signing in as sam would set this copy aside',
+        TreeStore.wouldSetAside({ url: URL_A, userId: 2, tenancyOwner: false }) === true
+        && TreeStore.wouldSetAside({ url: URL_A + '/', userId: 1 }) === false);
+    const toSam = await TreeStore.switchAccount({ url: URL_A, userId: 2, username: 'sam', previousUsername: 'alex' });
+    check('switching to sam sets alex\'s copy aside and starts empty', toSam.action === 'fresh' && toSam.setAside
+        && TreeStore.status().isEmpty && !TreeStore.status().dirty && TreeStore.status().owner.userId === 2);
+    check('sam does not inherit alex\'s focused folders or fold state',
+        JSON.stringify((await settings()).focusedFolderIds) === '[]' && (await settings()).foldState === undefined);
+    const stashes = await TreeStore.listStashes();
+    check('the set-aside copy is listed with its owner and unpushed edits',
+        stashes.length === 1 && stashes[0].username === 'alex' && stashes[0].userId === 1 && stashes[0].dirty
+        && stashes[0].editCount >= 2 && stashes[0].items > 0, JSON.stringify(stashes));
+    await TreeStore.sync.pull(cfgB);
+    check('sam pulls his own tree', (await TreeStore.getNode('sam-b1')) !== null && (await TreeStore.getNode('f1')) === null);
+    check('the queued removal did not land in sam\'s copy and is no longer queued',
+        !(await chrome.storage.local.get('tpPendingRemovals')).tpPendingRemovals);
+    await Tree.create({ parentId: 'sam-root', title: 'sam edit', url: 'https://sam-edit.example' });
+    await TreeStore.sync.push(cfgB);
+    check('sam\'s push names sam', lastPutBody.baseUserId === 2 && serverB.pushedRoots.some(r => r.id === 'sam-root'));
+
+    const back = await TreeStore.switchAccount({ url: URL_A, userId: 1, username: 'alex', previousUsername: 'sam' });
+    check('switching back to alex brings his copy back, unpushed edits and all',
+        back.action === 'restored' && TreeStore.status().dirty && TreeStore.status().owner.userId === 1
+        && (await TreeStore.getNode('f1')).children.some(c => c.url === 'https://unpushed.example'));
+    check('the tab-close removal was applied to alex\'s copy, where it belonged',
+        !JSON.stringify(await Tree.getTree()).includes('closed.example'));
+    check('his focused folders and fold state came back with it',
+        JSON.stringify((await settings()).focusedFolderIds) === '["f1"]' && (await settings()).foldState?.f1 === true);
+    check('sam\'s copy is set aside in turn, not discarded',
+        (await TreeStore.listStashes()).some(st => st.userId === 2 && st.username === 'sam'));
+
+    // A 412: the copy is alex's but the session is sam's.
+    let refused = null;
+    try { await TreeStore.sync.push(cfgB); } catch (e) { refused = e; }
+    check('pushing alex\'s copy with sam\'s session is refused with a 412 code',
+        refused && refused.status === 412 && refused.code === 'wrong-account', refused && refused.message);
+    check('  and the copy is untouched', TreeStore.status().dirty && TreeStore.status().owner.userId === 1);
+    await TreeStore.setAsideAndReset({ url: URL_A, userId: 2, username: 'sam' });
+    await TreeStore.sync.pull(cfgB);
+    check('setting it aside and pulling gives sam his tree', (await TreeStore.getNode('sam-root')) !== null
+        && TreeStore.status().owner.userId === 2 && !TreeStore.status().dirty);
+    const alexStash = (await TreeStore.listStashes()).find(st => st.userId === 1);
+    check('alex\'s dirty copy survived as a stash', alexStash && alexStash.dirty);
+    const html = await TreeStore.exportStashHtml(alexStash.key);
+    check('it exports as a bookmarks file with the unpushed edit', html.startsWith('<!DOCTYPE NETSCAPE-Bookmark-file-1>')
+        && html.includes('https://unpushed.example'));
+    let wrongRestore = null;
+    try { await TreeStore.restoreStash(alexStash.key, { url: URL_A, userId: 2 }); } catch (e) { wrongRestore = e; }
+    check('only alex can restore alex\'s copy', wrongRestore !== null && (await TreeStore.getNode('sam-root')) !== null);
+    const samStash = (await TreeStore.listStashes()).find(st => st.userId === 2);
+    await TreeStore.discardStash(samStash.key);
+    check('a stash can be discarded explicitly', !(await TreeStore.listStashes()).some(st => st.key === samStash.key));
+
+    // Copies from before accounts carry no stamp.
+    const legacy = { baseVersion: 5, roots: [{ id: 'old', kind: 'folder', title: 'Old copy', children: [] }], dirty: true, rev: 'legacy-rev' };
+    await chrome.storage.local.set({ tpTree: legacy });
+    check('a copy written elsewhere is adopted with its owner (none here)', TreeStore.status().owner === null
+        && (await TreeStore.getNode('old')) !== null);
+    check('an unstamped copy would be set aside for a non-owner, not for the owner',
+        TreeStore.wouldSetAside({ url: URL_A, userId: 2, tenancyOwner: false })
+        && !TreeStore.wouldSetAside({ url: URL_A, userId: 1, tenancyOwner: true }));
+    const adopted = await TreeStore.switchAccount({ url: URL_A, userId: 1, username: 'alex', tenancyOwner: true });
+    check('the tenancy owner adopts an unstamped copy in place', adopted.action === 'adopted'
+        && TreeStore.status().owner.userId === 1 && (await TreeStore.getNode('old')) !== null && TreeStore.status().dirty);
+    await chrome.storage.local.set({ tpTree: { ...legacy, rev: 'legacy-rev-2' } });
+    const notOwner = await TreeStore.switchAccount({ url: URL_A, userId: 2, username: 'sam', tenancyOwner: false });
+    check('anyone else sets it aside as a legacy copy', notOwner.action === 'fresh'
+        && (await TreeStore.listStashes()).some(st => st.key.endsWith('|legacy') && st.userId === null && st.dirty));
+
+    // Another context switching accounts: this page adopts the stamp too.
+    await chrome.storage.local.set({ tpTree: { baseVersion: 7, roots: [], dirty: false, owner: { url: URL_A, userId: 9, username: 'kim' }, rev: 'other-page' } });
+    check('a copy written by another page brings its owner with it', TreeStore.status().owner && TreeStore.status().owner.userId === 9);
+}
+
+const MAIN = 'https://server.test';
+const OTHER = 'https://other.test';
+const MOVED = 'https://moved.test';
+const clearStashes = async () => { for (const st of await TreeStore.listStashes()) await TreeStore.discardStash(st.key); };
+
+console.log('\n10. The same id and name on another server is another account');
+{
+    await TreeStore.setAsideAndReset({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main' });
+    await clearStashes();
+    await TreeStore.sync.pull({ url: MAIN, token: 'tok' });
+    check('a pull stamps the server id as well', TreeStore.status().owner.serverId === 'srv-main', JSON.stringify(TreeStore.status().owner));
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'NAS-only edit' });
+    check('an unpushed edit on the NAS copy', TreeStore.status().dirty);
+
+    const otherAlex = { url: OTHER, userId: 1, username: 'alex', serverId: 'srv-other', tenancyOwner: true };
+    check('alex #1 on another server would set the copy aside, despite the same id and name',
+        TreeStore.wouldSetAside(otherAlex) === true);
+    check('  so would that server when it does not say its id: the address differs',
+        TreeStore.wouldSetAside({ url: OTHER, userId: 1, username: 'alex' }) === true);
+    check('  and a rebuilt server at the same address, with a new server id',
+        TreeStore.wouldSetAside({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-rebuilt' }) === true);
+    check('the same server, address and id would not',
+        TreeStore.wouldSetAside({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main' }) === false);
+    check('  nor the same address typed differently', TreeStore.wouldSetAside({ url: 'https://SERVER.test:443/', userId: 1, serverId: 'srv-main' }) === false);
+
+    // The extension's URL field changed but the token still opens the other
+    // server: the push names the server its copy came from, and is refused.
+    let wrongServer = null;
+    try { await TreeStore.sync.push({ url: OTHER, token: 'tok' }); } catch (e) { wrongServer = e; }
+    check('a push of the NAS copy to the other server names its server and is refused (412)',
+        lastPutBody.baseServerId === 'srv-main' && wrongServer && wrongServer.status === 412 && wrongServer.code === 'wrong-account',
+        wrongServer && wrongServer.message);
+    check('  leaving the copy as it was', TreeStore.status().dirty && TreeStore.status().owner.url === MAIN);
+
+    const toOther = await TreeStore.switchAccount({ ...otherAlex, previousUsername: 'alex' });
+    check('signing in there sets the NAS copy aside and starts empty',
+        toOther.action === 'fresh' && toOther.setAside && TreeStore.status().isEmpty && TreeStore.status().owner.url === OTHER);
+    const nasStash = (await TreeStore.listStashes(otherAlex)).find(st => st.url === MAIN);
+    check('  the NAS copy is kept, unpushed edit and all, and is not that account\'s to restore',
+        nasStash && nasStash.dirty && nasStash.match === null, JSON.stringify(nasStash));
+    let crossRestore = null;
+    try { await TreeStore.restoreStash(nasStash.key, otherAlex, { moved: true }); } catch (e) { crossRestore = e; }
+    check('  not even when asked to treat it as moved', crossRestore !== null && TreeStore.status().owner.url === OTHER);
+    await TreeStore.sync.pull({ url: OTHER, token: 'tok' });
+    check('the other server\'s tree comes into a copy of its own',
+        (await TreeStore.getNode('other-root')) !== null && (await TreeStore.getNode('f1')) === null
+        && TreeStore.status().owner.serverId === 'srv-other');
+
+    const backToNas = await TreeStore.switchAccount({ url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true });
+    check('back on the NAS, its copy comes back with the edit',
+        backToNas.action === 'restored' && TreeStore.status().dirty
+        && (await Tree.getChildren('0')).some(n => n.title === 'NAS-only edit'));
+
+    // The same server at a new address: offered back, never assumed.
+    const movedAlex = { url: MOVED, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const toMoved = await TreeStore.switchAccount({ ...movedAlex, previousUsername: 'alex' });
+    check('a new address is not assumed to be the same server: the copy is set aside', toMoved.action === 'fresh' && toMoved.setAside);
+    const offered = (await TreeStore.listStashes(movedAlex)).find(st => st.url === MAIN && st.dirty);
+    check('  and offered back as "moved", since the server id matches', offered && offered.match === 'moved', JSON.stringify(offered));
+    check('  while the other server\'s copy is not offered', (await TreeStore.listStashes(movedAlex)).filter(st => st.url === OTHER).every(st => st.match === null));
+    let unconfirmed = null;
+    try { await TreeStore.restoreStash(offered.key, movedAlex); } catch (e) { unconfirmed = e; }
+    check('  restoring it needs the user to say it is the same server', unconfirmed !== null);
+    await TreeStore.restoreStash(offered.key, movedAlex, { moved: true });
+    check('once they do, it comes back stamped with the new address',
+        TreeStore.status().owner.url === MOVED && TreeStore.status().owner.serverId === 'srv-main' && TreeStore.status().dirty);
+    await TreeStore.sync.push({ url: MOVED, token: 'tok' });
+    check('  and pushes there as the same account', server.pushedRoots.some(r => r.title === 'NAS-only edit') && !TreeStore.status().dirty);
+}
+
+console.log('\n11. A copy made while nobody was signed in');
+{
+    await clearStashes();
+    // As a fresh install writes it once something is saved before sign-in.
+    await chrome.storage.local.set({ tpTree: {
+        baseVersion: 0, dirty: true, editCount: 1, owner: null, origin: 'local', rev: 'fresh-install',
+        roots: [{ id: 'sam-private', kind: 'folder', title: 'Workflow', children: [
+            { id: 'sam-private-1', kind: 'bookmark', title: 'Clinic', url: 'https://sam-private.example/medical' }
+        ] }]
+    } });
+    check('it is unstamped and says it was made here', TreeStore.status().owner === null && TreeStore.status().origin === 'local');
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    check('it would not be set aside for whoever signs in first', TreeStore.wouldSetAside(sam) === false);
+    const claimed = await TreeStore.switchAccount({ ...sam });
+    check('sam, signing in first, claims it as his working copy',
+        claimed.action === 'claimed' && TreeStore.status().owner.userId === 2 && (await TreeStore.getNode('sam-private')) !== null);
+    check('  nothing went into a set-aside copy for the server owner', (await TreeStore.listStashes()).length === 0);
+    const ownerLater = await TreeStore.switchAccount({ ...alex });
+    check('the owner signing in later on this browser does not get it',
+        ownerLater.action !== 'adopted' && ownerLater.action !== 'claimed' && (await TreeStore.getNode('sam-private')) === null);
+    const samsCopy = (await TreeStore.listStashes(sam)).find(st => st.userId === 2);
+    check('  it waits, set aside as sam\'s, for sam', samsCopy && samsCopy.dirty && samsCopy.match === 'same');
+    check('  and the owner cannot restore it', (await TreeStore.listStashes(alex)).find(st => st.key === samsCopy.key).match === null);
+    const samBack = await TreeStore.switchAccount({ ...sam });
+    check('sam gets it back when he signs in again', samBack.action === 'restored' && (await TreeStore.getNode('sam-private')) !== null);
+
+    // A copy from before accounts is still the owner's, but only on the
+    // server it was set aside from.
+    await clearStashes();
+    await chrome.storage.local.set({ tpTree: { baseVersion: 5, roots: [{ id: 'old2', kind: 'folder', title: 'Old copy', children: [] }], dirty: true, rev: 'legacy-3' } });
+    check('a stored copy with no origin is from before accounts', TreeStore.status().origin === 'pre-accounts');
+    await TreeStore.switchAccount({ ...sam });
+    const legacyStash = (await TreeStore.listStashes()).find(st => st.userId === null);
+    check('  sam sets it aside', legacyStash && legacyStash.origin === 'pre-accounts');
+    check('  the owner may restore it on that server, not on another',
+        (await TreeStore.listStashes(alex)).find(st => st.key === legacyStash.key).match === 'same'
+        && (await TreeStore.listStashes({ url: OTHER, userId: 1, serverId: 'srv-other', tenancyOwner: true })).find(st => st.key === legacyStash.key).match === null);
+
+    // How a fresh install and an upgraded one first load: a separate module
+    // instance, so ensureLoaded runs again against what is in storage.
+    storageData.delete('tpTree');
+    const { TreeStore: FreshInstall } = await import('../src/utils/treeStore.js?fresh-install');
+    await FreshInstall.load();
+    check('a fresh install starts with a copy made here', FreshInstall.status().origin === 'local' && FreshInstall.status().owner === null);
+    await FreshInstall.createNode({ parentId: null, kind: 'folder', title: 'Saved before sign-in' });
+    await FreshInstall.flush();
+    check('  and stores it as such', storageData.get('tpTree').origin === 'local' && storageData.get('tpTree').owner === null);
+    storageData.set('tpTree', { baseVersion: 3, roots: [{ id: 'upg', kind: 'folder', title: 'Upgraded', children: [] }], dirty: false });
+    const { TreeStore: Upgraded } = await import('../src/utils/treeStore.js?upgraded');
+    await Upgraded.load();
+    check('an install upgraded from before accounts loads its copy as the owner\'s', Upgraded.status().origin === 'pre-accounts');
 }
 
 console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
