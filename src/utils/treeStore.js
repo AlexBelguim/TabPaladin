@@ -1013,8 +1013,9 @@ function bookmarksHtml(roots) {
 // this copy and the push goes again — no conflict prompt for a link filed on
 // the phone. The rules are shareCore.js's applyOps (the PWA's), restated here
 // because the extension cannot load from pwa/: a node already here is
-// skipped; one whose folder is gone here goes to the end of the Bookmarks
-// root (counted as relocated) rather than being dropped by the next push; an
+// skipped; a folder with no parent goes at the top level; one whose folder is
+// gone here goes to the end of the Bookmarks root (counted as relocated)
+// rather than being dropped by the next push; an
 // undo removes a bookmark only while it still has that URL, a folder only
 // while it is empty. Not an edit of this copy's own: nothing is marked dirty.
 function applyServerOps(ops) {
@@ -1027,9 +1028,12 @@ function applyServerOps(ops) {
         if (op.kind === 'append') {
             for (const n of (op.payload && op.payload.nodes) || []) {
                 if (!n || !n.id || index.has(String(n.id))) { out.skipped++; continue; }
+                // A folder with no parent is one the phone made at the top
+                // level: it goes there, not under Bookmarks.
+                const topLevel = n.kind === 'folder' && (n.parentId === null || n.parentId === undefined || n.parentId === '');
                 let parent = n.parentId ? index.get(String(n.parentId)) : null;
                 parent = parent && parent.node.kind === 'folder' && !inVirtual(parent.node.id) ? parent.node : null;
-                if (!parent) {
+                if (!parent && !topLevel) {
                     parent = bookmarksRoot();
                     out.relocated++;
                 }

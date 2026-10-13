@@ -1320,6 +1320,15 @@ console.log('\n15. A push that meets links filed from the phone folds them in');
     fileOnServer([{ id: 'new-one', kind: 'bookmark', url: 'https://new.example/' }], 'unappend');
     const un = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
     check('an undo on the phone takes the link back out here too', un && un.removed === 1 && !(await TreeStore.getNode('new-one')));
+    // A folder the phone made at the top level (never pushed) and filed into:
+    // the server logs it with no parent.
+    fileOnServer([{ id: 'phone-top', parentId: null, kind: 'folder', title: 'Top on the phone' },
+        { id: 'phone-top-b', parentId: 'phone-top', kind: 'bookmark', title: 'In it', url: 'https://top.example/' }]);
+    const top = await TreeStore.sync.rebaseOnto(asAlex, { expect: await TreeStore.currentCopy() });
+    check('a folder filed with no parent goes at the top level, not under Bookmarks, and is no relocation',
+        top && top.applied === 2 && top.relocated === 0 && stored().roots.some(r => r.id === 'phone-top')
+        && !find((await TreeStore.getNode('bm-root')).children, 'phone-top') && (await TreeStore.getNode('phone-top')).children[0].id === 'phone-top-b',
+        JSON.stringify(top));
 
     await fresh();
     await TreeStore.createNode({ parentId: 'ai', kind: 'bookmark', title: 'Mine', url: 'https://mine.example/' });
