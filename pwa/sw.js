@@ -4,9 +4,9 @@
 // together — SHELL_CACHE, the SHELL entries and the importScripts below
 // included. Miss one and the phone keeps serving the old bundle from cache
 // while the desktop looks fixed. tools/test_pwa_release.mjs checks they agree.
-importScripts('shareCore.js?v=29');
+importScripts('shareCore.js?v=30');
 
-const SHELL_CACHE = 'tp-shell-v29';
+const SHELL_CACHE = 'tp-shell-v30';
 
 // Server URL, session token and who it is, mirrored here by the app: workers
 // cannot read localStorage, where the config actually lives. Cache Storage
@@ -17,9 +17,9 @@ const CONFIG_KEY = '/__tp_config';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=29',
-    '/app.js?v=29',
-    '/shareCore.js?v=29',
+    '/app.css?v=30',
+    '/app.js?v=30',
+    '/shareCore.js?v=30',
     '/shareSheet.js',
     '/bookmarksHtml.js',
     '/notesModel.js',

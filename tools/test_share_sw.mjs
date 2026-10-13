@@ -31,6 +31,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PWA = path.join(__dirname, '..', 'pwa');
 const SW_SRC = fs.readFileSync(path.join(PWA, 'sw.js'), 'utf8');
 const CORE_SRC = fs.readFileSync(path.join(PWA, 'shareCore.js'), 'utf8');
+// The shell version moves with every release; read it rather than pin it.
+const V = (SW_SRC.match(/const SHELL_CACHE = 'tp-shell-v(\d+)'/) || [])[1];
+const SHELL_NAME = `tp-shell-v${V}`;
 const ORIGIN = 'https://tab.example';
 
 let failures = 0;
@@ -284,14 +287,14 @@ async function main() {
         const w = loadWorker({ caches, fetchImpl });
         await dispatchFetch(w, new Request(ORIGIN + '/?share=1&url=https%3A%2F%2Fsecret.example%2Fx&title=t'), { mode: 'navigate' });
         await dispatchFetch(w, new Request(ORIGIN + '/?ref=home'), { mode: 'navigate' });
-        const shellKeys = [...(caches.stores.get('tp-shell-v29') || new Map()).keys()];
+        const shellKeys = [...(caches.stores.get(SHELL_NAME) || new Map()).keys()];
         check('navigations are cached under / only, never under their query', JSON.stringify(shellKeys) === '["/"]', JSON.stringify(shellKeys));
         check('  so no shared link sits in Cache Storage', ![...caches.stores.values()].some(m => [...m.keys()].some(k => k.includes('secret'))));
         const before = served.length;
         const { res } = await dispatchFetch(w, new Request(ORIGIN + '/?share=AbCdEfGhIjKlMnOpQrStUv'), { mode: 'navigate' });
         check('a share navigation is served from the cached shell first', (await res.text()) === '<html>shell 2</html>');
         check('  and the shell is refreshed in the background, under /', served.length === before + 1 && served[served.length - 1] === '/'
-            && (await (await (await caches.open('tp-shell-v29')).match('/')).text()) === '<html>shell 3</html>');
+            && (await (await (await caches.open(SHELL_NAME)).match('/')).text()) === '<html>shell 3</html>');
         const slow = loadWorker({ caches, fetchImpl: () => new Promise(() => {}) });
         const t0 = Date.now();
         const { res: offline } = await dispatchFetch(slow, new Request(ORIGIN + '/'), { mode: 'navigate' });
@@ -305,15 +308,15 @@ async function main() {
         const ext = [];
         w.listeners.install({ waitUntil: (p) => ext.push(p) });
         await Promise.all(ext);
-        const keys = [...caches.stores.get('tp-shell-v29').keys()];
+        const keys = [...caches.stores.get(SHELL_NAME).keys()];
         check('install caches every other shell file when one fails', keys.length >= 8 && !keys.includes('/notesModel.js')
-            && keys.includes('/app.js?v=29') && keys.includes('/shareCore.js?v=29'), JSON.stringify(keys));
-        for (const name of ['tp-shell-v28', 'tp-shell-v27', 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) await caches.open(name);
+            && keys.includes(`/app.js?v=${V}`) && keys.includes(`/shareCore.js?v=${V}`), JSON.stringify(keys));
+        for (const name of [`tp-shell-v${V - 1}`, `tp-shell-v${V - 2}`, 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) await caches.open(name);
         const ext2 = [];
         w.listeners.activate({ waitUntil: (p) => ext2.push(p) });
         await Promise.all(ext2);
         check('activate removes older shells only, keeping tp-config, tp-outbox and tp-data',
-            JSON.stringify([...caches.stores.keys()].sort()) === JSON.stringify(['other-app-cache', 'tp-config', 'tp-data', 'tp-outbox', 'tp-shell-v29']),
+            JSON.stringify([...caches.stores.keys()].sort()) === JSON.stringify(['other-app-cache', 'tp-config', 'tp-data', 'tp-outbox', SHELL_NAME]),
             JSON.stringify([...caches.stores.keys()]));
     }
     {
