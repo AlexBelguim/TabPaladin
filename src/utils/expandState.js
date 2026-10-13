@@ -17,6 +17,10 @@
 // regenerated on every regroup, so those go by name. Only explicit choices are
 // stored; a missing key means the card's default.
 //
+// The map holds the folders of whichever account's working copy is here. When
+// TreeStore sets a copy aside for another account's, that copy's entries go
+// with it (entriesFor) and come back with it (restore).
+//
 // Never throws: losing this costs a few collapsed folders, nothing more.
 
 const api = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
@@ -127,6 +131,43 @@ export const ExpandState = {
         }
         if (dropped) scheduleWrite();
         return dropped;
+    },
+
+    // The saved choices for tree-id cards that `belongs` claims: those of a
+    // working copy being set aside, which carries them (see TreeStore) so that
+    // pruning against the next account's tree loses none of them.
+    async entriesFor(belongs) {
+        await ExpandState.load();
+        const out = {};
+        for (const [k, v] of Object.entries(cards)) {
+            if (isUiKey(k)) continue;
+            let mine = false;
+            try { mine = Boolean(belongs(k)); } catch (e) { mine = false; }
+            if (mine) out[k] = { o: v.o, t: v.t };
+        }
+        return out;
+    },
+
+    // Put a set-aside copy's choices back as it comes back. A choice made
+    // here since then wins; the rest count as touched now, so the cap drops
+    // what the other account left behind before any of these.
+    async restore(entries) {
+        await ExpandState.load();
+        if (!entries || typeof entries !== 'object') return 0;
+        const now = Date.now();
+        let restored = 0;
+        for (const [k, v] of Object.entries(entries)) {
+            if (!k || isUiKey(k) || !v || (v.o !== 0 && v.o !== 1)) continue;
+            if (cards[k] && cards[k].t > (Number(v.t) || 0)) continue;
+            cards[k] = { o: v.o, t: now };
+            restored++;
+        }
+        if (restored) {
+            evict();
+            if (writeTimer) clearTimeout(writeTimer);
+            await writeNow();
+        }
+        return restored;
     },
 
     // prune(), but only against a working copy that is really there. An empty

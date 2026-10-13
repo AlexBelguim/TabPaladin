@@ -27,12 +27,17 @@
 // Signing in as someone else never pushes this copy into their account and
 // never discards it: switchAccount sets it aside (tpTreeStash:<url>|<userId>,
 // with the per-account state that travels with it) and brings back the new
-// account's own set-aside copy, if this browser has one.
+// account's own set-aside copy, if this browser has one. Each copy brought in
+// that way gets a new `copyId`, and listeners hear 'switch' — in this page and,
+// through the storage event, in every other one — so nothing drawn from the
+// previous copy is carried into this one.
 //
 // A copy with no stamp is one of two things, and `origin` says which: one
 // from before accounts ('pre-accounts', the server owner's), or one made in
 // this browser while nobody was signed in ('local', claimed by the first
 // account to sign in).
+
+import { ExpandState } from './expandState.js';
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
@@ -80,6 +85,7 @@ const state = {
     owner: null,        // {url, userId, username, serverId} of the account this copy belongs to; null = unstamped
     origin: null,       // for an unstamped copy: 'pre-accounts' (older version) or 'local' (made while signed out)
     editCount: 0,       // local edits since the last pull or push, for "N unpushed edits"
+    copyId: null,       // new each time another copy becomes the working copy (loadCopy)
     rev: null           // stamp of the last write, to recognise our own storage events
 };
 
@@ -148,6 +154,7 @@ async function ensureLoaded() {
                 state.owner = stored.owner || null;
                 state.origin = originOf(stored);
                 state.editCount = Number(stored.editCount) || (state.dirty ? 1 : 0);
+                state.copyId = stored.copyId || null;
                 state.rev = stored.rev || null;
             } else {
                 // Nothing here yet: whatever is made before someone signs in
@@ -184,6 +191,7 @@ async function persistNow() {
                 owner: state.owner,
                 origin: state.owner ? null : state.origin,
                 editCount: state.editCount,
+                copyId: state.copyId,
                 rev: state.rev
             }
         });
@@ -203,6 +211,9 @@ if (api.storage && api.storage.onChanged) {
         if (!changes[STORE_KEY]) return;
         const next = changes[STORE_KEY].newValue;
         if (!next || next.rev === state.rev) return;
+        // Another page brought another account's copy in: the same 'switch'
+        // its own listeners heard.
+        const switched = state.loaded && (next.copyId || null) !== state.copyId;
         state.baseVersion = Number(next.baseVersion) || 0;
         state.roots = Array.isArray(next.roots) ? next.roots : [];
         state.dirty = Boolean(next.dirty);
@@ -211,10 +222,11 @@ if (api.storage && api.storage.onChanged) {
         state.owner = next.owner || null;
         state.origin = originOf(next);
         state.editCount = Number(next.editCount) || 0;
+        state.copyId = next.copyId || null;
         state.rev = next.rev || null;
         state.loaded = true;
         reindex();
-        emit('external');
+        emit(switched ? 'switch' : 'external');
     });
 }
 
@@ -469,9 +481,10 @@ function countItems(roots) {
 }
 
 // Put the current working copy aside, with what belongs with it: the focused
-// folders and fold state (both hold this account's item ids) and any tab-close
-// removals still queued. Never overwrites an earlier stash. Returns its key,
-// or null when there was nothing to keep.
+// folders and which of its folder cards are open (both hold this account's
+// item ids, and ExpandState prunes ids the next account's tree lacks) and any
+// tab-close removals still queued. Never overwrites an earlier stash. Returns
+// its key, or null when there was nothing to keep.
 async function stashCurrent({ fallbackUrl, username = null } = {}) {
     if (!state.roots.length && !state.dirty) return null;
     const settings = await readSettings();
@@ -479,9 +492,11 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
     try {
         pendingRemovals = ((await api.storage.local.get(PENDING_REMOVALS_KEY)) || {})[PENDING_REMOVALS_KEY] || [];
     } catch (e) { /* nothing queued */ }
-    const index = await stashIndex();
+    let expanded = {};
+    try { expanded = await ExpandState.entriesFor((id) => index.has(id)); } catch (e) { /* UI state only */ }
+    const keys = await stashIndex();
     let key = stashKeyFor(state.owner, fallbackUrl);
-    if (index.includes(key)) key += '#' + Date.now();
+    if (keys.includes(key)) key += '#' + Date.now();
     const owner = state.owner ? { ...state.owner, username: state.owner.username || username } : null;
     await api.storage.local.set({
         [key]: {
@@ -496,10 +511,10 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
             username: owner ? owner.username : username,
             setAsideAt: new Date().toISOString(),
             focusedFolderIds: settings.focusedFolderIds || [],
-            foldState: settings.foldState,
+            expanded,
             pendingRemovals
         },
-        [STASH_INDEX_KEY]: [...index, key]
+        [STASH_INDEX_KEY]: [...keys, key]
     });
     if (pendingRemovals.length) await api.storage.local.remove(PENDING_REMOVALS_KEY);
     return key;
@@ -534,8 +549,9 @@ async function takeStashFor(target, { legacy = false } = {}) {
 }
 
 // Make `stash` (or, with none, an empty copy for `owner`) the working copy,
-// and put the per-account settings it carries back in place.
+// and put the per-account state it carries back in place.
 async function loadCopy(stash, owner) {
+    state.copyId = newId();
     state.roots = stash ? stash.roots || [] : [];
     state.baseVersion = stash ? Number(stash.baseVersion) || 0 : 0;
     state.dirty = stash ? Boolean(stash.dirty) : false;
@@ -546,10 +562,10 @@ async function loadCopy(stash, owner) {
     state.origin = null;
     reindex();
     const settings = await readSettings();
-    const next = { ...settings, focusedFolderIds: stash ? stash.focusedFolderIds || [] : [] };
-    if (stash && stash.foldState !== undefined) next.foldState = stash.foldState;
-    else delete next.foldState;
-    await api.storage.local.set({ [SETTINGS_KEY]: next });
+    await api.storage.local.set({ [SETTINGS_KEY]: { ...settings, focusedFolderIds: stash ? stash.focusedFolderIds || [] : [] } });
+    if (stash && stash.expanded) {
+        try { await ExpandState.restore(stash.expanded); } catch (e) { /* UI state only */ }
+    }
     if (stash && (stash.pendingRemovals || []).length) {
         await api.storage.local.set({ [PENDING_REMOVALS_KEY]: stash.pendingRemovals });
         await applyPendingRemovals();
@@ -700,6 +716,7 @@ export const TreeStore = {
             lastSyncKind: state.lastSyncKind,
             owner: state.owner ? { ...state.owner } : null,
             origin: state.owner ? null : state.origin,
+            copyId: state.copyId,
             isEmpty: state.roots.length === 0
         };
     },

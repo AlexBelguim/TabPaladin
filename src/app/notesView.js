@@ -11,7 +11,8 @@
 //
 // Saving stays explicit and local: Save or Ctrl+S writes the working copy, and
 // ⬆️ Push stays the only thing that talks to the server. An unsaved draft is
-// guarded on every way out of it, and survives leaving Notes through the gear.
+// guarded on every way out of it, and survives leaving Notes through the gear,
+// but never another account's working copy coming in (see "accounts").
 //
 // Layout is driven by classes set from here (.nv-cols-*, .nv-pane-*,
 // .nv-can-split, .is-read/.is-edit/.is-split). #notes-container itself is
@@ -56,6 +57,8 @@ const view = {
     pane: 'list',           // the pane narrow layouts show: 'side' | 'list' | 'note'
     cols: 3,
     restoreNoteId: null,    // last open note from a previous visit
+    copy: null,             // { id, owner } of the working copy the view was drawn from
+    checkParked: true,      // look for a parked draft of this account on the next refresh
     initialized: false,
     opened: false
 };
@@ -86,6 +89,210 @@ function loadPrefs() {
     view.mode = p.mode;
     view.shown = p.mode;
     view.restoreNoteId = p.noteId;
+}
+
+// --- accounts ---------------------------------------------------------------------
+//
+// The working copy can be swapped for another account's under the view:
+// signing in as someone else, a pull or a refused push that sets the copy
+// aside, a restore from Settings — in this page or in another one. Nothing
+// from the previous copy may reach the next: not the open note, not a draft,
+// not the selection. So the view starts over on the new copy's library.
+//
+// An unsaved draft belongs to the copy it was written in. Before a switch made
+// in this page, sidepanel.js asks (tabpaladin:before-account-switch) and the
+// draft is saved into the outgoing copy, so it is set aside with it, or
+// discarded. One nobody could ask about — the switch happened in another
+// page — is parked on this device under its account and comes back into the
+// editor when that account's copy does, never for anyone else's.
+
+const ACCOUNT_UI_KEY = 'tp_notes_ui_accounts_v1';
+const PARKED_KEY = 'tp_notes_parked_v1';
+const MAX_ACCOUNT_UI = 20;
+// Parked drafts that could not be written (storage full or blocked): kept for
+// as long as this page lives rather than dropped.
+const parkedHere = [];
+
+function readJson(key, fallback) {
+    try {
+        const raw = storage() ? storage().getItem(key) : null;
+        return raw ? JSON.parse(raw) : fallback;
+    } catch (e) {
+        return fallback;
+    }
+}
+
+function writeJson(key, value) {
+    try {
+        if (!storage()) return false;
+        storage().setItem(key, JSON.stringify(value));
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// An account's id at its server's address, however the address was typed.
+function ownerKey(owner) {
+    if (!owner) return 'unstamped';
+    let url = String(owner.url || '').replace(/\/+$/, '');
+    try {
+        const u = new URL(url);
+        url = u.origin + u.pathname.replace(/\/$/, '');
+    } catch (e) { /* not a URL: compare it as typed */ }
+    return `${url}|${Number(owner.userId)}`;
+}
+
+// The same account as TreeStore counts it: the same id at the same address,
+// on the same server where both know the server's id. Unstamped matches only
+// unstamped.
+function sameOwner(a, b) {
+    if (!a || !b) return !a && !b;
+    if (a.serverId && b.serverId && a.serverId !== b.serverId) return false;
+    return ownerKey(a) === ownerKey(b);
+}
+
+// Fold state, scope and last open note are per account; sort and mode stay
+// per device. The outgoing account's are kept for when it comes back.
+function swapAccountPrefs(fromOwner, toOwner) {
+    const stored = readJson(ACCOUNT_UI_KEY, {});
+    const map = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+    map[ownerKey(fromOwner)] = {
+        expanded: [...view.expanded],
+        scope: view.scope,
+        noteId: view.noteId || view.restoreNoteId || null,
+        t: Date.now()
+    };
+    const keys = Object.keys(map).sort((a, b) => (Number(map[b] && map[b].t) || 0) - (Number(map[a] && map[a].t) || 0));
+    for (const k of keys.slice(MAX_ACCOUNT_UI)) delete map[k];
+    writeJson(ACCOUNT_UI_KEY, map);
+    const entry = map[ownerKey(toOwner)];
+    // readNotesUi validates the entry the same way it does the device prefs.
+    const p = NM.readNotesUi({ getItem: () => (entry ? JSON.stringify(entry) : null) });
+    view.expanded = new Set(p.expanded);
+    view.scope = p.scope;
+    view.restoreNoteId = p.noteId;
+}
+
+function parkDraft(owner) {
+    const note = view.isNew ? null : currentNote();
+    const draft = {
+        owner: owner ? { url: owner.url, userId: owner.userId, username: owner.username || null, serverId: owner.serverId || null } : null,
+        noteId: view.isNew ? null : view.noteId,
+        notebookId: view.isNew || view.removed ? view.newParentId : note ? note.notebookId : null,
+        title: $('noteTitleInput').value,
+        content: $('noteContentInput').value,
+        loaded: { ...view.loaded },
+        parkedAt: new Date().toISOString()
+    };
+    const list = readJson(PARKED_KEY, []);
+    if (!writeJson(PARKED_KEY, [...(Array.isArray(list) ? list : []), draft])) parkedHere.push(draft);
+}
+
+function takeParkedDraft(owner) {
+    const list = readJson(PARKED_KEY, []);
+    if (Array.isArray(list)) {
+        const i = list.findIndex(d => d && typeof d.content === 'string' && sameOwner(d.owner, owner));
+        if (i !== -1) {
+            const [draft] = list.splice(i, 1);
+            if (writeJson(PARKED_KEY, list)) return draft;
+        }
+    }
+    const j = parkedHere.findIndex(d => sameOwner(d.owner, owner));
+    return j === -1 ? null : parkedHere.splice(j, 1)[0];
+}
+
+// Back into the editor, unsaved, as it was left: the note it was editing if
+// that is still here, otherwise as text to keep (a draft, or a note removed
+// since).
+function restoreParkedDraft(draft) {
+    const note = draft.noteId ? view.lib.notes.find(n => n.id === draft.noteId) : null;
+    const nbId = draft.notebookId && view.lib.notebooks.has(draft.notebookId) ? draft.notebookId : null;
+    view.noteId = note ? note.id : draft.noteId || null;
+    view.isNew = !draft.noteId;
+    view.removed = Boolean(draft.noteId && !note);
+    view.newParentId = note ? null : nbId;
+    view.restoreNoteId = note ? note.id : view.restoreNoteId;
+    view.loaded = note
+        ? { title: note.title, content: note.content }
+        : { title: String((draft.loaded && draft.loaded.title) || ''), content: String((draft.loaded && draft.loaded.content) || '') };
+    $('noteTitleInput').value = String(draft.title || '');
+    $('noteContentInput').value = String(draft.content || '');
+    view.shown = view.mode === 'split' && canSplit() ? 'split' : 'edit';
+    view.pane = 'note';
+    renderPreview();
+    renderNoteChrome();
+    renderBacklinks();
+    markSelectedRow();
+    layout();
+    toast(`Your unsaved note “${String(draft.title || '').trim() || 'Untitled'}” is back from before the account switch. Save it to keep it.`, 6000);
+}
+
+// Has the working copy become another one since the view last looked? Then
+// start over on it. A copy only stamped with its owner (claimed on sign-in,
+// adopted, or pulled) is the same copy; another account's tree pulled over it
+// is not.
+function noticeCopySwitch() {
+    const st = TreeStore.status();
+    if (!st.loaded) return false;
+    if (!view.copy) {
+        view.copy = { id: st.copyId, owner: st.owner };
+        return false;
+    }
+    const otherOwner = view.copy.owner && st.owner && !sameOwner(view.copy.owner, st.owner);
+    if (st.copyId === view.copy.id && !otherOwner) {
+        view.copy.owner = st.owner;
+        return false;
+    }
+    startOverForCopy(st);
+    return true;
+}
+
+function startOverForCopy(st) {
+    const from = view.copy ? view.copy.owner : null;
+    if (isDirty()) parkDraft(from);
+    swapAccountPrefs(from, st.owner);
+    view.copy = { id: st.copyId, owner: st.owner };
+    view.noteId = null;
+    view.isNew = false;
+    view.removed = false;
+    view.newParentId = null;
+    view.lib = NM.emptyLibrary();
+    view.query = '';
+    view.pane = 'list';
+    view.checkParked = true;
+    // Unseen, the next visit is a first visit for this account: it reopens
+    // that account's last note.
+    view.opened = isVisible();
+    moveCtx = null;
+    dragging = null;
+    clearTimeout(searchTimer);
+    closePopups();
+    closeMoveDialog();
+    $('notesSearchInput').value = '';
+    fillEditor('', '');
+    savePrefs();
+    renderSidebar();
+    renderList();
+    renderNoteChrome();
+    renderBacklinks();
+    layout();
+}
+
+// Before a switch made here: save the draft into the copy being set aside,
+// or discard it, or (Cancel twice) keep editing and call the switch off.
+async function settleDraftBeforeSwitch(action) {
+    const owner = TreeStore.status().owner;
+    const whose = owner && owner.username ? ` (${owner.username}’s)` : '';
+    if (window.confirm(`${action || 'Switching accounts'} sets this working copy${whose} aside, and the note open in Notes has unsaved changes.\n\n`
+        + `Save them into this copy first? They are set aside with it.\n\nOK = Save    Cancel = don’t save`)) {
+        return saveNote();
+    }
+    if (window.confirm(`Discard the unsaved changes to the note?\n\nOK = Discard    Cancel = keep editing (nothing is switched)`)) {
+        discardDraft();
+        return true;
+    }
+    return false;
 }
 
 // --- small helpers --------------------------------------------------------------
@@ -1045,7 +1252,15 @@ async function moveSelection(dir) {
 
 async function refresh() {
     const before = view.noteId && !view.isNew && !view.removed ? currentNote() : null;
-    view.lib = await NotesManager.getLibrary();
+    // A library read across a switch may be the previous copy's: read again.
+    let lib;
+    for (;;) {
+        const copyId = TreeStore.status().copyId;
+        lib = await NotesManager.getLibrary();
+        if (TreeStore.status().copyId === copyId) break;
+    }
+    noticeCopySwitch();
+    view.lib = lib;
     const nbId = NM.notebookIdOf(view.scope);
     if (nbId && !view.lib.notebooks.has(nbId)) view.scope = 'all';
 
@@ -1067,6 +1282,11 @@ async function refresh() {
     renderList();
     renderNoteChrome();
     renderBacklinks();
+    if (view.checkParked) {
+        view.checkParked = false;
+        const draft = !view.noteId && !view.isNew && !view.removed ? takeParkedDraft(TreeStore.status().owner) : null;
+        if (draft) restoreParkedDraft(draft);
+    }
 }
 
 // --- entry points ------------------------------------------------------------------------------
@@ -1122,6 +1342,9 @@ export function initNotesView() {
     if (view.initialized) return;
     view.initialized = true;
     loadPrefs();
+    // The prefs just read are the current copy's account's: note which copy
+    // that is before anything can switch it.
+    TreeStore.load().then(() => { noticeCopySwitch(); }).catch(() => {});
 
     $('viewNotesBtn')?.addEventListener('click', () => { openNotes(); });
 
@@ -1355,10 +1578,21 @@ export function initNotesView() {
         else closePopups();
     }).observe(sec, { attributes: true, attributeFilter: ['style'] });
 
+    // Signing in as someone else, or a pull or restore that sets this copy
+    // aside, asks here first while the open note has unsaved changes.
+    // Resolving false calls the switch off.
+    window.addEventListener('tabpaladin:before-account-switch', (e) => {
+        if (!isDirty() || !e.detail || typeof e.detail.waitUntil !== 'function') return;
+        e.detail.waitUntil(settleDraftBeforeSwitch(e.detail.action));
+    });
+
     // A pull, another page writing the working copy, or our own saves: redraw
-    // the tree and list a moment later. The editor itself is never rebuilt.
+    // the tree and list a moment later. The editor itself is never rebuilt —
+    // unless the copy is another account's now, which is noticed at once, so
+    // nothing (a Push, a Save) can reach the old note in between.
     let changeTimer = null;
     TreeStore.onChanged(() => {
+        noticeCopySwitch();
         if (changeTimer) return;
         changeTimer = setTimeout(async () => {
             changeTimer = null;

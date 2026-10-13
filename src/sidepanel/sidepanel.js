@@ -3625,6 +3625,15 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             const account = { url: base, userId: user.id, username: name, serverId, tenancyOwner: Boolean(user.tenancyOwner) };
             const known = user.id !== undefined && user.id !== null;
 
+            // A note left unsaved in Notes goes with the copy it was written
+            // in, never into this account's: saved into it first or discarded.
+            // Asked before the question below, which then counts that save.
+            if (known && TreeStore.wouldSetAside(account) && !(await beforeAccountSwitch(`Signing in as ${name}`))) {
+                fetch(base + '/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + data.token } }).catch(() => {});
+                authError('Sign-in cancelled — nothing changed.');
+                return;
+            }
+
             // The working copy here may belong to someone else — on this
             // server, or the same id on another one. It is never pushed into
             // this account and never discarded: it is set aside. A copy made
@@ -4296,6 +4305,10 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             if (moved && !confirm(`This copy was made on ${st.url}. Restore it here, on ${account.url}?\n\n`
                 + 'Only if that is the same server at a new address. A copy of the server\'s database reports the same id, '
                 + 'and what you push to a copy never reaches the original.')) return;
+            if (!(await beforeAccountSwitch('Restoring that copy'))) {
+                status.textContent = 'Restore cancelled — nothing changed.';
+                return;
+            }
             await TreeStore.restoreStash(st.key, account, { moved });
             await pruneStaleFocusedFolders().catch(() => 0);
             await loadWorkflows();
@@ -4431,6 +4444,7 @@ async function setAsideAndPull(cfg, err) {
     const me = await signedInAccount(cfg);
     const userId = me ? me.userId : err && err.userId;
     if (userId === undefined || userId === null) return 'Open Settings once so this browser learns which account it is signed in as, then try again.';
+    if (!(await beforeAccountSwitch('Pulling this account’s tree'))) return 'Push cancelled — this working copy belongs to another account.';
     await TreeStore.setAsideAndReset({ url: cfg.url, userId, username: me ? me.username : null, serverId: me ? me.serverId : null });
     const { version } = await TreeStore.sync.pull(cfg);
     await persistSyncStamp('pull');
@@ -4498,6 +4512,7 @@ async function doPull({ skipConfirm = false } = {}) {
     const me = await signedInAccount(cfg);
     let setAside = false;
     if (me && TreeStore.wouldSetAside(me)) {
+        if (!(await beforeAccountSwitch('This pull'))) return 'Pull cancelled.';
         await TreeStore.setAsideAndReset(me);
         setAside = true;
     } else if (!skipConfirm && status.dirty) {
@@ -4539,6 +4554,20 @@ async function beforeSync(kind) {
         detail: { kind, waitUntil: (p) => pending.push(Promise.resolve(p)) }
     }));
     await Promise.allSettled(pending);
+}
+
+// The same, before this working copy is set aside for another one (signing in
+// as someone else, a pull or refused push that sets it aside, a restore). An
+// unsaved note belongs to the copy it was written in: the notes view saves it
+// into that copy, so it is set aside with it, or discards it — or the user
+// keeps editing and a listener resolves false, which calls the switch off.
+async function beforeAccountSwitch(action) {
+    const pending = [];
+    window.dispatchEvent(new CustomEvent('tabpaladin:before-account-switch', {
+        detail: { action, waitUntil: (p) => pending.push(Promise.resolve(p)) }
+    }));
+    const results = await Promise.allSettled(pending);
+    return !results.some(r => r.status === 'fulfilled' && r.value === false);
 }
 
 document.getElementById('mainPushBtn').addEventListener('click', async () => {

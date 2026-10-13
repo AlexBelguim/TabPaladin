@@ -4,7 +4,9 @@
 //   1. src/utils/expandState.js: saved state comes back, defaults hold for
 //      cards never touched, junk in storage is ignored, a drag-hover open
 //      lasts the session but is never written, writes are debounced, another
-//      page's newer toggle is adopted, and the map is capped.
+//      page's newer toggle is adopted, and the map is capped. One account's
+//      folders can be handed to a set-aside copy and taken back from it
+//      (test_treestore drives that through a real account switch).
 //   2. Pruning drops only tree ids that are gone — and never runs against an
 //      empty working copy or after a failed startup pull, where every saved
 //      folder would look deleted. Driven through the same guard the sidepanel
@@ -165,6 +167,33 @@ await ExpandState.flush();
 const capped = stored();
 check('at most 500 entries are kept', Object.keys(capped).length === 500, String(Object.keys(capped).length));
 check('the most recently touched survive', capped.k699 && capped.k500);
+
+console.log('travels with a set-aside copy');
+ExpandState.set('acct1', true);
+ExpandState.set('acct2', false);
+ExpandState.set(aiGroupKey('carried'), false);
+const carried = await ExpandState.entriesFor((id) => id.startsWith('acct') || id === aiGroupKey('carried'));
+check('entriesFor hands over the copy\'s folders, never device-wide cards',
+    Object.keys(carried).sort().join() === 'acct1,acct2' && carried.acct1.o === 1 && carried.acct2.o === 0,
+    JSON.stringify(carried));
+await ExpandState.prune(async (id) => !id.startsWith('acct'));
+check('pruning against the next account\'s tree drops them here', !ExpandState.isOpen('acct1') && !('acct1' in stored()));
+for (let i = 0; i < 600; i++) ExpandState.set('other' + i, true);
+ExpandState.set('acct2', true);
+const restoredCount = await ExpandState.restore({
+    ...carried,
+    acct2: { o: 0, t: 1 },
+    [aiGroupKey('stray')]: { o: 1, t: 1 },
+    junk: { o: 7, t: 1 }
+});
+check('restore brings them back and writes them at once',
+    restoredCount === 1 && ExpandState.isOpen('acct1') && stored().acct1 && stored().acct1.o === 1);
+check('…though a choice made here since then wins', ExpandState.isOpen('acct2') === true && stored().acct2.o === 1);
+check('…they outrank the other account\'s leftovers under the cap',
+    Object.keys(stored()).length === 500 && 'acct1' in stored());
+check('…and device-wide cards and junk are never restored',
+    !(aiGroupKey('stray') in stored()) && !('junk' in stored()));
+check('restoring nothing is harmless', (await ExpandState.restore(null)) === 0 && (await ExpandState.restore({})) === 0);
 
 console.log('storage failures');
 const realSet = local.set;

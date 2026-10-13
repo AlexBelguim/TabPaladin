@@ -12,8 +12,10 @@
 //   4. The imports subtree is read-only, with delete/file going through the
 //      explicit server verbs.
 //   5. A working copy belongs to one account: pull and push stamp it, push
-//      names it, switching accounts sets it aside with its focused folders
-//      and queued removals and brings it back later, an unstamped copy is
+//      names it, switching accounts sets it aside with its focused folders,
+//      its open folder cards (ExpandState) and queued removals and brings it
+//      back later — with a new copyId and a 'switch' for listeners, here and
+//      in other pages — an unstamped copy is
 //      adopted only by the tenancy owner, and a 412 is answered by setting
 //      the copy aside — never by losing it.
 //   6. An account is an id on one server: the same id and name on another
@@ -176,6 +178,7 @@ const { TreeStore } = await import('../src/utils/treeStore.js');
 const { NotesManager } = await import('../src/utils/notesManager.js');
 const { PinsManager } = await import('../src/utils/pinsManager.js');
 const { StorageManager } = await import('../src/utils/storageManager.js');
+const { ExpandState, OPEN_TABS_KEY } = await import('../src/utils/expandState.js');
 
 console.log('\n1. Pull populates the working copy');
 await TreeStore.sync.pull(cfg);
@@ -485,11 +488,20 @@ console.log('\n9. A working copy belongs to one account');
     await TreeStore.sync.push(cfg);
     check('a push names the account it belongs to', lastPutBody && lastPutBody.baseUserId === 1);
 
-    // Alex has unpushed edits, focused folders, and a tab-close removal the
-    // background queued while no page was open.
+    // Alex has unpushed edits, focused folders, folder cards left open and
+    // closed, and a tab-close removal the background queued while no page was
+    // open.
     await Tree.create({ parentId: 'f1', title: 'unpushed', url: 'https://unpushed.example' });
     const doomed = await Tree.create({ parentId: 'f1', title: 'closed tab', url: 'https://closed.example' });
-    await chrome.storage.local.set({ settings: { ...(await settings()), focusedFolderIds: ['f1'], foldState: { f1: true } } });
+    await chrome.storage.local.set({ settings: { ...(await settings()), focusedFolderIds: ['f1'] } });
+    await ExpandState.load();
+    ExpandState.set('f1', true);
+    ExpandState.set('nb1', false);
+    ExpandState.set(OPEN_TABS_KEY, false);
+    await ExpandState.flush();
+    const switchKinds = [];
+    const stopListening = TreeStore.onChanged((kind) => switchKinds.push(kind));
+    const alexCopyId = TreeStore.status().copyId;
     storageData.set('tpPendingRemovals', [doomed.id]); // as the background writes it, no live page to apply it
     const edits = TreeStore.status().editCount;
     check('unpushed edits are counted', TreeStore.status().dirty && edits >= 2, String(edits));
@@ -500,14 +512,30 @@ console.log('\n9. A working copy belongs to one account');
     const toSam = await TreeStore.switchAccount({ url: URL_A, userId: 2, username: 'sam', previousUsername: 'alex' });
     check('switching to sam sets alex\'s copy aside and starts empty', toSam.action === 'fresh' && toSam.setAside
         && TreeStore.status().isEmpty && !TreeStore.status().dirty && TreeStore.status().owner.userId === 2);
-    check('sam does not inherit alex\'s focused folders or fold state',
-        JSON.stringify((await settings()).focusedFolderIds) === '[]' && (await settings()).foldState === undefined);
+    check('sam does not inherit alex\'s focused folders',
+        JSON.stringify((await settings()).focusedFolderIds) === '[]');
+    check('the switch is a new copy, and listeners hear \'switch\'',
+        switchKinds.includes('switch') && TreeStore.status().copyId && TreeStore.status().copyId !== alexCopyId,
+        JSON.stringify(switchKinds));
+    stopListening();
+    const alexStashRaw = storageData.get(toSam.setAside) || {};
+    check('alex\'s open and closed folder cards travel with his copy, device-wide cards do not',
+        alexStashRaw.expanded && alexStashRaw.expanded.f1 && alexStashRaw.expanded.f1.o === 1
+        && alexStashRaw.expanded.nb1 && alexStashRaw.expanded.nb1.o === 0
+        && !(OPEN_TABS_KEY in alexStashRaw.expanded) && !('foldState' in alexStashRaw),
+        JSON.stringify(alexStashRaw.expanded));
     const stashes = await TreeStore.listStashes();
     check('the set-aside copy is listed with its owner and unpushed edits',
         stashes.length === 1 && stashes[0].username === 'alex' && stashes[0].userId === 1 && stashes[0].dirty
         && stashes[0].editCount >= 2 && stashes[0].items > 0, JSON.stringify(stashes));
     await TreeStore.sync.pull(cfgB);
     check('sam pulls his own tree', (await TreeStore.getNode('sam-b1')) !== null && (await TreeStore.getNode('f1')) === null);
+    // What the sidepanel does after every pull and at startup.
+    await ExpandState.pruneAgainstTree(TreeStore);
+    await ExpandState.flush();
+    check('pruning against sam\'s tree drops alex\'s folders here (his copy has them)',
+        !ExpandState.isOpen('f1') && !((storageData.get('tpUiExpanded') || {}).cards || {}).f1
+        && ExpandState.isOpen(OPEN_TABS_KEY, true) === false);
     check('the queued removal did not land in sam\'s copy and is no longer queued',
         !(await chrome.storage.local.get('tpPendingRemovals')).tpPendingRemovals);
     await Tree.create({ parentId: 'sam-root', title: 'sam edit', url: 'https://sam-edit.example' });
@@ -520,8 +548,13 @@ console.log('\n9. A working copy belongs to one account');
         && (await TreeStore.getNode('f1')).children.some(c => c.url === 'https://unpushed.example'));
     check('the tab-close removal was applied to alex\'s copy, where it belonged',
         !JSON.stringify(await Tree.getTree()).includes('closed.example'));
-    check('his focused folders and fold state came back with it',
-        JSON.stringify((await settings()).focusedFolderIds) === '["f1"]' && (await settings()).foldState?.f1 === true);
+    await ExpandState.flush();
+    const cardsBack = (storageData.get('tpUiExpanded') || {}).cards || {};
+    check('his focused folders and open and closed folder cards came back with it',
+        JSON.stringify((await settings()).focusedFolderIds) === '["f1"]'
+        && ExpandState.isOpen('f1') === true && ExpandState.isOpen('nb1', true) === false
+        && cardsBack.f1 && cardsBack.f1.o === 1 && cardsBack.nb1 && cardsBack.nb1.o === 0,
+        JSON.stringify(cardsBack));
     check('sam\'s copy is set aside in turn, not discarded',
         (await TreeStore.listStashes()).some(st => st.userId === 2 && st.username === 'sam'));
 
@@ -562,6 +595,17 @@ console.log('\n9. A working copy belongs to one account');
     const notOwner = await TreeStore.switchAccount({ url: URL_A, userId: 2, username: 'sam', tenancyOwner: false });
     check('anyone else sets it aside as a legacy copy', notOwner.action === 'fresh'
         && (await TreeStore.listStashes()).some(st => st.key.endsWith('|legacy') && st.userId === null && st.dirty));
+
+    // Another page editing or pulling is 'external' here; another page
+    // bringing another copy in is the same 'switch' it heard itself.
+    const heard = [];
+    const stopHearing = TreeStore.onChanged((kind) => heard.push(kind));
+    const here = TreeStore.status().copyId;
+    await chrome.storage.local.set({ tpTree: { baseVersion: 6, roots: [], dirty: false, owner: { url: URL_A, userId: 2, username: 'sam' }, copyId: here, rev: 'other-page-edit' } });
+    await chrome.storage.local.set({ tpTree: { baseVersion: 3, roots: [], dirty: false, owner: { url: URL_A, userId: 4, username: 'lee' }, copyId: 'other-copy', rev: 'other-page-switch' } });
+    stopHearing();
+    check('another page\'s edit is \'external\' here, its account switch \'switch\'',
+        JSON.stringify(heard) === '["external","switch"]' && TreeStore.status().copyId === 'other-copy', JSON.stringify(heard));
 
     // Another context switching accounts: this page adopts the stamp too.
     await chrome.storage.local.set({ tpTree: { baseVersion: 7, roots: [], dirty: false, owner: { url: URL_A, userId: 9, username: 'kim' }, rev: 'other-page' } });
