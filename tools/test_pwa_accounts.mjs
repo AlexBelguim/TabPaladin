@@ -60,6 +60,11 @@
 //  14. A note open in the editor, changed or not, holds back an approval: a
 //      clean editor would otherwise save its old text over the approved one.
 //      One opened while the approval is on its way holds back its pull.
+//  15. Bookmark changes an AI chat suggested wait on Home with the server's
+//      preview, where they came from and why; approving one follows the same
+//      push-first rule and pulls; one gone out of date can only be rejected;
+//      a delete is flagged and asked about; a #changes= review link is filed
+//      as a suggestion only after a yes, and applies nothing.
 //
 // Run: node tools/test_pwa_accounts.mjs [--port 18982]
 //
@@ -1203,6 +1208,100 @@ try {
         (await treeTitles(alexTok)).includes('LATE APPROVAL BODY') && pulls() === pulls14 && bodyHas('nv-editing')
         && toastsSince(toasts14).some(t => /not pulled here under your open note/.test(t)), toastsSince(toasts14).join(' | '));
     await clickNv('cancel-edit');
+
+    console.log('\n15. Bookmark changes from AI chats wait on Home, previewed, for a clean copy');
+    const goHomeTap = async () => {
+        const t = { dataset: { nav: 'home' }, closest: () => t };
+        await byId('bottom-nav').fire('click', { target: t });
+        await settle();
+    };
+    const review = async () => (await api('/api/proposals/review', { token: alexTok })).json.proposals.filter(p => p.kind === 'tree');
+    // The change as last drawn on Home, its title, and its buttons.
+    const changeItem = (id) => [...created].reverse().find(e => typeof e.className === 'string' && /^change\b/.test(e.className) && e.dataset.id === String(id));
+    const changeButton = (id, cls) => [...created].reverse().find(e => e.tagName === 'BUTTON' && e.className.includes(cls) && e.dataset.id === String(id));
+    const alexTree = async () => (await api('/api/tree', { token: alexTok })).json;
+    let t15 = await alexTree();
+    let bm15 = t15.roots.find(r => r.role === 'bookmarks');
+    if (!bm15) throw new Error('alex has no Bookmarks root');
+    await propose(alexTok, { action: 'create_folder', parentId: bm15.id, path: 'From the chat', reason: 'For the reading list' });
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    let [c15] = await review();
+    check('a suggested folder is drawn on Home with what it would do, where it came from and why',
+        Boolean(c15) && Boolean(changeItem(c15.id)) && drawnSince(0, 'New folder “From the chat” in Bookmarks')
+        && drawnSince(0, '“For the reading list”') && drawnSince(0, 'Share link'), JSON.stringify(c15));
+    failNext = 'PUT /api/tree';
+    answers.prompt.push('Offline folder 15');
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    const approvals15 = approvals();
+    answers.confirm.push(false); // "Push your changes first, then approve." Cancel.
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('approving it over an unpushed edit asks to push first, and Cancel approves nothing',
+        /^Push your changes first, then approve\./.test(dialogs.confirm[dialogs.confirm.length - 1] || '') && approvals() === approvals15
+        && (await review()).length === 1);
+    answers.confirm.push(true); // OK = ⬆️ Push now
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    const pulls15 = pulls();
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    t15 = await alexTree();
+    bm15 = t15.roots.find(r => r.role === 'bookmarks');
+    const made15 = (bm15.children || []).find(c => c.title === 'From the chat');
+    check('pushed, Approve applies it on the server and pulls it here',
+        approvals() === approvals15 + 1 && pulls() === pulls15 + 1 && Boolean(made15) && (await review()).length === 0
+        && JSON.stringify(t15).includes('Offline folder 15'), JSON.stringify(bm15).slice(0, 300));
+
+    // Out of date: the folder it renames is renamed elsewhere first.
+    await propose(alexTok, { action: 'rename', id: made15.id, title: 'Renamed by the chat' });
+    made15.title = 'Renamed on the laptop';
+    const put15 = await api('/api/tree', { method: 'PUT', token: alexTok, body: { roots: t15.roots, baseVersion: t15.version } });
+    if (put15.status !== 200) throw new Error('could not rename: ' + JSON.stringify(put15.json));
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    [c15] = await review();
+    const approvals15b = approvals();
+    const toasts15 = toastCount();
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('a suggestion whose folder changed since is drawn out of date, and Approve sends nothing',
+        c15.status === 'stale' && /\bstale\b/.test(changeItem(c15.id).className) && changeButton(c15.id, 'proposal-approve').disabled === true
+        && approvals() === approvals15b && toastsSince(toasts15).some(t => /out of date/.test(t))
+        && drawnSince(0, 'was renamed to “Renamed on the laptop”'), JSON.stringify(c15));
+    await changeButton(c15.id, 'proposal-reject').fire('click');
+    await settle();
+    check('  Reject drops it', (await review()).length === 0 && JSON.stringify(await alexTree()).includes('Renamed on the laptop'));
+
+    // A delete is flagged and asked about.
+    await propose(alexTok, { action: 'delete', ids: [made15.id] });
+    await signIn('alex', alexPw);
+    await goHomeTap();
+    [c15] = await review();
+    const asked15 = dialogs.confirm.length;
+    answers.confirm.push(false);
+    await changeButton(c15.id, 'proposal-approve').fire('click');
+    await settle();
+    check('a suggested delete is flagged, and approving it asks first; No deletes nothing',
+        c15.danger === true && /\bdanger\b/.test(changeItem(c15.id).className)
+        && /DELETES/.test(dialogs.confirm[asked15] || '') && approvals() === approvals15b
+        && JSON.stringify(await alexTree()).includes('Renamed on the laptop'), dialogs.confirm.slice(asked15).join(' | '));
+    await changeButton(c15.id, 'proposal-reject').fire('click');
+    await settle();
+
+    // A review link from a chat that cannot POST: offered, then filed as a suggestion.
+    const link15 = '#changes=' + encodeURIComponent(JSON.stringify({ reason: 'Via a link', changes: [{ op: 'create_folder', parentId: bm15.id, path: 'Linked folder' }] }));
+    answers.confirm.push(true);
+    await tapLink(link15);
+    await settle();
+    const linked15 = await review();
+    check('a #changes= link asks, then files the suggestion for review; nothing is applied',
+        /suggested 1 change to your bookmarks/.test(dialogs.confirm[dialogs.confirm.length - 1] || '') && linked15.length === 1
+        && linked15[0].reason === 'Via a link' && !JSON.stringify(await alexTree()).includes('Linked folder')
+        && !localStorageShim.getItem('tp_pending_changes'), JSON.stringify(linked15));
+    await changeButton(linked15[0].id, 'proposal-reject').fire('click');
+    await settle();
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog);

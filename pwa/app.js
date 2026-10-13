@@ -118,6 +118,7 @@ const state = {
     nv: freshNv(),            // notes navigation: pane, scope, open note, editor draft
     keptDraft: null,          // an unsaved note's nv, set aside by a sign-out for that account's return
     proposals: [],            // pending LLM note proposals awaiting approval
+    changes: [],              // pending bookmark changes from AI chats (share link or MCP), with previews
     importers: [],            // configured import sources: [{id, provider, connected, items, ...}]
     importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
 };
@@ -292,6 +293,8 @@ async function bootstrap() {
     // token kept from last time may have expired while the app was closed,
     // and then the link waits for whoever signs in next.
     const arrived = stashImportHash({ claim: false });
+    // So is a link with suggested bookmark changes (offered at the end).
+    stashChangesHash();
 
     // A share that opened the app is in the outbox (or, from the old
     // redirect, in the URL, and goes in there now) before anything else.
@@ -361,6 +364,7 @@ async function bootstrap() {
     await refreshInbox();
     if (!shareSheet.isOpen()) await afterShareSheet();
     await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
+    await offerPendingChanges();
 }
 
 // What waits while the share sheet is up: the proposals (which would redraw
@@ -789,14 +793,29 @@ async function refreshInbox() {
     if (shareSheet) await shareSheet.refreshInbox();
 }
 
+// Everything AI chats proposed, from the share link or MCP: notes and orders
+// wait in Notes (state.proposals), bookmark changes on Home (state.changes),
+// each with the server's preview and whether it is out of date. An older
+// server only lists notes and orders.
 async function refreshProposals() {
+    const account = accountKey();
     try {
-        const data = await api('/api/proposals');
-        const before = state.proposals.length;
-        state.proposals = data.proposals || [];
-        // They arrive after the first paint: Home's banner and the library's
-        // pending block need a redraw when the count changed.
-        if (state.snapshot && state.proposals.length !== before) renderView();
+        let list;
+        try {
+            list = (await api('/api/proposals/review')).proposals || [];
+        } catch (e) {
+            if (e.status !== 404) throw e;
+            list = (await api('/api/proposals')).proposals || [];
+        }
+        // Signed out or switched while it was asked: not this account's.
+        if (accountKey() !== account) return;
+        const sig = (l) => l.map(p => `${p.id}:${p.status || ''}`).join(',');
+        const before = sig(state.proposals) + '|' + sig(state.changes);
+        state.proposals = list.filter(p => p.kind !== 'tree');
+        state.changes = list.filter(p => p.kind === 'tree');
+        // They arrive after the first paint: Home's banner and block and the
+        // library's pending block need a redraw when they changed.
+        if (state.snapshot && sig(state.proposals) + '|' + sig(state.changes) !== before) renderView();
         else syncBottomNav();
     } catch (e) {
         console.warn('Proposals fetch failed', e);
@@ -1318,6 +1337,9 @@ function renderHome(root) {
         actions.appendChild(btn);
     }
     wrap.appendChild(actions);
+
+    // Bookmark changes AI chats proposed wait here, on Home.
+    if (state.changes.length) wrap.appendChild(renderChangesBlock());
 
     // Proposals and imports wait in Notes; say so here.
     const pending = [];
@@ -1875,7 +1897,7 @@ function onNotesPopState(e) {
     // browser pops a fresh, state-less entry just before hashchange. That is
     // no way back to Home (and no reason to ask about an edit) — the
     // hashchange handler takes the entry over in stashImportHash.
-    if (!e.state && IMPORT_HASH_RE.test(location.hash)) return;
+    if (!e.state && (IMPORT_HASH_RE.test(location.hash) || location.hash.startsWith(CHANGES_HASH))) return;
     // An entry of another account's notes, left in the stack by an account
     // change, reads as Home: its pane, label and search are not this one's.
     const st = e.state && e.state.tp === 'nv' && e.state.account === accountKey() ? e.state : null;
@@ -2081,10 +2103,10 @@ function renderNvSide(lib) {
         pane.appendChild(empty);
     }
 
-    const share = nvEl('button', 'ghost-block nv-share', '🔗 Share notes with an LLM (1-hour link)');
+    const share = nvEl('button', 'ghost-block nv-share', '🔗 Share notes & bookmarks with an AI chat (1-hour link)');
     share.type = 'button';
     share.dataset.nv = 'share';
-    share.title = 'Create a 1-hour link with your notes + instructions to paste into any LLM chat';
+    share.title = 'Create a 1-hour link with your notes, bookmarks and instructions to paste into any AI chat that can browse';
     pane.appendChild(share);
     return pane;
 }
@@ -3123,6 +3145,228 @@ function askToPushBeforeApproving() {
         + `OK = ⬆️ Push now, then tap Approve again${writing ? ' (save or close the note first)' : ''}\n`
         + 'Cancel = not now — the proposal keeps waiting')) {
         pushNow();
+    }
+}
+
+// --- Bookmark changes suggested by AI chats (Home) ---
+//
+// The server plans each one against its tree as it is now and sends a line
+// per change (new folder, new bookmark, move, rename, DELETE) and whether it
+// is out of date: something it names was renamed, moved or removed since, in
+// which case it can only be rejected. Approving follows the note proposals'
+// rule: the server applies it and this copy pulls, so a copy with unpushed
+// edits (or a note open in the editor) pushes first. Built from DOM nodes:
+// everything shown here was written by a chat.
+function renderChangesBlock() {
+    const block = document.createElement('div');
+    block.className = 'proposals changes';
+    const heading = document.createElement('div');
+    heading.className = 'proposals-title';
+    heading.textContent = `🤖 Suggested changes (${state.changes.length})`;
+    block.appendChild(heading);
+    const intro = document.createElement('div');
+    intro.className = 'hint changes-intro';
+    intro.textContent = 'From AI chats. Nothing changes until you approve it.';
+    block.appendChild(intro);
+
+    if (state.dirty) {
+        const hint = document.createElement('div');
+        hint.className = 'proposal proposals-push-hint';
+        const text = document.createElement('div');
+        text.className = 'proposal-text';
+        const snippet = document.createElement('span');
+        snippet.className = 'snippet';
+        snippet.textContent = 'Push your changes first, then approve.';
+        text.appendChild(snippet);
+        const actions = document.createElement('div');
+        actions.className = 'proposal-actions';
+        const push = document.createElement('button');
+        push.className = 'primary proposals-push';
+        push.textContent = '⬆️ Push';
+        push.addEventListener('click', () => pushNow());
+        actions.appendChild(push);
+        hint.append(text, actions);
+        block.appendChild(hint);
+    }
+
+    for (const p of state.changes) block.appendChild(renderChangeItem(p));
+    return block;
+}
+
+function changeSourceLabel(p) {
+    if (p.source === 'mcp') return p.tokenName ? `MCP · ${p.tokenName}` : 'MCP (token revoked)';
+    return 'Share link';
+}
+
+function renderChangeItem(p) {
+    const stale = p.status === 'stale';
+    const item = document.createElement('div');
+    item.className = 'change' + (stale ? ' stale' : '') + (p.danger ? ' danger' : '');
+    item.dataset.id = String(p.id);
+
+    const head = document.createElement('div');
+    head.className = 'change-head';
+    const title = document.createElement('span');
+    title.className = 'title';
+    title.textContent = (p.danger ? '⚠️ ' : '') + (p.title || 'Suggested changes');
+    const src = document.createElement('span');
+    src.className = 'change-src';
+    src.textContent = `${changeSourceLabel(p)}${p.createdAt ? ' · ' + NM.relativeTime(p.createdAt, Date.now()) : ''}`;
+    head.append(title, src);
+    item.appendChild(head);
+
+    if (p.reason) {
+        const reason = document.createElement('div');
+        reason.className = 'change-reason';
+        reason.textContent = `“${p.reason}”`;
+        item.appendChild(reason);
+    }
+
+    const list = document.createElement('ul');
+    list.className = 'change-preview';
+    for (const line of p.preview || []) {
+        const li = document.createElement('li');
+        li.className = `op-${String(line.op || '').replace(/[^a-z_]/g, '')}` + (line.danger ? ' danger' : '');
+        li.textContent = line.text;
+        list.appendChild(li);
+    }
+    item.appendChild(list);
+
+    if (stale) {
+        const why = document.createElement('div');
+        why.className = 'change-stale';
+        why.textContent = 'Out of date — nothing of it can be applied: ' + (p.stale || []).join(' ');
+        item.appendChild(why);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'proposal-actions';
+    const approve = document.createElement('button');
+    approve.className = 'primary proposal-approve' + (p.danger ? ' danger' : '');
+    approve.textContent = p.danger ? 'Approve, deleting' : 'Approve';
+    approve.disabled = stale;
+    approve.addEventListener('click', () => resolveChange(p, true));
+    const reject = document.createElement('button');
+    reject.className = 'proposal-reject';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', () => resolveChange(p, false));
+    approve.dataset.id = reject.dataset.id = String(p.id);
+    actions.append(approve, reject);
+    item.appendChild(actions);
+    return item;
+}
+
+async function resolveChange(p, approve) {
+    if (approve && p.status === 'stale') {
+        showToast('This suggestion is out of date — reject it and ask the chat again.');
+        return;
+    }
+    if (approve && (state.dirty || editorOpen())) {
+        askToPushBeforeApproving();
+        return;
+    }
+    if (approve && p.danger) {
+        const lines = (p.preview || []).filter(l => l.danger).map(l => '• ' + l.text).join('\n');
+        if (!confirm(`This suggestion DELETES:\n\n${lines}\n\nA history version is kept on the server. Approve it?`)) return;
+    }
+    const account = accountKey();
+    try {
+        setStatus(approve ? 'Approving…' : 'Rejecting…');
+        await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+        setStatus('');
+        if (approve) {
+            const done = 'Suggested changes applied';
+            if (accountKey() !== account) {
+                // Signed out or switched meanwhile: this copy is not the one it went into.
+            } else if (state.dirty) {
+                showToast(`${done} on the server — not pulled here, over the changes made meanwhile.`);
+            } else if (editorOpen()) {
+                showToast(`${done} on the server — not pulled here under your open note. ⬇️ Pull once it is saved or closed.`);
+            } else {
+                showToast(`${done}.`);
+                await pullSnapshot();
+            }
+        } else {
+            showToast('Suggestion rejected.');
+        }
+        await refreshProposals();
+        renderView();
+    } catch (e) {
+        setStatus('');
+        if (e.status === 409 && e.code === 'stale') {
+            const why = (e.body && e.body.stale && e.body.stale[0]) || 'the bookmarks changed since.';
+            showToast(`Out of date, nothing was applied: ${why}`);
+            await refreshProposals();
+            renderView();
+            return;
+        }
+        alert('Action failed: ' + ((e.body && e.body.error) || e.message));
+    }
+}
+
+// Review links for bookmark changes: /#changes=<percent-encoded JSON
+// {"changes": [...], "reason": "..."}>, from chats that cannot POST to the
+// share link. The fragment never reaches the server: the link is kept on the
+// phone until someone is signed in, then — once they say yes — filed with
+// the server as a suggestion like any other, checked there against their
+// tree, and waits on Home for approval. Nothing is applied by the link.
+const CHANGES_HASH = '#changes=';
+const PENDING_CHANGES_KEY = 'tp_pending_changes';
+
+function stashChangesHash() {
+    if (!location.hash.startsWith(CHANGES_HASH)) return false;
+    try {
+        localStorage.setItem(PENDING_CHANGES_KEY, JSON.stringify({ hash: location.hash, at: new Date().toISOString() }));
+    } catch (e) {
+        showToast('This suggestion link could not be kept on the phone — it stays in the address bar for now.');
+        return false;
+    }
+    history.replaceState(history.state, '', location.pathname);
+    return true;
+}
+
+let offeringChanges = false;
+
+async function offerPendingChanges() {
+    if (offeringChanges || !configured()) return;
+    let rec = null;
+    try { rec = JSON.parse(localStorage.getItem(PENDING_CHANGES_KEY) || 'null'); } catch (e) { /* corrupt */ }
+    if (!rec || typeof rec.hash !== 'string') return;
+    const drop = () => { try { localStorage.removeItem(PENDING_CHANGES_KEY); } catch (e) { /* storage blocked */ } };
+    let body = null;
+    const raw = rec.hash.slice(CHANGES_HASH.length);
+    try { body = JSON.parse(decodeURIComponent(raw)); } catch (e) {
+        try { body = JSON.parse(raw); } catch (e2) { /* not JSON */ }
+    }
+    if (Array.isArray(body)) body = { changes: body };
+    if (!body || typeof body !== 'object' || (!Array.isArray(body.changes) && !body.action)) {
+        drop();
+        showToast('This suggestion link could not be read.');
+        return;
+    }
+    const n = Array.isArray(body.changes) ? body.changes.length : 1;
+    const who = (state.identity && state.identity.username) || localStorage.getItem(LS.username) || 'this account';
+    offeringChanges = true;
+    try {
+        if (!confirm(`An AI chat suggested ${n} change${n === 1 ? '' : 's'} to your bookmarks.\n\n`
+            + `Add ${n === 1 ? 'it' : 'them'} to ${who}'s Suggested changes on Home? You review and approve there; nothing changes before that.`)) {
+            drop();
+            return;
+        }
+        await api('/api/proposals', { method: 'POST', body: JSON.stringify(body) });
+        drop();
+        showToast('Added to Suggested changes — review it on Home.');
+        await refreshProposals();
+        if (state.view !== 'home') goHome();
+        else renderView();
+    } catch (e) {
+        if (e.status === 401) return; // kept for the next sign-in
+        drop();
+        const problems = (e.body && e.body.problems) || [];
+        alert('The suggestion was not added: ' + ((e.body && e.body.error) || e.message)
+            + (problems.length ? '\n\n' + problems.slice(0, 8).join('\n') : ''));
+    } finally {
+        offeringChanges = false;
     }
 }
 
@@ -4245,9 +4489,12 @@ function openSettings() {
     const urlEl = $('cfg-url');
     if (urlEl) urlEl.value = state.config.url || defaultServerUrl();
     refreshAuthUi();
+    forgetMadeMcpToken();
+    mcpError('');
     show($('settings-sheet'));
     if (state.config.token) {
         refreshImporters();
+        refreshMcpTokens();
         refreshWhoAmI().then(() => { refreshAuthUi(); refreshUsers(); });
     }
 }
@@ -4790,8 +5037,11 @@ function resetAccountUi() {
     closeNotesSheets();
     hide($('inbox-sheet'));
     state.proposals = [];
+    state.changes = [];
     state.importers = [];
     renderImporters(); // Settings stays open over a sign-out
+    mcpTokens = null;
+    renderMcpTokens();
     state.importBatch = null;
     setInboxCount(0);
     // An open share sheet stays (the share is not the account's), but draws
@@ -4827,6 +5077,142 @@ function reopenKeptDraft() {
     navDepth++;
     history.pushState(nvHistoryState(), '', location.pathname);
     renderView();
+}
+
+// --- AI chats: MCP tokens (Settings) ---
+//
+// A token lets an MCP client (Claude Code, Claude Desktop through a bridge)
+// read this account's bookmarks and notes and suggest changes at the server's
+// /mcp. The server shows a new token once and keeps only its hash; here it
+// sits in a read-only field until Settings closes or another is made. An
+// older server has no /api/mcp/tokens: the block stays hidden.
+
+let mcpTokens = null;   // [{id, name, prefix, createdAt, lastUsedAt}] | null (not loaded)
+let mcpEndpoint = '';
+
+async function refreshMcpTokens() {
+    const block = $('mcp-block');
+    if (!block) return;
+    if (!configured()) { mcpTokens = null; renderMcpTokens(); return; }
+    const account = accountKey();
+    try {
+        const data = await api('/api/mcp/tokens');
+        if (accountKey() !== account) return;
+        mcpTokens = data.tokens || [];
+        mcpEndpoint = data.endpoint || `${(state.config.url || '').replace(/\/$/, '')}/mcp`;
+    } catch (e) {
+        mcpTokens = null;
+    }
+    renderMcpTokens();
+}
+
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString() : '');
+
+function renderMcpTokens() {
+    const block = $('mcp-block');
+    const list = $('mcp-tokens-list');
+    if (!block || !list) return;
+    if (!mcpTokens) {
+        hide(block);
+        forgetMadeMcpToken();
+        list.replaceChildren();
+        return;
+    }
+    show(block);
+    $('mcp-endpoint').textContent = mcpEndpoint;
+    const rows = mcpTokens.map(t => {
+        const row = document.createElement('div');
+        row.className = 'import-row mcp-token-row';
+        const head = document.createElement('div');
+        head.className = 'import-head';
+        const name = document.createElement('span');
+        name.className = 'import-name';
+        name.textContent = t.name;
+        const prefix = document.createElement('span');
+        prefix.className = 'import-count';
+        prefix.textContent = `${t.prefix}…`;
+        head.append(name, prefix);
+        const meta = document.createElement('div');
+        meta.className = 'import-meta';
+        meta.textContent = `Made ${fmtDate(t.createdAt)} · ${t.lastUsedAt ? `last used ${fmtDate(t.lastUsedAt)}` : 'never used'} · read + suggest`;
+        const actions = document.createElement('div');
+        actions.className = 'import-actions';
+        const revoke = document.createElement('button');
+        revoke.type = 'button';
+        revoke.className = 'danger';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', () => revokeMcpToken(t));
+        actions.appendChild(revoke);
+        row.append(head, meta, actions);
+        return row;
+    });
+    if (!rows.length) {
+        const none = document.createElement('p');
+        none.className = 'hint';
+        none.textContent = 'No tokens yet.';
+        rows.push(none);
+    }
+    list.replaceChildren(...rows);
+}
+
+function mcpError(message) {
+    const el = $('mcp-error');
+    if (!el) return;
+    el.textContent = message || '';
+    el.classList.toggle('hidden', !message);
+}
+
+async function createMcpToken() {
+    if (signedOutRefuses()) return;
+    mcpError('');
+    const nameEl = $('mcp-token-name');
+    const name = (nameEl.value || '').trim();
+    if (!name) { mcpError('Give the token a name, so you can tell your tokens apart.'); nameEl.focus(); return; }
+    try {
+        const made = await api('/api/mcp/tokens', { method: 'POST', body: JSON.stringify({ name }) });
+        nameEl.value = '';
+        mcpEndpoint = made.endpoint || mcpEndpoint;
+        $('mcp-token-value').value = made.token;
+        $('mcp-token-cmd').value = `claude mcp add --transport http --scope user tabpaladin ${mcpEndpoint} --header "Authorization: Bearer ${made.token}"`;
+        show($('mcp-token-made'));
+        await refreshMcpTokens();
+    } catch (e) {
+        mcpError((e.body && e.body.error) || e.message);
+    }
+}
+
+async function revokeMcpToken(t) {
+    if (!confirm(`Revoke “${t.name}”?\n\nAny AI chat using it stops reaching your bookmarks and notes at once. Suggestions it already made stay until you approve or reject them.`)) return;
+    mcpError('');
+    try {
+        await api(`/api/mcp/tokens/${encodeURIComponent(t.id)}`, { method: 'DELETE' });
+        showToast(`Revoked “${t.name}”.`);
+    } catch (e) {
+        mcpError((e.body && e.body.error) || e.message);
+    }
+    await refreshMcpTokens();
+}
+
+async function copyField(id, done) {
+    const el = $(id);
+    if (!el || !el.value) return;
+    try {
+        await navigator.clipboard.writeText(el.value);
+        showToast(done);
+    } catch (e) {
+        el.focus();
+        el.select();
+        showToast('Select it and copy it by hand.');
+    }
+}
+
+// The made token leaves the screen when Settings closes: it is never kept.
+function forgetMadeMcpToken() {
+    const value = $('mcp-token-value');
+    const cmd = $('mcp-token-cmd');
+    if (value) value.value = '';
+    if (cmd) cmd.value = '';
+    hide($('mcp-token-made'));
 }
 
 // --- Users (admins) ---
@@ -5228,7 +5614,7 @@ window.addEventListener('DOMContentLoaded', () => {
         if (state.view === 'notes') renderView();
     });
 
-    safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
+    safeAddListener('settings-close', 'click', () => { hide($('settings-sheet')); forgetMadeMcpToken(); });
     safeAddListener('cfg-save', 'click', saveSettings);
     safeAddListener('cfg-url', 'input', updateOriginNotice);
     safeAddListener('cfg-use-origin', 'click', useOriginServer);
@@ -5287,6 +5673,10 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('auth-discard', 'click', discardPreviousEdits);
     safeAddListener('imports-show-removed', 'change', refreshImporters);
     safeAddListener('users-add', 'click', () => openUserSheet('add'));
+    safeAddListener('ai-share-link', 'click', () => { if (!signedOutRefuses()) createShareLink(); });
+    safeAddListener('mcp-token-create', 'click', createMcpToken);
+    safeAddListener('mcp-token-copy', 'click', () => copyField('mcp-token-value', 'Token copied — it will not be shown again.'));
+    safeAddListener('mcp-token-cmd-copy', 'click', () => copyField('mcp-token-cmd', 'Command copied.'));
     safeAddListener('auth-change-password', 'click', () => openUserSheet('self-password'));
     safeAddListener('user-sheet-close', 'click', () => hide($('user-sheet')));
     safeAddListener('user-sheet-submit', 'click', submitUserSheet);
@@ -5369,7 +5759,10 @@ window.addEventListener('DOMContentLoaded', () => {
     bootstrap();
 
     // Import links tapped while the app is already open.
-    window.addEventListener('hashchange', () => { processImportHashIfAny(); });
+    window.addEventListener('hashchange', () => {
+        processImportHashIfAny();
+        if (stashChangesHash()) offerPendingChanges();
+    });
 
     if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('sw.js').catch(() => {});
