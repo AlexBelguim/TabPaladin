@@ -383,6 +383,13 @@ export function makeStore(db) {
                 .all(sourceId);
         },
 
+        // One archive row by the source's own id for it, or null. For callers
+        // that resolved the source through getSource or listSources(userId).
+        itemByExternal(sourceId, externalId) {
+            return db.prepare('SELECT * FROM import_items WHERE source_id = ? AND external_id = ?')
+                .get(sourceId, String(externalId)) || null;
+        },
+
         // What the virtual subtree draws: everything except items the user has
         // already filed into their own tree.
         activeItemsFor(sourceId) {
@@ -398,6 +405,16 @@ export function makeStore(db) {
             const now = new Date().toISOString();
             const stmt = db.prepare('UPDATE import_items SET filed_at = ? WHERE id = ?');
             const run = db.transaction((list) => { for (const id of list) stmt.run(now, id); });
+            run(ids);
+            return ids.length;
+        },
+
+        // The filing was taken back (an undo in the share sheet, or a forced
+        // push that erased the filed copy): draw these in the archive again.
+        unmarkFiled(ids) {
+            if (!ids.length) return 0;
+            const stmt = db.prepare('UPDATE import_items SET filed_at = NULL WHERE id = ?');
+            const run = db.transaction((list) => { for (const id of list) stmt.run(id); });
             run(ids);
             return ids.length;
         },

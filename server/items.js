@@ -93,6 +93,21 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- The changes to an account's tree that did not replace it: links
+        -- filed from the share sheet (append) and their undo (unappend). Each
+        -- row names the version it applies to and the one it made, so a client
+        -- can tell a gap made only of these from one it has to pull. See
+        -- opsSince. user_id and its guards are added like everyone else's.
+        CREATE TABLE IF NOT EXISTS tree_ops (
+            user_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            base_version INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, version)
+        );
     `);
 
     function forUser(uid) {
@@ -100,6 +115,17 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         if (!Number.isInteger(userId) || userId <= 0) throw new Error(`Not an account id: ${uid}`);
         if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId)) throw new Error(`No account with id ${userId}`);
         return makeUserStore(db, userId, { maxSnapshots });
+    }
+
+    // Boot: every account's ops floor, where it has none yet. Before this
+    // release nothing was logged, so a gap below an account's current version
+    // must never look like one made only of appends.
+    function initOpsFloors() {
+        let n = 0;
+        for (const { id } of db.prepare('SELECT id FROM users ORDER BY id').all()) {
+            if (forUser(id).initOpsFloor()) n++;
+        }
+        return n;
     }
 
     // Boot-time heal of duplicate role folders, per account and role: two
@@ -119,8 +145,18 @@ export function makeItemsStore(db, { maxSnapshots = 200 } = {}) {
         return { healed: users.length > 0, users };
     }
 
-    return { forUser, healAllUsers };
+    return { forUser, healAllUsers, initOpsFloors };
 }
+
+// Roles whose folders hold app-managed things — notes, saved workflows,
+// pins — that a shared link is never filed into.
+const NOT_A_FILING_TARGET = new Set(['notes', 'workflows', 'pins']);
+
+// The ops log keeps at most this many rows per account. A client further
+// behind than that gets an incomplete answer and pulls, as it would anyway.
+const MAX_OPS_PER_USER = 1000;
+
+const CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 // One account's view of the store. Reached only through forUser, which has
 // already checked that the account exists.
@@ -140,8 +176,40 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         return Number(getMeta('treeVersion') || 0);
     }
 
-    // The next value of the server-wide version sequence, now this account's.
-    const bumpVersion = () => bumpTreeVersion(db, userId);
+    // Every change to the tree takes the next value of the server-wide version
+    // sequence, through here. A change that replaces the tree ('replace', or
+    // 'system' for the server's own boot steps) raises the ops floor to the
+    // new version and forgets the log below it: a client older than that has
+    // to pull. An 'append' or 'unappend' is logged instead, with the version
+    // it applied to, so the log says exactly what a client missed.
+    function bump(kind, payload = null) {
+        const base = version();
+        const next = bumpTreeVersion(db, userId);
+        if (kind === 'append' || kind === 'unappend') {
+            // An account whose floor was never set (made since the boot that
+            // set everyone's): nothing before this is known to be in the log.
+            if (getMeta('opsFloor') === null) setMeta('opsFloor', base);
+            db.prepare('INSERT INTO tree_ops (user_id, version, base_version, kind, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+                .run(userId, next, base, kind, JSON.stringify(payload || {}), new Date().toISOString());
+            db.prepare(`
+                DELETE FROM tree_ops WHERE user_id = ? AND version NOT IN (
+                    SELECT version FROM tree_ops WHERE user_id = ? ORDER BY version DESC LIMIT ?
+                )
+            `).run(userId, userId, MAX_OPS_PER_USER);
+        } else {
+            setMeta('opsFloor', next);
+            db.prepare('DELETE FROM tree_ops WHERE user_id = ? AND version <= ?').run(userId, next);
+        }
+        return next;
+    }
+
+    // An account with no tree version yet has nothing to protect: its first
+    // change sets the floor (see bump), so no row is written for it here.
+    function initOpsFloor() {
+        if (getMeta('opsFloor') !== null || getMeta('treeVersion') === null) return false;
+        setMeta('opsFloor', version());
+        return true;
+    }
 
     // Every tree change funnels through here so history and the version counter
     // can never drift apart. History rows reuse the old snapshots table; new
@@ -305,7 +373,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
             }
         };
         roots.forEach((r, i) => walk(r, null, i));
-        bumpVersion();
+        bump('replace');
         recordHistory(roots, deviceId);
     });
 
@@ -376,7 +444,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
                 INSERT INTO items (id, parent_id, position, kind, role, title, created_at, updated_at, user_id)
                 VALUES (?, NULL, ?, 'folder', 'bookmarks', 'Bookmarks', ?, ?, ?)
             `).run(id, max + 1, now, now, userId);
-            bumpVersion();
+            bump('system');
             return { id, created: true };
         }
 
@@ -395,7 +463,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
                 .run(chosen.id, pos++, now, c.id, userId);
             moved++;
         }
-        bumpVersion();
+        bump('system');
         return { id: chosen.id, created: false, renamedFrom: chosen.title, moved };
     });
 
@@ -565,7 +633,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
             `).run(newId(), targetId, max + 1, title,
                 JSON.stringify({ content, createdAt: now, updatedAt: now }), now, now, userId);
         }
-        bumpVersion();
+        bump('replace');
     });
 
     // Reorder notes to match a list of titles, per parent folder; notes not in
@@ -588,7 +656,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
                 stmt.run(i, k.kind === 'note' ? sorted[ni++].id : k.id, userId);
             });
         }
-        bumpVersion();
+        bump('replace');
     });
 
     function applyNoteProposal(prop) {
@@ -602,6 +670,215 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         }
         recordHistory(readTree().roots, 'llm-proposal');
         return { ok: true };
+    }
+
+    // --- Appends: links filed from the share sheet ---------------------------
+    //
+    // The one write besides a full push that adds to the tree, like saving a
+    // workflow is an exception to push/pull on the extension's side: a filed
+    // link lands at once instead of waiting for the phone to push its whole
+    // copy. It only ever adds — new folders, and a bookmark at the end of each
+    // — and is logged in tree_ops rather than as a history snapshot, so a
+    // phone's shares cannot push the restore points out of the window.
+
+    // What the log holds after `since`: complete only when every change from
+    // `since` up to the current version is in it — a chain of appends and
+    // unappends with nothing between them. Anything else (a push, a proposal,
+    // an older version than the floor, or one this account never had) is
+    // incomplete, and the client pulls.
+    function opsSince(since) {
+        const current = version();
+        const raw = getMeta('opsFloor');
+        const floor = raw === null ? current : Number(raw);
+        const n = Number(since);
+        const incomplete = { version: current, floor, complete: false, ops: [] };
+        if (!Number.isInteger(n) || n < 0 || n > current) return incomplete;
+        if (n === current) return { version: current, floor, complete: true, ops: [] };
+        if (n < floor) return incomplete;
+        const rows = db.prepare('SELECT version, base_version, kind, payload FROM tree_ops WHERE user_id = ? AND version > ? ORDER BY version')
+            .all(userId, n);
+        const ops = [];
+        let at = n;
+        for (const r of rows) {
+            if (Number(r.base_version) !== at) return incomplete;
+            let payload;
+            try { payload = JSON.parse(r.payload); } catch (e) { return incomplete; }
+            ops.push({ version: Number(r.version), kind: r.kind, payload });
+            at = Number(r.version);
+        }
+        if (at !== current) return incomplete;
+        return { version: current, floor, complete: true, ops };
+    }
+
+    // Can a link be filed into folder `id`? {ok, row} or {ok:false, reason}:
+    // 'missing' (no such folder in this account's tree), 'not-a-folder', or
+    // 'read-only' (inside notes, workflows or pins, or the virtual imports
+    // archive, which is never stored).
+    function folderTarget(id) {
+        const key = String(id || '');
+        if (!key) return { ok: false, reason: 'missing' };
+        if (key.startsWith('imp:') || key === 'imports:root') return { ok: false, reason: 'read-only' };
+        const row = db.prepare('SELECT id, parent_id, kind, role, title FROM items WHERE user_id = ? AND id = ?').get(userId, key);
+        if (!row) return { ok: false, reason: 'missing' };
+        if (row.kind !== 'folder') return { ok: false, reason: 'not-a-folder' };
+        const up = db.prepare('SELECT id, parent_id, role FROM items WHERE user_id = ? AND id = ?');
+        let cur = row;
+        for (let hops = 0; cur && hops < 1000; hops++) {
+            if (cur.role && NOT_A_FILING_TARGET.has(cur.role)) return { ok: false, reason: 'read-only' };
+            cur = cur.parent_id ? up.get(userId, cur.parent_id) : null;
+        }
+        return { ok: true, row };
+    }
+
+    const nextPosition = (parentId) => db.prepare(
+        'SELECT COALESCE(MAX(position), -1) + 1 AS p FROM items WHERE user_id = ? AND parent_id IS ?'
+    ).get(userId, parentId).p;
+
+    // File one bookmark into folders, creating the ones that do not exist yet.
+    //
+    //   targets   [{folderId} | {newFolder: {id, title, parentId}, existing?}]
+    //             the folders to file into. A newFolder is created when its
+    //             id is not there yet; `existing` says the client already has
+    //             it (a folder made on the phone and never pushed), so an undo
+    //             leaves it alone.
+    //   folders   [{id, title, parentId}] created first and not filed into:
+    //             the never-pushed ancestors of a newFolder target.
+    //   bookmark  {title, url}
+    //   skip      Map folderId -> bookmarkId of folders that already hold this
+    //             link for the caller (an earlier filing of the same share).
+    //
+    // A retry with a folder id that is already there with the same title and
+    // parent reuses it. A folder already holding this exact URL is reported
+    // under `already` and gets no second copy. The version moves once, and
+    // only when something was created; the change is logged as one 'append'
+    // and no history snapshot is written. Returns {baseVersion, version,
+    // created: [node], already: [{folderId, bookmarkId}], failed: [{folderId |
+    // newFolderId, reason}], filed: [{folderId, bookmarkId, createdFolderIds}]}.
+    const appendToFolders = db.transaction(({ targets = [], folders = [], bookmark, skip = new Map() }) => {
+        const baseVersion = version();
+        const now = new Date().toISOString();
+        const created = [];
+        const failed = [];
+        const already = [];
+        const filed = [];
+        const madeHere = new Set();      // folders created or reused in this request
+        const removable = new Set();     // ... of which an undo may take back
+        const foreign = db.prepare('SELECT 1 FROM items WHERE id = ? AND user_id IS NOT ?');
+        const own = db.prepare('SELECT id, kind, title, parent_id FROM items WHERE user_id = ? AND id = ?');
+
+        const writableParent = (parentId) => madeHere.has(parentId) || folderTarget(parentId).ok;
+
+        // {ok, id} or {ok:false, reason}
+        const ensureFolder = (spec, { undoable }) => {
+            const id = spec && typeof spec.id === 'string' ? spec.id.trim() : '';
+            const title = spec && typeof spec.title === 'string' ? spec.title.trim().slice(0, 200) : '';
+            const parentId = spec && typeof spec.parentId === 'string' ? spec.parentId : '';
+            if (!CLIENT_ID_RE.test(id) || !title) return { ok: false, reason: 'invalid' };
+            if (!parentId || !writableParent(parentId)) return { ok: false, reason: 'missing' };
+            const row = own.get(userId, id);
+            if (row) {
+                if (row.kind === 'folder' && row.title === title && row.parent_id === parentId) {
+                    madeHere.add(id);
+                    return { ok: true, id };
+                }
+                return { ok: false, reason: 'conflict' };
+            }
+            if (foreign.get(id, userId)) return { ok: false, reason: 'conflict' };
+            db.prepare(`
+                INSERT INTO items (id, parent_id, position, kind, title, created_at, updated_at, user_id)
+                VALUES (?, ?, ?, 'folder', ?, ?, ?, ?)
+            `).run(id, parentId, nextPosition(parentId), title, now, now, userId);
+            created.push({ id, parentId, kind: 'folder', title });
+            madeHere.add(id);
+            if (undoable) removable.add(id);
+            return { ok: true, id };
+        };
+
+        for (const spec of folders) {
+            const made = ensureFolder(spec, { undoable: false });
+            if (!made.ok) failed.push({ newFolderId: spec && spec.id ? String(spec.id) : null, reason: made.reason });
+        }
+
+        const into = [];
+        for (const t of targets) {
+            if (t && t.newFolder) {
+                const made = ensureFolder(t.newFolder, { undoable: !t.existing });
+                if (made.ok) into.push(made.id);
+                else failed.push({ newFolderId: t.newFolder.id ? String(t.newFolder.id) : null, reason: made.reason });
+                continue;
+            }
+            const folderId = t && typeof t.folderId === 'string' ? t.folderId : '';
+            if (madeHere.has(folderId)) { into.push(folderId); continue; }
+            const check = folderTarget(folderId);
+            if (check.ok) into.push(folderId);
+            else failed.push({ folderId, reason: check.reason });
+        }
+
+        const url = String(bookmark.url);
+        const title = String(bookmark.title || url);
+        const sameUrl = db.prepare("SELECT id FROM items WHERE user_id = ? AND parent_id = ? AND kind = 'bookmark' AND url = ? LIMIT 1");
+        for (const folderId of [...new Set(into)]) {
+            if (skip.has(folderId)) {
+                already.push({ folderId, bookmarkId: skip.get(folderId) });
+                continue;
+            }
+            const there = sameUrl.get(userId, folderId, url);
+            if (there) {
+                already.push({ folderId, bookmarkId: there.id });
+                continue;
+            }
+            const id = newId();
+            db.prepare(`
+                INSERT INTO items (id, parent_id, position, kind, title, url, created_at, updated_at, user_id)
+                VALUES (?, ?, ?, 'bookmark', ?, ?, ?, ?, ?)
+            `).run(id, folderId, nextPosition(folderId), title, url, now, now, userId);
+            created.push({ id, parentId: folderId, kind: 'bookmark', title, url });
+            filed.push({ folderId, bookmarkId: id, createdFolderIds: [...removable] });
+        }
+
+        const v = created.length ? bump('append', { nodes: created }) : baseVersion;
+        return { baseVersion, version: v, created, already, failed, filed };
+    });
+
+    // Take back what appendToFolders added: [{id, kind:'bookmark', url} |
+    // {id, kind:'folder'}], in order (bookmarks first, then folders deepest
+    // first). A bookmark goes only while it is still a bookmark with that URL;
+    // a folder only while it is empty. Anything changed since is kept. The
+    // version moves once when something went, logged as one 'unappend'.
+    // Returns {baseVersion, version, removed: [item], kept: [id], gone: [id]}.
+    const removeAppended = db.transaction((list) => {
+        const baseVersion = version();
+        const removed = [];
+        const kept = [];
+        const gone = [];
+        const get = db.prepare('SELECT id, kind, url FROM items WHERE user_id = ? AND id = ?');
+        const kids = db.prepare('SELECT COUNT(*) AS n FROM items WHERE user_id = ? AND parent_id = ?');
+        const del = db.prepare('DELETE FROM items WHERE user_id = ? AND id = ?');
+        for (const it of list || []) {
+            const id = String(it && it.id || '');
+            const row = id ? get.get(userId, id) : null;
+            if (!row) { gone.push(id); continue; }
+            const same = it.kind === 'bookmark'
+                ? row.kind === 'bookmark' && row.url === String(it.url)
+                : row.kind === 'folder' && kids.get(userId, id).n === 0;
+            if (!same) { kept.push(id); continue; }
+            del.run(userId, id);
+            removed.push(it.kind === 'bookmark' ? { id, kind: 'bookmark', url: row.url } : { id, kind: 'folder' });
+        }
+        const v = removed.length ? bump('unappend', { items: removed }) : baseVersion;
+        return { baseVersion, version: v, removed, kept, gone };
+    });
+
+    // How deep a folder sits, for removing created folders children first.
+    function depthOf(id) {
+        const up = db.prepare('SELECT parent_id FROM items WHERE user_id = ? AND id = ?');
+        let depth = 0;
+        let cur = up.get(userId, id);
+        while (cur && cur.parent_id && depth < 1000) {
+            depth++;
+            cur = up.get(userId, cur.parent_id);
+        }
+        return depth;
     }
 
     // --- Migration from a pre-format-2 snapshot -----------------------------
@@ -706,6 +983,12 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         applyNoteProposal,
         migrateFromLatestSnapshotIfNeeded,
         healDuplicateRoles,
-        recordHistory
+        recordHistory,
+        initOpsFloor,
+        opsSince,
+        folderTarget,
+        appendToFolders,
+        removeAppended,
+        depthOf
     };
 }

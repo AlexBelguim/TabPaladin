@@ -1,9 +1,11 @@
 // Per-account preferences shared between the extension and the PWA.
 //
 // A small key/value store, not settings sync: each value is one JSON document
-// the clients agree on the shape of. The first consumer is 'share.targets'
-// ({v:1, domains:{'x.com':{recent:[{folderId,count,lastUsedAt}], pinned:[folderId]}}}),
-// keyed by link domain because a Web Share Target never says which app shared.
+// the clients agree on the shape of. The first consumer is 'share', the share
+// sheet's choices per app ({v:1, slots:4, apps:{'x':{pinned:[folderId],
+// hidden:[folderId]}}}), keyed by the app a link belongs to because a Web
+// Share Target never says which app shared. How often each folder was used is
+// not stored here: the server counts filings (GET /api/shares/stats).
 // Values may name folder ids that were deleted or never pushed since; clients
 // drop ids they do not know on read.
 //

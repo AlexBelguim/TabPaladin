@@ -14,7 +14,9 @@
 //      everything, and a Reddit connection waits for its owner's confirm
 //      click before anything is stored or swept.
 //
-// Run: node tools/test_imports.mjs
+// Run: node tools/test_imports.mjs [--port 0]
+//
+// Section 15 listens on 127.0.0.1 at --port (default 0: any free port).
 
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import express from '../server/node_modules/express/index.js';
@@ -35,6 +37,9 @@ function check(name, cond, detail) {
         console.error(`FAIL  ${name}${detail ? ` — ${detail}` : ''}`);
     }
 }
+
+const portArg = process.argv.indexOf('--port');
+const PORT = portArg === -1 ? 0 : Number(process.argv[portArg + 1]) || 0;
 
 // --- Fake Reddit ---------------------------------------------------------
 
@@ -418,7 +423,7 @@ async function accountTests() {
     const as = (id) => (req, res, next) => { req.user = { id, username: id === ALEX ? 'alex' : 'sam' }; next(); };
     const authFor = (req, res, next) => as(Number(req.headers['x-user']) || ALEX)(req, res, next);
     attachRoutes(app, { store, requireAuth: authFor, accountName: (id) => (id === ALEX ? 'alex' : 'sam') });
-    const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+    const server = await new Promise(resolve => { const s = app.listen(PORT, '127.0.0.1', () => resolve(s)); });
     const base = `http://127.0.0.1:${server.address().port}`;
     const call = async (path, { user = ALEX, method = 'GET', body, form } = {}) => {
         const res = await realFetch(base + path, {

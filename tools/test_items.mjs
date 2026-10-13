@@ -12,6 +12,12 @@
 //   5. Notes SQL: listing with notebooks (and their paths), proposal
 //      upsert-by-title that keeps unknown payload fields, notebook names
 //      resolved the way the clients resolve them, reorder.
+//   6. Appends from the share sheet: at the end of each folder, one version
+//      bump, logged in tree_ops with no history snapshot, never into notes,
+//      workflows, pins or the archive; undo takes back only what is
+//      unchanged; and the ops log is complete only for a gap made of appends
+//      — every whole-tree change raises the floor, which starts at an
+//      existing account's current version.
 //
 // Every database here is a single-account one that has been through the
 // ownership migration, and the store is that account's (forUser(1)). What
@@ -405,6 +411,122 @@ console.log('\n7. Duplicate role folders are merged, nothing dropped');
         healed.healed && after.filter(n => n.role === 'workflows').length === 1);
     check('boot heal keeps the duplicate\'s children', after.some(n => n.url === 'https://x3.example'));
     check('a clean tree is left alone', items.healDuplicateRoles().healed === false);
+    db.close();
+}
+
+console.log('\n8. Appends from the share sheet, and the ops log');
+{
+    const { db, items } = freshDb();
+    const meta = (key) => (db.prepare('SELECT value FROM user_tree_meta WHERE user_id = 1 AND key = ?').get(key) || {}).value ?? null;
+    const opsRows = () => db.prepare('SELECT version, base_version, kind FROM tree_ops WHERE user_id = 1 ORDER BY version').all();
+    const snaps = () => db.prepare('SELECT COUNT(*) AS n FROM snapshots WHERE user_id = 1').get().n;
+    items.writeTree([
+        { id: 'bm', kind: 'folder', role: 'bookmarks', title: 'Bookmarks', children: [
+            { id: 'ai', kind: 'folder', title: 'AI', children: [
+                { id: 'p1', kind: 'bookmark', title: 'Paper 1', url: 'https://arxiv.org/abs/1' },
+                { id: 'p2', kind: 'bookmark', title: 'Paper 2', url: 'https://arxiv.org/abs/2' }
+            ] },
+            { id: 'dev', kind: 'folder', title: 'Dev', children: [] }
+        ] },
+        { id: 'nr', kind: 'folder', role: 'notes', title: 'Notes', children: [{ id: 'nb', kind: 'folder', title: 'Book', children: [] }] },
+        { id: 'wf', kind: 'folder', role: 'workflows', title: 'Workflows', children: [{ id: 'wf1', kind: 'folder', title: 'Morning', children: [] }] },
+        { id: 'pn', kind: 'folder', role: 'pins', title: 'Pinned', children: [] }
+    ]);
+    check('a whole-tree write sets the ops floor to its version', Number(meta('opsFloor')) === items.version());
+    const v0 = items.version();
+    const snaps0 = snaps();
+
+    const r = items.appendToFolders({ targets: [{ folderId: 'ai' }, { folderId: 'dev' }], bookmark: { title: 'Paper 3', url: 'https://arxiv.org/abs/3' } });
+    const ai = findFolder(items.readTree().roots, 'AI');
+    check('appendToFolders files at the end of each folder, read back in place',
+        r.created.length === 2 && ai.children.map(c => c.title).join() === 'Paper 1,Paper 2,Paper 3'
+        && findFolder(items.readTree().roots, 'Dev').children[0].url === 'https://arxiv.org/abs/3');
+    const positions = db.prepare("SELECT position FROM items WHERE user_id = 1 AND parent_id = 'ai' ORDER BY position").all().map(p => p.position);
+    check('  at the next position', JSON.stringify(positions) === '[0,1,2]', JSON.stringify(positions));
+    check('  bumping the version exactly once', r.baseVersion === v0 && r.version === items.version() && r.version > v0);
+    check('  as one logged append and no history snapshot', opsRows().length === 1 && opsRows()[0].kind === 'append'
+        && opsRows()[0].base_version === v0 && snaps() === snaps0);
+
+    const again = items.appendToFolders({ targets: [{ folderId: 'ai' }], bookmark: { title: 'Paper 3', url: 'https://arxiv.org/abs/3' } });
+    check('a folder already holding the URL is "already", with no version bump',
+        again.created.length === 0 && again.already.length === 1 && again.version === r.version && items.version() === r.version);
+
+    const refused = items.appendToFolders({
+        targets: [{ folderId: 'nb' }, { folderId: 'wf1' }, { folderId: 'pn' }, { folderId: 'p1' }, { folderId: 'nowhere' }, { folderId: 'imp:src:1' }],
+        bookmark: { title: 'x', url: 'https://x.example/' }
+    });
+    check('notes, workflows, pins, a bookmark, a missing id and the virtual archive are refused, saying why',
+        refused.created.length === 0 && JSON.stringify(refused.failed.map(f => f.reason))
+            === '["read-only","read-only","read-only","not-a-folder","missing","read-only"]', JSON.stringify(refused.failed));
+
+    const made = items.appendToFolders({
+        targets: [{ newFolder: { id: 'aaaaaaaaaaaaaaaa', title: 'Talks', parentId: 'bm' } }],
+        bookmark: { title: 'Talk', url: 'https://youtube.com/watch?v=1' }
+    });
+    const madeAgain = items.appendToFolders({
+        targets: [{ newFolder: { id: 'aaaaaaaaaaaaaaaa', title: 'Talks', parentId: 'bm' } }],
+        bookmark: { title: 'Talk 2', url: 'https://youtube.com/watch?v=2' }
+    });
+    check('a new folder is created with the client\'s id, and a retry with that id reuses it',
+        made.created.map(n => n.kind).join() === 'folder,bookmark' && madeAgain.created.map(n => n.kind).join() === 'bookmark'
+        && findFolder(items.readTree().roots, 'Talks').children.length === 2
+        && db.prepare("SELECT COUNT(*) AS n FROM items WHERE user_id = 1 AND title = 'Talks'").get().n === 1);
+    const clash = items.appendToFolders({
+        targets: [{ newFolder: { id: 'aaaaaaaaaaaaaaaa', title: 'Not talks', parentId: 'bm' } }],
+        bookmark: { title: 'x', url: 'https://x.example/2' }
+    });
+    check('  the same id with another title is a conflict, not a rename', clash.created.length === 0 && clash.failed[0].reason === 'conflict');
+
+    // The log: complete only for a gap made of appends.
+    const full = items.opsSince(v0);
+    check('opsSince from before the appends is complete, in order, folders before bookmarks',
+        full.complete && full.ops.length === 3 && full.ops.every(o => o.kind === 'append')
+        && full.ops[1].payload.nodes.map(n => n.kind).join() === 'folder,bookmark', JSON.stringify(full));
+    check('  and from the current version there is nothing to miss', items.opsSince(items.version()).complete
+        && items.opsSince(items.version()).ops.length === 0);
+    check('  a version older than the floor, or one never held, is incomplete',
+        !items.opsSince(v0 - 1).complete && !items.opsSince(items.version() + 5).complete && !items.opsSince('x').complete);
+
+    const un = items.removeAppended([
+        { id: made.created[1].id, kind: 'bookmark', url: 'https://youtube.com/watch?v=1' },
+        { id: madeAgain.created[0].id, kind: 'bookmark', url: 'https://changed.example/' },
+        { id: 'aaaaaaaaaaaaaaaa', kind: 'folder' }
+    ]);
+    check('removeAppended takes back an unchanged bookmark, keeps a changed one and a folder that is not empty',
+        un.removed.length === 1 && JSON.stringify(un.kept) === JSON.stringify([madeAgain.created[0].id, 'aaaaaaaaaaaaaaaa'])
+        && findFolder(items.readTree().roots, 'Talks').children.length === 1);
+    check('  logged as an unappend, still a complete gap', opsRows().at(-1).kind === 'unappend' && items.opsSince(v0).complete
+        && items.opsSince(v0).ops.length === 4);
+
+    // A whole-tree change in the gap makes it incomplete, raises the floor
+    // and forgets the log below it.
+    for (const [what, change] of [
+        ['writeTree', () => items.writeTree(items.readTree().roots, { deviceId: 'pc' })],
+        ['upsertNote', () => items.applyNoteProposal({ kind: 'note', title: 'N', content: 'x', notebook: null })],
+        ['reorderNotes', () => items.applyNoteProposal({ kind: 'reorder', content: JSON.stringify(['N']) })]
+    ]) {
+        const before = items.version();
+        items.appendToFolders({ targets: [{ folderId: 'dev' }], bookmark: { title: what, url: `https://${what.toLowerCase()}.example/` } });
+        change();
+        check(`${what} raises the floor to its version and prunes the log`,
+            Number(meta('opsFloor')) === items.version() && opsRows().length === 0, `${meta('opsFloor')} vs ${items.version()}`);
+        check(`  so a gap across it is incomplete`, !items.opsSince(before).complete);
+    }
+    db.close();
+}
+{
+    // A database from before this release: its accounts have versions but
+    // no floor, and no log — nothing before now may look complete.
+    const { db, items } = freshDb();
+    items.writeTree([{ id: 'f', kind: 'folder', title: 'F', children: [] }]);
+    const v1 = items.version();
+    items.writeTree([{ id: 'f', kind: 'folder', title: 'F2', children: [] }]);
+    db.prepare("DELETE FROM user_tree_meta WHERE key = 'opsFloor'").run();
+    const store = makeItemsStore(db);
+    check('initOpsFloors sets the floor of an existing account to its current version',
+        store.initOpsFloors() === 1 && Number(db.prepare("SELECT value FROM user_tree_meta WHERE user_id = 1 AND key = 'opsFloor'").get().value) === items.version());
+    check('  so the gap from before it is incomplete', !items.opsSince(v1).complete && items.opsSince(items.version()).complete);
+    check('  and running it again changes nothing', store.initOpsFloors() === 0);
     db.close();
 }
 

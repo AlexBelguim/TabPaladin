@@ -47,6 +47,7 @@ import {
     initTenancySchema, migrateOwnership, digestTables, preflight, writeRefusal, checkOwnership,
     deleteUserData, nextUserId, bumpTreeVersion, userStats, serverId, DIGEST_TABLES, PER_USER_TABLES, MARKER_FILE
 } from '../server/tenancy.js';
+import { migrateShares, makeSharesStore } from '../server/shares.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -157,7 +158,7 @@ function v2Fixture(file = ':memory:', { users = ['alex'] } = {}) {
 }
 
 // What the server does at boot, headless: the schema block, the first admin,
-// the migration, the version.
+// the migration, the share inbox's columns and ops floors, the version.
 async function upgrade(db, env = {}, { failAt = null, maxSnapshots = 200 } = {}) {
     migrateUsers(db);
     initTenancySchema(db);
@@ -166,6 +167,8 @@ async function upgrade(db, env = {}, { failAt = null, maxSnapshots = 200 } = {})
     const boot = await bootstrapAdmin(db, env);
     if (!boot.ok) throw new Error(boot.error);
     const result = migrateOwnership(db, { env, failAt, bootstrappedUserIds: boot.created ? [boot.created.id] : [] });
+    migrateShares(db);
+    store.initOpsFloors();
     setSchemaVersion(db);
     return { store, result, boot };
 }
@@ -226,7 +229,7 @@ async function migrationTests() {
         const recorded = JSON.parse(db.prepare("SELECT value FROM server_meta WHERE key = 'tenancy_digest'").get().value);
         check('the digest is recorded with the recovered ids', recorded.tables.items.n === before.items.n
             && JSON.stringify(recorded.orphanSourceIds) === '[7,9]');
-        check('schema version is 3', db.pragma('user_version', { simple: true }) === SCHEMA_VERSION && SCHEMA_VERSION === 3);
+        check(`schema version is ${SCHEMA_VERSION}`, db.pragma('user_version', { simple: true }) === SCHEMA_VERSION && SCHEMA_VERSION >= 3);
 
         const imports = makeImportsStore(db);
         check('removed sources stay out of the tree but are listed on request',
@@ -274,10 +277,11 @@ async function migrationTests() {
         check('without the marker preflight passes', preflight(db, file, { schemaVersion: SCHEMA_VERSION }).ok);
         const tight = preflight(db, file, { schemaVersion: SCHEMA_VERSION, statfs: () => ({ bavail: 1, bsize: 1024 }) });
         check('too little disk refuses with the sizes', !tight.ok && /not enough disk/.test(tight.error) && /MB/.test(tight.error), tight.error);
-        db.pragma('user_version = 4');
+        const NEXT = SCHEMA_VERSION + 1;
+        db.pragma(`user_version = ${NEXT}`);
         const newer = preflight(db, file, { schemaVersion: SCHEMA_VERSION });
-        check('a database from a newer build (user_version 4) is refused', !newer.ok && /newer TabPaladin/.test(newer.error)
-            && /sync\.db\.pre-v4-/.test(newer.error), newer.error);
+        check(`a database from a newer build (user_version ${NEXT}) is refused`, !newer.ok && /newer TabPaladin/.test(newer.error)
+            && new RegExp(`sync\\.db\\.pre-v${NEXT}-`).test(newer.error), newer.error);
         db.close();
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
     }
@@ -420,6 +424,25 @@ async function isolationTests() {
     db.prepare("INSERT INTO user_prefs VALUES (?, 'share.targets', '{\"v\":1}', ?)").run(sam.id, T);
     check('prefs are per account', !db.prepare("SELECT 1 FROM user_prefs WHERE user_id = 1").get());
 
+    // Shares: sam's inbox, filed into sam's own tree, and never into alex's.
+    const shares = makeSharesStore(db, { items: store, importsStore: imports });
+    const SAM_SID = 'sam-share-0000000001';
+    shares.forUser(sam.id).intake({ sid: SAM_SID, url: 'https://sam-share.example/a', app: 'site:sam-share.example' });
+    const intoAlex = shares.forUser(sam.id).file(SAM_SID, { targets: [{ folderId: 'bm' }] });
+    check('sam cannot file a share into alex\'s folder: it is not in his tree', intoAlex.refused && intoAlex.failed[0].reason === 'missing',
+        JSON.stringify(intoAlex));
+    const intoOwn = shares.forUser(sam.id).file(SAM_SID, { targets: [{ folderId: samRoot.id }] });
+    check('  but files it into his own', intoOwn && intoOwn.created.length === 1 && samItems.readTree().roots.some(r => JSON.stringify(r).includes('sam-share.example')));
+    check('alex sees nothing of sam\'s share, by sid or in any list', shares.forUser(1).get(SAM_SID) === null
+        && ['pending', 'filed'].every(s => shares.forUser(1).list({ status: s }).every(x => x.sid !== SAM_SID))
+        && Object.keys(shares.forUser(1).stats()).length === 0);
+    check('a sid alex reuses is his own share, not sam\'s', shares.forUser(1).intake({ sid: SAM_SID, url: 'https://alex.example/' }).created === true
+        && shares.forUser(sam.id).get(SAM_SID).url === 'https://sam-share.example/a');
+    db.prepare('DELETE FROM shared_links WHERE user_id = 1 AND sid = ?').run(SAM_SID);
+    const samOps = store.forUser(sam.id).opsSince(intoOwn.baseVersion);
+    check('the filing is in sam\'s ops log only', samOps.complete && samOps.ops.length === 1
+        && db.prepare('SELECT COUNT(*) AS n FROM tree_ops WHERE user_id = 1').get().n === 0);
+
     samItems.writeTree([{ id: 'late', kind: 'folder', title: 'late', children: [] }]);
     check('after all of sam\'s activity, alex\'s data is byte-identical', accountDigest(db, 1) === alexBaseline);
 
@@ -432,7 +455,9 @@ async function isolationTests() {
         ['note_proposals', "INSERT INTO note_proposals (title, content, created_at, user_id) VALUES ('g', 'g', ?, ?)", [T, 999]],
         ['import_sources', "INSERT INTO import_sources (provider, created_at, user_id) VALUES ('x', ?, ?)", [T, 999]],
         ['user_tree_meta', "INSERT INTO user_tree_meta VALUES (?, 'treeVersion', '1')", [999]],
-        ['user_prefs', "INSERT INTO user_prefs VALUES (?, 'k', '1', ?)", [999, T]]
+        ['user_prefs', "INSERT INTO user_prefs VALUES (?, 'k', '1', ?)", [999, T]],
+        ['tree_ops', "INSERT INTO tree_ops (user_id, version, base_version, kind, payload, created_at) VALUES (?, 1, 0, 'append', '{}', ?)", [999, T]],
+        ['share_filings', "INSERT INTO share_filings (share_id, user_id, folder_id, bookmark_id, url, tree_version, filed_at) VALUES (1, ?, 'f', 'b', 'https://g', 1, ?)", [999, T]]
     ]) {
         const e = throws(() => db.prepare(sql).run(...args));
         check(`${table}: an insert for a missing account is refused`, e && /must name an existing user/.test(e.message), e && e.message);
@@ -463,9 +488,12 @@ async function isolationTests() {
     check('the removed source\'s archive, tombstones and OAuth state went with it',
         counts.import_items === 1 && counts.import_dismissed === 1 && counts.import_oauth_state === 1 && counts.import_sources === 1,
         JSON.stringify(counts));
+    // user_tree_meta: his tree version and the floor of his tree's ops log.
     check('as did its tree, history, tokens, proposals, prefs, session and account',
         counts.items > 0 && counts.snapshots > 0 && counts.share_tokens === 1 && counts.note_proposals === 1
-        && counts.user_prefs === 1 && counts.sessions === 1 && counts.users === 1 && counts.user_tree_meta === 1, JSON.stringify(counts));
+        && counts.user_prefs === 1 && counts.sessions === 1 && counts.users === 1 && counts.user_tree_meta === 2, JSON.stringify(counts));
+    check('and its shares with where they were filed', counts.shared_links === 1 && counts.share_filings === 1 && counts.tree_ops === 0,
+        JSON.stringify(counts));
     const removedTotal = ['import_items', 'import_dismissed', 'import_oauth_state', 'import_sources', 'items', 'snapshots',
         'shared_links', 'share_tokens', 'note_proposals', 'sessions', 'users'].reduce((n, t) => n + (counts[t] || 0), 0);
     const totalAfter = DIGEST_TABLES.reduce((n, t) => n + db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n, 0);
@@ -486,7 +514,7 @@ async function isolationTests() {
 // listed with the reason they are safe; an exception that no longer matches
 // anything fails too, so the list cannot rot.
 
-const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs)\b/i;
+const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops)\b/i;
 const SCAN_SKIP = new Set(['server/tenancy.js']); // operates across accounts by design: the migration, deletion, stats
 const ALLOWED = [
     ['server/index.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],
@@ -708,12 +736,15 @@ async function endToEnd() {
         // --- This server boots on the same directory.
         let srv = start(NEW, NEW_PORT, dataDir);
         await srv.ready();
+        // Both copies are named after the schema this build upgrades to: the
+        // ownership migration and every later step run on the same boot.
+        const V = SCHEMA_VERSION;
         check('the boot log names the owner, the recovered source and both copies',
-            /Tenancy migration: assigned \d+ rows to alex \(#1\); recovered 1 removed import source\(s\); pre-upgrade copy sync\.db\.pre-v3-\S+; post-upgrade copy sync\.db\.post-v3-/.test(srv.log()),
+            new RegExp(`Tenancy migration: assigned \\d+ rows to alex \\(#1\\); recovered 1 removed import source\\(s\\); pre-upgrade copy sync\\.db\\.pre-v${V}-\\S+; post-upgrade copy sync\\.db\\.post-v${V}-`).test(srv.log()),
             srv.log());
         const files = fs.readdirSync(dataDir);
-        const preCopy = files.find(f => f.startsWith('sync.db.pre-v3-'));
-        const postCopy = files.find(f => f.startsWith('sync.db.post-v3-'));
+        const preCopy = files.find(f => f.startsWith(`sync.db.pre-v${V}-`));
+        const postCopy = files.find(f => f.startsWith(`sync.db.post-v${V}-`));
         const verify = spawnSync(process.execPath, [path.join(SERVER, 'verify_tenancy.js'), path.join(dataDir, preCopy), path.join(dataDir, postCopy)],
             { encoding: 'utf8' });
         check('verify_tenancy.js proves the pre and post copies match', verify.status === 0, verify.stdout + verify.stderr);
@@ -862,13 +893,13 @@ async function endToEnd() {
             lastLog = r.log;
         }
         check('eight boots, eight refusals', codes.every(code => code === 1), codes.join(','));
-        check('the first says why and where the backup is', /Tenancy migration refused, nothing changed, backup at \S*sync\.db\.pre-v3-/.test(firstLog)
+        check('the first says why and where the backup is', new RegExp(`Tenancy migration refused, nothing changed, backup at \\S*sync\\.db\\.pre-v${SCHEMA_VERSION}-`).test(firstLog)
             && /2 accounts exist; set TENANCY_OWNER/.test(firstLog), firstLog);
         check('later ones stop at the marker', /a previous migration was refused/.test(lastLog), lastLog);
         const after = fs.readdirSync(crashDir);
         check('every older daily backup is still there', dailies.every(f => after.includes(f)) && after.filter(f => f.startsWith('sync.db.bak-')).length === 3,
             after.join(', '));
-        check('exactly one pre-upgrade copy was taken', after.filter(f => f.startsWith('sync.db.pre-v3-')).length === 1, after.join(', '));
+        check('exactly one pre-upgrade copy was taken', after.filter(f => f.startsWith(`sync.db.pre-v${SCHEMA_VERSION}-`)).length === 1, after.join(', '));
         check('the marker is there', after.includes(MARKER_FILE));
         const c2 = new Database(path.join(crashDir, 'sync.db'), { readonly: true });
         check('the database is untouched (no columns, still version 2)', !hasColumn(c2, 'items', 'user_id') && c2.pragma('user_version', { simple: true }) === 2);

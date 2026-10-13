@@ -17,11 +17,12 @@ import path from 'node:path';
 // Tables whose rows carry user_id themselves.
 export const OWNED_TABLES = ['items', 'snapshots', 'shared_links', 'share_tokens', 'note_proposals', 'import_sources'];
 
-// Every table holding one account's data, including the two born per-user.
+// Every table holding one account's data, including those born per-user:
+// tree metadata, prefs, the tree's ops log and where shared links were filed.
 // import_items, import_dismissed and import_oauth_state are scoped through
 // their source_id instead: a source row is never hard-deleted except by an
 // explicit purge, which takes its archive with it.
-export const PER_USER_TABLES = [...OWNED_TABLES, 'user_tree_meta', 'user_prefs'];
+export const PER_USER_TABLES = [...OWNED_TABLES, 'user_tree_meta', 'user_prefs', 'tree_ops', 'share_filings'];
 
 // Everything that existed before accounts were separated. The migration may
 // only add columns to these; their content must come out byte-identical.
@@ -120,14 +121,21 @@ function ensureOwnershipColumns(db) {
 // A row whose owner does not exist is refused at the database, not just in
 // the routes: a forgotten user_id becomes a 500 instead of a row nobody can
 // see, and a write that raced an account deletion cannot land afterwards.
-function ensureGuards(db) {
-    for (const table of PER_USER_TABLES) {
+// The same guards for tables made after the ownership migration ran on this
+// boot (share_filings, by migrateShares). Idempotent.
+export function ensureOwnerGuards(db, tables) {
+    for (const table of tables) {
+        if (!PER_USER_TABLES.includes(table)) throw new Error(`${table} is not a per-account table`);
         if (!tableExists(db, table)) continue;
         const when = `WHEN NEW.user_id IS NULL OR NOT EXISTS (SELECT 1 FROM users WHERE id = NEW.user_id)`;
         const body = `BEGIN SELECT RAISE(ABORT, '${table}.user_id must name an existing user'); END`;
         db.exec(`CREATE TRIGGER IF NOT EXISTS ${table}_owner_insert BEFORE INSERT ON ${table} ${when} ${body};`);
         db.exec(`CREATE TRIGGER IF NOT EXISTS ${table}_owner_update BEFORE UPDATE OF user_id ON ${table} ${when} ${body};`);
     }
+}
+
+function ensureGuards(db) {
+    ensureOwnerGuards(db, PER_USER_TABLES);
     const indexes = [
         ['items', 'CREATE INDEX IF NOT EXISTS idx_items_user_parent ON items(user_id, parent_id, position)'],
         ['snapshots', 'CREATE INDEX IF NOT EXISTS idx_snapshots_user_ts ON snapshots(user_id, timestamp DESC)'],
@@ -314,7 +322,7 @@ function laterBoot(db, ownerId, env) {
         adoptTo = users[0];
     }
     if (!adoptTo) {
-        throw new Error(`${unowned.total} unowned rows and ${users.length} accounts: restore sync.db.pre-v3 or set TENANCY_OWNER`);
+        throw new Error(`${unowned.total} unowned rows and ${users.length} accounts: restore the pre-upgrade copy (sync.db.pre-v…) or set TENANCY_OWNER`);
     }
     for (const table of Object.keys(unowned.byTable)) {
         db.prepare(`UPDATE ${table} SET user_id = ? WHERE user_id IS NULL`).run(adoptTo.id);
@@ -525,6 +533,11 @@ export function bumpTreeVersion(db, userId) {
 
 export function userStats(db, userId) {
     const one = (sql, ...args) => (db.prepare(sql).get(...args) || {}).n || 0;
+    // The inbox is what waits to be filed: links filed or dismissed stay in
+    // the table (nothing in it is hard-deleted) but are not in the inbox.
+    const inboxSql = hasColumn(db, 'shared_links', 'status')
+        ? "SELECT COUNT(*) AS n FROM shared_links WHERE user_id = ? AND status = 'pending'"
+        : 'SELECT COUNT(*) AS n FROM shared_links WHERE user_id = ?';
     return {
         bookmarks: one("SELECT COUNT(*) AS n FROM items WHERE user_id = ? AND kind = 'bookmark'", userId),
         notes: one("SELECT COUNT(*) AS n FROM items WHERE user_id = ? AND kind = 'note'", userId),
@@ -536,7 +549,7 @@ export function userStats(db, userId) {
         removedImports: one('SELECT COUNT(*) AS n FROM import_sources WHERE user_id = ? AND deleted_at IS NOT NULL', userId),
         // Removed sources' archives included: they are still this account's.
         archived: one('SELECT COUNT(*) AS n FROM import_items WHERE source_id IN (SELECT id FROM import_sources WHERE user_id = ?)', userId),
-        inbox: one('SELECT COUNT(*) AS n FROM shared_links WHERE user_id = ?', userId),
+        inbox: one(inboxSql, userId),
         proposals: one('SELECT COUNT(*) AS n FROM note_proposals WHERE user_id = ?', userId),
         history: one('SELECT COUNT(*) AS n FROM snapshots WHERE user_id = ?', userId),
         prefs: one('SELECT COUNT(*) AS n FROM user_prefs WHERE user_id = ?', userId)
@@ -565,7 +578,9 @@ export function deleteUserData(db, userId, { deletedBy = null } = {}) {
         run('items', 'DELETE FROM items WHERE user_id = ?', userId);
         run('user_tree_meta', 'DELETE FROM user_tree_meta WHERE user_id = ?', userId);
         run('snapshots', 'DELETE FROM snapshots WHERE user_id = ?', userId);
+        run('share_filings', 'DELETE FROM share_filings WHERE user_id = ?', userId);
         run('shared_links', 'DELETE FROM shared_links WHERE user_id = ?', userId);
+        run('tree_ops', 'DELETE FROM tree_ops WHERE user_id = ?', userId);
         run('share_tokens', 'DELETE FROM share_tokens WHERE user_id = ?', userId);
         run('note_proposals', 'DELETE FROM note_proposals WHERE user_id = ?', userId);
         run('user_prefs', 'DELETE FROM user_prefs WHERE user_id = ?', userId);

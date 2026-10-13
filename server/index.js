@@ -21,6 +21,7 @@ import {
 } from './tenancy.js';
 import { attachPrefs } from './prefs.js';
 import { attachUserAdmin } from './admin.js';
+import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,7 +31,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PWA_DIR = process.env.PWA_DIR || path.resolve(__dirname, '..', 'pwa');
 const MAX_SNAPSHOTS = Number(process.env.MAX_SNAPSHOTS || 200);
 // Per-account caps. They refuse new rows and never prune existing ones: one
-// account filling the disk would otherwise make everyone's pushes fail.
+// account filling the disk would otherwise make everyone's pushes fail. The
+// inbox cap counts the links still waiting to be filed.
 const MAX_INBOX_PER_USER = Math.max(1, Number(process.env.MAX_INBOX_PER_USER || 5000));
 const MAX_PROPOSALS_PER_USER = Math.max(1, Number(process.env.MAX_PROPOSALS_PER_USER || 200));
 
@@ -73,7 +75,9 @@ db.pragma('journal_mode = WAL');
 //   2. the boot backup;
 //   3. the schema: CREATE IF NOT EXISTS and additive ALTERs only;
 //   4. the first admin, so a token-only database has an owner to migrate to;
-//   5. the ownership migration, one transaction, refused rather than guessed;
+//   5. the ownership migration, one transaction, refused rather than guessed,
+//      then the share inbox's columns and the tree's ops floors (additive,
+//      idempotent, after the ownership migration has named every row's owner);
 //   6. the schema version and, the first time, a post-migration copy;
 //   7. ownership warnings, then the owner's own boot steps;
 //   8. routes and the import scheduler, then listen.
@@ -190,6 +194,20 @@ try {
 } catch (e) {
     const marker = writeRefusal(DATA_DIR, e, schemaBackup);
     console.error(`[TabPaladin] Tenancy migration refused, nothing changed, backup at ${schemaBackup || '(none)'}: ${e.message}`);
+    console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
+    process.exit(1);
+}
+// The inbox becomes per-account shares with filings (shares.js). One
+// transaction of additive steps: refused like the ownership migration, with
+// nothing changed, rather than half-applied.
+try {
+    const shares = migrateShares(db);
+    if (shares.added.length) console.log(`[TabPaladin] Share inbox: added ${shares.added.join(', ')} to shared_links.`);
+    const floors = items.initOpsFloors();
+    if (floors) console.log(`[TabPaladin] Started the tree ops log for ${floors} account(s).`);
+} catch (e) {
+    const marker = writeRefusal(DATA_DIR, e, schemaBackup);
+    console.error(`[TabPaladin] Share inbox migration refused, nothing changed, backup at ${schemaBackup || '(none)'}: ${e.message}`);
     console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
     process.exit(1);
 }
@@ -475,6 +493,13 @@ const { store: importsStore } = attachImports(app, {
     accountName: (id) => (userById(db, id) || {}).username || null
 });
 
+// --- Shared links ---
+// The share sheet's inbox and filing (/api/shares*), the tree's ops log
+// (/api/tree/ops) and the old /api/shared routes over the same rows.
+// After the importers, because X and Instagram shares go to their archive.
+const shares = makeSharesStore(db, { items, importsStore, maxPending: MAX_INBOX_PER_USER });
+attachShareRoutes(app, { store: shares, items, requireAuth, serverId: SERVER_ID });
+
 // --- The tree ---
 //
 // GET returns the caller's tree plus a virtual, read-only imports subtree that
@@ -553,9 +578,20 @@ app.put('/api/tree', requireAuth, jsonTree, (req, res) => {
             });
         }
     }
+    // A forced push from an older base may erase links filed from the phone
+    // since (they were never in the pusher's copy): those shares go back to
+    // the inbox, in the same transaction as the push.
+    const base = Number(baseVersion);
+    const erasesUnseen = Boolean(force) && !(Number.isFinite(base) && base >= current);
     let version;
     try {
-        version = store.writeTree(roots, { deviceId: deviceId || null });
+        version = db.transaction(() => {
+            const v = store.writeTree(roots, { deviceId: deviceId || null });
+            if (erasesUnseen) {
+                shares.forUser(req.user.id).reopenAfterForce({ baseVersion: Number.isFinite(base) ? base : 0, deviceId: deviceId || null });
+            }
+            return v;
+        })();
     } catch (e) {
         if (e instanceof ForeignIdError) {
             return res.status(412).json({ error: WRONG_ACCOUNT, code: 'foreign-ids', count: e.count, userId: req.user.id, serverId: SERVER_ID });
@@ -587,36 +623,8 @@ app.get('/api/history/:id', requireAuth, (req, res) => {
     res.json({ ok: true, timestamp: row.timestamp, deviceId: row.device_id, snapshot: JSON.parse(row.json) });
 });
 
-// --- Shared links inbox (for PWA "Share to TabPaladin" + manual paste) ---
-app.get('/api/shared', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, url, title, created_at FROM shared_links WHERE user_id = ? ORDER BY created_at DESC')
-        .all(req.user.id);
-    res.json({ ok: true, links: rows });
-});
-
-app.post('/api/shared', requireAuth, (req, res) => {
-    const { url, title } = req.body || {};
-    if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing url' });
-    const held = db.prepare('SELECT COUNT(*) AS n FROM shared_links WHERE user_id = ?').get(req.user.id).n;
-    if (held >= MAX_INBOX_PER_USER) {
-        return res.status(429).json({ error: `Your inbox already holds ${held} links, the most it keeps. File or clear some first.` });
-    }
-    const ts = new Date().toISOString();
-    const info = db.prepare('INSERT INTO shared_links (url, title, created_at, user_id) VALUES (?, ?, ?, ?)')
-        .run(url, title || null, ts, req.user.id);
-    res.json({ ok: true, id: info.lastInsertRowid, createdAt: ts });
-});
-
-app.delete('/api/shared/:id', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM shared_links WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
-    res.json({ ok: true });
-});
-
-// Clears the caller's inbox only.
-app.delete('/api/shared', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM shared_links WHERE user_id = ?').run(req.user.id);
-    res.json({ ok: true });
-});
+// The shared-links inbox lives in shares.js now (/api/shares*, and the old
+// /api/shared routes over the same rows).
 
 const SHARE_TTL_MS = Math.max(1, Number(process.env.SHARE_TTL_MINUTES || 60)) * 60 * 1000;
 

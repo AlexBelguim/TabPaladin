@@ -46,7 +46,7 @@ the network.
 | `TABPALADIN_TOKEN` | *(off)* | Legacy shared token, passed to the server as `AUTH_TOKEN`. Requests bearing it (`Authorization: Bearer` or `X-API-Key`) act as the account that owned the data before accounts were separated — for scripts, and for clients that predate logins. It cannot manage accounts. At least 32 characters; the old example value from this README is refused. Also the admin password on a first start without `ADMIN_PASSWORD`. |
 | `TENANCY_OWNER` | *(unset)* | Only for the [upgrade to separate accounts](#upgrading-to-separate-accounts-schema-3), and only when the database already holds more than one account: the username (or id) whose data it all is. |
 | `IMPORTS_SCHEDULER` | *(on)* | `off` stops the import scheduler — for rehearsing on a copy of a real database. |
-| `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the shared-links inbox and on pending LLM proposals. Past them new rows get `429`; nothing is pruned. |
+| `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the links waiting in the shared-links inbox and on pending LLM proposals. Past them new rows get `429`; nothing is pruned. |
 | `IMPORT_SECRET` | *(off)* | Encrypts importer OAuth refresh tokens at rest. |
 | `TRUST_PROXY` | `loopback, uniquelocal` | Express `trust proxy`: which proxies may set `X-Forwarded-For` / `-Proto`. Set `1` or `true` if your proxy reaches the server from a public address. |
 | `CORS_ORIGIN` | *(off)* | Extra comma-separated origins allowed to call the API cross-origin. The server's own origin and browser-extension origins (`chrome-extension://`, `moz-extension://`) are always allowed. |
@@ -189,6 +189,31 @@ merged together, and its writes are refused by the database. This version
 refuses to start on a database upgraded by a newer one and says which copy to
 restore.
 
+A server that goes straight from before accounts to a later schema runs every
+step on the same boot, and its copies are named after the version it ends at
+(`sync.db.pre-v4-…`, `sync.db.post-v4-…`); `verify_tenancy.js` compares those
+the same way.
+
+### Upgrading to the share inbox (schema 4)
+
+The first start of this version takes `sync.db.pre-v4-<timestamp>`, then, in
+one transaction after the ownership migration:
+
+- adds columns to `shared_links` (`sid`, `url_key`, `app`, `source`, `raw`,
+  `status`, `note`, `updated_at`, `filed_at`), each only when it is missing.
+  Every existing row keeps every value it had and reads as a pending share of
+  its account — exactly the inbox it was;
+- creates `share_filings` (where each share was filed) and, in the tree store,
+  `tree_ops` (the log of filed links, see [Shared links](#shared-links));
+- sets every account's ops floor to its current tree version, so nothing from
+  before the upgrade can look like a gap a client may fold in.
+
+The boot log says `Share inbox: added …`. A failure rolls the step back,
+writes `data/MIGRATION_REFUSED` and stops, like the ownership migration.
+Running it again is a no-op. Rolling back to the previous image means
+restoring `sync.db.pre-v4-*` (the previous image refuses a schema-4 database);
+links shared or filed since are lost with it, so export what you need first.
+
 ## The tree
 
 `GET /api/tree` returns `{ version, roots, userId, serverId }` — an array of
@@ -230,6 +255,16 @@ current version — another device pushed in between — the push is refused wit
 write bumps the version and lands a `{format: 2, roots}` row in the history
 table.
 
+The one other write is a link filed from the share sheet (below): it appends
+a bookmark (and any new folders) without replacing anything, bumps the version
+once, and is logged in `tree_ops` instead of history. `GET
+/api/tree/ops?since=N` returns `{ version, floor, complete, ops }`: `complete`
+is true only when every change after N is such an append (or its undo). A
+client whose push met a 409 with a complete gap folds `ops` into its working
+copy and pushes again, so a link filed from the phone never turns into a
+conflict prompt on the computer. Any other change in the gap — a push, an
+approved proposal — makes it incomplete, and the client pulls as before.
+
 A working copy that belongs to another account is refused with **412**, which
 `force` does not override: `code: "wrong-account"` when `baseUserId` names
 someone else or `baseServerId` another server, `code: "foreign-ids"` when the
@@ -264,13 +299,21 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/tree` | the tree (+ virtual imports subtree), `userId` and `serverId` |
 | PUT | `/api/tree` | replace the tree `{ roots, baseVersion, baseUserId?, baseServerId?, deviceId?, force? }`; 409 on a stale baseVersion, 412 for another account's or server's copy |
 | GET | `/api/tree/version` | cheap freshness probe |
+| GET | `/api/tree/ops?since=N` | what a copy based on N missed, when that was only filed links: `{ version, floor, complete, ops, userId, serverId }` |
 | GET | `/api/history` | list of past tree versions |
 | GET | `/api/history/:id` | fetch a specific past version |
 | POST | `/api/push`, GET `/api/pull` | **410 Gone** — the legacy snapshot sync, kept only to tell old clients to update |
-| GET | `/api/shared` | pending links inbox |
-| POST | `/api/shared` | add `{ url, title? }` |
-| DELETE | `/api/shared/:id` | remove one inbox entry |
-| DELETE | `/api/shared` | clear inbox |
+| POST | `/api/shares` | take a share in `{ sid, url, title?, app?, urlKey?, source?, raw? }`; idempotent on `sid`; X / Instagram links are archived on arrival |
+| GET | `/api/shares` | `?status=pending\|filed\|archived\|dismissed&limit&before` — shares with their filings |
+| GET | `/api/shares/:sid` | one share (`id-<n>` addresses a share taken in without a sid) |
+| POST | `/api/shares/:sid/file` | `{ targets: [{folderId} \| {newFolder: {id, title, parentId}, existing?}], folders?, title?, url?, app? }` → `{ baseVersion, version, share, created, already, failed }`; 422 when every target failed |
+| POST | `/api/shares/:sid/unfile` | `{ folderIds? }` — undo: removes the bookmarks it made while unchanged and the folders it made while empty |
+| POST | `/api/shares/:sid/dismiss`, `/restore` | out of the inbox (never deleted), and back |
+| GET | `/api/shares/stats` | `{ apps: { <app>: [{ folderId, n, last }] } }` over the last year |
+| GET | `/api/prefs/share` | the share sheet's pins and hidden folders per app (an ordinary pref) |
+| GET | `/api/shared` | legacy: the waiting links, `{ links: [{ id, url, title, created_at }] }` |
+| POST | `/api/shared` | legacy: add `{ url, title? }` (http(s) only) |
+| DELETE | `/api/shared/:id`, `/api/shared` | legacy: dismiss one, or every waiting link of yours (nothing is deleted) |
 | POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`) |
 | GET | `/api/proposals` | list pending LLM note proposals |
 | POST | `/api/proposals/:id/approve` | apply a proposal to the tree (bumps the version) |
@@ -292,6 +335,40 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/imports/reddit/callback` | **no auth** — OAuth redirect, guarded by a one-shot `state`; asks which account receives the connection |
 | POST | `/api/imports/reddit/confirm` | **no auth** — the confirm page's form, guarded by a one-time nonce |
 | GET | `/` (and other paths) | serves the PWA |
+
+## Shared links
+
+Every link shared to the app — from the Android share sheet, a pasted link or
+the clipboard — is a row in the account's `shared_links`, made idempotent by
+the client's share id (`sid`): the service worker and the app may both upload
+the same share, and a retry after a lost answer lands one row. Its `status`:
+
+| status | means |
+|---|---|
+| `pending` | waiting in the inbox |
+| `archived` | an X or Instagram post: archived on arrival (as `/api/imports/capture` always did), waiting to be filed or left there |
+| `filed` | filed into one or more folders (`share_filings`) |
+| `dismissed` | Later / ✕ — out of the inbox, never deleted; `restore` brings it back |
+
+**Filing** (`POST /api/shares/:sid/file`) appends a bookmark at the end of each
+chosen folder in one transaction: new folders first (a client may send a
+folder it made itself and has not pushed, with its own id, so its later push
+matches), then the bookmarks, one version bump and one `tree_ops` append — no
+history snapshot, so a phone's shares cannot push the restore points out of
+the window. A folder already holding this share, or this exact URL, is
+reported as `already` and gets no second copy. Folders inside notes,
+workflows or pins, and the virtual archive, are refused. Other waiting shares
+of the same link are filed with it, and an X or Instagram share's archive row
+is marked filed so it is not drawn twice. **Undo** (`unfile`) removes the
+bookmarks it made while they still carry that URL and the folders it made
+while they are empty, and logs an unappend.
+
+**A forced push** from a copy that never saw a filing can erase it. When a
+`force` push's `baseVersion` is older than the server's, filings made since
+whose bookmark is gone are dropped, and a share left with none goes back to
+the inbox with the note *Removed by a forced push from <device>*. A push that
+saw the bookmark and deleted it was deliberate: the share stays filed, its
+filing marked `present: false`.
 
 ## LLM share links
 
@@ -423,6 +500,7 @@ node tools/test_share_sw.mjs   # PWA service worker share handling
 node tools/test_security.mjs  # token check, async scrypt, rate limiter, HTML escaping
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
 node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
+node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, legacy routes, forced-push safety net (starts a server)
 node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block
 ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off MAX_PROPOSALS_PER_USER=3 DATA_DIR=/tmp/tp node server/index.js &
 node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server

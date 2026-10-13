@@ -14,7 +14,9 @@
 // never reaching each other's tree, history, inbox, notes, proposals, imports
 // or prefs, a reset signing an account out (sign-ins racing it included), an
 // admin change decided by who is acting when it lands, a push stamped with
-// another server refused, and a delete removing exactly that account; and —
+// another server refused, and a delete removing exactly that account; the
+// share inbox's routes (tokens required, the legacy /api/shared contract, the
+// /share fallback); and —
 // last, because it locks this IP out — the login rate limit (expects
 // AUTH_MAX_FAILURES between 8 and 20).
 
@@ -307,6 +309,54 @@ for (let i = 0; i < 25 && adminLimited === null; i++) {
 check('wrong current passwords are rate-limited like sign-ins', adminLimited !== null, 'never limited');
 check("and that does not lock out the owner", (await call('/api/users', { token })).status === 200
     && (await call('/api/login', { method: 'POST', body: { username: USER, password: NEWPASS } })).status === 200);
+
+// 15b. The share inbox: every route needs a token and works with one, the
+// legacy /api/shared contract still holds, and the /share fallback still
+// hands all three fields to the app.
+const shareSid = 'auth-test-share-0001';
+const shareRoutes = [
+    ['POST', '/api/shares', { sid: shareSid, url: 'https://auth-share.example/a', title: 'A', app: 'site:auth-share.example' }, 200],
+    ['GET', '/api/shares', undefined, 200],
+    ['GET', '/api/shares/stats', undefined, 200],
+    ['GET', `/api/shares/${shareSid}`, undefined, 200],
+    ['POST', `/api/shares/${shareSid}/dismiss`, {}, 200],
+    ['POST', `/api/shares/${shareSid}/restore`, {}, 200],
+    ['POST', `/api/shares/${shareSid}/file`, { targets: [{ folderId: 'no-such-folder' }] }, 422],
+    ['POST', `/api/shares/${shareSid}/unfile`, {}, 200],
+    ['GET', `/api/tree/ops?since=${(await call('/api/tree/version', { token })).json?.version}`, undefined, 200],
+    ['PUT', '/api/prefs/share', { value: { v: 1, slots: 4, apps: {} } }, 200],
+    ['GET', '/api/prefs/share', undefined, 200]
+];
+for (const [method, p, body, want] of shareRoutes) {
+    const anon = await call(p, { method, body });
+    const authed = await call(p, { method, token, body });
+    check(`${method} ${p.replace(/since=\d+/, 'since=N')}: 401 without a token, ${want} with one`, anon.status === 401 && authed.status === want,
+        `HTTP ${anon.status} / ${authed.status} ${JSON.stringify(authed.json).slice(0, 200)}`);
+}
+const opsNow = await call(`/api/tree/ops?since=${(await call('/api/tree/version', { token })).json?.version}`, { token });
+check('/api/tree/ops from the current version is complete and empty', opsNow.json?.complete === true && opsNow.json.ops.length === 0
+    && opsNow.json.userId === OWNER_ID && opsNow.json.serverId === SERVER_ID, JSON.stringify(opsNow.json));
+const legacyAdd = await call('/api/shared', { method: 'POST', token, body: { url: 'https://legacy-contract.example/', title: 'Legacy' } });
+const legacyList = await call('/api/shared', { token });
+const legacyRow = (legacyList.json?.links || []).find(l => l.url === 'https://legacy-contract.example/');
+check('legacy POST /api/shared answers {ok, id, createdAt} and GET lists {id, url, title, created_at}',
+    legacyAdd.status === 200 && Number.isInteger(legacyAdd.json?.id) && legacyAdd.json.createdAt
+    && legacyRow && legacyRow.id === legacyAdd.json.id && legacyRow.title === 'Legacy' && legacyRow.created_at === legacyAdd.json.createdAt
+    && JSON.stringify(Object.keys(legacyRow).sort()) === JSON.stringify(['created_at', 'id', 'title', 'url']), JSON.stringify(legacyList.json));
+check('legacy POST /api/shared refuses a javascript: link',
+    (await call('/api/shared', { method: 'POST', token, body: { url: 'javascript:alert(1)' } })).status === 400);
+await call(`/api/shared/${legacyAdd.json?.id}`, { method: 'DELETE', token });
+check('legacy DELETE /api/shared/:id takes it out of the list', !(await call('/api/shared', { token })).json.links.some(l => l.id === legacyAdd.json?.id)
+    && (await call('/api/shares?status=dismissed', { token })).json.shares.some(s => s.url === 'https://legacy-contract.example/'));
+const fallback = await fetch(BASE + '/share', {
+    method: 'POST', redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ url: '', title: 'A title', text: 'Look https://x.com/a/status/9' }).toString()
+});
+const loc = new URL(fallback.headers.get('location') || '/', BASE);
+check('POST /share redirects into the app with url, title and text', fallback.status === 303 && loc.pathname === '/'
+    && loc.searchParams.get('share') === '1' && loc.searchParams.get('title') === 'A title'
+    && loc.searchParams.get('text') === 'Look https://x.com/a/status/9' && loc.searchParams.has('url'), `${fallback.status} ${loc.href}`);
 
 // 16. The OAuth callback echoes the provider's error, escaped.
 const cb = await fetch(BASE + '/api/imports/reddit/callback?error=' + encodeURIComponent('<script>alert(1)</script>'));

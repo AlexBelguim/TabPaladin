@@ -85,6 +85,64 @@ function rowsForExternalIds(store, sourceId, externalIds) {
     return store.itemsFor(sourceId).filter(r => wanted.has(String(r.external_id)));
 }
 
+// Capture a shared link into the archive it belongs to, for one account.
+// Shared by POST /api/imports/capture and the share inbox (shares.js), which
+// archives X and Instagram shares on arrival exactly as the capture route
+// always has. Returns {result, sourceId, externalId}: `result` is the
+// capture route's JSON, unchanged; the ids say which archive row it is.
+export function captureLink(store, userId, { url, title }) {
+    const hit = classify(url);
+    if (!hit) return { result: { ok: true, captured: false, reason: 'not a manual import source' }, sourceId: null, externalId: null };
+
+    // This account's active source for the provider, created on first use.
+    let source = store.listSources(userId).find(s => s.provider === hit.provider);
+    if (!source) {
+        source = store.createSource({
+            provider: hit.provider,
+            label: hit.label,
+            config: { listTitle: 'Saved' },
+            intervalMinutes: 60,
+            userId
+        });
+    }
+
+    // Already archived. Not an error — sharing the same post twice is a
+    // normal thing to do — and deliberately not re-upserted, so its capture
+    // date and therefore its month folder stay put.
+    if (store.itemByExternal(source.id, hit.externalId)) {
+        return {
+            result: { ok: true, captured: true, duplicate: true, provider: hit.provider, items: store.countItems(source.id).total },
+            sourceId: source.id, externalId: hit.externalId
+        };
+    }
+
+    // Deleted before, deliberately. Honour that rather than silently
+    // resurrecting it; re-sharing is a clear enough signal to undo it.
+    store.undismiss(source.id, [hit.externalId]);
+
+    // No date is available from a share, so capture time it is. It is
+    // written once and never updated, which is what keeps the monthly
+    // grouping stable.
+    const now = new Date().toISOString();
+    store.upsertItem(source.id, {
+        externalId: hit.externalId,
+        url: hit.url,
+        title: title || hit.url,
+        container: hit.container,
+        createdUtc: now,
+        extra: { capturedVia: 'share' }
+    });
+
+    return {
+        result: {
+            ok: true, captured: true, duplicate: false,
+            provider: hit.provider, sourceId: source.id,
+            items: store.countItems(source.id).total
+        },
+        sourceId: source.id, externalId: hit.externalId
+    };
+}
+
 export function attachRoutes(app, { store, requireAuth, accountName = () => null }) {
     // ?includeRemoved=1 adds removed sources (flagged `removed`), whose
     // archives are kept until purged.
@@ -239,52 +297,7 @@ export function attachRoutes(app, { store, requireAuth, accountName = () => null
     app.post('/api/imports/capture', requireAuth, (req, res) => {
         const { url, title } = req.body || {};
         if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing url' });
-
-        const hit = classify(url);
-        if (!hit) return res.json({ ok: true, captured: false, reason: 'not a manual import source' });
-
-        // This account's active source for the provider, created on first use.
-        let source = store.listSources(req.user.id).find(s => s.provider === hit.provider);
-        if (!source) {
-            source = store.createSource({
-                provider: hit.provider,
-                label: hit.label,
-                config: { listTitle: 'Saved' },
-                intervalMinutes: 60,
-                userId: req.user.id
-            });
-        }
-
-        // Already archived. Not an error — sharing the same post twice is a
-        // normal thing to do — and deliberately not re-upserted, so its capture
-        // date and therefore its month folder stay put.
-        const existing = store.itemsFor(source.id).find(i => i.external_id === hit.externalId);
-        if (existing) {
-            return res.json({ ok: true, captured: true, duplicate: true, provider: hit.provider, items: store.countItems(source.id).total });
-        }
-
-        // Deleted before, deliberately. Honour that rather than silently
-        // resurrecting it; re-sharing is a clear enough signal to undo it.
-        store.undismiss(source.id, [hit.externalId]);
-
-        // No date is available from a share, so capture time it is. It is
-        // written once and never updated, which is what keeps the monthly
-        // grouping stable.
-        const now = new Date().toISOString();
-        store.upsertItem(source.id, {
-            externalId: hit.externalId,
-            url: hit.url,
-            title: title || hit.url,
-            container: hit.container,
-            createdUtc: now,
-            extra: { capturedVia: 'share' }
-        });
-
-        res.json({
-            ok: true, captured: true, duplicate: false,
-            provider: hit.provider, sourceId: source.id,
-            items: store.countItems(source.id).total
-        });
+        res.json(captureLink(store, req.user.id, { url, title }).result);
     });
 
     // --- Reddit OAuth ---
