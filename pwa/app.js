@@ -6,6 +6,7 @@
 // Recent-links modal is appended to the current folder, then pushed.
 
 import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
+import * as NM from './notesModel.js';
 
 const LS = {
     url: 'tp_pwa_url',
@@ -27,10 +28,8 @@ const state = {
     pathIds: [],              // breadcrumb stack of folder identifiers (root, child, ...)
     inbox: [],                // [{id, url, title}]
     dirty: false,             // unsaved local edits to the snapshot
-    openNoteId: null,         // _pwaId of the note open in the detail view
-    editingNewNote: false,    // detail view is editing a not-yet-created note
-    newNotePrefill: null,     // optional pre-filled content for a new note (e.g. from a wikilink)
-    newNoteParentId: null,    // _pwaId of the notebook a new note is filed into (null = notes root)
+    view: 'home',             // 'home' (search, pins, bookmark folders) | 'notes'
+    nv: freshNv(),            // notes navigation: pane, scope, open note, editor draft
     proposals: [],            // pending LLM note proposals awaiting approval
     importers: [],            // configured import sources: [{id, provider, connected, items, ...}]
     importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
@@ -109,7 +108,8 @@ function showToast(message) {
     toast.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
     toast.style.textAlign = 'center';
     toast.style.pointerEvents = 'none';
-    toast.style.whiteSpace = 'nowrap';
+    toast.style.width = 'max-content';
+    toast.style.maxWidth = 'calc(100vw - 32px)';
     toast.textContent = message;
 
     document.body.appendChild(toast);
@@ -245,33 +245,19 @@ async function processImportHashIfAny() {
     const found = await ensureNotesFolder();
     if (!found) return;
 
-    if (notebook) {
-        let nb = (found.node.children || []).find(c =>
-            (c.type === 'folder' || c.type === 'root') && c.title === notebook);
-        if (!nb) {
-            nb = { type: 'folder', title: notebook, children: [] };
-            assignIds(nb);
-            found.node.children = found.node.children || [];
-            found.node.children.push(nb);
-            state.dirty = true;
-            try {
-                setStatus('Saving…');
-                await pushSnapshot();
-                setStatus('');
-            } catch (e) {
-                setStatus('');
-            }
-        }
-        state.newNoteParentId = nb._pwaId;
+    // The notebook is resolved the same way the server and the extension do
+    // (an exact top-level name, 'Parent / Child', a unique nested name), and
+    // a missing one is only created on ✓ Done — nothing is saved or pushed
+    // before the note has been reviewed.
+    let parentId = null;
+    let pendingNotebookName = null;
+    if (notebook && notebook.trim()) {
+        const res = NM.resolveNotebookByName(notesLibrary(), notebook);
+        if (res && res.id) parentId = res.id;
+        else if (res) pendingNotebookName = notebook.trim();
     }
-
-    state.newNotePrefill = content;
-    state.editingNewNote = true;
-    state.openNoteId = null;
-    renderView();
-    const sec = document.getElementById('notes-section');
-    if (sec) sec.scrollIntoView();
-    showToast('Review the note, then press Save.');
+    await startNewNote({ parentId, content, pendingNotebookName, from: 'Home' });
+    showToast('Review the note, then press ✓ Done.');
 }
 
 // --- Wire format <-> local shape ---
@@ -360,7 +346,12 @@ async function refreshInbox() {
 async function refreshProposals() {
     try {
         const data = await api('/api/proposals');
+        const before = state.proposals.length;
         state.proposals = data.proposals || [];
+        // They arrive after the first paint: Home's banner and the library's
+        // pending block need a redraw when the count changed.
+        if (state.snapshot && state.proposals.length !== before) renderView();
+        else syncBottomNav();
     } catch (e) {
         console.warn('Proposals fetch failed', e);
     }
@@ -401,9 +392,34 @@ function findNodeByPath(pathIds) {
 }
 
 // --- Render ---
+// What the last render showed, so a pane change can manage scrolling.
+let lastRender = { view: 'home', pane: null, noteId: null, scope: null };
+const nvScroll = { library: 0, list: 0, listScope: null };
+
 function renderView() {
     setStatus('');
-    document.body.classList.toggle('note-open', Boolean(state.openNoteId || state.editingNewNote));
+    const notes = state.view === 'notes';
+    const prev = lastRender;
+    const cur = { view: state.view, pane: state.nv.pane, noteId: state.nv.noteId, scope: state.nv.scope };
+    const desktop = isDesktop();
+
+    // A phone scrolls the page itself: remember where the pane being left was.
+    if (!desktop && prev.view === 'notes' && (cur.view !== 'notes' || prev.pane !== cur.pane)) {
+        if (prev.pane === 'library') nvScroll.library = window.scrollY;
+        if (prev.pane === 'list') { nvScroll.list = window.scrollY; nvScroll.listScope = prev.scope; }
+    }
+    // A desktop scrolls each pane on its own: keep them through the rebuild.
+    const paneScroll = {};
+    if (desktop && notes && prev.view === 'notes') {
+        for (const p of ['side', 'list', 'note']) {
+            const el = document.querySelector(`.nv-${p}`);
+            if (el) paneScroll[p] = el.scrollTop;
+        }
+    }
+
+    document.body.classList.toggle('view-notes', notes);
+    for (const p of ['library', 'list', 'note']) document.body.classList.toggle(`pane-${p}`, notes && cur.pane === p);
+    document.body.classList.toggle('nv-editing', notes && state.nv.editing);
     renderBreadcrumb();
     renderContent();
     updateInboxFab();
@@ -411,6 +427,28 @@ function renderView() {
         renderQuickFileSheet();
     }
     updatePushBtnState();
+    syncBottomNav();
+
+    if (notes) {
+        const paneChanged = prev.view !== 'notes' || prev.pane !== cur.pane;
+        const noteChanged = cur.pane === 'note' && prev.noteId !== cur.noteId;
+        if (desktop) {
+            const set = (p, y) => { const el = document.querySelector(`.nv-${p}`); if (el && y) el.scrollTop = y; };
+            set('side', paneScroll.side);
+            if (prev.scope === cur.scope) set('list', paneScroll.list);
+            if (!noteChanged && prev.noteId === cur.noteId) set('note', paneScroll.note);
+        } else if (paneChanged || noteChanged) {
+            // An opened note starts at its top, with its toolbar on screen;
+            // back from a note lands where the list was.
+            let y = 0;
+            if (cur.pane === 'list' && prev.pane === 'note' && nvScroll.listScope === cur.scope) y = nvScroll.list;
+            else if (cur.pane === 'library' && prev.view === 'notes') y = nvScroll.library;
+            window.scrollTo(0, y);
+        }
+    } else if (prev.view === 'notes') {
+        window.scrollTo(0, 0);
+    }
+    lastRender = cur;
 }
 
 function updatePushBtnState() {
@@ -438,8 +476,6 @@ function renderBreadcrumb() {
         a.addEventListener('click', (e) => {
             e.preventDefault();
             state.pathIds = state.pathIds.slice(0, idx + 1);
-            state.openNoteId = null;
-            state.editingNewNote = false;
             renderView();
         });
         bc.appendChild(a);
@@ -456,9 +492,8 @@ function renderContent() {
     const root = $('content');
     if (!root) return;
     root.innerHTML = '';
-    // An open note is a fullscreen page — no bookmark chrome around it.
-    if (state.openNoteId || state.editingNewNote) {
-        renderNotesSection(root);
+    if (state.view === 'notes') {
+        renderNotesScreen(root);
         return;
     }
     const node = findNodeByPath(state.pathIds);
@@ -466,9 +501,12 @@ function renderContent() {
         root.innerHTML = '<div class="empty">Folder not found.</div>';
         return;
     }
-    // The notes folder gets its own editor UI instead of generic bookmark rows.
+    // A path into the notes folder (left over from before Notes had a screen
+    // of its own) opens Notes instead of drawing notes as bookmark rows.
     if (isNotesFolder(node)) {
-        renderNotesView(root, node);
+        state.pathIds = [state.snapshot._pwaId];
+        state.view = 'notes';
+        queueMicrotask(renderView);
         return;
     }
     // Everything under the imports root is server-managed: the sweep rebuilds
@@ -509,7 +547,6 @@ function renderContent() {
     bookmarks.forEach(b => root.appendChild(renderBookmarkRow(b)));
 
     if (state.pathIds.length === 1) {
-        renderNotesSection(root);
         renderWorkflowsSection(root);
     }
 }
@@ -554,8 +591,6 @@ function renderFolderRow(folder) {
     `;
     row.addEventListener('click', () => {
         state.pathIds = [...state.pathIds, folder._pwaId];
-        state.openNoteId = null;
-        state.editingNewNote = false;
         renderView();
     });
     return row;
@@ -768,9 +803,9 @@ function renderHome(root) {
         wrap.appendChild(grid);
     }
 
-    // Quick actions. These delegate to the existing topbar/menu buttons rather
+    // Quick actions. Most delegate to the existing topbar/menu buttons rather
     // than re-implementing their handlers — the phone gets bigger targets for
-    // the same four things, and there is still one code path per action.
+    // the same things, and there is still one code path per action.
     const actionsHead = document.createElement('div');
     actionsHead.className = 'home-head';
     actionsHead.textContent = 'Quick actions';
@@ -779,7 +814,7 @@ function renderHome(root) {
     const actions = document.createElement('div');
     actions.className = 'home-actions';
     const ACTIONS = [
-        { label: '📝 Notes', cls: 'a-notes', delegate: 'notesBtn' },
+        { label: '+ New note', cls: 'a-notes', run: () => startNewNote({ parentId: null, from: 'Home' }) },
         { label: '📋 Unfiled links', cls: 'a-clip', delegate: 'clipBtn' },
         { label: '⬇️ Pull', cls: 'a-pull', delegate: 'pullBtn' },
         { label: '⬆️ Push', cls: 'a-push', delegate: 'pushBtn' }
@@ -790,6 +825,7 @@ function renderHome(root) {
         btn.className = 'home-action ' + a.cls;
         btn.textContent = a.label;
         btn.addEventListener('click', () => {
+            if (a.run) { a.run(); return; }
             const target = document.getElementById(a.delegate);
             if (target) target.click();
         });
@@ -797,60 +833,52 @@ function renderHome(root) {
     }
     wrap.appendChild(actions);
 
-    // Recent notes, with open-task counts read from the markdown.
-    const notesFolder = findNotesFolderWithPath();
-    const recent = collectRecentNotes(notesFolder?.node).slice(0, 4);
-    if (recent.length) {
+    // Proposals and imports wait in Notes; say so here.
+    const pending = [];
+    if (state.proposals.length) {
+        pending.push(`${state.proposals.length} note${state.proposals.length === 1 ? '' : 's'} waiting for approval`);
+    }
+    if (state.importBatch) pending.push('an import waiting for review');
+    if (pending.length) {
+        const banner = document.createElement('button');
+        banner.type = 'button';
+        banner.className = 'home-pending';
+        const text = pending.join(' · ');
+        banner.textContent = `${text.charAt(0).toUpperCase()}${text.slice(1)} · Review ›`;
+        banner.addEventListener('click', () => openNotes({ pane: 'library' }));
+        wrap.appendChild(banner);
+    }
+
+    // Recent notes: the three most recently edited, from any notebook depth.
+    // Notes has its own screen now; this is only the way back into the latest.
+    const lib = notesLibrary();
+    if (lib.notes.length) {
         const head = document.createElement('div');
-        head.className = 'home-head';
-        head.textContent = 'Recent notes';
+        head.className = 'home-head home-head-row';
+        head.innerHTML = `<span>Recent notes</span><button type="button" class="home-head-link">All ${lib.notes.length} ›</button>`;
+        head.querySelector('button').addEventListener('click', () => {
+            openNotes({ pane: 'list', scope: 'all', query: '', noteId: null });
+        });
         wrap.appendChild(head);
 
         const panel = document.createElement('div');
-        panel.className = 'home-panel';
-        for (const n of recent) {
-            const row = document.createElement('div');
-            row.className = 'home-note-row';
-            const left = document.createElement('span');
-            left.className = 'home-note-title';
-            left.textContent = n.title;
-            const right = document.createElement('span');
-            right.className = 'home-note-meta';
-            right.textContent = n.total ? `${n.open} of ${n.total} open` : '';
-            row.append(left, right);
-            row.addEventListener('click', () => {
-                state.openNoteId = n.id;
-                state.editingNewNote = false;
-                renderView();
-            });
+        panel.className = 'home-panel recent-notes';
+        const now = Date.now();
+        for (const n of NM.sortNotes(lib.notes, 'edited').slice(0, 3)) {
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'recent-note';
+            row.innerHTML =
+                `<span class="rn-top"><span class="rn-title${n.title ? '' : ' untitled'}">${escapeHtml(n.title || 'Untitled')}</span>`
+                + `<span class="rn-time">${escapeHtml(NM.relativeTime(n.updatedAt, now))}</span></span>`
+                + `<span class="rn-bottom"><span class="rn-preview">${escapeHtml(n.preview)}</span>${taskPillHtml(n.tasks)}</span>`;
+            row.addEventListener('click', () => openNoteById(n.id, { from: 'Home' }));
             panel.appendChild(row);
         }
         wrap.appendChild(panel);
     }
 
     root.appendChild(wrap);
-}
-
-// Notes anywhere under the notes root, newest-looking first, with task counts.
-function collectRecentNotes(node, out = []) {
-    if (!node) return out;
-    for (const child of node.children || []) {
-        if (isNoteBookmark(child)) {
-            const { content } = decodeNote(child);
-            let open = 0;
-            let total = 0;
-            for (const line of String(content).split(/\r?\n/)) {
-                const task = parseTaskLine(line);
-                if (!task) continue;
-                total++;
-                if (!task.checked) open++;
-            }
-            out.push({ id: child._pwaId, title: child.title || 'Untitled', open, total });
-        } else if (child.type === 'folder') {
-            collectRecentNotes(child, out);
-        }
-    }
-    return out;
 }
 
 function isNotesFolder(node) {
@@ -971,13 +999,24 @@ function isNoteBookmark(b) {
         && b.title !== '__tabpaladin_root__';
 }
 
+// Memoised by the url string: the notes screen reads every note on each
+// render, and a few hundred decodeURIComponent + JSON.parse calls per tap add
+// up on a phone. Callers get a copy, so the cache cannot be edited through it.
+const decodedNoteUrls = new Map();
+
 function decodeNote(b) {
-    try {
-        const p = JSON.parse(decodeURIComponent(b.url.slice(NOTE_DATA_PREFIX.length)));
-        return { content: p.content || '', createdAt: p.createdAt || null, updatedAt: p.updatedAt || null };
-    } catch (e) {
-        return { content: '', createdAt: null, updatedAt: null };
+    let hit = decodedNoteUrls.get(b.url);
+    if (!hit) {
+        try {
+            const p = JSON.parse(decodeURIComponent(b.url.slice(NOTE_DATA_PREFIX.length)));
+            hit = { content: p.content || '', createdAt: p.createdAt || null, updatedAt: p.updatedAt || null };
+        } catch (e) {
+            hit = { content: '', createdAt: null, updatedAt: null };
+        }
+        if (decodedNoteUrls.size > 2000) decodedNoteUrls.clear();
+        decodedNoteUrls.set(b.url, hit);
     }
+    return { ...hit };
 }
 
 function encodeNoteUrl({ content, createdAt, updatedAt }) {
@@ -999,38 +1038,6 @@ function findNotesFolderWithPath() {
         return null;
     };
     return walk(state.snapshot, [state.snapshot._pwaId]);
-}
-
-// Replace [[oldTitle]] with [[newTitle]] inside a content string.
-function rewriteWikiLink(content, oldTitle, newTitle) {
-    const escaped = oldTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return content.replace(new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`, 'g'), `[[${newTitle}]]`);
-}
-
-// Markdown task lists — mirrors NotesManager.parseTaskLine/toggleTaskAtLine in
-// the extension. The PWA is served standalone and can't import from src/.
-// The list marker is optional: a bare "[ ] thing" is treated as a task too,
-// because that is how people actually type them. Kept identical to
-// src/utils/notesManager.js — the two implementations must agree or a note
-// toggles on one device and not the other.
-const TASK_LINE_RE = /^(\s*)(?:[-*]\s+)?\[([ xX])\]\s?(.*)$/;
-
-function parseTaskLine(line) {
-    const m = String(line).match(TASK_LINE_RE);
-    if (!m) return null;
-    return { indent: m[1].length, checked: m[2].toLowerCase() === 'x', label: m[3] };
-}
-
-// Flip one checkbox, leaving every other character of the note untouched.
-function toggleTaskAtLine(content, lineIndex) {
-    const text = String(content == null ? '' : content);
-    const lines = text.split('\n');
-    if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= lines.length) return text;
-    const line = lines[lineIndex];
-    const m = line.match(/^(\s*(?:[-*]\s+)?\[)([ xX])(\])/);
-    if (!m) return text;
-    lines[lineIndex] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + line.slice(m[1].length + 1);
-    return lines.join('\n');
 }
 
 // Locate the notes folder, offering to create + push it if missing.
@@ -1069,213 +1076,1237 @@ async function ensureNotesFolder() {
     return findNotesFolderWithPath();
 }
 
-function buildNoteRow(note, onOpen) {
-    const meta = decodeNote(note);
-    const snippet = meta.content.replace(/\s+/g, ' ').trim().slice(0, 80);
-    const row = document.createElement('div');
-    row.className = 'row note';
-    row.innerHTML = `
-        <span class="icon">📝</span>
-        <div class="note-row-text">
-            <span class="title">${escapeHtml(note.title || 'Untitled')}</span>
-            ${snippet ? `<span class="snippet">${escapeHtml(snippet)}</span>` : ''}
-        </div>
-    `;
-    row.addEventListener('click', onOpen);
-    return row;
+// --- Notes screen -------------------------------------------------------------
+//
+// Notebook-first, the same three panes as the extension's notes page:
+//   library — All notes / Open tasks / Unfiled, then the notebook tree at any
+//             depth with its fold state remembered on this device
+//   list    — the scope's notes by last edit, with plain-text previews, task
+//             progress and scoped search
+//   note    — the note itself, read or edit
+// A phone shows one pane at a time and drills through them with real history
+// entries, so Android back walks note > list > library > Home. From 900px the
+// panes sit side by side — same DOM, CSS only.
+//
+// Tree, counts, previews, search and the title rule all come from
+// notesModel.js, the byte-identical twin of the extension's copy, so both
+// clients agree on every one of them.
+
+const NV_UI = { expanded: new Set(), sort: 'edited', prefs: NM.defaultNotesUi() };
+
+function notesStorage() {
+    try { return window.localStorage; } catch (e) { return null; }
 }
 
-// --- Notebooks: direct subfolders of the notes root act as named groups ---
-
-// All notes under a folder (recursively) as { note, parent } entries.
-function collectNotes(folder, out = []) {
-    for (const c of folder.children || []) {
-        if (isNoteBookmark(c)) out.push({ note: c, parent: folder });
-        else if (c && (c.type === 'folder' || c.type === 'root')) collectNotes(c, out);
-    }
-    return out;
+function loadNotesPrefs() {
+    const p = NM.readNotesUi(notesStorage());
+    NV_UI.expanded = new Set(p.expanded);
+    NV_UI.sort = p.sort;
+    NV_UI.prefs = p;
 }
 
-// Every note in the collection as { note, parent }, or [] when there is no notes folder.
-function allNotes() {
+// Per device, never synced. The mode field belongs to the extension's
+// Read/Edit/Split and is carried through untouched.
+function saveNotesPrefs() {
+    const prev = NM.readNotesUi(notesStorage());
+    NM.writeNotesUi(notesStorage(), {
+        ...prev,
+        expanded: [...NV_UI.expanded],
+        sort: NV_UI.sort,
+        scope: state.nv.scope,
+        noteId: state.nv.noteId || prev.noteId
+    });
+}
+
+function isFolderNode(n) {
+    return Boolean(n) && (n.type === 'folder' || n.type === 'root');
+}
+
+// How notesModel reads this app's nodes: folders, note bookmarks, _pwaId.
+const NOTES_ADAPTER = {
+    children: (n) => n.children || [],
+    isFolder: isFolderNode,
+    isNote: isNoteBookmark,
+    id: (n) => n._pwaId,
+    title: (n) => n.title || '',
+    fields: (n) => decodeNote(n)
+};
+
+function notesLibrary() {
     const found = findNotesFolderWithPath();
-    return found ? collectNotes(found.node) : [];
+    return found ? NM.buildLibrary(found.node, NOTES_ADAPTER) : NM.emptyLibrary();
 }
 
-// Find a note by _pwaId anywhere under folder; returns { note, parent } or null.
-function findNoteWithParent(folder, noteId) {
-    for (const c of folder.children || []) {
-        if (isNoteBookmark(c) && c._pwaId === noteId) return { note: c, parent: folder };
-        if (c && (c.type === 'folder' || c.type === 'root')) {
-            const r = findNoteWithParent(c, noteId);
-            if (r) return r;
-        }
-    }
-    return null;
-}
-
-// Direct subfolders of the notes root = notebooks.
-function notebookFolders(notesRoot) {
-    return (notesRoot.children || []).filter(c =>
-        (c.type === 'folder' || c.type === 'root') && c.title !== '__tabpaladin_meta__');
-}
-
-// --- Notes section (root view): notes live under the bookmarks, not in the tree ---
-function renderNotesSection(root) {
-    const section = document.createElement('div');
-    section.className = 'notes-section';
-    section.id = 'notes-section';
-
+// A node anywhere under the notes root: { node, parent, index }, or null.
+function findNotesNode(id) {
     const found = findNotesFolderWithPath();
-
-    // Detail view (existing note or new one) replaces the section content.
-    if ((state.editingNewNote || state.openNoteId) && found) {
-        let note = null;
-        let parent = found.node;
-        if (state.editingNewNote) {
-            parent = (found.node.children || []).find(c => c._pwaId === state.newNoteParentId) || found.node;
-        } else {
-            const r = findNoteWithParent(found.node, state.openNoteId);
-            if (r) {
-                note = r.note;
-                parent = r.parent;
-            } else {
-                state.openNoteId = null; // note vanished — fall back to the list
+    if (!found || !id) return null;
+    const walk = (folder) => {
+        const kids = folder.children || [];
+        for (let i = 0; i < kids.length; i++) {
+            if (kids[i]._pwaId === id) return { node: kids[i], parent: folder, index: i };
+            if (isFolderNode(kids[i])) {
+                const hit = walk(kids[i]);
+                if (hit) return hit;
             }
         }
-        if (state.editingNewNote || note) {
-            section.classList.add('detail-open');
-            renderNoteDetail(section, parent, note);
-            root.appendChild(section);
+        return null;
+    };
+    return walk(found.node);
+}
+
+// Every notes write goes through here: mark the copy dirty and push it, with
+// the usual 409 dialog. The phone's working copy lives only in memory, so a
+// note kept here unpushed would be gone after a reload — that is why notes
+// push in the same step, unlike the extension. One helper, so changing that
+// is a change in one place.
+async function commitNotesEdit(label = 'Saving…', doneToast = '') {
+    state.dirty = true;
+    updatePushBtnState();
+    try {
+        setStatus(label);
+        await pushSnapshot();
+        setStatus('');
+        if (doneToast) showToast(doneToast);
+        return true;
+    } catch (e) {
+        setStatus('');
+        showToast(`Push failed: ${e.message} — kept on this phone, use ⬆️ to retry.`);
+        return false;
+    } finally {
+        updatePushBtnState();
+        syncBottomNav();
+    }
+}
+
+// --- navigation ---
+
+function freshNv() {
+    return {
+        pane: 'library',          // 'library' | 'list' | 'note'
+        scope: 'all',             // 'all' | 'tasks' | 'unfiled' | 'nb:<id>'
+        noteId: null,
+        editing: false,
+        isNew: false,
+        newParentId: null,        // where a new note is filed (null = Unfiled)
+        pendingNotebookName: null, // an import link's notebook, created on ✓ Done
+        query: '',
+        from: 'Notes',            // label of where back goes
+        draft: null,              // the editor's text, kept across re-renders
+        loaded: null              // what the editor started from
+    };
+}
+
+// History entries pushed above the Home entry; stored in each entry too, so
+// a popstate knows where it landed.
+let navDepth = 0;
+let skipNavGuardOnce = false;
+
+function isDesktop() {
+    return window.matchMedia('(min-width: 900px)').matches;
+}
+
+function nvHistoryState() {
+    const nv = state.nv;
+    return { tp: 'nv', depth: navDepth, pane: nv.pane, scope: nv.scope, noteId: nv.noteId, from: nv.from, query: nv.query };
+}
+
+function placeLabel(lib) {
+    if (state.view !== 'notes') return 'Home';
+    if (state.nv.pane === 'library') return 'Notes';
+    if (state.nv.pane === 'list') return NM.scopeLabel(lib || notesLibrary(), state.nv.scope);
+    const hit = findNotesNode(state.nv.noteId);
+    return hit ? hit.node.title || 'Untitled' : 'Notes';
+}
+
+// Show Notes or move within it. Every pane change is a history entry with the
+// URL left as it is — no hash, so back and forward never reach the #note= /
+// #notes= / #reorder= import handler. mode: 'auto' (push when the pane
+// changes), 'push', 'replace' or 'none'.
+function openNotes(patch = {}, { history: mode = 'auto' } = {}) {
+    const wasNotes = state.view === 'notes';
+    const prevPane = state.nv.pane;
+    const from = placeLabel();
+    const next = { ...state.nv, ...patch };
+    const push = mode === 'push' || (mode === 'auto' && (!wasNotes || prevPane !== next.pane));
+    if (push && patch.from === undefined) next.from = from;
+    state.view = 'notes';
+    state.nv = next;
+    if (push) {
+        navDepth++;
+        history.pushState(nvHistoryState(), '', location.pathname);
+    } else if (mode !== 'none') {
+        history.replaceState(nvHistoryState(), '', location.pathname);
+    }
+    saveNotesPrefs();
+    renderView();
+}
+
+function editorDirty() {
+    const nv = state.nv;
+    if (state.view !== 'notes' || !nv.editing || nv.draft == null) return false;
+    if (nv.isNew) return nv.draft.trim() !== '';
+    return nv.draft !== (nv.loaded == null ? '' : nv.loaded);
+}
+
+// The guard on every way out of an edit: back, the bottom nav, wikilinks, the
+// wordmark, another note.
+function confirmDiscardEdit() {
+    return !editorDirty() || confirm('Discard unsaved changes?');
+}
+
+function stopEditing() {
+    Object.assign(state.nv, {
+        editing: false,
+        isNew: false,
+        draft: null,
+        loaded: null,
+        newParentId: null,
+        pendingNotebookName: null
+    });
+}
+
+// Notes from the topbar 📝 or the tab bar. A phone always lands on the
+// library; a desktop comes back to the last scope and note.
+function enterNotes() {
+    if (state.view === 'notes') {
+        if (isDesktop()) return;
+        if (!confirmDiscardEdit()) return;
+        stopEditing();
+        openNotes({ pane: 'library' });
+        return;
+    }
+    const lib = notesLibrary();
+    const p = NV_UI.prefs;
+    const scopeOk = !NM.notebookIdOf(p.scope) || lib.notebooks.has(NM.notebookIdOf(p.scope));
+    stopEditing();
+    if (isDesktop()) {
+        const last = p.noteId && lib.notes.find(n => n.id === p.noteId);
+        openNotes({
+            pane: last ? 'note' : 'list',
+            scope: scopeOk ? p.scope : 'all',
+            noteId: last ? last.id : null,
+            query: ''
+        });
+    } else {
+        openNotes({ pane: 'library', scope: scopeOk ? p.scope : 'all', noteId: null, query: '' });
+    }
+}
+
+function goHome() {
+    if (!state.snapshot) return;
+    if (!confirmDiscardEdit()) return;
+    stopEditing();
+    closeNotesSheets();
+    state.pathIds = [state.snapshot._pwaId];
+    if (state.view === 'notes' && navDepth > 0) {
+        // Unwind to the Home entry so back from Home leaves the app, as it should.
+        skipNavGuardOnce = true;
+        history.go(-navDepth);
+        return;
+    }
+    state.view = 'home';
+    renderView();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// '‹' in the list or note toolbar: back to wherever you came from.
+function nvBack({ confirmed = false } = {}) {
+    if (!confirmed && !confirmDiscardEdit()) return;
+    if (navDepth > 0) {
+        skipNavGuardOnce = true;
+        history.back();
+        return;
+    }
+    // Nothing of ours to go back to (a reload landed here): step up by hand.
+    stopEditing();
+    const pane = state.nv.pane;
+    if (pane === 'note') openNotes({ pane: 'list' }, { history: 'replace' });
+    else if (pane === 'list') openNotes({ pane: 'library' }, { history: 'replace' });
+    else {
+        state.view = 'home';
+        history.replaceState(null, '', location.pathname);
+        renderView();
+    }
+}
+
+function onNotesPopState(e) {
+    const st = e.state && e.state.tp === 'nv' ? e.state : null;
+    if (!skipNavGuardOnce && editorDirty() && !confirm('Discard unsaved changes?')) {
+        // Stay: put back the entry back just took away.
+        history.pushState(nvHistoryState(), '', location.pathname);
+        return;
+    }
+    skipNavGuardOnce = false;
+    stopEditing();
+    closeNotesSheets();
+    navDepth = st ? Math.max(0, Number(st.depth) || 0) : 0;
+    if (!st) {
+        state.view = 'home';
+    } else {
+        state.view = 'notes';
+        Object.assign(state.nv, {
+            pane: st.pane || 'library',
+            scope: st.scope || 'all',
+            noteId: st.noteId || null,
+            from: st.from || 'Notes',
+            query: st.query || ''
+        });
+    }
+    renderView();
+}
+
+function openNoteById(id, { from } = {}) {
+    if (!confirmDiscardEdit()) return;
+    stopEditing();
+    const patch = { pane: 'note', noteId: id };
+    if (from) patch.from = from;
+    // Desktop switches notes in place; a phone stacks them so back returns.
+    const same = state.nv.pane === 'note';
+    openNotes(patch, { history: same && isDesktop() ? 'replace' : 'auto' });
+}
+
+async function startNewNote({ parentId = null, content = '', from, pendingNotebookName = null } = {}) {
+    if (!confirmDiscardEdit()) return;
+    const found = await ensureNotesFolder();
+    if (!found) return;
+    stopEditing();
+    const patch = {
+        pane: 'note', noteId: null, isNew: true, editing: true,
+        newParentId: parentId, pendingNotebookName,
+        draft: content, loaded: content
+    };
+    if (from) patch.from = from;
+    openNotes(patch, { history: 'push' });
+    focusNoteEditor();
+}
+
+function focusNoteEditor() {
+    requestAnimationFrame(() => {
+        const ta = document.getElementById('note-body-input');
+        if (!ta) return;
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+    });
+}
+
+// Drop scope and note ids a pull or another device removed.
+function validateNv(lib) {
+    const nv = state.nv;
+    const nbId = NM.notebookIdOf(nv.scope);
+    if (nbId && !lib.notebooks.has(nbId)) nv.scope = 'all';
+    if (nv.noteId && !nv.isNew && !lib.notes.some(n => n.id === nv.noteId)) {
+        nv.noteId = null;
+        if (nv.editing && nv.draft != null) {
+            // The note vanished under an edit: keep the text as a new note.
+            nv.isNew = true;
+            showToast('This note was removed elsewhere — ✓ Done keeps your text as a new note.');
+        } else {
+            stopEditing();
+            if (nv.pane === 'note' && !isDesktop()) nv.pane = 'list';
+        }
+    }
+}
+
+// --- rendering ---
+
+function nvEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = text;
+    return el;
+}
+
+function taskPillHtml(tasks) {
+    if (!tasks || !tasks.total) return '';
+    if (tasks.open === 0) return `<span class="nv-pill done" title="All tasks done">✓ ${tasks.done}/${tasks.total}</span>`;
+    const pct = Math.round((tasks.done / tasks.total) * 100);
+    return `<span class="nv-pill" title="${tasks.done} of ${tasks.total} tasks done">`
+        + `<span class="nv-pill-bar"><span style="width:${pct}%"></span></span>${tasks.done}/${tasks.total}</span>`;
+}
+
+function noteRowHtml(note, { chip = false, titleRanges = null, snippet = null, now = Date.now() } = {}) {
+    const untitled = !String(note.title || '').trim();
+    const title = untitled
+        ? 'Untitled'
+        : (titleRanges && titleRanges.length ? NM.highlightHtml(note.title, titleRanges, escapeHtml) : escapeHtml(note.title));
+    const preview = snippet
+        ? `${escapeHtml(snippet.before)}<mark>${escapeHtml(snippet.hit)}</mark>${escapeHtml(snippet.after)}`
+        : escapeHtml(note.preview);
+    const pathChip = chip && note.notebookId
+        ? `<span class="nv-chip" title="${escapeHtml(note.path.join(' › '))}">📓 ${escapeHtml(NM.pathLabel(note.path, 28))}</span>`
+        : '';
+    const chips = taskPillHtml(note.tasks) + pathChip;
+    const selected = state.nv.noteId === note.id && !state.nv.isNew;
+    return `<div class="nv-row${selected ? ' selected' : ''}" data-nv="open-note" data-id="${escapeHtml(note.id)}" role="button" tabindex="0">`
+        + `<div class="nv-row-top"><span class="nv-row-title${untitled ? ' untitled' : ''}">${title}</span>`
+        + `<span class="nv-row-time">${escapeHtml(NM.relativeTime(note.updatedAt, now))}</span></div>`
+        + (preview ? `<div class="nv-row-preview">${preview}</div>` : '')
+        + (chips ? `<div class="nv-row-chips">${chips}</div>` : '')
+        + '</div>';
+}
+
+function renderNotesScreen(root) {
+    root.classList.remove('in-imports');
+    const lib = notesLibrary();
+    validateNv(lib);
+    const nv = nvEl('div', 'nv');
+    nv.append(renderNvSide(lib), renderNvList(lib), renderNvNote(lib));
+    root.appendChild(nv);
+}
+
+function renderNvSide(lib) {
+    const pane = nvEl('section', 'nv-pane nv-side');
+    const head = nvEl('div', 'nv-side-head');
+    head.innerHTML = '<h2>Notes</h2><button type="button" class="nv-round primary" data-nv="new-note" aria-label="New note" title="New note">+</button>';
+    pane.appendChild(head);
+
+    const search = nvEl('button', 'nv-searchbar', '🔍 Search notes');
+    search.type = 'button';
+    search.dataset.nv = 'search';
+    pane.appendChild(search);
+
+    // Proposals and import review wait here, unchanged.
+    if (state.importBatch) pane.appendChild(renderImportBlock());
+    if (state.proposals.length > 0) pane.appendChild(renderProposalsBlock());
+
+    const scopes = nvEl('div', 'nv-card nv-scopes');
+    scopes.innerHTML = [
+        ['all', '🗒', 'All notes', lib.counts.all],
+        ['tasks', '☐', 'Open tasks', lib.counts.openTasks],
+        ['unfiled', '📥', 'Unfiled', lib.counts.unfiled]
+    ].map(([s, icon, label, n]) =>
+        `<button type="button" class="nv-scope${state.nv.scope === s ? ' selected' : ''}" data-nv="scope" data-scope="${s}">`
+        + `<span class="nv-ico" aria-hidden="true">${icon}</span><span class="nv-name">${label}</span>`
+        + `<span class="nv-count">${n}</span><span class="nv-chev-r" aria-hidden="true">›</span></button>`).join('');
+    pane.appendChild(scopes);
+
+    const label = nvEl('div', 'nv-label-row');
+    label.innerHTML = '<span>Notebooks</span><button type="button" class="nv-text-btn" data-nv="new-notebook">+ New notebook</button>';
+    pane.appendChild(label);
+
+    const tree = nvEl('div', 'nv-tree');
+    const rows = [];
+    const walk = (books) => {
+        for (const b of books) {
+            const kids = b.children.length > 0;
+            const open = kids && NV_UI.expanded.has(b.id);
+            const id = escapeHtml(b.id);
+            const name = escapeHtml(b.title || '(unnamed)');
+            rows.push(
+                `<div class="nv-tree-row${state.nv.scope === 'nb:' + b.id ? ' selected' : ''}" style="--depth:${b.depth}">`
+                + (kids
+                    ? `<button type="button" class="nv-fold${open ? ' open' : ''}" data-nv="fold" data-id="${id}" aria-expanded="${open}" aria-label="${open ? 'Collapse' : 'Expand'} ${name}"><span aria-hidden="true">▸</span></button>`
+                    : '<span class="nv-fold-space"></span>')
+                + `<button type="button" class="nv-tree-name" data-nv="open-nb" data-id="${id}">`
+                + `<span class="nv-ico" aria-hidden="true">📓</span><span class="nv-name">${name}</span>`
+                + `<span class="nv-count">${b.totalCount}</span></button>`
+                + `<button type="button" class="nv-more" data-nv="nb-menu" data-id="${id}" aria-label="Actions for ${name}">⋯</button>`
+                + '</div>');
+            if (open) walk(b.children);
+        }
+    };
+    walk(lib.roots);
+    tree.innerHTML = rows.join('');
+    pane.appendChild(tree);
+
+    if (!lib.notes.length && !lib.roots.length) {
+        const empty = nvEl('div', 'nv-empty');
+        empty.innerHTML = '<p>No notes yet</p><button type="button" class="primary" data-nv="new-note">+ New note</button>';
+        pane.appendChild(empty);
+    }
+
+    const share = nvEl('button', 'ghost-block nv-share', '🔗 Share notes with an LLM (1-hour link)');
+    share.type = 'button';
+    share.dataset.nv = 'share';
+    share.title = 'Create a 1-hour link with your notes + instructions to paste into any LLM chat';
+    pane.appendChild(share);
+    return pane;
+}
+
+function renderNvList(lib) {
+    const nv = state.nv;
+    const pane = nvEl('section', 'nv-pane nv-list');
+    const nbId = NM.notebookIdOf(nv.scope);
+    const nb = nbId ? lib.notebooks.get(nbId) : null;
+    const label = NM.scopeLabel(lib, nv.scope);
+
+    const back = nvEl('div', 'nv-backrow');
+    back.innerHTML = `<button type="button" class="nv-back" data-nv="list-back">‹ ${escapeHtml(nv.pane === 'list' ? nv.from || 'Notes' : 'Notes')}</button>`
+        + '<span class="nv-spacer"></span>'
+        + '<button type="button" class="nv-icon" data-nv="new-note" aria-label="New note" title="New note">+</button>'
+        + (nb ? '<button type="button" class="nv-icon" data-nv="list-menu" aria-label="Notebook actions" title="Notebook actions">⋯</button>' : '');
+    pane.appendChild(back);
+
+    const head = nvEl('div', 'nv-list-head');
+    const count = nb ? nb.totalCount : NM.notesInScope(lib, nv.scope).length;
+    const sub = [nb && nb.depth > 0 ? nb.path.join(' › ') : '', `${count} note${count === 1 ? '' : 's'}`].filter(Boolean).join(' · ');
+    head.innerHTML = `<h2>${escapeHtml(label)}</h2><div class="nv-sub">${escapeHtml(sub)}</div>`;
+    pane.appendChild(head);
+
+    const tools = nvEl('div', 'nv-tools');
+    tools.innerHTML =
+        `<input type="search" class="nv-search" id="nv-search" autocomplete="off" spellcheck="false" aria-label="Search notes"`
+        + ` placeholder="${escapeHtml(nv.scope === 'all' ? 'Search all notes' : `Search in ${label}`)}">`
+        + '<select class="nv-sort" id="nv-sort" aria-label="Sort notes">'
+        + `<option value="edited"${NV_UI.sort === 'edited' ? ' selected' : ''}>Edited ▾</option>`
+        + `<option value="title"${NV_UI.sort === 'title' ? ' selected' : ''}>Title A–Z ▾</option>`
+        + `<option value="manual"${NV_UI.sort === 'manual' ? ' selected' : ''}>Manual ▾</option>`
+        + '</select>';
+    tools.querySelector('input').value = nv.query;
+    pane.appendChild(tools);
+
+    const results = nvEl('div', 'nv-results');
+    results.id = 'nv-results';
+    fillNvResults(results, lib);
+    pane.appendChild(results);
+    return pane;
+}
+
+function fillNvResults(box, lib) {
+    const nv = state.nv;
+    const nbId = NM.notebookIdOf(nv.scope);
+    const nb = nbId ? lib.notebooks.get(nbId) : null;
+    const label = NM.scopeLabel(lib, nv.scope);
+    const pool = NM.notesInScope(lib, nv.scope);
+    const now = Date.now();
+    const q = nv.query.trim();
+    const html = [];
+
+    if (q) {
+        const scoped = nv.scope !== 'all';
+        const hits = NM.searchNotes(lib, q, nb ? { notebookId: nb.id } : scoped ? { notes: pool } : {});
+        if (!hits.length) {
+            html.push(`<div class="nv-empty"><p>No notes match “${escapeHtml(q)}”</p>`
+                + `<button type="button" class="primary" data-nv="create-from-query">+ Create note “${escapeHtml(q)}”</button>`
+                + (scoped ? '<button type="button" class="ghost-block" data-nv="search-all">Search all notes</button>' : '')
+                + '</div>');
+        } else {
+            html.push(`<div class="nv-summary">${hits.length} match${hits.length === 1 ? '' : 'es'}`
+                + (scoped ? ` in ${escapeHtml(label)} · <button type="button" class="nv-text-btn" data-nv="search-all">Search all notes</button>` : '')
+                + '</div>');
+            for (const r of hits) html.push(noteRowHtml(r.note, { chip: true, titleRanges: r.titleRanges, snippet: r.snippet, now }));
+        }
+    } else {
+        if (nb) {
+            for (const child of nb.children) {
+                html.push(`<button type="button" class="nv-subnb" data-nv="open-nb" data-id="${escapeHtml(child.id)}">`
+                    + `<span class="nv-ico" aria-hidden="true">📓</span><span class="nv-name">${escapeHtml(child.title || '(unnamed)')}</span>`
+                    + `<span class="nv-count">${child.totalCount}</span><span class="nv-chev-r" aria-hidden="true">›</span></button>`);
+            }
+        }
+        const chip = nv.scope === 'all' || nv.scope === 'tasks';
+        const notes = NM.sortNotes(pool, NV_UI.sort);
+        if (NV_UI.sort === 'edited') {
+            for (const g of NM.groupByRecency(notes, now)) {
+                html.push(`<div class="nv-bucket">${escapeHtml(g.bucket)}</div>`);
+                for (const n of g.notes) html.push(noteRowHtml(n, { chip, now }));
+            }
+        } else {
+            for (const n of notes) html.push(noteRowHtml(n, { chip, now }));
+        }
+        if (!notes.length && !(nb && nb.children.length)) {
+            if (nb) {
+                html.push(`<div class="nv-empty"><p>No notes in ${escapeHtml(label)} yet</p>`
+                    + '<button type="button" class="primary" data-nv="new-here">+ New note here</button></div>');
+            } else if (nv.scope === 'tasks') {
+                html.push('<div class="nv-empty"><p>No open tasks.</p></div>');
+            } else if (nv.scope === 'unfiled') {
+                html.push('<div class="nv-empty"><p>No unfiled notes.</p></div>');
+            } else {
+                html.push('<div class="nv-empty"><p>No notes yet</p><button type="button" class="primary" data-nv="new-note">+ New note</button></div>');
+            }
+        }
+    }
+    box.innerHTML = html.join('');
+}
+
+let nvSearchTimer = null;
+function onNvSearchInput(input) {
+    clearTimeout(nvSearchTimer);
+    nvSearchTimer = setTimeout(() => {
+        state.nv.query = input.value;
+        history.replaceState(nvHistoryState(), '', location.pathname);
+        const box = document.getElementById('nv-results');
+        if (box) {
+            fillNvResults(box, notesLibrary());
+            box.scrollTop = 0;
+        }
+    }, 100);
+}
+
+function renderNvNote(lib) {
+    const nv = state.nv;
+    const pane = nvEl('section', 'nv-pane nv-note');
+    const note = nv.noteId ? lib.notes.find(n => n.id === nv.noteId) : null;
+    if (!note && !nv.isNew) {
+        pane.appendChild(nvEl('div', 'nv-note-empty', 'Select a note, or press + to start one'));
+        return pane;
+    }
+
+    const page = nvEl('div', 'note-page');
+    const bar = nvEl('div', 'note-topbar');
+    const backLabel = nv.from || 'Notes';
+    let right;
+    if (nv.editing) {
+        right = '<button type="button" data-nv="cancel-edit" title="Discard changes" aria-label="Discard changes">✕</button>'
+            + '<button type="button" class="note-done primary" data-nv="done" title="Save (Ctrl+S)">✓ Done</button>';
+    } else {
+        right = '<button type="button" data-nv="edit" title="Edit" aria-label="Edit">✏️</button>'
+            + '<div class="note-menu-wrap"><button type="button" data-nv="note-menu" title="More" aria-label="More">⋯</button>'
+            + '<div id="note-menu-pop" class="hidden">'
+            + '<button type="button" class="menu-item" data-nv="rename-note">Rename…</button>'
+            + '<button type="button" class="menu-item" data-nv="move-note">Move to…</button>'
+            + '<hr>'
+            + '<button type="button" class="menu-item danger" data-nv="delete-note">Delete note</button>'
+            + '</div></div>';
+    }
+    bar.innerHTML = `<button type="button" class="nv-back" data-nv="note-back">‹ ${escapeHtml(backLabel)}</button>`
+        + `<div class="note-topbar-right">${right}</div>`;
+    page.appendChild(bar);
+
+    if (nv.editing) {
+        if (nv.isNew) {
+            let where = 'Unfiled';
+            if (nv.pendingNotebookName) where = `${nv.pendingNotebookName} (new)`;
+            else if (nv.newParentId && lib.notebooks.has(nv.newParentId)) where = lib.notebooks.get(nv.newParentId).title || '(unnamed)';
+            const chip = nvEl('button', 'nv-crumb', `in ${where} ▾`);
+            chip.type = 'button';
+            chip.dataset.nv = 'crumb';
+            chip.title = 'Choose where the new note is filed';
+            page.appendChild(chip);
+        }
+        const ta = nvEl('textarea');
+        ta.id = 'note-body-input';
+        ta.placeholder = '# Note title…';
+        ta.value = nv.draft == null ? '' : nv.draft;
+        page.appendChild(ta);
+        requestAnimationFrame(() => autogrowNoteEditor(ta));
+    } else {
+        const nb = note.notebookId ? lib.notebooks.get(note.notebookId) : null;
+        const crumb = nvEl('button', 'nv-crumb', nb ? `📓 ${NM.pathLabel(nb.path, 34)}` : '📥 Unfiled');
+        crumb.type = 'button';
+        crumb.dataset.nv = 'crumb';
+        crumb.title = `${nb ? nb.path.join(' › ') : 'Unfiled'} — Move to…`;
+        page.appendChild(crumb);
+        const h1 = nvEl('h1', 'note-title' + (note.title ? '' : ' untitled'), note.title || 'Untitled');
+        page.appendChild(h1);
+        const meta = NM.noteMetaLine(note);
+        if (meta) page.appendChild(nvEl('div', 'note-meta', meta));
+        const body = nvEl('div', 'note-preview-body');
+        body.id = 'note-preview';
+        body.innerHTML = renderNotePreviewHtml(note.content, note.title)
+            || '<span style="color:var(--muted);">Empty note. Tap ✏️ to write.</span>';
+        const links = NM.backlinksTo(lib, note.title, note.id);
+        if (links.length) {
+            body.insertAdjacentHTML('beforeend', '<div class="note-backlinks"><span style="color:var(--muted);">Linked from:</span> '
+                + links.map(n => `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title || 'Untitled')}</span>`).join(' ')
+                + '</div>');
+        }
+        page.appendChild(body);
+    }
+    pane.appendChild(page);
+    return pane;
+}
+
+// Grow the editor with the content — a note page, not a fixed input box.
+function autogrowNoteEditor(ta) {
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = Math.max(ta.scrollHeight, Math.round(window.innerHeight * 0.6)) + 'px';
+}
+
+// --- note actions ---
+
+function startEditing() {
+    const hit = findNotesNode(state.nv.noteId);
+    if (!hit) return;
+    const content = decodeNote(hit.node).content;
+    Object.assign(state.nv, { editing: true, isNew: false, draft: content, loaded: content });
+    renderView();
+    focusNoteEditor();
+}
+
+function cancelEditing() {
+    if (!confirmDiscardEdit()) return;
+    if (state.nv.isNew) {
+        // Cancelling a brand-new note leaves the page entirely.
+        stopEditing();
+        nvBack({ confirmed: true });
+        return;
+    }
+    stopEditing();
+    renderView();
+}
+
+// Rewrite [[Old]] in every other note after a rename. Their edited time is
+// kept: a rename is not an edit of theirs, and bumping it would jump them all
+// to the top of Recent.
+function rewriteLinksAfterRename(oldTitle, newTitle, exceptId) {
+    const found = findNotesFolderWithPath();
+    if (!found || !oldTitle || oldTitle === newTitle) return;
+    const walk = (folder) => {
+        for (const c of folder.children || []) {
+            if (isNoteBookmark(c) && c._pwaId !== exceptId) {
+                const meta = decodeNote(c);
+                const rewritten = NM.rewriteWikiLink(meta.content, oldTitle, newTitle);
+                if (rewritten !== meta.content) {
+                    c.url = encodeNoteUrl({ content: rewritten, createdAt: meta.createdAt, updatedAt: meta.updatedAt });
+                }
+            } else if (isFolderNode(c)) {
+                walk(c);
+            }
+        }
+    };
+    walk(found.node);
+}
+
+// Create the folders an import link named, now that the note is being saved.
+function ensureNotebookByName(name) {
+    const found = findNotesFolderWithPath();
+    if (!found) return null;
+    const res = NM.resolveNotebookByName(notesLibrary(), name);
+    if (!res) return found.node;
+    if (res.id) return findNotesNode(res.id)?.node || found.node;
+    let parent = res.create.parentId ? findNotesNode(res.create.parentId)?.node : found.node;
+    if (!parent) parent = found.node;
+    for (const segment of res.create.segments) {
+        const nb = { type: 'folder', title: segment, children: [] };
+        assignIds(nb);
+        parent.children = parent.children || [];
+        parent.children.push(nb);
+        NV_UI.expanded.add(parent._pwaId);
+        parent = nb;
+    }
+    return parent;
+}
+
+async function saveNoteEdit() {
+    const nv = state.nv;
+    if (!nv.editing) return;
+    const found = await ensureNotesFolder();
+    if (!found) return;
+    const content = nv.draft == null ? '' : nv.draft;
+    const now = new Date().toISOString();
+    if (nv.isNew) {
+        let parent = null;
+        if (nv.pendingNotebookName) parent = ensureNotebookByName(nv.pendingNotebookName);
+        else if (nv.newParentId) parent = findNotesNode(nv.newParentId)?.node;
+        if (!isFolderNode(parent)) parent = found.node;
+        const r = NM.resolveTitleOnSave({ storedTitle: null, loadedContent: nv.loaded || '', newContent: content });
+        const note = { type: 'bookmark', title: r.title, url: encodeNoteUrl({ content: r.content, createdAt: now, updatedAt: now }) };
+        assignIds(note);
+        parent.children = parent.children || [];
+        parent.children.push(note);
+        stopEditing();
+        nv.noteId = note._pwaId;
+        history.replaceState(nvHistoryState(), '', location.pathname);
+    } else {
+        const hit = findNotesNode(nv.noteId);
+        if (!hit) {
+            showToast('This note is gone — copy your text before leaving.');
+            return;
+        }
+        const note = hit.node;
+        const meta = decodeNote(note);
+        const r = NM.resolveTitleOnSave({
+            storedTitle: note.title,
+            loadedContent: nv.loaded == null ? meta.content : nv.loaded,
+            newContent: content
+        });
+        const oldTitle = note.title;
+        note.title = r.title;
+        note.url = encodeNoteUrl({ content: r.content, createdAt: meta.createdAt || now, updatedAt: now });
+        rewriteLinksAfterRename(oldTitle, r.title, note._pwaId);
+        stopEditing();
+    }
+    saveNotesPrefs();
+    renderView();
+    await commitNotesEdit('Saving…', 'Note saved.');
+    renderView();
+}
+
+async function toggleNoteTask(line) {
+    const hit = findNotesNode(state.nv.noteId);
+    if (!hit || state.nv.editing) return;
+    const meta = decodeNote(hit.node);
+    const updated = NM.toggleTaskAtLine(meta.content, line);
+    if (updated === meta.content) return;
+    const now = new Date().toISOString();
+    hit.node.url = encodeNoteUrl({ content: updated, createdAt: meta.createdAt || now, updatedAt: now });
+    renderView();
+    await commitNotesEdit();
+    renderView();
+}
+
+async function renameNote(id) {
+    const hit = findNotesNode(id);
+    if (!hit) return;
+    const note = hit.node;
+    const meta = decodeNote(note);
+    const name = prompt('Rename note:', note.title || '');
+    if (name === null) return;
+    const r = NM.resolveTitleOnSave({
+        storedTitle: note.title, loadedContent: meta.content, newContent: meta.content, titleField: name
+    });
+    if (r.title === note.title && r.content === meta.content) return;
+    const now = new Date().toISOString();
+    const oldTitle = note.title;
+    note.title = r.title;
+    note.url = encodeNoteUrl({ content: r.content, createdAt: meta.createdAt || now, updatedAt: now });
+    rewriteLinksAfterRename(oldTitle, r.title, id);
+    renderView();
+    await commitNotesEdit('Renaming…', `Renamed to “${r.title}”.`);
+    renderView();
+}
+
+async function deleteNote(id) {
+    const hit = findNotesNode(id);
+    if (!hit) return;
+    if (!confirm(`Delete note “${hit.node.title || 'Untitled'}”?`)) return;
+    hit.parent.children = (hit.parent.children || []).filter(c => c !== hit.node);
+    if (state.nv.noteId === id) {
+        state.nv.noteId = null;
+        if (!isDesktop() && state.nv.pane === 'note') {
+            renderView();
+            await commitNotesEdit('Deleting…', 'Note deleted.');
+            nvBack({ confirmed: true });
             return;
         }
     }
-
-    const header = document.createElement('div');
-    header.className = 'notes-section-header';
-    const title = document.createElement('h2');
-    title.textContent = '📝 Notes';
-    header.appendChild(title);
-
-    const shareBtn = document.createElement('button');
-    shareBtn.textContent = '🔗 Share with LLM';
-    shareBtn.title = 'Create a 1-hour link with your notes + instructions to paste into any LLM chat';
-    shareBtn.addEventListener('click', createShareLink);
-    header.appendChild(shareBtn);
-
-    const newNotebookBtn = document.createElement('button');
-    newNotebookBtn.textContent = '📓+';
-    newNotebookBtn.title = 'New notebook';
-    newNotebookBtn.addEventListener('click', createNotebook);
-    header.appendChild(newNotebookBtn);
-
-    const newBtn = document.createElement('button');
-    newBtn.textContent = '+ New Note';
-    newBtn.addEventListener('click', async () => {
-        const f = await ensureNotesFolder();
-        if (!f) return;
-        state.openNoteId = null;
-        state.editingNewNote = true;
-        state.newNoteParentId = null;
-        renderView();
-    });
-    header.appendChild(newBtn);
-    section.appendChild(header);
-
-    if (state.importBatch) {
-        section.appendChild(renderImportBlock());
-    }
-
-    if (state.proposals.length > 0) {
-        section.appendChild(renderProposalsBlock());
-    }
-
-    if (!found) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No notes yet.';
-        section.appendChild(empty);
-        root.appendChild(section);
-        return;
-    }
-
-    const openNote = (note) => () => {
-        state.openNoteId = note._pwaId;
-        state.editingNewNote = false;
-        state.newNoteParentId = null;
-        renderView();
-    };
-
-    // Loose notes live directly in the notes root.
-    const looseNotes = (found.node.children || []).filter(isNoteBookmark);
-    for (const note of looseNotes) {
-        section.appendChild(buildNoteRow(note, openNote(note)));
-    }
-
-    // Notebooks as collapsible groups.
-    for (const nb of notebookFolders(found.node)) {
-        const nbNotes = (nb.children || []).filter(isNoteBookmark);
-        const det = document.createElement('details');
-        det.className = 'notebook';
-        det.open = true;
-        const sum = document.createElement('summary');
-        sum.innerHTML = `<span class="notebook-name">📓 ${escapeHtml(nb.title || '(unnamed)')}</span><span class="count">${nbNotes.length}</span>`;
-        det.appendChild(sum);
-
-        const addBtn = document.createElement('button');
-        addBtn.className = 'notebook-add';
-        addBtn.textContent = '+ Note';
-        addBtn.addEventListener('click', () => {
-            state.openNoteId = null;
-            state.editingNewNote = true;
-            state.newNoteParentId = nb._pwaId;
-            renderView();
-        });
-        det.appendChild(addBtn);
-
-        if (nbNotes.length === 0) {
-            const empty = document.createElement('div');
-            empty.className = 'empty';
-            empty.textContent = 'Empty notebook.';
-            det.appendChild(empty);
-        }
-        for (const note of nbNotes) {
-            det.appendChild(buildNoteRow(note, openNote(note)));
-        }
-        section.appendChild(det);
-    }
-
-    if (looseNotes.length === 0 && notebookFolders(found.node).length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No notes yet.';
-        section.appendChild(empty);
-    }
-    root.appendChild(section);
+    renderView();
+    await commitNotesEdit('Deleting…', 'Note deleted.');
+    renderView();
 }
 
-async function createNotebook() {
+function openNoteByTitle(title) {
+    if (!confirmDiscardEdit()) return;
+    const lib = notesLibrary();
+    const note = NM.findNoteByTitle(lib, title);
+    if (note) {
+        stopEditing();
+        openNotes({ pane: 'note', noteId: note.id }, { history: 'push' });
+        return;
+    }
+    // A link to a missing note starts a new one, Obsidian-style, in the same notebook.
+    const from = state.nv.noteId ? lib.notes.find(n => n.id === state.nv.noteId) : null;
+    startNewNote({ parentId: from ? from.notebookId : null, content: `# ${title}\n\n` });
+}
+
+// --- notebook actions ---
+
+function folderTitles(folder, exceptId = null) {
+    return (folder.children || []).filter(c => isFolderNode(c) && c._pwaId !== exceptId).map(c => c.title);
+}
+
+async function createNotebookIn(parentId = null, { andThen } = {}) {
     const found = await ensureNotesFolder();
-    if (!found) return;
-    const name = prompt('Notebook name:');
-    if (name === null) return;
-    const trimmed = name.trim();
-    if (!trimmed) { showToast('Notebook name cannot be empty.'); return; }
-    const nb = { type: 'folder', title: trimmed, children: [] };
+    if (!found) return null;
+    const parent = parentId ? findNotesNode(parentId)?.node : found.node;
+    if (!isFolderNode(parent)) { showToast('That notebook is gone.'); return null; }
+    const name = prompt(parentId ? `New notebook inside “${parent.title}”:` : 'New notebook name:');
+    if (name === null) return null;
+    const problem = NM.notebookNameProblem(name, folderTitles(parent));
+    if (problem) { showToast(problem); return null; }
+    const nb = { type: 'folder', title: name.trim(), children: [] };
     assignIds(nb);
-    found.node.children = found.node.children || [];
-    found.node.children.push(nb);
-    state.dirty = true;
-    try {
-        setStatus('Saving…');
-        await pushSnapshot();
-        showToast(`Notebook "${trimmed}" created.`);
-        setStatus('');
-    } catch (e) {
-        alert('Save failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
-        setStatus('');
+    parent.children = parent.children || [];
+    parent.children.push(nb);
+    if (parentId) NV_UI.expanded.add(parentId);
+    saveNotesPrefs();
+    if (andThen) {
+        await andThen(nb);
+        return nb;
     }
     renderView();
+    await commitNotesEdit('Saving…', `Notebook “${nb.title}” created.`);
+    renderView();
+    return nb;
+}
+
+async function renameNotebook(id) {
+    const hit = findNotesNode(id);
+    if (!hit || !isFolderNode(hit.node)) return;
+    const name = prompt('Rename notebook:', hit.node.title || '');
+    if (name === null || name.trim() === hit.node.title) return;
+    const problem = NM.notebookNameProblem(name, folderTitles(hit.parent, id));
+    if (problem) { showToast(problem); return; }
+    hit.node.title = name.trim();
+    renderView();
+    await commitNotesEdit('Renaming…', 'Notebook renamed.');
+    renderView();
+}
+
+// Is `id` the folder itself or somewhere inside it?
+function folderContains(folder, id) {
+    if (folder._pwaId === id) return true;
+    return (folder.children || []).some(c => isFolderNode(c) && folderContains(c, id));
+}
+
+async function moveNotebookTo(id, targetId) {
+    const hit = findNotesNode(id);
+    const found = findNotesFolderWithPath();
+    if (!hit || !found || !isFolderNode(hit.node)) return;
+    const target = targetId ? findNotesNode(targetId)?.node : found.node;
+    if (!isFolderNode(target)) { showToast('That notebook is gone.'); return; }
+    if (folderContains(hit.node, target._pwaId)) { showToast('A notebook cannot move into itself.'); return; }
+    if (target === hit.parent) return;
+    const problem = NM.notebookNameProblem(hit.node.title, folderTitles(target, id));
+    if (problem) { showToast(problem); return; }
+    hit.parent.children = hit.parent.children.filter(c => c !== hit.node);
+    target.children = target.children || [];
+    target.children.push(hit.node);
+    if (targetId) NV_UI.expanded.add(targetId);
+    saveNotesPrefs();
+    renderView();
+    await commitNotesEdit('Moving…', `Moved to ${movedToLabel(targetId, 'the top level')}`);
+    renderView();
+}
+
+async function moveNoteTo(id, targetId) {
+    const hit = findNotesNode(id);
+    const found = findNotesFolderWithPath();
+    if (!hit || !found) return;
+    const target = targetId ? findNotesNode(targetId)?.node : found.node;
+    if (!isFolderNode(target)) { showToast('That notebook is gone.'); return; }
+    if (target === hit.parent) return;
+    // Re-parent only: the note's url (and so its edited time) is untouched.
+    hit.parent.children = hit.parent.children.filter(c => c !== hit.node);
+    target.children = target.children || [];
+    target.children.push(hit.node);
+    renderView();
+    await commitNotesEdit('Moving…', `Moved to ${movedToLabel(targetId, 'Unfiled')}`);
+    renderView();
+}
+
+function movedToLabel(targetId, rootLabel) {
+    if (!targetId) return rootLabel;
+    const nb = notesLibrary().notebooks.get(targetId);
+    return nb ? NM.pathLabel(nb.path) : 'the notebook';
+}
+
+// Always a lift: the notebook's notes and sub-notebooks take its place in its
+// parent, in order and with their ids. Deleting a notebook never deletes notes.
+async function deleteNotebook(id) {
+    const hit = findNotesNode(id);
+    if (!hit || !isFolderNode(hit.node)) return;
+    const lib = notesLibrary();
+    const nb = lib.notebooks.get(id);
+    const parentNb = nb && nb.parentId ? lib.notebooks.get(nb.parentId) : null;
+    const parts = [];
+    if (nb && nb.directCount) parts.push(`${nb.directCount} note${nb.directCount === 1 ? '' : 's'}`);
+    if (nb && nb.children.length) parts.push(`${nb.children.length} notebook${nb.children.length === 1 ? '' : 's'}`);
+    const title = hit.node.title || '(unnamed)';
+    const msg = parts.length
+        ? `Delete notebook “${title}”? Its ${parts.join(' and ')} move up to ${parentNb ? parentNb.title : 'Notes'}.`
+        : `Delete notebook “${title}”?`;
+    if (!confirm(msg)) return;
+    hit.parent.children = NM.liftChildren(hit.parent.children, hit.index, hit.node.children || []);
+    NV_UI.expanded.delete(id);
+    if (state.nv.scope === `nb:${id}`) state.nv.scope = parentNb ? `nb:${parentNb.id}` : 'all';
+    if (state.nv.newParentId === id) state.nv.newParentId = parentNb ? parentNb.id : null;
+    saveNotesPrefs();
+    history.replaceState(nvHistoryState(), '', location.pathname);
+    renderView();
+    await commitNotesEdit('Deleting…', `Notebook “${title}” deleted.`);
+    renderView();
+}
+
+// --- sheets: Move to… and notebook actions ---
+
+let moveCtx = null;
+
+function closeNotesSheets() {
+    hide($('move-sheet'));
+    hide($('nb-sheet'));
+}
+
+function openMoveSheet(kind, id = null) {
+    const lib = notesLibrary();
+    let currentId = null;
+    let excludeId = null;
+    let heading = 'Move to…';
+    if (kind === 'note') {
+        const n = lib.notes.find(x => x.id === id);
+        if (!n) return;
+        currentId = n.notebookId;
+        heading = `Move “${n.title || 'Untitled'}” to…`;
+    } else if (kind === 'new') {
+        currentId = state.nv.pendingNotebookName ? undefined : state.nv.newParentId;
+        heading = 'File the new note in…';
+    } else {
+        const b = lib.notebooks.get(id);
+        if (!b) return;
+        currentId = b.parentId;
+        excludeId = id;
+        heading = `Move notebook “${b.title || '(unnamed)'}” to…`;
+    }
+    moveCtx = { kind, id };
+    $('move-title').textContent = heading;
+    const atRoot = currentId === null;
+    const opts = NM.notebookOptions(lib, { excludeId, currentId: currentId === undefined ? null : currentId });
+    const rows = [];
+    if (kind === 'new' && state.nv.pendingNotebookName) {
+        rows.push(`<button type="button" class="move-opt current" disabled><span class="nv-ico">📓</span>`
+            + `<span class="nv-name">${escapeHtml(state.nv.pendingNotebookName)} (new)</span><span class="tick">✓</span></button>`);
+    }
+    rows.push(`<button type="button" class="move-opt${atRoot ? ' current' : ''}" data-target=""${atRoot ? ' disabled' : ''}>`
+        + `<span class="nv-ico">${kind === 'notebook' ? '🗒' : '📥'}</span><span class="nv-name">${kind === 'notebook' ? 'Top level' : 'Unfiled'}</span>`
+        + `${atRoot ? '<span class="tick">✓</span>' : ''}</button>`);
+    for (const o of opts) {
+        rows.push(`<button type="button" class="move-opt${o.current ? ' current' : ''}" style="--depth:${o.depth}" data-target="${escapeHtml(o.id)}"${o.disabled ? ' disabled' : ''}>`
+            + `<span class="nv-ico">📓</span><span class="nv-name">${escapeHtml(o.title || '(unnamed)')}</span>`
+            + `<span class="nv-count">${o.count}</span>${o.current ? '<span class="tick">✓</span>' : ''}</button>`);
+    }
+    $('move-list').innerHTML = rows.join('');
+    hide($('nb-sheet'));
+    show($('move-sheet'));
+}
+
+async function moveSheetPick(targetId) {
+    const ctx = moveCtx;
+    hide($('move-sheet'));
+    if (!ctx) return;
+    const target = targetId || null;
+    if (ctx.kind === 'new') {
+        state.nv.newParentId = target;
+        state.nv.pendingNotebookName = null;
+        renderView();
+        return;
+    }
+    if (ctx.kind === 'note') await moveNoteTo(ctx.id, target);
+    else await moveNotebookTo(ctx.id, target);
+}
+
+// '+ New notebook…' in the picker: a top-level notebook, then the move.
+async function moveSheetNewNotebook() {
+    const ctx = moveCtx;
+    hide($('move-sheet'));
+    if (!ctx) return;
+    await createNotebookIn(null, {
+        andThen: async (nb) => {
+            if (ctx.kind === 'new') {
+                state.nv.newParentId = nb._pwaId;
+                state.nv.pendingNotebookName = null;
+                renderView();
+                await commitNotesEdit('Saving…', `Notebook “${nb.title}” created.`);
+                renderView();
+            } else if (ctx.kind === 'note') {
+                await moveNoteTo(ctx.id, nb._pwaId);
+            } else {
+                await moveNotebookTo(ctx.id, nb._pwaId);
+            }
+        }
+    });
+}
+
+function openNotebookSheet(id) {
+    const nb = notesLibrary().notebooks.get(id);
+    if (!nb) return;
+    $('nb-sheet-title').textContent = `📓 ${nb.title || '(unnamed)'}`;
+    $('nb-sheet').dataset.id = id;
+    hide($('move-sheet'));
+    show($('nb-sheet'));
+}
+
+async function notebookSheetAction(act) {
+    const id = $('nb-sheet').dataset.id;
+    hide($('nb-sheet'));
+    if (!id) return;
+    if (act === 'new-note') {
+        if (state.nv.pane !== 'note') openNotes({ pane: 'list', scope: `nb:${id}`, query: '' });
+        startNewNote({ parentId: id });
+    } else if (act === 'new-sub') {
+        await createNotebookIn(id);
+    } else if (act === 'rename') {
+        await renameNotebook(id);
+    } else if (act === 'move') {
+        openMoveSheet('notebook', id);
+    } else if (act === 'delete') {
+        await deleteNotebook(id);
+    }
+}
+
+// One delegated handler for everything the notes screen draws, installed once
+// at startup — the old note page added a document listener on every render.
+function onNotesClick(e) {
+    if (state.view !== 'notes') return;
+    const box = e.target.closest('.note-task-box');
+    if (box) {
+        e.preventDefault();
+        toggleNoteTask(Number(box.dataset.line));
+        return;
+    }
+    const wiki = e.target.closest('.note-wikilink');
+    if (wiki && wiki.dataset.target) {
+        openNoteByTitle(wiki.dataset.target);
+        return;
+    }
+    const pop = $('note-menu-pop');
+    const t = e.target.closest('[data-nv]');
+    if (!t) return;
+    const act = t.dataset.nv;
+    const id = t.dataset.id;
+    if (act !== 'note-menu' && pop) pop.classList.add('hidden');
+    const lib = () => notesLibrary();
+    switch (act) {
+        case 'new-note': {
+            const inList = t.closest('.nv-list');
+            const nbId = inList ? NM.notebookIdOf(state.nv.scope) : null;
+            startNewNote({ parentId: nbId && lib().notebooks.has(nbId) ? nbId : null });
+            break;
+        }
+        case 'new-here':
+            startNewNote({ parentId: NM.notebookIdOf(state.nv.scope) });
+            break;
+        case 'search':
+            openNotes({ pane: 'list', scope: 'all', query: '' });
+            requestAnimationFrame(() => document.getElementById('nv-search')?.focus());
+            break;
+        case 'scope':
+            if (!confirmDiscardEdit()) return;
+            openNotes({ pane: 'list', scope: t.dataset.scope, query: '' });
+            break;
+        case 'open-nb':
+            if (!confirmDiscardEdit()) return;
+            openNotes({ pane: 'list', scope: `nb:${id}`, query: '' }, { history: state.nv.pane === 'list' ? 'push' : 'auto' });
+            break;
+        case 'fold':
+            if (NV_UI.expanded.has(id)) NV_UI.expanded.delete(id);
+            else NV_UI.expanded.add(id);
+            saveNotesPrefs();
+            renderView();
+            break;
+        case 'nb-menu':
+            openNotebookSheet(id);
+            break;
+        case 'list-menu': {
+            const nbId = NM.notebookIdOf(state.nv.scope);
+            if (nbId) openNotebookSheet(nbId);
+            break;
+        }
+        case 'new-notebook':
+            createNotebookIn(null);
+            break;
+        case 'share':
+            createShareLink();
+            break;
+        case 'list-back':
+            if (isDesktop()) openNotes({ pane: 'library' });
+            else nvBack();
+            break;
+        case 'note-back':
+            nvBack();
+            break;
+        case 'open-note':
+            openNoteById(id);
+            break;
+        case 'search-all':
+            openNotes({ scope: 'all' }, { history: 'replace' });
+            break;
+        case 'create-from-query': {
+            const q = state.nv.query.trim();
+            const nbId = NM.notebookIdOf(state.nv.scope);
+            startNewNote({ parentId: nbId && lib().notebooks.has(nbId) ? nbId : null, content: `# ${q}\n\n` });
+            break;
+        }
+        case 'edit':
+            startEditing();
+            break;
+        case 'cancel-edit':
+            cancelEditing();
+            break;
+        case 'done':
+            saveNoteEdit();
+            break;
+        case 'note-menu':
+            e.stopPropagation();
+            if (pop) pop.classList.toggle('hidden');
+            break;
+        case 'rename-note':
+            renameNote(state.nv.noteId);
+            break;
+        case 'move-note':
+            openMoveSheet('note', state.nv.noteId);
+            break;
+        case 'delete-note':
+            deleteNote(state.nv.noteId);
+            break;
+        case 'crumb':
+            if (state.nv.isNew) openMoveSheet('new');
+            else if (state.nv.noteId) openMoveSheet('note', state.nv.noteId);
+            break;
+        default:
+            break;
+    }
+}
+
+function onNotesInput(e) {
+    if (state.view !== 'notes') return;
+    if (e.target.id === 'nv-search') {
+        onNvSearchInput(e.target);
+    } else if (e.target.id === 'note-body-input') {
+        state.nv.draft = e.target.value;
+        autogrowNoteEditor(e.target);
+    }
+}
+
+function onNotesChange(e) {
+    if (state.view !== 'notes' || e.target.id !== 'nv-sort') return;
+    NV_UI.sort = e.target.value;
+    saveNotesPrefs();
+    const box = document.getElementById('nv-results');
+    if (box) fillNvResults(box, notesLibrary());
+}
+
+// Desktop keys: '/' searches, ↑/↓ walk the list, Esc clears search or leaves
+// an edit, Ctrl/Cmd+S saves.
+function onNotesKeydown(e) {
+    if (state.view !== 'notes') return;
+    if (document.querySelector('.sheet:not(.hidden)')) return;
+    const t = e.target;
+    const search = document.getElementById('nv-search');
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 's') {
+        if (state.nv.editing) {
+            e.preventDefault();
+            saveNoteEdit();
+        }
+        return;
+    }
+    if (e.key === 'Escape') {
+        if (t === search && search.value) {
+            e.preventDefault();
+            search.value = '';
+            onNvSearchInput(search);
+        } else if (state.nv.editing) {
+            e.preventDefault();
+            cancelEditing();
+        }
+        return;
+    }
+    const inField = t && t.closest && t.closest('input, textarea, select');
+    if (e.key === '/' && !inField && !e.ctrlKey && !e.metaKey && search) {
+        e.preventDefault();
+        if (!isDesktop() && state.nv.pane !== 'list') {
+            openNotes({ pane: 'list' });
+            requestAnimationFrame(() => document.getElementById('nv-search')?.focus());
+        } else {
+            search.focus();
+            search.select();
+        }
+        return;
+    }
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && (!inField || t === search) && isDesktop()) {
+        const rows = [...document.querySelectorAll('#nv-results .nv-row[data-id]')];
+        if (!rows.length) return;
+        e.preventDefault();
+        let i = rows.findIndex(r => r.dataset.id === state.nv.noteId);
+        i = i === -1 ? (e.key === 'ArrowDown' ? 0 : rows.length - 1)
+            : Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)));
+        openNoteById(rows[i].dataset.id);
+        const row = document.querySelector(`#nv-results .nv-row[data-id="${CSS.escape(rows[i].dataset.id)}"]`);
+        if (row) row.scrollIntoView({ block: 'nearest' });
+    }
 }
 
 // --- LLM share link ---
@@ -1339,7 +2370,12 @@ async function resolveProposal(p, approve) {
         await api(`/api/proposals/${p.id}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
         setStatus('');
         if (approve) {
-            showToast(p.kind === 'reorder' ? 'New order applied.' : `Note "${p.title}" added.`);
+            if (p.kind === 'reorder') {
+                // The default Edited sort would hide the new order.
+                NV_UI.sort = 'manual';
+                saveNotesPrefs();
+            }
+            showToast(p.kind === 'reorder' ? 'New order applied (Manual order)' : `Note "${p.title}" added.`);
             await pullSnapshot(); // server applied the change — pull it down
         } else {
             showToast('Proposal rejected.');
@@ -1372,8 +2408,7 @@ function renderImportBlock() {
             .join('');
     } else {
         list.innerHTML = batch.items.map(it => {
-            const m = it.content.match(/^#\s+(.+?)\s*$/m);
-            const t = m ? m[1].trim() : 'Untitled';
+            const t = NM.leadingTitle(it.content) || 'Untitled';
             return `<div class="import-item">📝 ${escapeHtml(t)}${it.notebook ? ` <span class="notebook-badge">📓 ${escapeHtml(it.notebook)}</span>` : ''}</div>`;
         }).join('');
     }
@@ -1403,21 +2438,14 @@ async function applyImportBatch() {
 
     if (batch.kind === 'reorder') {
         applyNoteOrder(found.node, batch.order);
+        NV_UI.sort = 'manual';
+        saveNotesPrefs();
     } else {
         for (const it of batch.items) {
-            let parent = found.node;
-            if (it.notebook) {
-                parent = (found.node.children || []).find(c =>
-                    (c.type === 'folder' || c.type === 'root') && c.title === it.notebook);
-                if (!parent) {
-                    parent = { type: 'folder', title: it.notebook, children: [] };
-                    assignIds(parent);
-                    found.node.children = found.node.children || [];
-                    found.node.children.push(parent);
-                }
-            }
-            const m = it.content.match(/^#\s+(.+?)\s*$/m);
-            const title = (m ? m[1].trim() : '') || 'Untitled';
+            // Resolved against the tree as it grows, so two items naming the
+            // same new notebook land in one notebook.
+            const parent = it.notebook ? (ensureNotebookByName(it.notebook) || found.node) : found.node;
+            const title = NM.leadingTitle(it.content) || 'Untitled';
             const note = { type: 'bookmark', title, url: encodeNoteUrl({ content: it.content, createdAt: now, updatedAt: now }) };
             assignIds(note);
             parent.children = parent.children || [];
@@ -1431,7 +2459,7 @@ async function applyImportBatch() {
         setStatus('Saving…');
         await pushSnapshot();
         showToast(batch.kind === 'reorder'
-            ? 'Notes reordered.'
+            ? 'New order applied (Manual order)'
             : `Imported ${batch.items.length} note${batch.items.length > 1 ? 's' : ''}.`);
         setStatus('');
     } catch (e) {
@@ -1458,49 +2486,6 @@ function applyNoteOrder(notesRoot, order) {
     sortFolder(notesRoot);
 }
 
-function renderNotesView(container, folder) {
-    // Detail view (existing note or a new one being composed)
-    if (state.editingNewNote || state.openNoteId) {
-        const note = state.editingNewNote
-            ? null
-            : (folder.children || []).find(c => c._pwaId === state.openNoteId && isNoteBookmark(c));
-        if (!state.editingNewNote && !note) {
-            state.openNoteId = null; // note vanished — fall back to the list
-        } else {
-            renderNoteDetail(container, folder, note);
-            return;
-        }
-    }
-
-    container.innerHTML = '';
-    const addBtn = document.createElement('button');
-    addBtn.className = 'primary';
-    addBtn.style.marginBottom = '10px';
-    addBtn.textContent = '+ New Note';
-    addBtn.addEventListener('click', () => {
-        state.editingNewNote = true;
-        state.openNoteId = null;
-        renderView();
-    });
-    container.appendChild(addBtn);
-
-    const notes = (folder.children || []).filter(isNoteBookmark);
-    if (notes.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No notes yet.';
-        container.appendChild(empty);
-        return;
-    }
-    for (const note of notes) {
-        container.appendChild(buildNoteRow(note, () => {
-            state.openNoteId = note._pwaId;
-            state.editingNewNote = false;
-            renderView();
-        }));
-    }
-}
-
 // Render note content as safe HTML, GitHub/Obsidian-style: # headings,
 // real - and 1. lists, **bold**, *italic*, [[wiki-links]] as clickable
 // chips, bare URLs as links. Everything else is escaped text.
@@ -1516,22 +2501,30 @@ function renderNoteInline(escapedLine) {
     return html;
 }
 
-function renderNotePreviewHtml(content) {
+// `skipTitle` drops a leading '# Title' that repeats the note's title, which
+// the page already shows as its heading.
+function renderNotePreviewHtml(content, skipTitle = '') {
     const out = [];
     let listTag = null; // 'ul' | 'ol' | null
     const closeList = () => {
         if (listTag) { out.push(`</${listTag}>`); listTag = null; }
     };
     const lines = String(content || '').split('\n');
+    const first = lines.findIndex(l => l.trim());
+    const skip = String(skipTitle || '').trim().toLowerCase();
     for (let i = 0; i < lines.length; i++) {
         const rawLine = lines[i];
+        if (i === first && skip) {
+            const h1 = rawLine.match(/^#\s+(.+?)\s*$/);
+            if (h1 && h1[1].trim().toLowerCase() === skip) continue;
+        }
         const line = escapeHtml(rawLine);
         const trimmed = line.trim();
         if (!trimmed) { closeList(); continue; }
 
         // Task items before the plain-bullet rule — "- [ ] x" is also a bullet.
         // data-line ties the box back to its source line for the write-back.
-        const task = parseTaskLine(rawLine);
+        const task = NM.parseTaskLine(rawLine);
         if (task) {
             if (listTag !== 'ul') { closeList(); out.push('<ul class="note-tasks">'); listTag = 'ul'; }
             out.push(
@@ -1572,272 +2565,30 @@ function renderNotePreviewHtml(content) {
     return out.join('\n');
 }
 
-// Notes whose content links to [[title]] (excluding the note itself), across all notebooks.
-function getNoteBacklinks(title, excludeId) {
-    if (!title) return [];
-    const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`\\[\\[\\s*${escaped}\\s*\\]\\]`);
-    return allNotes()
-        .filter(e => e.note._pwaId !== excludeId && re.test(decodeNote(e.note).content))
-        .map(e => e.note);
+// --- Bottom tab bar ---
+// The highlight follows what is on screen rather than the last tap: Notes
+// while Notes shows, Inbox or Settings only while their sheet is open, Home
+// otherwise — including a note opened straight from Home, whose back goes
+// to Home. The Notes tab carries the pending-proposal count.
+function syncBottomNav() {
+    const nav = $('bottom-nav');
+    const open = (id) => { const el = $(id); return Boolean(el) && !el.classList.contains('hidden'); };
+    const fromHome = state.nv.pane === 'note' && state.nv.from === 'Home';
+    const active = open('settings-sheet') ? 'settings'
+        : open('inbox-sheet') ? 'inbox'
+            : state.view === 'notes' && !fromHome ? 'notes' : 'home';
+    if (nav) {
+        for (const b of nav.querySelectorAll('button[data-nav]')) b.classList.toggle('on', b.dataset.nav === active);
+        const badge = nav.querySelector('.bn-badge');
+        if (badge) {
+            const n = state.proposals.length;
+            badge.textContent = n > 99 ? '99+' : String(n);
+            badge.classList.toggle('hidden', n === 0);
+        }
+    }
+    const notesBtn = $('notesBtn');
+    if (notesBtn) notesBtn.classList.toggle('on', state.view === 'notes');
 }
-
-// Obsidian-style: reading view renders markdown; the pencil switches to an
-// editor styled exactly like the page. The first "# " heading is the title.
-function renderNoteDetail(container, folder, note) {
-    const meta = note
-        ? decodeNote(note)
-        : { content: state.newNotePrefill || '', createdAt: null, updatedAt: null };
-    state.newNotePrefill = null;
-    container.innerHTML = `
-        <div class="note-page">
-            <div class="note-topbar">
-                <button id="note-back-btn" title="Back to notes">←</button>
-                <div class="note-topbar-right">
-                    <button id="note-edit-btn" title="Edit">✏️</button>
-                    <button id="note-save-btn" class="hidden" title="Save">✓</button>
-                    <button id="note-cancel-btn" class="hidden" title="Discard changes">✕</button>
-                    <div class="note-menu-wrap">
-                        <button id="note-menu-btn" title="More">⋯</button>
-                        <div id="note-menu-pop" class="hidden">
-                            ${note ? '<select id="note-move-select" class="note-move" title="Move to notebook"></select>' : ''}
-                            ${note ? '<button id="note-delete-btn" class="danger menu-item">Delete note</button>' : ''}
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div id="note-preview" class="note-preview-body"></div>
-            <textarea id="note-body-input" class="hidden"
-                      placeholder="# Note title&#10;&#10;Write here… Link notes with [[Note Title]].">${escapeHtml(meta.content)}</textarea>
-        </div>
-    `;
-
-    const textarea = container.querySelector('#note-body-input');
-    const previewEl = container.querySelector('#note-preview');
-    const editBtn = container.querySelector('#note-edit-btn');
-    const saveBtn = container.querySelector('#note-save-btn');
-    const cancelBtn = container.querySelector('#note-cancel-btn');
-    const menuBtn = container.querySelector('#note-menu-btn');
-    const menuPop = container.querySelector('#note-menu-pop');
-
-    // Grow the editor with the content — a note page, not a fixed input box.
-    const autogrow = () => {
-        textarea.style.height = 'auto';
-        textarea.style.height = Math.max(textarea.scrollHeight, Math.round(window.innerHeight * 0.6)) + 'px';
-    };
-    textarea.addEventListener('input', autogrow);
-
-    // Title comes from the first "# " heading; falls back to the stored title.
-    function currentTitle() {
-        const m = textarea.value.match(/^#\s+(.+?)\s*$/m);
-        if (m) return m[1].trim();
-        return (note && note.title) || 'Untitled';
-    }
-
-    function openNoteByTitle(title) {
-        const found = allNotes().find(e => e.note.title === title);
-        if (found) {
-            state.openNoteId = found.note._pwaId;
-            state.editingNewNote = false;
-            state.newNoteParentId = null;
-        } else {
-            // A link to a missing note starts a new one, Obsidian-style.
-            state.openNoteId = null;
-            state.editingNewNote = true;
-            state.newNotePrefill = `# ${title}\n\n`;
-        }
-        renderView();
-    }
-
-    function renderReadingView() {
-        const body = renderNotePreviewHtml(textarea.value);
-        let html = body || '<span style="color:var(--muted);">Empty note. Tap ✏️ to write.</span>';
-        const backlinks = getNoteBacklinks(currentTitle(), note ? note._pwaId : null);
-        if (backlinks.length > 0) {
-            const items = backlinks.map(n =>
-                `<span class="note-wikilink note-backlink" data-target="${escapeHtml(n.title)}">${escapeHtml(n.title)}</span>`
-            ).join(' ');
-            html += `<div class="note-backlinks"><span style="color:var(--muted);">Linked from:</span> ${items}</div>`;
-        }
-        previewEl.innerHTML = html;
-    }
-
-    function setMode(edit) {
-        editBtn.classList.toggle('hidden', edit);
-        saveBtn.classList.toggle('hidden', !edit);
-        cancelBtn.classList.toggle('hidden', !edit);
-        textarea.classList.toggle('hidden', !edit);
-        previewEl.classList.toggle('hidden', edit);
-        if (edit) {
-            autogrow();
-            textarea.focus();
-        } else {
-            renderReadingView();
-        }
-    }
-
-    editBtn.addEventListener('click', () => setMode(true));
-    cancelBtn.addEventListener('click', () => {
-        if (textarea.value !== meta.content && !confirm('Discard unsaved changes?')) return;
-        textarea.value = meta.content;
-        if (note) {
-            setMode(false);
-        } else {
-            // Cancelling a brand-new note leaves the page entirely.
-            state.editingNewNote = false;
-            state.openNoteId = null;
-            state.newNoteParentId = null;
-            renderView();
-        }
-    });
-    previewEl.addEventListener('click', async (e) => {
-        const box = e.target.closest('.note-task-box');
-        if (box) {
-            const updated = toggleTaskAtLine(textarea.value, Number(box.dataset.line));
-            if (updated === textarea.value) return;
-            textarea.value = updated;
-            renderReadingView();
-            // A note that isn't saved yet just updates in place; the user's ✓
-            // writes it. An existing note syncs the tick straight away.
-            if (!note) return;
-            const now = new Date().toISOString();
-            note.url = encodeNoteUrl({ content: updated, createdAt: meta.createdAt || now, updatedAt: now });
-            meta.content = updated;
-            state.dirty = true;
-            try {
-                setStatus('Saving…');
-                await pushSnapshot();
-                setStatus('');
-            } catch (err) {
-                setStatus('');
-                showToast('Save failed: ' + err.message + ' — use ⬆️ to retry.');
-            }
-            return;
-        }
-        const link = e.target.closest('.note-wikilink');
-        if (link && link.dataset.target) openNoteByTitle(link.dataset.target);
-    });
-
-    menuBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        menuPop.classList.toggle('hidden');
-    });
-    document.addEventListener('click', () => menuPop.classList.add('hidden'));
-
-    // Existing notes open in reading mode (like a note app); new notes in edit mode.
-    setMode(!note);
-
-    container.querySelector('#note-back-btn').addEventListener('click', () => {
-        state.openNoteId = null;
-        state.editingNewNote = false;
-        state.newNoteParentId = null;
-        renderView();
-    });
-
-    // Move an existing note between notebooks.
-    const moveSel = container.querySelector('#note-move-select');
-    if (moveSel && note) {
-        const foundRoot = findNotesFolderWithPath();
-        const notesRoot = foundRoot ? foundRoot.node : null;
-        const notebooks = notesRoot ? notebookFolders(notesRoot) : [];
-        const makeOpt = (value, label) => {
-            const o = document.createElement('option');
-            o.value = value;
-            o.textContent = label;
-            return o;
-        };
-        moveSel.appendChild(makeOpt('', '📥 No notebook'));
-        for (const nb of notebooks) moveSel.appendChild(makeOpt(nb._pwaId, '📓 ' + (nb.title || '(unnamed)')));
-        moveSel.value = folder === notesRoot ? '' : folder._pwaId;
-        moveSel.addEventListener('change', async () => {
-            const target = notebooks.find(nb => nb._pwaId === moveSel.value) || notesRoot;
-            if (!target || target === folder) return;
-            folder.children = (folder.children || []).filter(c => c._pwaId !== note._pwaId);
-            target.children = target.children || [];
-            target.children.push(note);
-            folder = target;
-            state.dirty = true;
-            try {
-                setStatus('Moving…');
-                await pushSnapshot();
-                showToast(`Moved to ${moveSel.value ? target.title : 'No notebook'}.`);
-                setStatus('');
-            } catch (e) {
-                alert('Move failed: ' + e.message);
-                setStatus('');
-            }
-        });
-    }
-
-    saveBtn.addEventListener('click', async () => {
-        const content = textarea.value;
-        const title = currentTitle();
-        const now = new Date().toISOString();
-        const oldTitle = note ? note.title : null;
-
-        if (note) {
-            note.title = title;
-            note.url = encodeNoteUrl({ content, createdAt: meta.createdAt || now, updatedAt: now });
-        } else {
-            note = { type: 'bookmark', title, url: encodeNoteUrl({ content, createdAt: now, updatedAt: now }) };
-            assignIds(note);
-            folder.children = folder.children || [];
-            folder.children.push(note);
-            state.openNoteId = note._pwaId;
-            state.editingNewNote = false;
-        }
-        meta.content = content;
-
-        // Rename: rewrite [[Old Title]] links in all other notes so they don't break.
-        if (oldTitle && oldTitle !== title) {
-            for (const entry of allNotes()) {
-                const sibling = entry.note;
-                if (sibling._pwaId === note._pwaId) continue;
-                const sMeta = decodeNote(sibling);
-                const rewritten = rewriteWikiLink(sMeta.content, oldTitle, title);
-                if (rewritten !== sMeta.content) {
-                    sibling.url = encodeNoteUrl({ content: rewritten, createdAt: sMeta.createdAt || now, updatedAt: now });
-                }
-            }
-        }
-
-        state.newNoteParentId = null;
-
-        state.dirty = true;
-        try {
-            setStatus('Saving…');
-            await pushSnapshot();
-            showToast('Note saved.');
-            setStatus('');
-            // Stay on the note, back in reading mode.
-            setMode(false);
-        } catch (e) {
-            alert('Save failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
-            setStatus('');
-        }
-    });
-
-    const deleteBtn = container.querySelector('#note-delete-btn');
-    if (deleteBtn) {
-        deleteBtn.addEventListener('click', async () => {
-            if (!confirm(`Delete note "${note.title || 'Untitled'}"?`)) return;
-            folder.children = (folder.children || []).filter(c => c._pwaId !== note._pwaId);
-            state.openNoteId = null;
-            state.dirty = true;
-            try {
-                setStatus('Saving…');
-                await pushSnapshot();
-                showToast('Note deleted.');
-                setStatus('');
-            } catch (e) {
-                alert('Delete failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
-                setStatus('');
-            }
-            renderView();
-        });
-    }
-}
-
 
 // --- Inbox modal ---
 function updateInboxFab() {
@@ -2763,47 +3514,85 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    safeAddListener('notesBtn', 'click', async (e) => {
+    safeAddListener('notesBtn', 'click', (e) => {
         e.stopPropagation();
         e.preventDefault();
-        const found = await ensureNotesFolder();
-        if (!found) return;
-        // Notes live in their own section on the root view — jump there.
-        state.pathIds = [state.snapshot._pwaId];
-        state.openNoteId = null;
-        state.editingNewNote = false;
-        renderView();
-        const sec = document.getElementById('notes-section');
-        if (sec) sec.scrollIntoView({ behavior: 'smooth' });
+        enterNotes();
     });
 
-    // The wordmark goes home: close any open note and return to the root view,
-    // which is where search and the pinned tiles live.
-    const goHome = () => {
-        if (!state.snapshot) return;
-        state.openNoteId = null;
-        state.editingNewNote = false;
-        state.pathIds = [state.snapshot._pwaId];
-        renderView();
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    };
+    // The wordmark goes home: back to the root view, which is where search
+    // and the pinned tiles live. An unsaved edit asks first.
     safeAddListener('brand-home', 'click', goHome);
 
-    // Bottom tab bar. Notes/Inbox/Settings delegate to the controls that
-    // already exist so there is still one handler per action.
+    // Bottom tab bar. Inbox and Settings open their sheets; the highlight
+    // itself is drawn from state by syncBottomNav, not from the tap.
     const nav = document.getElementById('bottom-nav');
     if (nav) {
         nav.addEventListener('click', (e) => {
             const btn = e.target.closest('button[data-nav]');
             if (!btn) return;
-            for (const b of nav.querySelectorAll('button')) b.classList.toggle('on', b === btn);
             const dest = btn.dataset.nav;
             if (dest === 'home') goHome();
-            else if (dest === 'notes') document.getElementById('notesBtn')?.click();
+            else if (dest === 'notes') enterNotes();
             else if (dest === 'inbox') openInbox();
             else if (dest === 'settings') document.getElementById('settingsBtn')?.click();
+            syncBottomNav();
         });
     }
+    // Sheets open and close from many places (a 401 opens Settings), so watch
+    // them rather than chasing every caller.
+    const sheetWatch = new MutationObserver(syncBottomNav);
+    for (const id of ['settings-sheet', 'inbox-sheet']) {
+        const el = $(id);
+        if (el) sheetWatch.observe(el, { attributes: true, attributeFilter: ['class'] });
+    }
+
+    // Notes: one delegated listener set for everything the screen draws.
+    const content = $('content');
+    if (content) {
+        content.addEventListener('click', onNotesClick);
+        content.addEventListener('input', onNotesInput);
+        content.addEventListener('change', onNotesChange);
+        content.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' || state.view !== 'notes') return;
+            const row = e.target.closest && e.target.closest('.nv-row[data-id]');
+            if (row) openNoteById(row.dataset.id);
+        });
+    }
+    document.addEventListener('click', (e) => {
+        const pop = $('note-menu-pop');
+        if (pop && !e.target.closest('.note-menu-wrap')) pop.classList.add('hidden');
+    });
+    document.addEventListener('keydown', onNotesKeydown);
+    window.addEventListener('popstate', onNotesPopState);
+    safeAddListener('move-close', 'click', () => hide($('move-sheet')));
+    safeAddListener('move-new-nb', 'click', moveSheetNewNotebook);
+    safeAddListener('move-list', 'click', (e) => {
+        const opt = e.target.closest('.move-opt[data-target]');
+        if (opt && !opt.disabled) moveSheetPick(opt.dataset.target);
+    });
+    safeAddListener('nb-sheet-close', 'click', () => hide($('nb-sheet')));
+    safeAddListener('nb-sheet-list', 'click', (e) => {
+        const b = e.target.closest('[data-nb-act]');
+        if (b) notebookSheetAction(b.dataset.nbAct);
+    });
+    // Leaving with an unsaved note (closing the tab, reloading) asks first.
+    window.addEventListener('beforeunload', (e) => {
+        if (!editorDirty()) return;
+        e.preventDefault();
+        e.returnValue = '';
+    });
+    // The topbar height feeds the desktop notes panes' height.
+    const measureTopbar = () => {
+        const bar = $('topbar');
+        if (bar) document.documentElement.style.setProperty('--topbar-h', `${bar.offsetHeight}px`);
+    };
+    measureTopbar();
+    window.addEventListener('resize', measureTopbar);
+    // Crossing 900px swaps the phone's one pane for side-by-side ones.
+    window.matchMedia('(min-width: 900px)').addEventListener('change', () => {
+        if (state.view === 'notes') renderView();
+    });
 
     safeAddListener('settings-close', 'click', () => hide($('settings-sheet')));
     safeAddListener('cfg-save', 'click', saveSettings);
@@ -2960,6 +3749,12 @@ window.addEventListener('DOMContentLoaded', () => {
             checkUnfiledLinks().catch(() => {});
         }
     });
+
+    // Notes always opens fresh at start-up; an entry left over from before a
+    // reload would otherwise claim a pane this page is not showing.
+    loadNotesPrefs();
+    if (history.state && history.state.tp === 'nv') history.replaceState(null, '', location.pathname);
+    syncBottomNav();
 
     bootstrap();
 
