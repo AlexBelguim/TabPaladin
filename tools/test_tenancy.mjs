@@ -517,7 +517,7 @@ async function isolationTests() {
 const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops)\b/i;
 const SCAN_SKIP = new Set(['server/tenancy.js']); // operates across accounts by design: the migration, deletion, stats
 const ALLOWED = [
-    ['server/index.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],
+    ['server/llmShare.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],
     ['server/imports/store.js', 'SELECT * FROM import_sources WHERE deleted_at IS NULL ORDER BY id', 'listAllSources: the scheduler and the boot warning'],
     ['server/imports/store.js', 'SELECT * FROM import_sources WHERE id = ?', 'getSourceUnscoped: OAuth callback, authenticated by its one-shot state'],
     ['server/imports/store.js', 'SELECT credentials FROM import_sources WHERE id = ?', 'by primary key, after getSource(id, userId) or listAllSources'],
@@ -771,11 +771,12 @@ async function endToEnd() {
         }
         check('import sources identical (removed ones hidden by default)',
             JSON.stringify(withoutKeys(newView.imports, ['removed', 'removedAt'])) === JSON.stringify(oldView.imports));
-        // The page gained one instruction line about nested notebooks; every
-        // note, heading and the rest of the instructions must be unchanged.
-        const NESTED_HINT = '- A notebook inside another is listed as "Parent / Child"; pass that whole path as "notebook" to file into it.\n';
+        // The page has since gained instructions and the bookmarks (the AI
+        // chats release); every note and notebook heading must be unchanged.
+        const notesPart = (page) => page.slice(page.indexOf('## Existing notes ('));
         check('the LLM share page serves the same notes',
-            newView.llm.split(srv.base).join('BASE').replace(NESTED_HINT, '') === oldView.llm.split(old.base).join('BASE'));
+            oldView.llm.includes('## Existing notes (') && newView.llm.includes('## Existing notes (')
+            && notesPart(newView.llm).split(srv.base).join('BASE') === notesPart(oldView.llm).split(old.base).join('BASE'));
         const removed = (await http(srv.base, '/api/imports?includeRemoved=1', { token: tok })).json.sources.filter(s => s.removed);
         check('the orphaned X archive is back, as a removed source', removed.length === 1 && removed[0].provider === 'x' && removed[0].items === 1,
             JSON.stringify(removed));

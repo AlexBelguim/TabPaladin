@@ -945,6 +945,51 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         return { ok: true, baseVersion, version: v, created, already };
     });
 
+    // --- Changes proposed by AI chats, applied on approval -------------------
+    //
+    // The rows a proposal is planned against (treeChanges.planChanges): every
+    // item of this account, in tree order.
+    function treeRows() {
+        return db.prepare('SELECT id, parent_id, position, kind, role, title, url FROM items WHERE user_id = ? ORDER BY parent_id, position, id')
+            .all(userId);
+    }
+
+    // Approve a proposed change in one transaction: `plan(rows)` runs inside
+    // it, against the rows as they are now, and returns {ok, actions} or
+    // {ok: false, ...}; nothing is written unless it is ok. Then the version
+    // moves (as a replace: clients pull, as after any proposal), a history
+    // snapshot is written, and `after()` runs (the proposal row's removal),
+    // all or nothing. Returns the plan with {version}, or the refusal.
+    const applyTreeChanges = db.transaction((plan, { deviceId = 'ai-proposal', after = null } = {}) => {
+        const result = plan(treeRows());
+        if (!result || !result.ok) return result || { ok: false, stale: ['Nothing to apply.'] };
+        const now = new Date().toISOString();
+        const insert = db.prepare(`
+            INSERT INTO items (id, parent_id, position, kind, title, url, created_at, updated_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const move =db.prepare('UPDATE items SET parent_id = ?, position = ?, updated_at = ? WHERE user_id = ? AND id = ?');
+        const rename = db.prepare('UPDATE items SET title = ?, updated_at = ? WHERE user_id = ? AND id = ?');
+        const del = db.prepare('DELETE FROM items WHERE user_id = ? AND id = ?');
+        for (const a of result.actions) {
+            if (a.type === 'folder' || a.type === 'bookmark') {
+                // Fresh random ids (newId). One already taken, by anyone, is
+                // refused by the primary key, which rolls all of it back.
+                insert.run(a.id, a.parentId, nextPosition(a.parentId), a.type, a.title, a.type === 'bookmark' ? a.url : null, now, now, userId);
+            } else if (a.type === 'move') {
+                move.run(a.parentId, nextPosition(a.parentId), now, userId, a.id);
+            } else if (a.type === 'rename') {
+                rename.run(a.title, now, userId, a.id);
+            } else if (a.type === 'delete') {
+                for (const id of a.ids) del.run(userId, id);
+            }
+        }
+        const v = bump('replace');
+        recordHistory(readTree().roots, deviceId);
+        if (after) after();
+        return { ...result, version: v };
+    });
+
     // How deep a folder sits, for removing created folders children first.
     function depthOf(id) {
         const up = db.prepare('SELECT parent_id FROM items WHERE user_id = ? AND id = ?');
@@ -1066,6 +1111,8 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         appendToFolders,
         appendWorkflow,
         removeAppended,
-        depthOf
+        depthOf,
+        treeRows,
+        applyTreeChanges
     };
 }

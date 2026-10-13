@@ -14,8 +14,9 @@ import { initTenancySchema, nextUserId, bumpTreeVersion, getServerMeta } from '.
 // Bumped whenever a boot-time migration changes the schema; a database below
 // it is backed up before anything touches it. 3: every row names its account.
 // 4: shared links are a per-account inbox with filings (shares.js), and the
-// tree logs its appends (tree_ops).
-export const SCHEMA_VERSION = 4;
+// tree logs its appends (tree_ops). 5 (AI access): proposals gain bookmark
+// changes and where they came from (proposals.js).
+export const SCHEMA_VERSION = 5;
 
 export const MIN_PASSWORD_LENGTH = 8;
 export const MAX_PASSWORD_LENGTH = 256;

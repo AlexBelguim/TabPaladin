@@ -49,7 +49,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from '../server/node_modules/better-sqlite3/lib/index.js';
 import { hashPassword } from '../server/security.js';
-import { migrateUsers } from '../server/users.js';
+import { migrateUsers, SCHEMA_VERSION } from '../server/users.js';
 import { migrateOwnership, digestTables } from '../server/tenancy.js';
 import { makeItemsStore } from '../server/items.js';
 import { migrateShares } from '../server/shares.js';
@@ -588,12 +588,16 @@ async function rehearsal() {
         srv = startServer(dataDir);
         await srv.ready();
         const files = fs.readdirSync(dataDir);
+        // Schema 3 straight to this build's schema: one pre-upgrade copy, named
+        // for the version it upgrades to.
+        const pre = `pre-v${SCHEMA_VERSION}`;
         check('this server takes a pre-upgrade copy before anything else, then adds the inbox\'s columns',
-            files.some(f => f.startsWith('sync.db.pre-v4-')) && /Backed up the database to \S+sync\.db\.pre-v4-/.test(srv.log())
-            && srv.log().indexOf('pre-v4') < srv.log().indexOf('Share inbox: added sid'), srv.log());
+            files.some(f => f.startsWith(`sync.db.${pre}-`))
+            && new RegExp(`Backed up the database to \\S+sync\\.db\\.${pre}-`).test(srv.log())
+            && srv.log().indexOf(pre) < srv.log().indexOf('Share inbox: added sid'), srv.log());
         const c1 = counts();
-        check('every table keeps every row, and the schema is 4', JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c1.rows[t]])))
-            === JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c0.rows[t]]))) && c1.version === 4,
+        check(`every table keeps every row, and the schema is ${SCHEMA_VERSION}`, JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c1.rows[t]])))
+            === JSON.stringify(Object.fromEntries(TABLES.filter(t => t !== 'user_tree_meta').map(t => [t, c0.rows[t]]))) && c1.version === SCHEMA_VERSION,
             JSON.stringify([c0, c1]));
         const after = await views(BASE);
         for (const k of Object.keys(before)) {
