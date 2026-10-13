@@ -168,6 +168,11 @@ async function bootstrap() {
 
     if (!configured()) {
         setStatus('Open Settings (⚙) to configure your sync server.');
+        // An import link stays in the URL for the reload after setup. Tag its
+        // entry, so coming back to it later reads as Home, not as a new link.
+        if (IMPORT_HASH_RE.test(location.hash) && !history.state) {
+            history.replaceState({ tp: 'import-pending' }, '', location.href);
+        }
         return;
     }
     try { await pullSnapshot(); } catch (e) { /* status already set */ }
@@ -181,6 +186,8 @@ async function bootstrap() {
 // Used by LLM chats that cannot POST. The fragment never reaches the server;
 // the note opens in the editor for review and is only stored when the user
 // presses ✓ Done. A first-line "# " heading becomes the title, as usual.
+const IMPORT_HASH_RE = /^#(note|notes|reorder)=/;
+
 async function processImportHashIfAny() {
     const raw = location.hash.slice(1);
 
@@ -273,8 +280,11 @@ async function processImportHashIfAny() {
         if (res && res.id) parentId = res.id;
         else if (res) pendingNotebookName = notebook.trim();
     }
-    await startNewNote({ parentId, content, pendingNotebookName, from: 'Home' });
-    showToast('Review the note, then press ✓ Done.');
+    if (await startNewNote({ parentId, content, pendingNotebookName })) {
+        showToast('Review the note, then press ✓ Done.');
+    } else if (editorDirty()) {
+        showToast('Import skipped — your unsaved edit is still open.');
+    }
 }
 
 // --- Wire format <-> local shape ---
@@ -1348,6 +1358,11 @@ function nvBack({ confirmed = false } = {}) {
 }
 
 function onNotesPopState(e) {
+    // An import link opened while the app runs is a fragment navigation: the
+    // browser pops a fresh, state-less entry just before hashchange. That is
+    // no way back to Home (and no reason to ask about an edit) — the
+    // hashchange handler takes the entry over in consumeHash.
+    if (!e.state && IMPORT_HASH_RE.test(location.hash)) return;
     const st = e.state && e.state.tp === 'nv' ? e.state : null;
     if (!skipNavGuardOnce && editorDirty() && !confirm('Discard unsaved changes?')) {
         // Stay: put back the entry back just took away.
@@ -1383,10 +1398,11 @@ function openNoteById(id, { from } = {}) {
     openNotes(patch, { history: same && isDesktop() ? 'replace' : 'auto' });
 }
 
+// Resolves true once the editor is open.
 async function startNewNote({ parentId = null, content = '', from, pendingNotebookName = null } = {}) {
-    if (!confirmDiscardEdit()) return;
+    if (!confirmDiscardEdit()) return false;
     const found = await ensureNotesFolder();
-    if (!found) return;
+    if (!found) return false;
     stopEditing();
     const patch = {
         pane: 'note', noteId: null, isNew: true, editing: true,
@@ -1396,6 +1412,7 @@ async function startNewNote({ parentId = null, content = '', from, pendingNotebo
     if (from) patch.from = from;
     openNotes(patch, { history: 'push' });
     focusNoteEditor();
+    return true;
 }
 
 function focusNoteEditor() {
