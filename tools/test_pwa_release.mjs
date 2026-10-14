@@ -54,11 +54,13 @@ const asShell = (ref) => '/' + ref.replace(/^\.?\//, '');
 const missing = htmlRefs.map(asShell).filter(r => !shell.includes(r));
 check('everything index.html loads is in SHELL, with the same ?v=', missing.length === 0, missing.join(', '));
 check('the worker imports what the page loads: the same shareCore.js', imported.every(i => htmlRefs.includes(i)), JSON.stringify([imported, htmlRefs]));
+// Every module app.js imports, and what they import in turn (the shared core
+// in lib/ imports its fellow twins), as paths under pwa/.
 const modules = new Set();
 const walkImports = (file) => {
     const src = read(file);
-    for (const m of src.matchAll(/^\s*import\s+(?:[^'"]+\s+from\s+)?['"](\.\/[^'"]+)['"]/gm)) {
-        const f = m[1].replace(/^\.\//, '');
+    for (const m of src.matchAll(/^\s*import\s+(?:[^'"]+\s+from\s+)?['"](\.\.?\/[^'"]+)['"]/gm)) {
+        const f = path.posix.normalize(path.posix.join(path.posix.dirname(file), m[1]));
         if (!modules.has(f)) { modules.add(f); walkImports(f); }
     }
 };

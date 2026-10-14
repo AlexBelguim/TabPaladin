@@ -8,28 +8,32 @@
 //      account only once the account says yes — in the sheet, or asked at
 //      sign-in for one an earlier build queued.
 //   2. Unpushed edits survive a revoked session: signing in as someone else
-//      is refused (nothing of theirs is pulled over the edits), signing back
-//      in as the same account does not pull, and Push then keeps the edits.
+//      sets them aside on the phone (nothing of theirs is pulled over the
+//      edits, none of the edits goes into theirs), signing back in as the
+//      same account brings them back without a pull, and Push then keeps the
+//      edits. (The working copy is the shared core's: TreeStore's set-aside
+//      copies stand where an earlier build refused the sign-in.)
 //   3. A clean copy switches accounts cleanly, and the per-device lists from
 //      before accounts are adopted by the server's owner only.
 //   4. Admins see the Users block; plain users do not.
 //   5. A share the server refuses while you are signed in (a full inbox) is
 //      kept on the phone, the share sheet says why, and it goes up once there
 //      is room.
-//   6. Signing out with unpushed edits asks first and keeps them: nobody else
-//      can sign in over them, the same account gets them back, and nothing
-//      (a bookmarks file import) adds to them meanwhile. Closing the app
-//      while they are kept asks first.
+//   6. Signing out with unpushed edits asks first and keeps them: anyone else
+//      signing in sets them aside, never over them (and at another address
+//      the same id is not taken on trust), the same account gets them back
+//      without a pull, and nothing (a bookmarks file import) adds to them
+//      meanwhile. Closing the app while they are kept asks first.
 //   7. Nothing of the notes screen crosses accounts. An unsaved note counts
-//      as unpushed work: signing out asks, it reopens only for its account,
-//      and nobody else signs in over it, even after an expired session. A
-//      clean sign-out or account switch closes any open note, the import
-//      review and the server's lists, so the next account can neither see
-//      the last one's text nor save it into its own tree. Opening a new
-//      notebook or note and cancelling leaves nothing to push. The sign-out
-//      unwinds the notes screen's history entries without wiping the status
-//      that says what it kept, and closing the app asks first while a note
-//      is set aside.
+//      as unpushed work: signing out asks, it is parked on the phone for its
+//      account and reopens only for it, and whoever else signs in, even after
+//      an expired session, never sees it. A clean sign-out or account switch
+//      closes any open note, the import review and the server's lists, so the
+//      next account can neither see the last one's text nor save it into its
+//      own tree. Opening a new notebook or note and cancelling leaves nothing
+//      to push. The sign-out unwinds the notes screen's history entries
+//      without wiping the status that says what it kept. A 409 asks to pull
+//      the server's tree or, after a second yes, to force.
 //   8. An LLM proposal (a note or an order) is never approved over unpushed
 //      edits or a note open in the editor, since the approval's pull would
 //      replace them: the app says to push (or save) first, offers ⬆️ Push,
@@ -79,6 +83,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+// Every start of the app is a page of its own: modules of its own.
+import { closePage } from './fresh_page.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -398,6 +404,16 @@ const waitingRow = (title) => [...created].reverse()
 const noteLink = (title, body) => '#note=' + encodeURIComponent(`# ${title}\n\n${body}`);
 // The note editor's text as drawn since a mark (a count of `created`).
 const editorSince = (mark) => [...created.slice(mark)].reverse().find(e => e.tagName === 'TEXTAREA')?.value ?? null;
+// The working copies set aside on the phone, as the page keeps them (in its
+// platform: this browser has neither IndexedDB nor Cache Storage, so in
+// memory, as the copy itself), and the notes parked on the phone.
+const setAside = async () => {
+    const p = globalThis.__tpPlatform;
+    const index = (await p.getRaw(['tpTreeStashIndex'])).tpTreeStashIndex || [];
+    const got = index.length ? await p.getRaw(index) : {};
+    return index.map(k => got[k]).filter(Boolean);
+};
+const parkedNotes = () => JSON.parse(localStorageShim.getItem('tp_notes_parked_v1') || '[]');
 
 // The app started afresh at a URL, as after the phone's OS closed it: a new
 // page with nothing in memory, only what the phone kept in localStorage. The
@@ -405,6 +421,8 @@ const editorSince = (mark) => [...created.slice(mark)].reverse().find(e => e.tag
 // document's.
 let starts = 0;
 async function coldStart(url) {
+    // The page before is gone: it hears, reads and writes nothing more.
+    closePage();
     elements.clear();
     for (const k of Object.keys(windowListeners)) delete windowListeners[k];
     for (const k of Object.keys(documentListeners)) delete documentListeners[k];
@@ -481,17 +499,23 @@ try {
         && dialogs.alert.some(m => /Signed out/.test(m)), dialogs.alert.join(' | '));
     check('the edit is not on the server', !(await treeTitles(alexNew)).includes('Offline edit'));
 
-    const pullsBefore = requests.filter(r => r === 'GET /api/tree').length;
+    const mark2 = created.length;
+    const toasts2 = toastCount();
     await signIn('sam', 'sam-password-1');
-    check('signing in as sam is refused while alex\'s edits are unpushed',
-        /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent), byId('auth-error').textContent);
-    check('  with a way to discard them deliberately', !byId('auth-discard').classList.contains('hidden') && /alex/.test(byId('auth-discard').textContent));
-    check('  and nothing of sam\'s was pulled or stored', !localStorageShim.getItem('tp_pwa_token')
-        && requests.filter(r => r === 'GET /api/tree').length === pullsBefore);
+    const samFirst = (await api('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json.token;
+    const aside2 = (await setAside()).find(s => s.owner && s.owner.username === 'alex');
+    check('signing in as sam sets alex\'s unpushed edits aside on the phone, never over them',
+        localStorageShim.getItem('tp_pwa_userid') === '2' && aside2 && aside2.dirty && JSON.stringify(aside2.roots).includes('Offline edit'),
+        JSON.stringify(aside2 && aside2.owner));
+    check('  and says so', toastsSince(toasts2).some(t => /keeps unpushed changes for alex/.test(t)), toastsSince(toasts2).join(' | '));
+    check('  nothing of them is drawn for sam, or goes into his tree', !drawnSince(mark2, 'Offline edit')
+        && !(await treeTitles(samFirst)).includes('Offline edit') && !(await treeTitles(samFirst)).includes('Phone folder'));
+    const pullsBefore = requests.filter(r => r === 'GET /api/tree').length;
 
     await signIn('alex', 'new horse battery');
-    check('signing back in as alex does not pull over the edits', requests.filter(r => r === 'GET /api/tree').length === pullsBefore);
-    check('and says what to do', /unpushed edits from before you were signed out/.test(byId('status').textContent), byId('status').textContent);
+    check('signing back in as alex brings them back, and does not pull over the edits', requests.filter(r => r === 'GET /api/tree').length === pullsBefore
+        && dirtyShown());
+    check('and says what to do', /Restored unpushed changes.*Push to keep them/.test(byId('status').textContent), byId('status').textContent);
     await byId('pushBtn').fire('click');
     await settle();
     check('Push then keeps them', (await treeTitles(alexNew)).includes('Offline edit'));
@@ -579,21 +603,27 @@ try {
     check('a bookmarks file imported while signed out is refused, not added to the kept copy',
         !importAsked && /Sign in first/.test(lastToast()), lastToast());
     const pullsAtSignOut = requests.filter(r => r === 'GET /api/tree').length;
+    const keptAt6 = async () => (await setAside()).find(s => s.owner && s.owner.username === 'alex' && s.owner.url === BASE && s.dirty
+        && JSON.stringify(s.roots).includes('Unpushed at sign-out'));
+    const mark6 = created.length;
     await signIn('sam', 'sam-password-1');
-    check('sam cannot sign in over alex\'s unpushed edits',
-        /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent)
-        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    check('sam signing in sets alex\'s unpushed edits aside on the phone, never over them, and shows none of them',
+        localStorageShim.getItem('tp_pwa_userid') === '2' && Boolean(await keptAt6()) && !drawnSince(mark6, 'Unpushed at sign-out'));
     // The same account id at another address is not taken on trust either.
     await signIn('alex', 'new horse battery', `http://localhost:${PORT}`);
-    check('nor can alex #1 at another server address', /for alex on http:\/\/127\.0\.0\.1/.test(byId('auth-error').textContent)
-        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    check('nor is alex #1 at another server address given them on trust: they stay set aside for the address they came from',
+        localStorageShim.getItem('tp_pwa_userid') === '1' && localStorageShim.getItem('tp_pwa_url') === `http://localhost:${PORT}`
+        && Boolean(await keptAt6()) && !drawnSince(mark6, 'Unpushed at sign-out') && !dirtyShown());
+    const pullsBack = requests.filter(r => r === 'GET /api/tree').length;
     await signIn('alex', 'new horse battery');
     check('alex signs back in to his edits, with no pull over them',
-        requests.filter(r => r === 'GET /api/tree').length === pullsAtSignOut
-        && /unpushed edits from before you were signed out/.test(byId('status').textContent), byId('status').textContent);
+        requests.filter(r => r === 'GET /api/tree').length === pullsBack && pullsBack >= pullsAtSignOut && dirtyShown()
+        && /Restored unpushed changes/.test(byId('status').textContent), byId('status').textContent);
 
     console.log('\n7. Notes never cross accounts');
-    answers.confirm.push(true); // the laptop's push from section 6: overwrite it
+    // The laptop's push from section 6: not pulled over, overwritten.
+    answers.confirm.push(false); // "Pull the server's tree now (… discarded)?" No.
+    answers.confirm.push(true); // "Force-push this phone's version…?" Yes.
     await byId('pushBtn').fire('click');
     await settle();
     check('alex\'s push carries his edits and nothing imported while he was out',
@@ -626,13 +656,17 @@ try {
         && /unsaved note stays on this phone until alex signs in/.test(byId('status').textContent), byId('status').textContent);
     check('  back on the Home entry, so back leaves the app', H.index === 0 && !(entry().state && entry().state.tp === 'nv'),
         JSON.stringify({ index: H.index, state: entry().state }));
-    check('  and closing the app now asks first: the note set aside lives only in this page', unloadAsks());
+    const parkedHalf = () => parkedNotes().find(d => /half-written thought/.test(d.content) && d.owner && d.owner.username === 'alex');
+    check('  and the note is kept on the phone, parked for alex: closing the app loses nothing', Boolean(parkedHalf()) && !unloadAsks(),
+        JSON.stringify(parkedNotes().map(d => d.owner)));
     check('  and nothing of alex\'s is on screen: no copy, proposals or inbox',
-        /Signed out/.test(byId('content').innerHTML) && !badgeShown() && byId('inbox-fab').classList.contains('hidden'),
-        byId('content').innerHTML);
+        /Signed out|Open Settings/.test(byId('content').innerHTML) && !/ALEX PRIVATE|Diary/.test(byId('content').innerHTML)
+        && !badgeShown() && byId('inbox-fab').classList.contains('hidden'), byId('content').innerHTML);
+    const mark7a = created.length;
     await signIn('sam', 'sam-password-1');
-    check('sam cannot sign in over alex\'s unsaved note',
-        /an unsaved note for alex/.test(byId('auth-error').textContent) && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    check('sam signing in never sees alex\'s unsaved note, which stays parked for alex',
+        localStorageShim.getItem('tp_pwa_userid') === '2' && !bodyHas('nv-editing') && !drawnSince(mark7a, 'half-written thought')
+        && !drawnSince(mark7a, 'ALEX PRIVATE') && Boolean(parkedHalf()));
     await signIn('alex', 'new horse battery');
     check('alex signs back in to his note, still open with his text',
         bodyHas('nv-editing') && /half-written thought/.test(lastEditorText() || ''), lastEditorText());
@@ -678,16 +712,13 @@ try {
     await byId('pullBtn').fire('click');
     await settle();
     check('the session expires under an open edit', !localStorageShim.getItem('tp_pwa_token') && bodyHas('nv-editing'));
-    await signIn('sam', 'sam-password-1');
-    check('sam cannot sign in over the note alex was writing',
-        /an unsaved note for alex/.test(byId('auth-error').textContent) && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
-    answers.prompt.push('alex');
-    await byId('auth-discard').fire('click');
-    check('discarding alex\'s edits by name closes the note', !bodyHas('view-notes') && !bodyHas('nv-editing'));
+    const parkedMid = () => parkedNotes().find(d => /mid-session thought/.test(d.content) && d.owner && d.owner.username === 'alex');
     mark = created.length;
     await signIn('sam', 'sam-password-1');
-    check('then sam signs in, with nothing of alex\'s drawn', localStorageShim.getItem('tp_pwa_userid') === '2'
-        && !bodyHas('nv-editing') && !drawnSince(mark, 'ALEX PRIVATE') && !drawnSince(mark, 'mid-session'));
+    check('sam signing in over the note alex was writing parks it for alex: neither discarded nor sam\'s',
+        localStorageShim.getItem('tp_pwa_userid') === '2' && Boolean(parkedMid()) && !bodyHas('view-notes') && !bodyHas('nv-editing'),
+        JSON.stringify(parkedNotes().map(d => [d.owner && d.owner.username, d.content.slice(-20)])));
+    check('then sam is signed in, with nothing of alex\'s drawn', !drawnSince(mark, 'ALEX PRIVATE') && !drawnSince(mark, 'mid-session'));
     await clickNv('done');
     check('  or saved into sam\'s tree', !/ALEX PRIVATE|mid-session/.test(await treeTitles(samNow)));
 
@@ -706,6 +737,15 @@ try {
     console.log('\n8. Approving a proposal waits for a clean copy');
     await propose(alexTok, { action: 'reorder', order: ['From the LLM', 'Diary'] });
     await signIn('alex', alexPw);
+    check('(alex signing in has the note he was writing back, in its editor)', bodyHas('nv-editing')
+        && /mid-session thought/.test(lastEditorText() || '') && !parkedMid(), lastEditorText());
+    // Thrown away on purpose, here: ✕, and yes.
+    answers.confirm.push(true); // "Discard unsaved changes?"
+    await clickNv('cancel-edit');
+    await byId('brand-home').fire('click');
+    await settle();
+    check('(discarded on purpose, it is gone)', !bodyHas('nv-editing') && !parkedMid()
+        && !/mid-session/.test(await treeTitles(alexTok)));
     failNext = 'PUT /api/tree'; // the phone is offline for this push
     answers.prompt.push('Offline folder');
     await byId('newFolderBtn').fire('click');
@@ -737,7 +777,9 @@ try {
     await findProposal('From the LLM').querySelector('.proposal-approve').fire('click');
     await settle();
     check('OK pushes the edit, and still approves nothing', (await treeTitles(alexTok)).includes('Offline folder') && !dirtyShown()
-        && approvals() === approvals8 && (await serverProposals()).length === 2);
+        && approvals() === approvals8 && (await serverProposals()).length === 2,
+        JSON.stringify({ dirty: dirtyShown(), pushed: (await treeTitles(alexTok)).includes('Offline folder'), approvals: approvals() - approvals8,
+            waiting: (await serverProposals()).length, status: byId('status').textContent, toast: lastToast(), asks: dialogs.confirm.slice(-2) }));
     asked8 = dialogs.confirm.length;
     await findProposal('From the LLM').querySelector('.proposal-approve').fire('click');
     await settle();

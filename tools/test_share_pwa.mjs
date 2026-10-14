@@ -36,9 +36,10 @@
 //      and a share a forced push erased with its note; a share both
 //      uploaded and still on the phone is listed and counted once.
 //  10. The copy kept on the phone is its account's: kept over a sign-out with
-//      unpushed edits (and brought back for that account only, nobody else
-//      signing in over it), gone with a clean sign-out, never shown to the
-//      next account.
+//      unpushed edits, and brought back for that account only — someone else
+//      signing in meanwhile sets it aside on the phone, never over it, never
+//      showing it — gone with a clean sign-out, never shown to the next
+//      account.
 //  11. Sheets opened over the share sheet (Sign in, Settings, the Inbox)
 //      are drawn over it.
 //  12. Save as note signed out keeps the text on the phone and on screen.
@@ -55,6 +56,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+// Every start of the app is a page of its own: modules of its own.
+import { closePage } from './fresh_page.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -308,10 +311,28 @@ const button = (text, mark = 0) => [...since(mark)].reverse().find(e => e.tagNam
 const drawnText = (text, mark = 0) => since(mark).some(e => [e.textContent, e.value].some(s => typeof s === 'string' && s.includes(text)));
 const lastToast = () => [...document.body.children].reverse().find(c => c.id === 'tp-toast')?.textContent || '';
 const outbox = Share.cacheOutbox(cachesShim);
+// The working copy as kept on the phone, in the last release's shape (the
+// copy this browser, without IndexedDB, keeps in tp-data writes it there too).
 const kept = async () => {
     const c = await cachesShim.open('tp-data');
     const hit = await c.match('/__tp_tree');
     return hit ? hit.json() : null;
+};
+// What the shared core keeps on the phone: here, without IndexedDB, in
+// tp-data one entry a key (pwa/platform.js). The copies set aside.
+const keptKey = async (key) => {
+    const c = await cachesShim.open('tp-data');
+    const hit = await c.match('/__tp_kv/' + encodeURIComponent(key));
+    return hit ? hit.json() : undefined;
+};
+const keptStashes = async () => {
+    const index = (await keptKey('tpTreeStashIndex')) || [];
+    const out = [];
+    for (const k of index) {
+        const s = await keptKey(k);
+        if (s) out.push(s);
+    }
+    return out;
 };
 
 // The worker's half of a share: kept in the outbox, then the app opened on it.
@@ -323,6 +344,8 @@ async function shareFromWorker(fields, account) {
 
 let starts = 0;
 async function coldStart(url) {
+    // The page before is gone: it hears, reads and writes nothing more.
+    closePage();
     elements.clear();
     for (const k of Object.keys(windowListeners)) delete windowListeners[k];
     for (const k of Object.keys(documentListeners)) delete documentListeners[k];
@@ -784,16 +807,23 @@ try {
     await coldStart(`${BASE}/`);
     check('the next start, signed out, brings it back for alex without showing it', /Restored unpushed changes .* sign in as alex/.test(byId('status').textContent)
         && /Signed out/.test(byId('content').innerHTML), byId('status').textContent);
+    const mark10a = created.length;
     await signIn('sam', 'sam-password-1');
-    check('sam cannot sign in over it', /unpushed edit/.test(byId('auth-error').textContent) && /for alex/.test(byId('auth-error').textContent)
-        && !localStorageShim.getItem('tp_pwa_token'), byId('auth-error').textContent);
+    const aside10 = (await keptStashes()).find(s => s.owner && s.owner.username === 'alex');
+    check('sam signing in sets it aside on the phone, never over it: alex\'s unpushed edit is kept, and none of it is shown or pushed for sam',
+        localStorageShim.getItem('tp_pwa_user') === 'sam' && aside10 && aside10.dirty && JSON.stringify(aside10.roots).includes('Kept for alex')
+        && !drawnText('Kept for alex', mark10a) && !JSON.stringify((await kept()) || {}).includes('Kept for alex')
+        && /keeps unpushed changes for alex/.test(document.body.children.filter(c => c.id === 'tp-toast').map(c => c.textContent).join(' | ')),
+        JSON.stringify({ aside: aside10 && aside10.owner, user: localStorageShim.getItem('tp_pwa_user') }));
+    const pullsBeforeAlex = requests.filter(r => r === 'GET /api/tree').length;
     await signIn('alex', PASSWORD);
+    check('  alex signing in has it back, saying so', /Restored unpushed changes/.test(byId('status').textContent), byId('status').textContent);
     await byId('pushBtn').fire('click');
     await settle();
     // The sign-out above ended the session the test held; a fresh one.
     const A10 = (await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token;
-    check('alex signs in to it, nothing pulled over it, and pushes it', requests.filter(r => r === 'GET /api/tree').length === pulls10
-        && Boolean(byTitle((await tree(A10)).roots, 'Kept for alex')), byId('status').textContent);
+    check('alex signs in to it, nothing pulled over it, and pushes it', requests.filter(r => r === 'GET /api/tree').length === pullsBeforeAlex
+        && pulls10 <= pullsBeforeAlex && Boolean(byTitle((await tree(A10)).roots, 'Kept for alex')), byId('status').textContent);
     const outAt = new Date().toISOString();
     await byId('auth-signout').fire('click');
     await settle();
@@ -851,11 +881,13 @@ try {
     await coldStart(`${BASE}/`);
     check('sam\'s start says the phone keeps alex\'s unpushed changes', document.body.children.slice(toasts14)
         .some(c => c.id === 'tp-toast' && /keeps unpushed changes for alex/.test(c.textContent)));
+    const aside14 = () => keptStashes().then(list => list.find(s => s.owner && s.owner.username === 'alex' && s.dirty
+        && JSON.stringify(s.roots).includes('Alex unpushed elsewhere')));
+    check('  set aside on the phone for alex, not pulled over or pushed for sam', Boolean(await aside14())
+        && !JSON.stringify((await kept()) || {}).includes('Alex unpushed elsewhere'));
     await byId('auth-signout').fire('click');
     await settle();
-    const kept14 = await kept();
-    check('  sam\'s clean sign-out leaves them on the phone', kept14 && kept14.dirty && kept14.account.username === 'alex'
-        && JSON.stringify(kept14.roots).includes('Alex unpushed elsewhere'), JSON.stringify(kept14 && kept14.account));
+    check('  sam\'s clean sign-out leaves them on the phone', Boolean(await aside14()));
     await signIn('alex', PASSWORD);
     check('  and alex signing in has them back, saying so', /Restored unpushed changes/.test(byId('status').textContent), byId('status').textContent);
     await byId('pushBtn').fire('click');

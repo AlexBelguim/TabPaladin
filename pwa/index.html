@@ -17,6 +17,13 @@
       <img src="icons/icon192.png" alt="" width="22" height="22">
       <h1>TabPaladin</h1>
     </button>
+    <!-- The sync chip: what this device holds that the server does not yet
+         (in the top bar from 900px; on a phone, a count on Home below). -->
+    <div id="sync-chip" class="sync-chip" role="status">
+      <span id="sync-chip-label"></span>
+      <button id="sync-chip-push" type="button" class="ghost" title="Push this device's changes to the server">Push</button>
+      <button id="sync-chip-pull" type="button" class="ghost" title="Pull the server's tree">Pull</button>
+    </div>
     <button id="notesBtn" class="ghost" title="Open notes">📝</button>
     <button id="pushBtn" class="ghost" title="Push latest to sync server">⬆️</button>
     <div id="menu-wrap">
@@ -41,7 +48,7 @@
        earns its place, and thumbs reach the bottom of a phone more easily than
        the top-right corner the ⋯ menu lives in. -->
   <nav id="bottom-nav">
-    <button type="button" data-nav="home" class="on"><span class="bn-i">🏠</span>Home</button>
+    <button type="button" data-nav="home" class="on"><span class="bn-i">🏠</span>Home<span class="bn-badge sync-badge hidden" aria-label="Changes not pushed yet"></span></button>
     <button type="button" data-nav="notes"><span class="bn-i">📝</span>Notes<span class="bn-badge hidden" aria-label="Notes waiting for approval"></span></button>
     <button type="button" data-nav="inbox"><span class="bn-i">📥</span>Inbox<span class="bn-badge inbox-badge hidden" aria-label="Links waiting to be filed"></span></button>
     <button type="button" data-nav="settings"><span class="bn-i">⚙</span>Settings</button>
@@ -97,7 +104,6 @@
         <small id="auth-setup-hint" class="hint hidden"></small>
         <small id="auth-error" class="hint error hidden"></small>
         <button id="auth-submit" class="primary">Sign in</button>
-        <button id="auth-discard" class="ghost-block danger hidden"></button>
       </div>
 
       <div id="auth-signed-in" class="hidden">
@@ -168,6 +174,16 @@
         <p id="storage-status" class="hint"></p>
         <small id="storage-error" class="hint error hidden"></small>
         <button id="storage-persist" class="ghost-block hidden" type="button">Keep my data on this device</button>
+        <label class="check-row"><input id="push-after-change" type="checkbox"> Push after each change (this device)</label>
+        <small id="push-after-change-hint" class="hint"></small>
+        <!-- Working copies set aside on this device: another account's, or
+             one a restore put aside. Each comes back when its account signs
+             in; here it can be brought back, exported, or discarded. -->
+        <div id="stash-block" class="hidden">
+          <strong class="block-title">Set-aside copies</strong>
+          <p class="hint">Kept on this device, never discarded unasked. Each comes back on its own when its account signs in.</p>
+          <div id="stash-list"></div>
+        </div>
       </div>
     </div>
   </div>
