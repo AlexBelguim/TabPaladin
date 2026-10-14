@@ -80,6 +80,20 @@
 //  15. A push of a copy that is another account's (412) is never forced and
 //      never pulled over: Cancel changes nothing, OK sets it aside and pulls
 //      this account's tree.
+//  16. Notes half-written in two windows survive a step back to the last
+//      release (which keeps one, and writes its own over 'tpLiveDraft') and
+//      forward again.
+//  17. A note localStorage will not park is never lost: a gone window's
+//      stays where it was kept, an open one goes to IndexedDB, and each comes
+//      back with its copy.
+//  18. A step back's later copy is taken in while IndexedDB is full (into
+//      Cache Storage), and tp-data is never written over with an older copy;
+//      one nothing can take in is set aside at the next start, not lost.
+//  19. A window of the last release that takes the copy from this one while
+//      it cannot answer: this one stops, writes nothing over that window's
+//      copy and loses nothing it made, and Use here carries on with both.
+//  20. Where the copy can only be kept in memory (each window's its own), one
+//      window edits at a time, even with Web Locks.
 //
 // Run: node tools/test_pwa_durable.mjs [--port 18987]
 
@@ -770,9 +784,14 @@ const byId = (id) => {
     return elements.get(id);
 };
 const storage = new Map();
+// `parkedRefused`: localStorage refuses the parked notes' list, as a full one does.
+let parkedRefused = false;
 const localStorageShim = {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
-    setItem: (k, v) => storage.set(k, String(v)),
+    setItem: (k, v) => {
+        if (parkedRefused && k === 'tp_notes_parked_v1') throw Object.assign(new Error('The quota has been exceeded.'), { name: 'QuotaExceededError' });
+        storage.set(k, String(v));
+    },
     removeItem: (k) => storage.delete(k),
     clear: () => storage.clear()
 };
@@ -886,7 +905,9 @@ Object.assign(globalThis, {
 });
 globalThis.addEventListener = (ev, fn) => { (windowListeners[ev] = windowListeners[ev] || []).push(fn); };
 globalThis.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
-globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+// `wide`: the window is 900px wide or more (a computer's, or a phone turned on its side).
+let wide = false;
+globalThis.matchMedia = (q) => ({ matches: wide && /min-width:\s*900px/.test(String(q)), addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
 globalThis.requestAnimationFrame = globalThis.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
 globalThis.cancelAnimationFrame = globalThis.cancelAnimationFrame || ((id) => clearTimeout(id));
 globalThis.innerWidth = 375;
@@ -899,9 +920,12 @@ const Share = globalThis.TPShare;
 let currentTag = null;
 let withStorageManager = true;
 let withLocks = true;
+// What the browser says it is (none: a browser that says nothing).
+let userAgent = null;
 function enterWindow(tag) {
     Object.defineProperty(globalThis, 'navigator', {
-        value: { clipboard: null, ...(withLocks ? { locks: lockHub.forTag(tag) } : {}), ...(withStorageManager ? { storage: storageManager } : {}) },
+        value: { clipboard: null, ...(withLocks ? { locks: lockHub.forTag(tag) } : {}), ...(withStorageManager ? { storage: storageManager } : {}),
+            ...(userAgent ? { userAgent } : {}) },
         configurable: true
     });
     globalThis.BroadcastChannel = channelHub.classFor(tag);
@@ -979,6 +1003,9 @@ const idsIn = (nodes, out = []) => { for (const n of nodes || []) { out.push(n.i
 const has = (rec, title) => Boolean(rec && JSON.stringify(rec.roots || []).includes(JSON.stringify(title)));
 const kvTree = () => idb.peek('tpTree');
 const kvDrafts = () => idb.peek('tpLiveDraft');
+// This release's live drafts, one per window (the last release reads only tpLiveDraft).
+const windowDrafts = () => idb.peek('tpWindowDrafts') || {};
+const windowDraftTexts = () => Object.values(windowDrafts()).map(d => d.content);
 const draftTexts = () => Object.values(kvDrafts() || {}).map(d => d.content);
 const tpData = async () => {
     const c = await cachesShim.open('tp-data');
@@ -1001,6 +1028,12 @@ const sheetOpen = () => !byId('share-sheet').classList.contains('hidden');
 const statusText = () => byId('status').textContent;
 async function clickNv(nv) {
     const t = { dataset: { nv }, closest: (sel) => (sel === '[data-nv]' ? t : null) };
+    await byId('content').fire('click', { target: t });
+    await settle();
+}
+// A tap on a row the notes screen drew for one note.
+async function clickNvId(nv, id) {
+    const t = { dataset: { nv, id }, closest: (sel) => (sel === '[data-nv]' ? t : null) };
     await byId('content').fire('click', { target: t });
     await settle();
 }
@@ -1111,6 +1144,8 @@ async function otherCoreWindow(tag) {
         globalThis.__tpPlatform = page;
     }
 }
+// The page's own TreeStore: the module app.js imported for this start.
+const pageTreeStore = async () => (await import(pathToFileURL(path.join(REPO, 'pwa', 'lib', 'treeStore.js')).href + '?start=' + starts)).TreeStore;
 const drawnSince = (mark, text) => created.slice(mark).some(e => [e.value, e.textContent, e.innerHTML].some(s => typeof s === 'string' && s.includes(text)));
 const parkedNotes = () => JSON.parse(localStorageShim.getItem('tp_notes_parked_v1') || '[]');
 const bodyHasEditing = () => document.body.classList.contains('nv-editing');
@@ -1942,6 +1977,201 @@ try {
         JSON.stringify({ st: statusText(), owner: kvTree().owner, aside: Boolean(aside15) }));
     check('  and the other window has alex\'s copy now too, sam\'s kept for sam', await until(() => Boolean(x15.T.status().owner) && x15.T.status().owner.username === 'alex', 3000));
     x15.close();
+
+    // =================================================================================
+    console.log('\n16. Notes half-written in two windows, a step back to the last release, and forward again');
+    if (!document.body.classList.contains('view-notes')) await byId('notesBtn').fire('click');
+    await clickNv('new-note');
+    await typeNote('# Note X\n\nNOTE X TEXT');
+    await pastDraftWrite();
+    // Another window of this release wrote a note of its own a moment later,
+    // and is gone.
+    idb.poke('tpWindowDrafts', { ...windowDrafts(), ...DC.liveDraftsFor({ pane: 'note', editing: true, isNew: true, draft: '# Note Y\n\nNOTE Y TEXT', loaded: '' },
+        accountOf(alexLogin), 'window-y-21', new Date(Date.now() + 60000).toISOString()) });
+    await typeNote('# Note X\n\nNOTE X TEXT, and more');
+    await pastDraftWrite();
+    const mirror16 = Object.values(kvDrafts() || {});
+    check('each window\'s note is kept where the last release never writes, the newest mirrored where it reads',
+        windowDraftTexts().some(t => /NOTE X TEXT, and more/.test(t)) && windowDraftTexts().some(t => /NOTE Y TEXT/.test(t))
+        && mirror16.length === 1 && mirror16[0].mirror && /NOTE Y TEXT/.test(mirror16[0].content), JSON.stringify({ win: windowDraftTexts(), mirror: mirror16.map(d => d.content) }));
+    // The app is killed, and the last release starts: it opens the one note
+    // it reads, and its first write replaces all of tpLiveDraft with its own.
+    closePage();
+    lockHub.closeTag(currentTag);
+    channelHub.closeTag(currentTag);
+    const v32view21 = DC.fromKvRecord(kvTree(), kvDrafts());
+    check('(the last release finds the newest note to open)', Boolean(v32view21.nv) && /NOTE Y TEXT/.test(v32view21.nv.draft));
+    idb.poke('tpLiveDraft', DC.liveDraftsFor({ ...v32view21.nv, draft: '# Note Y\n\nNOTE Y TEXT, edited in the last release' }, v32view21.account, 'v32-window-21'));
+    await coldStart(`${BASE}/`, { tag: 'w16' });
+    await pastDraftWrite();
+    const all16 = [lastEditorText() || '', ...parkedNotes().map(d => d.content)].join('\n---\n');
+    check('forward again, nothing is lost: the note of the window the last release never read, and that release\'s own, both back',
+        /NOTE X TEXT, and more/.test(all16) && /NOTE Y TEXT, edited in the last release/.test(all16), all16);
+    answers.confirm.push(true); // Discard unsaved changes?
+    await clickNv('cancel-edit');
+    localStorageShim.removeItem('tp_notes_parked_v1');
+
+    // =================================================================================
+    console.log('\n17. Parking a note when localStorage will not take it');
+    parkedRefused = true;
+    idb.poke('tpWindowDrafts', { ...windowDrafts(), ...DC.liveDraftsFor({ pane: 'note', editing: true, isNew: true, draft: 'SAM NOTE, NOWHERE ELSE', loaded: '' },
+        accountOf(samLogin), 'gone-window-22') });
+    const toasts17 = toastMark();
+    await coldStart(`${BASE}/`, { tag: 'w17' });
+    await pastDraftWrite();
+    check('a gone window\'s note for another account, which localStorage will not park, stays where it was kept, and no word says otherwise',
+        windowDraftTexts().includes('SAM NOTE, NOWHERE ELSE') && !parkedNotes().length && !bodyHasEditing()
+        && !toastsSince(toasts17).some(m => /stays open here only/.test(m)), JSON.stringify({ win: windowDraftTexts(), toasts: toastsSince(toasts17) }));
+    if (!document.body.classList.contains('view-notes')) await byId('notesBtn').fire('click');
+    await clickNv('new-note');
+    await typeNote('# Alex 22\n\nALEX NOTE AS SAM SIGNS IN');
+    await pastDraftWrite();
+    await signIn('sam', 'sam-password-1');
+    await pastDraftWrite();
+    check('alex\'s open note, which localStorage will not park, is kept on the device for alex, its editor closed over sam\'s copy',
+        Object.values(windowDrafts()).some(d => /ALEX NOTE AS SAM SIGNS IN/.test(d.content) && d.owner && d.owner.username === 'alex')
+        && !/ALEX NOTE AS SAM SIGNS IN/.test(lastEditorText() || '') && kvTree().owner.username === 'sam',
+        JSON.stringify(Object.values(windowDrafts()).map(d => [d.owner && d.owner.username, d.content])));
+    check('  and sam has his note back, in its editor', bodyHasEditing() && /SAM NOTE, NOWHERE ELSE/.test(lastEditorText() || ''), lastEditorText());
+    answers.confirm.push(true); // Discard unsaved changes?
+    await clickNv('cancel-edit');
+    parkedRefused = false;
+    await signIn('alex', PASSWORD);
+    check('  and alex his', bodyHasEditing() && /ALEX NOTE AS SAM SIGNS IN/.test(lastEditorText() || ''), lastEditorText());
+    answers.confirm.push(true); // Discard unsaved changes?
+    await clickNv('cancel-edit');
+    await pastDraftWrite();
+    check('(nothing left behind)', !windowDraftTexts().some(t => /SAM NOTE|ALEX NOTE AS SAM/.test(t)), JSON.stringify(windowDraftTexts()));
+
+    // =================================================================================
+    console.log('\n18. A step back\'s copy, taken in while IndexedDB is full');
+    const k18 = kvTree();
+    const stepBack18 = (title, at) => {
+        const roots = JSON.parse(JSON.stringify(kvTree().roots));
+        roots.find(r => r.role === 'bookmarks').children.push({ id: 'aaaaaaaaaaaa' + String(Math.floor(Math.random() * 9000) + 1000), kind: 'folder', title, children: [] });
+        return { v: 1, savedAt: at, account: accountOf(alexLogin), roots, version: kvTree().baseVersion, dirty: true, editCount: 1,
+            importIds: [], serverIds: (kvTree().meta || {}).serverIds || [], nv: null, keptDraft: null, pathIds: [] };
+    };
+    const cacheKv18 = async (key) => {
+        const hit = await (await cachesShim.open('tp-data')).match('/__tp_kv/' + encodeURIComponent(key));
+        return hit ? hit.json() : undefined;
+    };
+    await putTpData(stepBack18('Step back on a full disk', new Date(Date.now() + 1000).toISOString()));
+    idb.ctl.quotaFull = true;
+    await coldStart(`${BASE}/`, { tag: 'w18' });
+    check('taken in all the same, into Cache Storage: the step back\'s edit is the copy here', has(await cacheKv18('tpTree'), 'Step back on a full disk')
+        && /Restored unpushed changes/.test(statusText()) && !has(kvTree(), 'Step back on a full disk'), statusText());
+    visibility = 'hidden';
+    fireDocument('visibilitychange');
+    await sleep(100);
+    visibility = 'visible';
+    check('  and going to the background writes it into tp-data again, not the older copy IndexedDB holds', has(await tpData(), 'Step back on a full disk'));
+    idb.ctl.quotaFull = false;
+    await coldStart(`${BASE}/`, { tag: 'w18b' });
+    check('  the next start, with room again, has it in IndexedDB', has(kvTree(), 'Step back on a full disk') && (await cacheKv18('tpTree')) === undefined);
+    await byId('pushBtn').fire('click');
+    await settle();
+    // Cache Storage full too: nothing takes it in at the start.
+    await putTpData(stepBack18('Second step back', new Date(Date.now() + 2000).toISOString()));
+    idb.ctl.quotaFull = true;
+    cachesFull = true;
+    await coldStart(`${BASE}/`, { tag: 'w18c' });
+    idb.ctl.quotaFull = false;
+    cachesFull = false;
+    check('not taken in, nothing having room: tp-data keeps its later copy', has(await tpData(), 'Second step back') && !has(kvTree(), 'Second step back'));
+    offline = /^PUT \/api\/tree$/;
+    await newFolder('Made after the failed take-in');
+    offline = null;
+    await pastCopyWrite();
+    visibility = 'hidden';
+    fireDocument('visibilitychange');
+    await sleep(100);
+    visibility = 'visible';
+    check('  this window writes its own copy now, but never tp-data over that later one', has(kvTree(), 'Made after the failed take-in')
+        && has(await tpData(), 'Second step back') && !has(await tpData(), 'Made after the failed take-in'));
+    await coldStart(`${BASE}/`, { tag: 'w18d' });
+    const aside18 = kvStashes().find(s => has(s, 'Second step back'));
+    check('  the next start keeps this window\'s copy, and sets that one aside for alex to bring back, rather than lose it',
+        has(kvTree(), 'Made after the failed take-in') && Boolean(aside18) && aside18.ownerWas && aside18.ownerWas.username === 'alex' && aside18.dirty
+        && localStorageShim.getItem('tp_copy_tpdata_held') === null, JSON.stringify({ aside: Boolean(aside18), held: localStorageShim.getItem('tp_copy_tpdata_held') }));
+    await byId('pushBtn').fire('click');
+    await settle();
+
+    // =================================================================================
+    console.log('\n19. A window of the last release takes the copy from this one while it cannot answer');
+    await coldStart(`${BASE}/`, { tag: 'v19' });
+    check('(this release\'s window edits, holding \'tp-primary\' with its others)', !guardShown() && lockHub.holders('tp-primary').includes('v19'));
+    offline = /^PUT \/api\/tree$/;
+    await newFolder('Kept before the take-over');
+    await pastCopyWrite();
+    // A tab of the last release that never started (behind its card) takes
+    // the copy; this window, frozen in the background, does not answer.
+    channelHub.freeze('v19');
+    const old19 = otherWindow('old19');
+    const took19 = await old19.take();
+    // It claims the copy, as the last release does: in IndexedDB and in localStorage.
+    const claim19 = { id: 'old19', at: Date.now() };
+    idb.poke('tpPrimary', claim19);
+    localStorageShim.setItem('tp_copy_claim', JSON.stringify(claim19));
+    channelHub.freeze('v19', false);
+    // Back, this window makes an edit before it has heard.
+    answers.prompt.push('Made here after the take-over');
+    await byId('newFolderBtn').fire('click');
+    await until(() => guardShown(), 4000);
+    await pastCopyWrite();
+    offline = null;
+    check('the take-over is heard: this window stops, behind the card, saying a tab from before the update took the copy',
+        took19.ok && took19.how === 'taken' && guardShown() && /took over the copy/.test(byId('primary-guard-text').textContent)
+        && !lockHub.holders('tp-primary').includes('v19'), JSON.stringify({ took19, text: byId('primary-guard-text').textContent }));
+    check('  what it made since is not written over that tab\'s copy, nor lost: it waits in this window, and closing asks first',
+        !has(kvTree(), 'Made here after the take-over') && has(kvTree(), 'Kept before the take-over') && unloadAsks());
+    // The last release's window edits from what is kept, and writes without reading first.
+    const kept19 = DC.fromKvRecord(kvTree(), kvDrafts());
+    const roots19 = JSON.parse(JSON.stringify(kept19.roots));
+    roots19.find(r => r.role === 'bookmarks').children.push({ id: 'aaaaaaaaaaaa0024', kind: 'folder', title: 'Made in the last release', children: [] });
+    const v32rec24 = DC.toKvRecord({ ...kept19, roots: roots19, dirty: true, editCount: (kept19.editCount || 0) + 1, savedAt: new Date(Date.now() + 500).toISOString() },
+        { copyId: kept19.copyId, seq: kept19.seq + 1 });
+    const w19 = await DC.createKv(idb.factory).write({ tpTree: v32rec24 }, { fence: claim19 });
+    check('(that tab\'s write goes through: its claim is the latest)', !w19.fenced && has(kvTree(), 'Made in the last release'));
+    await sleep(300);
+    check('  and this window, behind the card, takes nothing of it in, nor writes over it', !has(kvTree(), 'Made here after the take-over')
+        && kvTree().rev === v32rec24.rev);
+    reloadsBefore = reloads;
+    await byId('primary-take').fire('click');
+    await until(() => !guardShown(), 8000);
+    await settle();
+    await pastCopyWrite();
+    const after19 = kvTree();
+    check('Use here: that tab writes down and lets go, and this one carries on with both, in this release\'s record',
+        old19.events.includes('yielded') && !guardShown() && reloads === reloadsBefore && after19.pwa >= 33 && after19.owner.username === 'alex'
+        && has(after19, 'Made in the last release') && has(after19, 'Made here after the take-over') && has(after19, 'Kept before the take-over')
+        && lockHub.holders('tp-primary').includes('v19'),
+        JSON.stringify({ ev: old19.events, guard: guardShown(), reloads: reloads - reloadsBefore, pwa: after19.pwa, last: has(after19, 'Made in the last release'), here: has(after19, 'Made here after the take-over') }));
+    check('  and should that tab write again, this one\'s claim stops it', (await DC.createKv(idb.factory).write({ tpTree: v32rec24 }, { fence: claim19 })).fenced);
+    old19.close();
+    channelHub.closeTag('old19');
+    await byId('pushBtn').fire('click');
+    await settle();
+    const t19 = await tree(A);
+    check('  everything of both is pushed from here', ['Made in the last release', 'Made here after the take-over', 'Kept before the take-over']
+        .every(title => Boolean(byTitle(t19.roots, title))));
+
+    // =================================================================================
+    console.log('\n20. A browser that keeps nothing between starts: one window edits at a time, even with Web Locks');
+    const cachesBefore20 = globalThis.caches;
+    globalThis.indexedDB = undefined;
+    globalThis.caches = undefined;
+    await coldStart(`${BASE}/`, { tag: 'm20' });
+    const held20 = (await lockHub.forTag('probe20').query()).held;
+    check('each window\'s copy being its own (in memory), this one edits holding \'tp-primary\' alone',
+        held20.some(l => l.name === 'tp-primary' && l.mode === 'exclusive' && l.clientId === 'm20'), JSON.stringify(held20.filter(l => l.name === 'tp-primary')));
+    const other20 = otherWindow('o20');
+    check('  so another window starting meanwhile waits, never editing a copy of its own beside it', (await other20.start()) === 'secondary');
+    other20.close();
+    channelHub.closeTag('o20');
+    globalThis.indexedDB = idb.factory;
+    globalThis.caches = cachesBefore20;
+    await coldStart(`${BASE}/`, { tag: 'w20b' });
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog.slice(-2000));

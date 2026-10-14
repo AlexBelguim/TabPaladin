@@ -77,6 +77,9 @@
 //  20. The platform itself: settings never store the session token, what a
 //      page decorates a write with is written, a fenced window writes
 //      nothing, and without IndexedDB the store is Cache Storage, then memory.
+//  21. Two windows over an IndexedDB that fills up: one window's edit kept in
+//      Cache Storage is read by the other too, which makes its own on top of
+//      it, never over it; and IndexedDB with room again takes the copy back.
 //
 // Run: node tools/test_treestore.mjs           both runs
 //      node tools/test_treestore.mjs --web     the web app's run only
@@ -1755,6 +1758,83 @@ if (WEB) {
         let closedRead = null;
         try { await p.storage.local.get('tpTree'); } catch (e) { closedRead = e; }
         check('a page that has closed reads nothing more', closedRead !== null);
+    }
+
+    console.log('\n21. Two windows over an IndexedDB that fills up: the copy goes to Cache Storage, for both');
+    {
+        // One IndexedDB (full on demand) and one Cache Storage, shared by
+        // both windows, as a browser's are.
+        const idbMap = new Map();
+        const full = { on: false };
+        const shared = Platform.memoryBackend(idbMap);
+        const idbFor = () => ({
+            kind: 'indexeddb',
+            open: async () => {},
+            getMany: (k) => shared.getMany(k),
+            write: async (e, o) => {
+                if (full.on) throw Object.assign(new Error('The quota has been exceeded.'), { name: 'QuotaExceededError' });
+                return shared.write(e, o);
+            },
+            claim: (c) => shared.claim(c)
+        });
+        const cacheData = new Map();
+        const cacheKey = (k) => (typeof k === 'string' ? k : k.url);
+        const cache = {
+            match: async (k) => (cacheData.has(cacheKey(k)) ? new Response(cacheData.get(cacheKey(k))) : undefined),
+            put: async (k, r) => { cacheData.set(cacheKey(k), await r.text()); },
+            delete: async (k) => cacheData.delete(cacheKey(k)),
+            keys: async () => [...cacheData.keys()]
+        };
+        const caches2 = { open: async () => cache };
+        const open = async (name, { channel = true } = {}) => {
+            const platform = Platform.createPlatform({ backend: idbFor(), caches: caches2, BroadcastChannel: channel ? globalThis.BroadcastChannel : null, id: name });
+            globalThis.__tpPlatform = platform;
+            try {
+                const { TreeStore: T } = await import(`${LIB}/treeStore.js?full-disk-${name}`);
+                await T.load();
+                return { platform, T };
+            } finally {
+                globalThis.__tpPlatform = webPlatform;
+            }
+        };
+        const titles = (T) => T.roots().map(n => n.title).join(',');
+        const asideCopy = () => (cacheData.has('/__tp_kv/tpTree') ? JSON.parse(cacheData.get('/__tp_kv/tpTree')) : null);
+        const a = await open('full-a');
+        const b = await open('full-b');
+        await a.T.createNode({ parentId: null, kind: 'folder', title: 'E0' });
+        await a.T.flush();
+        await until(() => titles(b.T) === 'E0');
+        full.on = true;
+        await a.T.createNode({ parentId: null, kind: 'folder', title: 'E1' });
+        const keptA = await a.T.flush();
+        await until(() => titles(b.T) === 'E0,E1');
+        await b.T.createNode({ parentId: null, kind: 'folder', title: 'E2' });
+        const keptB = await b.T.flush();
+        await until(() => titles(a.T) === 'E0,E1,E2');
+        await wait(30);
+        check('IndexedDB full: one window\'s edit kept in Cache Storage, then the other\'s made on top of it — neither lost',
+            keptA && keptB && titles(a.T) === 'E0,E1,E2' && titles(b.T) === 'E0,E1,E2'
+            && asideCopy() && asideCopy().roots.map(n => n.title).join(',') === 'E0,E1,E2',
+            JSON.stringify({ keptA, keptB, a: titles(a.T), b: titles(b.T), aside: asideCopy() && asideCopy().roots.map(n => n.title), idb: idbMap.get('tpTree').roots.map(n => n.title) }));
+        // A window that hears neither (no channel), opened now: it starts
+        // from the copy in Cache Storage, not IndexedDB's older one, and its
+        // edit goes on top of both windows' — never over them.
+        const c = await open('full-c', { channel: false });
+        await c.T.createNode({ parentId: null, kind: 'folder', title: 'E2C' });
+        const keptC = await c.T.flush();
+        check('  a window that hears neither starts from the copy in Cache Storage, and its edit goes on top of theirs',
+            keptC && titles(c.T) === 'E0,E1,E2,E2C' && asideCopy() && asideCopy().roots.map(n => n.title).join(',') === 'E0,E1,E2,E2C',
+            JSON.stringify({ c: titles(c.T), aside: asideCopy() && asideCopy().roots.map(n => n.title) }));
+        full.on = false;
+        await a.T.createNode({ parentId: null, kind: 'folder', title: 'E3' });
+        await a.T.flush();
+        await until(() => titles(b.T) === 'E0,E1,E2,E2C,E3');
+        check('  IndexedDB with room again takes the whole copy back, and Cache Storage lets go of it',
+            idbMap.get('tpTree').roots.map(n => n.title).join(',') === 'E0,E1,E2,E2C,E3' && asideCopy() === null && titles(b.T) === 'E0,E1,E2,E2C,E3',
+            JSON.stringify({ idb: idbMap.get('tpTree').roots.map(n => n.title), aside: Boolean(asideCopy()) }));
+        a.platform.close();
+        b.platform.close();
+        c.platform.close();
     }
 }
 

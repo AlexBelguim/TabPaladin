@@ -43,13 +43,22 @@
 // what the last one kept into TreeStore's record (planMigration): the copy,
 // a newer one in tp-data after a step back, a note set aside by a sign-out
 // (now a parked draft, as the extension parks them: tp_notes_parked_v1), and
-// the drafts kept with set-aside copies. Single-window mode (the guard below)
-// remains where Web Locks are missing.
+// the drafts kept with set-aside copies. Each window's live draft goes under
+// WINDOW_DRAFTS_KEY, where the last release never writes; the newest is
+// mirrored into 'tpLiveDraft' for it. Single-window mode (the guard below)
+// remains where Web Locks are missing. Where they are not, the windows of this
+// release hold 'tp-primary' together, and their claims (`v`) stop none of
+// them — only a later claim of the last release's does (claimedSince).
 
 export const DB_NAME = 'tabpaladin';
 export const STORE = 'kv';
 export const TREE_KEY = 'tpTree';
 export const DRAFT_KEY = 'tpLiveDraft';
+// The live drafts of the shared core's release, one per window. The last
+// release keeps one note under DRAFT_KEY and writes every one of its own over
+// the whole key, so this release keeps its windows' notes where it never
+// writes, and mirrors only the newest into DRAFT_KEY for it.
+export const WINDOW_DRAFTS_KEY = 'tpWindowDrafts';
 export const CLAIM_KEY = 'tpPrimary';
 export const LOCK_NAME = 'tp-primary';
 export const CHANNEL_NAME = 'tp-primary';
@@ -205,12 +214,12 @@ export function createKv(factory, { name = DB_NAME, store = STORE } = {}) {
     // stops. A claim from the future is the clock set back since, not a
     // later window: it is written over.
     function claim(c) {
-        const mine = { id: c.id, at: Number(c.at) || Date.now() };
+        const mine = claimRecord(c);
         return run('readwrite', (os, out) => {
             const r = os.get(CLAIM_KEY);
             r.onsuccess = () => {
                 const cur = r.result;
-                if (claimedSince(cur, mine) && !(Number(cur.at) > Date.now())) {
+                if (claimedSince(cur, { ...mine, shared: Boolean(c.shared) }) && !(Number(cur.at) > Date.now())) {
                     out.holder = cur;
                     return;
                 }
@@ -226,9 +235,21 @@ export function createKv(factory, { name = DB_NAME, store = STORE } = {}) {
 // Has another window claimed the copy since `fence` ({id, at}) did? A claim
 // older than this window's own is a window from before it, whose claim this
 // one could not write over (a full disk): not a reason to stop.
+//
+// A claim says which release made it (`v`, from this one on; the last
+// release's say nothing). Where every window of this release edits the copy
+// together (Web Locks keep them in turn: a fence with `shared`), another of
+// its claims stops nothing — only a later claim of the last release's does:
+// a window of it that took the copy over from one of this release's.
 export function claimedSince(claim, fence) {
     if (!claim || !claim.id || !fence || claim.id === fence.id) return false;
+    if (fence.shared && Number(claim.v) >= PWA_RECORD) return false;
     return (Number(claim.at) || 0) >= (Number(fence.at) || 0);
+}
+
+// A claim as it is kept: who, when, and which release.
+export function claimRecord(c) {
+    return { id: c.id, at: Number(c.at) || Date.now(), ...(Number(c.v) ? { v: Number(c.v) } : {}) };
 }
 
 function abortError() {

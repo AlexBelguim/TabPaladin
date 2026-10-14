@@ -31,7 +31,7 @@
 // settings overlay (the session token lives in localStorage, never here), and
 // close() for a page that is going away.
 
-import { createKv, newId, CLAIM_KEY } from './durableCopy.js';
+import { createKv, newId, CLAIM_KEY, claimedSince, claimRecord, DRAFT_KEY, WINDOW_DRAFTS_KEY } from './durableCopy.js';
 
 export const KV_CHANNEL = 'tp-kv';
 export const DATA_CACHE = 'tp-data';
@@ -72,9 +72,7 @@ export function memoryBackend(map = new Map()) {
         async write(entries, { fence = null } = {}) {
             if (fence) {
                 const claim = map.get(CLAIM_KEY);
-                if (claim && claim.id && claim.id !== fence.id && (Number(claim.at) || 0) >= (Number(fence.at) || 0)) {
-                    return { fenced: true, holder: json(claim) };
-                }
+                if (claimedSince(claim, fence)) return { fenced: true, holder: json(claim) };
             }
             for (const [k, v] of Object.entries(entries)) {
                 if (v === null || v === undefined) map.delete(k);
@@ -84,10 +82,10 @@ export function memoryBackend(map = new Map()) {
         },
         async claim(c) {
             const cur = map.get(CLAIM_KEY);
-            if (cur && cur.id && cur.id !== c.id && (Number(cur.at) || 0) >= (Number(c.at) || 0) && !(Number(cur.at) > Date.now())) {
+            if (claimedSince(cur, { ...claimRecord(c), shared: Boolean(c.shared) }) && !(Number(cur.at) > Date.now())) {
                 return { claimed: false, holder: json(cur) };
             }
-            map.set(CLAIM_KEY, { id: c.id, at: Number(c.at) || Date.now() });
+            map.set(CLAIM_KEY, claimRecord(c));
             return { claimed: true, holder: null };
         }
     };
@@ -129,9 +127,7 @@ export function cacheBackend(cacheStorage) {
             const c = await open();
             if (fence) {
                 const claim = await read(c, CLAIM_KEY);
-                if (claim && claim.id && claim.id !== fence.id && (Number(claim.at) || 0) >= (Number(fence.at) || 0)) {
-                    return { fenced: true, holder: claim };
-                }
+                if (claimedSince(claim, fence)) return { fenced: true, holder: claim };
             }
             for (const [k, v] of Object.entries(entries)) {
                 if (v === null || v === undefined) await c.delete(keyOf(k));
@@ -142,10 +138,10 @@ export function cacheBackend(cacheStorage) {
         async claim(cl) {
             const c = await open();
             const cur = await read(c, CLAIM_KEY);
-            if (cur && cur.id && cur.id !== cl.id && (Number(cur.at) || 0) >= (Number(cl.at) || 0) && !(Number(cur.at) > Date.now())) {
+            if (claimedSince(cur, { ...claimRecord(cl), shared: Boolean(cl.shared) }) && !(Number(cur.at) > Date.now())) {
                 return { claimed: false, holder: cur };
             }
-            await c.put(keyOf(CLAIM_KEY), new Response(JSON.stringify({ id: cl.id, at: Number(cl.at) || Date.now() }), { headers: { 'Content-Type': 'application/json' } }));
+            await c.put(keyOf(CLAIM_KEY), new Response(JSON.stringify(claimRecord(cl)), { headers: { 'Content-Type': 'application/json' } }));
             return { claimed: true, holder: null };
         }
     };
@@ -162,6 +158,21 @@ function unopenable(e) {
 // than the version it was written over (TreeStore's seq).
 const TREE_KEY = 'tpTree';
 const seqOf = (v) => (v && typeof v === 'object' ? Number(v.seq) || 0 : -1);
+
+// Is the copy kept in Cache Storage (`aside`, written by this release when a
+// full IndexedDB refused it) later than IndexedDB's (`kept`)? Further in line
+// (seq) — unless IndexedDB's was written after it by the last release, after
+// a step back: that release knew nothing of Cache Storage, so it went on from
+// an older version than this one, and its line is behind although its copy
+// is the later one (when it was written says so: savedAt).
+function asideIsLater(aside, kept) {
+    if (aside === undefined || aside === null) return false;
+    if (kept === undefined || kept === null) return true;
+    const lastRelease = typeof kept === 'object' && !(Number(kept.pwa) >= 33);
+    const at = (v) => Date.parse((v && v.savedAt) || '') || 0;
+    if (lastRelease && at(kept) > at(aside)) return false;
+    return seqOf(aside) > seqOf(kept);
+}
 
 // What an IndexedDB store takes in from Cache Storage when it opens: what
 // was kept there while IndexedDB could not be opened, or (the working copy)
@@ -191,8 +202,8 @@ async function foldInFromCache(b, cacheStorage) {
         if (v === undefined || k === CLAIM_KEY) continue;
         const cur = have[k];
         if (k === TREE_KEY) {
-            if (cur === undefined || seqOf(v) > seqOf(cur)) entries[k] = v;
-        } else if (k === 'tpLiveDraft' && cur && typeof cur === 'object' && v && typeof v === 'object') {
+            if (asideIsLater(v, cur)) entries[k] = v;
+        } else if ((k === DRAFT_KEY || k === WINDOW_DRAFTS_KEY) && cur && typeof cur === 'object' && v && typeof v === 'object') {
             entries[k] = { ...v, ...cur };
         } else if (k === 'tpTreeStashIndex' && Array.isArray(cur) && Array.isArray(v)) {
             entries[k] = [...cur, ...v.filter(x => !cur.includes(x))];
@@ -229,6 +240,13 @@ export function createPlatform(env = {}) {
     const listeners = new Set();
     let closed = false;
     let fence = () => null;
+    // While it says so, this page reads, writes and hears nothing of the
+    // store through storage.local (setGate): it lost the copy to a window
+    // that writes without reading first, and what it holds stays in memory.
+    let gate = () => false;
+    const gated = () => {
+        try { return Boolean(gate()); } catch (e) { return false; }
+    };
     let decorate = null;
     const writeHooks = new Set();
     const fencedHooks = new Set();
@@ -240,8 +258,9 @@ export function createPlatform(env = {}) {
     // memory. Chosen at the first use and kept for the page's life.
     let chosen = null;
     // A working copy kept in Cache Storage because IndexedDB refused it (a
-    // full disk): read whenever it is the later one, until IndexedDB takes a
-    // later one again.
+    // full disk) — by this window or another: read whenever it is the later
+    // one, and gone once IndexedDB takes a later one again. True while one is
+    // known to be there.
     let treeFallback = false;
     function backend() {
         if (!chosen) {
@@ -282,7 +301,7 @@ export function createPlatform(env = {}) {
             channel = new Channel(KV_CHANNEL);
             channel.onmessage = (e) => {
                 const msg = e && e.data;
-                if (closed || !msg || typeof msg !== 'object' || msg.from === id || !msg.changes) return;
+                if (closed || gated() || !msg || typeof msg !== 'object' || msg.from === id || !msg.changes) return;
                 const changes = {};
                 for (const [k, c] of Object.entries(msg.changes)) {
                     changes[k] = { oldValue: known.get(k), newValue: c ? c.newValue : undefined };
@@ -344,19 +363,31 @@ export function createPlatform(env = {}) {
         return { ...value, backend: rest };
     }
 
+    // The working copy is read from both places, whichever window put it in
+    // Cache Storage: a window that kept reading IndexedDB's while another's
+    // later writes went there would take the older one for another window's
+    // write, and write over the later one.
     async function getMany(b, list) {
         const got = await b.getMany(list);
-        if (treeFallback && list.includes(TREE_KEY) && b.kind === 'indexeddb') {
+        if (list.includes(TREE_KEY) && b.kind === 'indexeddb' && env.caches && typeof env.caches.open === 'function') {
             try {
                 const kept = (await cacheBackend(env.caches).getMany([TREE_KEY]))[TREE_KEY];
-                if (kept !== undefined && seqOf(kept) > seqOf(got[TREE_KEY])) got[TREE_KEY] = kept;
+                treeFallback = kept !== undefined;
+                if (asideIsLater(kept, got[TREE_KEY])) got[TREE_KEY] = kept;
             } catch (e) { /* IndexedDB's, then */ }
         }
         return got;
     }
 
+    function gateError() {
+        const e = fencedError(null);
+        e.message = 'This window lost the copy to another: nothing is read or written here until it has it back.';
+        return e;
+    }
+
     async function get(keys) {
         if (closed) throw closedError();
+        if (gated()) throw gateError();
         const b = await backend();
         const list = keysOf(keys);
         if (list === null) throw new Error('Listing every key is not offered here.');
@@ -393,6 +424,11 @@ export function createPlatform(env = {}) {
     async function write(entries) {
         if (closed) throw closedError();
         const b = await backend();
+        if (gated()) {
+            const e = gateError();
+            for (const fn of writeHooks) { try { fn({ entries, error: e, backend: b.kind }); } catch (x) { /* hook */ } }
+            throw e;
+        }
         const f = fence();
         let res;
         let aside = false;
@@ -406,14 +442,14 @@ export function createPlatform(env = {}) {
             }
             res = { fenced: false, holder: null };
         }
+        if (res && res.fenced) {
+            for (const fn of fencedHooks) { try { fn(res.holder); } catch (x) { /* hook */ } }
+            throw fencedError(res.holder);
+        }
         if (!aside && treeFallback && b.kind === 'indexeddb' && entries[TREE_KEY]) {
             // IndexedDB has the later copy again.
             treeFallback = false;
             try { await (await env.caches.open(DATA_CACHE)).delete(CACHE_PREFIX + encodeURIComponent(TREE_KEY)); } catch (e) { treeFallback = true; }
-        }
-        if (res && res.fenced) {
-            for (const fn of fencedHooks) { try { fn(res.holder); } catch (x) { /* hook */ } }
-            throw fencedError(res.holder);
         }
         if (closed) return;
         const changes = {};
@@ -472,6 +508,12 @@ export function createPlatform(env = {}) {
         setFence(fn) {
             fence = typeof fn === 'function' ? fn : () => null;
         },
+        // () => true while this page may neither read nor write the store
+        // through storage.local, nor hear of it (see `gate` above). getRaw,
+        // putRaw and claim stay open: the page takes the copy back with them.
+        setGate(fn) {
+            gate = typeof fn === 'function' ? fn : () => false;
+        },
         onFenced(fn) {
             fencedHooks.add(fn);
             return () => fencedHooks.delete(fn);
@@ -496,11 +538,26 @@ export function createPlatform(env = {}) {
             return getMany(b, keysOf(keys) || []);
         },
         // Write as is: no decorator, no fence. For moving what an earlier
-        // release kept into place before anything else reads it.
+        // release kept into place before anything else reads it. A working
+        // copy a full IndexedDB refuses goes to Cache Storage, as every write
+        // of it does (keepTreeAside), with what came with it: {aside: true}.
         async putRaw(entries) {
             if (closed) throw closedError();
-            const res = await (await backend()).write(json(entries));
-            return res;
+            const b = await backend();
+            const clean = json(entries);
+            try {
+                return await b.write(clean);
+            } catch (e) {
+                if (!isQuota(e) || b.kind !== 'indexeddb' || !clean[TREE_KEY] || !env.caches || typeof env.caches.open !== 'function') throw e;
+                const kept = Object.fromEntries(Object.entries(clean).filter(([, v]) => v !== null && v !== undefined));
+                try {
+                    await cacheBackend(env.caches).write(kept);
+                } catch (x) {
+                    throw e;
+                }
+                treeFallback = true;
+                return { fenced: false, holder: null, aside: true };
+            }
         },
         closed: () => closed,
         // The page is going away: nothing more is read, written or heard.

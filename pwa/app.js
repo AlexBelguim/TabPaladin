@@ -14,7 +14,8 @@
 // edits unasked — and every window of the app edits the one copy at once,
 // each hearing the others. What this file draws (state.snapshot) is a view of
 // TreeStore's copy, rebuilt whenever it changes. Without Web Locks (a
-// plain-http address) one window edits at a time, as before.
+// plain-http address), or where the copy can only be kept in memory (each
+// window's its own), one window edits at a time, as before.
 //
 // A phone pushes after each change by default, as it always has; a computer
 // keeps its edits until Push (a per-device setting, with a sync chip).
@@ -3943,7 +3944,9 @@ let lastFold = null;
 // work. The wait lets word of a lock taken meanwhile arrive; a claim another
 // window made since says the same.
 async function ensureStillEditing() {
-    if (guard && guard.mode !== 'none') {
+    // Without Web Locks any later claim; with them, a later one of the last
+    // release's (fenceId).
+    if ((guard && guard.mode !== 'none') || (!guard && claimedAt && webLocks())) {
         const mine = !halted() && await claimStillMine();
         if (!mine && !halted()) lostCopy();
     }
@@ -4434,6 +4437,10 @@ const SYNC_WAIT_MS = 8000;
 const TP_DATA_AT_KEY = 'tp_copy_tpdata_at';
 const CLAIM_LS_KEY = 'tp_copy_claim';
 const CLEARED_AT_KEY = 'tp_copy_cleared_at';
+// The savedAt of a later copy tp-data holds (written by the last release
+// after a step back) that a start could not take in: kept from being written
+// over (tpDataHeld), and set aside by the next start that can.
+const TP_DATA_HELD_KEY = 'tp_copy_tpdata_held';
 const LIVE_DRAFT_LOCK = 'tp-live-drafts';
 const PAGE_LOCK_PREFIX = 'tp-notes-page:';
 
@@ -4455,6 +4462,8 @@ let copyMark = Date.now();
 // showed.
 let keptAt = null;
 let keptPath = [];
+// tp-data's later copy this start could not take in (see TP_DATA_HELD_KEY).
+let tpDataHeld = null;
 
 function stampSavedAt() {
     copyMark = Math.max(Date.now(), copyMark + 1);
@@ -4514,11 +4523,22 @@ function sameKeptAccount(acct) {
     return Boolean(name) && String(acct.username || '').normalize('NFKC').toLowerCase() === name;
 }
 
-// Another window edits the copy now (no Web Locks here): this one writes
-// nothing.
+// Another window edits the copy now (no Web Locks here, or a window of the
+// last release took it from this one: lostToLast): this one writes nothing.
 function halted() {
-    return Boolean(guard) && !guard.isPrimary();
+    return lostToLast || (Boolean(guard) && !guard.isPrimary());
 }
+
+// With Web Locks: a window of the last release took the copy from this one
+// ('tp-primary', stolen while this one could not answer, or its claim later
+// than this one's). That window writes what it holds without reading first,
+// so from here this one reads, writes and hears nothing of the copy (the
+// platform's gate) — what it holds that was not written yet stays in its
+// memory (refusedWhileLost) — until Use here has that window write down and
+// let go, and this one takes the copy back (resumeAfterLastRelease).
+let lostToLast = false;
+let refusedWhileLost = false;
+platform.setGate(() => lostToLast);
 
 // --- What every write of the copy carries, and what it did -------------------------
 
@@ -4543,17 +4563,28 @@ function stepBackDraft(rec) {
 }
 platform.onWrite(({ entries, error, backend, aside }) => {
     if (!(DC.TREE_KEY in entries)) return;
+    // Refused because a window of the last release took the copy: what
+    // this window held stays in its memory, and comes back with the copy.
+    if (error && error.name === 'FencedError' && lostToLast) refusedWhileLost = true;
     noteCopyWrite({ error, backend, aside });
     if (!error) mirrorToTpData(entries[DC.TREE_KEY], { aside });
 });
-// A write met another window's later claim (no Web Locks): this one stops.
-platform.onFenced(() => lostCopy());
+// A write met another window's later claim (without Web Locks any other
+// window's; with them, one of the last release's): this one stops, holding
+// what was not written.
+platform.onFenced(() => {
+    if (!guard) refusedWhileLost = true;
+    lostCopy();
+});
 
 // The same copy into tp-data, in the last release's shape, with the note being
 // written. A copy that holds nothing of anyone's (what a clean sign-out
-// leaves) is no copy there, as the last release kept it.
+// leaves) is no copy there, as the last release kept it. Not while tp-data
+// holds a later copy this window could not take in (tpDataHeld): it would
+// be written over with an older one.
 let mirrorChain = Promise.resolve();
 function mirrorToTpData(rec, { aside = false } = {}) {
+    if (tpDataHeld) return mirrorChain;
     const v1 = rec ? DC.toV1Record(rec, { nv: editorOpen() ? state.nv : null }) : null;
     mirrorChain = mirrorChain.then(async () => {
         if (!(await writeData(TREE_KEY, v1))) return;
@@ -4600,11 +4631,18 @@ function noteCopyWrite({ error, backend, aside }) {
 // When this window claimed the copy: writes stop once another has since.
 let claimedAt = 0;
 
-// What every write checks where one window edits at a time, or null where
-// every window edits.
+// What every write checks: this window's claim. Where one window edits at a
+// time any later claim stops it; where every window of this release edits
+// (Web Locks: `shared`), only a later claim of the last release's does
+// (DC.claimedSince) — a window of it that took the copy over from this one.
+// Null before this window has claimed the copy, or where nothing can say
+// (an old browser).
 function fenceId() {
-    const id = guard ? guard.fence() : null;
-    return id ? { id, at: claimedAt } : null;
+    if (guard) {
+        const id = guard.fence();
+        return id ? { id, at: claimedAt, v: DC.PWA_RECORD } : null;
+    }
+    return claimedAt && webLocks() ? { id: windowId, at: claimedAt, v: DC.PWA_RECORD, shared: true } : null;
 }
 platform.setFence(fenceId);
 
@@ -4623,24 +4661,34 @@ function claimedElsewhere(fence) {
 // without Web Locks): this one stops at once, before it holds anything.
 async function claimCopy() {
     claimedAt = Date.now();
-    const fence = { id: windowId, at: claimedAt };
+    const fence = fenceId() || { id: windowId, at: claimedAt, v: DC.PWA_RECORD };
     try { localStorage.setItem(CLAIM_LS_KEY, JSON.stringify(fence)); } catch (e) { /* IndexedDB holds it */ }
     let res = null;
     try { res = await platform.claim(fence); } catch (e) { /* nowhere to keep it: localStorage holds it */ }
-    if (guard && guard.fence() && res && res.claimed === false) {
+    if (!res || res.claimed !== false) return;
+    if (guard && guard.fence()) {
         try { localStorage.setItem(CLAIM_LS_KEY, JSON.stringify(res.holder)); } catch (e) { /* IndexedDB holds it */ }
         lostCopy();
+    } else if (!guard && webLocks() && !(Number(res.holder && res.holder.v) >= DC.PWA_RECORD)) {
+        // A window of the last release claimed it since: that one edits.
+        try { localStorage.setItem(CLAIM_LS_KEY, JSON.stringify(res.holder)); } catch (e) { /* IndexedDB holds it */ }
+        lostToLastRelease();
     }
 }
 
 function lostCopy() {
     if (guard) guard.lost('fenced');
+    else if (webLocks()) lostToLastRelease();
 }
 
 // Work in this window that the device could not keep: the last write failed
-// (a full disk). Only this window has it, so it never lets go of it unasked,
-// and losing the copy does not drop it (enterSecondary).
+// (a full disk), a parked note is held here only, or what this window held
+// when a window of the last release took the copy. Only this window has it,
+// so it never lets go of it unasked, and losing the copy does not drop it
+// (enterSecondary).
 function unkeptWork() {
+    if (refusedWhileLost || heldDrafts.some(h => !h.kept)) return true;
+    if (lostToLast && editorDirty()) return true;
     if (!copyWriteError) return false;
     return Boolean(state.snapshot && state.dirty) || editorDirty();
 }
@@ -4689,7 +4737,12 @@ function storedIdentityWithUrl() {
     return { ...storedIdentity(), url: (state.config.url || '').replace(/\/+$/, '') };
 }
 
-async function migrateKept() {
+// `seqFloor`: the place in line of the copy this window holds in memory, when
+// it takes the copy back from a window of the last release that wrote it
+// meanwhile (resumeAfterLastRelease): the record made of what that window
+// wrote comes after it, so this window takes it in (TreeStore never takes in
+// a version older than its own).
+async function migrateKept({ seqFloor = 0 } = {}) {
     let got = {};
     try {
         got = await platform.getRaw([DC.TREE_KEY, DC.DRAFT_KEY, DC.STASH_INDEX_KEY]);
@@ -4699,9 +4752,11 @@ async function migrateKept() {
     const tp = await readData(TREE_KEY);
     let tpWrittenAt = null;
     let clearedAt = null;
+    let heldAt = null;
     try {
         tpWrittenAt = localStorage.getItem(TP_DATA_AT_KEY);
         clearedAt = localStorage.getItem(CLEARED_AT_KEY);
+        heldAt = localStorage.getItem(TP_DATA_HELD_KEY);
     } catch (e) { /* unknown */ }
     // From here, this window stamps what it writes later than anything kept,
     // and than a clear left unfinished.
@@ -4710,26 +4765,61 @@ async function migrateKept() {
     noteKeptTime(tp && tp.savedAt);
     keptAt = (got[DC.TREE_KEY] && got[DC.TREE_KEY].savedAt) || null;
     keptPath = got[DC.TREE_KEY] && Array.isArray(got[DC.TREE_KEY].pathIds) ? got[DC.TREE_KEY].pathIds.map(String) : [];
-    const index = Array.isArray(got[DC.STASH_INDEX_KEY]) ? got[DC.STASH_INDEX_KEY] : [];
+    let index = Array.isArray(got[DC.STASH_INDEX_KEY]) ? got[DC.STASH_INDEX_KEY] : [];
     const plan = DC.planMigration({
         kvRaw: got[DC.TREE_KEY] || null, drafts: got[DC.DRAFT_KEY] || null, tp, tpWrittenAt, clearedAt,
         stashIndex: index, identity: storedIdentityWithUrl()
     });
+    const fromTpData = plan.action === 'convert' && plan.from === 'tp-data';
+    // tp-data's later copy that a start before this one could not take in
+    // (TP_DATA_HELD_KEY): taken in now when it is still the later one, as
+    // any is (below); set aside, kept for its account to bring back, when
+    // this device has written a later copy of its own since — never lost,
+    // nor written over by the next mirror.
+    const tpRec = tp && tp.v === 1 && Array.isArray(tp.roots) ? tp : null;
+    const extra = [];
+    if (heldAt && tpRec && tpRec.savedAt === heldAt && !fromTpData) {
+        const core = DC.toCoreRecord(tpRec, { identity: storedIdentityWithUrl() });
+        const drafts = tpRec.nv && tpRec.nv.editing ? DC.liveDraftsFor(tpRec.nv, tpRec.account || {}, 'tp-data', tpRec.savedAt || undefined) : null;
+        const st = DC.stashEntry({ ...core, importIds: tpRec.importIds, serverIds: tpRec.serverIds, keptDraft: tpRec.keptDraft || null },
+            drafts, [...index, ...(plan.stash ? [plan.stash.key] : [])], Date.now(), 'not-taken-in');
+        await platform.putRaw({ [st.key]: st.value, [DC.STASH_INDEX_KEY]: [...index, st.key] });
+        index = [...index, st.key];
+        extra.push(st.key);
+    }
     if (plan.action === 'convert') {
+        if (seqFloor && !(Number(plan.record.seq) > seqFloor)) plan.record.seq = seqFloor + 1;
         // The note a sign-out set aside, parked for the copy's account first,
-        // so the record written next carries it for a step back as well.
-        if (plan.keptDraft && plan.keptDraft.editing) parkDrafts([DC.draftFromNv(plan.keptDraft, stampOfRecord(plan.record), plan.record.savedAt || undefined)]);
+        // so the record written next carries it for a step back as well (and
+        // carries it all the same when it could not be parked).
+        const kept = plan.keptDraft && plan.keptDraft.editing ? plan.keptDraft : null;
+        const parked = !kept || parkDrafts([DC.draftFromNv(kept, stampOfRecord(plan.record), plan.record.savedAt || undefined)]);
         // Written as every write of it is (a step back reads it the same),
         // keeping when it was kept.
         const record = DC.decorateCoreRecord(plan.record, { savedAt: plan.record.savedAt || undefined, pathIds: plan.record.pathIds,
-            keptDraft: stepBackDraft(plan.record) });
+            keptDraft: stepBackDraft(plan.record) || (parked ? null : kept) });
         const entries = { [DC.TREE_KEY]: record };
         // The note open when tp-data was written (IndexedDB's is in the
         // live drafts already): one more live draft, of a page that is gone.
-        if (plan.nv && plan.nv.editing) {
-            entries[DC.DRAFT_KEY] = { ...(got[DC.DRAFT_KEY] || {}), ...DC.liveDraftsFor(plan.nv, plan.account || {}, 'kept-' + DC.newId(), record.savedAt) };
+        const openNote = plan.nv && plan.nv.editing ? plan.nv : null;
+        if (openNote) {
+            entries[DC.DRAFT_KEY] = { ...(got[DC.DRAFT_KEY] || {}), ...DC.liveDraftsFor(openNote, plan.account || {}, 'kept-' + DC.newId(), record.savedAt) };
         }
-        await platform.putRaw(entries);
+        let res;
+        try {
+            res = await platform.putRaw(entries);
+        } catch (e) {
+            // Not taken in (the device refuses writes): tp-data keeps its
+            // later copy — this window never mirrors over it, and the next
+            // start that can takes it in, or sets it aside.
+            if (fromTpData) holdTpData(plan.record.savedAt);
+            throw e;
+        }
+        // IndexedDB full: kept in Cache Storage instead (the platform), where
+        // this start reads the copy but not the live drafts — the note open
+        // in it is parked, to come back from there.
+        if (res && res.aside && openNote) parkDrafts([DC.draftFromNv(openNote, stampOfRecord(plan.record), record.savedAt || undefined)]);
+        if (fromTpData && heldAt) forgetHeldTpData();
         keptAt = record.savedAt || keptAt;
         // And into tp-data, for the release before the last one.
         await mirrorToTpData(record);
@@ -4748,6 +4838,7 @@ async function migrateKept() {
         await platform.putRaw({ [DC.TREE_KEY]: null });
         keptAt = null;
     }
+    if (extra.length) forgetHeldTpData();
     // The last release's set-aside copies: their parts into their meta, their
     // notes parked with them.
     const keys = plan.action === 'drop' && plan.stash ? [...index, plan.stash.key] : index;
@@ -4760,6 +4851,17 @@ async function migrateKept() {
             await platform.putRaw({ [key]: m.value });
         }
     }
+}
+
+function holdTpData(savedAt) {
+    if (!savedAt) return;
+    tpDataHeld = savedAt;
+    try { localStorage.setItem(TP_DATA_HELD_KEY, savedAt); } catch (e) { /* this window still never mirrors over it */ }
+}
+
+function forgetHeldTpData() {
+    tpDataHeld = null;
+    try { localStorage.removeItem(TP_DATA_HELD_KEY); } catch (e) { /* set aside again next start: one more copy, nothing lost */ }
 }
 
 function stampOfRecord(rec) {
@@ -4800,6 +4902,13 @@ async function startCopy() {
 // as long as it lives. An entry whose lock nobody holds is a window that is
 // gone (closed, or killed): the next start takes it — back into its editor
 // when it is this copy's and someone is signed in to it, else parked.
+//
+// This release keeps them under a key of its own (DC.WINDOW_DRAFTS_KEY). The
+// last release keeps one note, under 'tpLiveDraft', and every write of its
+// replaces the whole of that key with its own: there it finds, after a step
+// back, the newest of this release's notes written for the copy's account (a
+// copy, marked `mirror`), and nothing it writes can reach the others. What it
+// wrote there itself is taken by the next start like a window's that is gone.
 
 function webLocks() {
     return typeof navigator !== 'undefined' && navigator && navigator.locks && typeof navigator.locks.request === 'function'
@@ -4833,16 +4942,30 @@ let liveChain = Promise.resolve();
 // What this window last wrote as its live draft, or null while it has none.
 let liveWritten = null;
 
-// Read, change and write the live-draft map, one window at a time. `fn`
-// returns false to write nothing.
+const asDraftMap = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? { ...v } : {});
+
+// Read, change and write the live drafts, one window at a time: `fn(map,
+// legacy)` changes this release's map and the last release's, or returns
+// false to write nothing. Both are written in one go, the newest note of the
+// copy's account mirrored into the last release's.
 function updateLiveDrafts(fn) {
     const run = async () => {
-        const data = await platform.storage.local.get(DC.DRAFT_KEY);
-        const stored = data && data[DC.DRAFT_KEY];
-        const map = stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
-        if ((await fn(map)) === false) return;
-        if (Object.keys(map).length) await platform.storage.local.set({ [DC.DRAFT_KEY]: map });
-        else await platform.storage.local.remove(DC.DRAFT_KEY);
+        const data = await platform.storage.local.get([DC.WINDOW_DRAFTS_KEY, DC.DRAFT_KEY]);
+        const map = asDraftMap(data && data[DC.WINDOW_DRAFTS_KEY]);
+        const legacy = asDraftMap(data && data[DC.DRAFT_KEY]);
+        if ((await fn(map, legacy)) === false) return;
+        for (const [id, d] of Object.entries(legacy)) if (d && d.mirror) delete legacy[id];
+        const owner = copyStatus().owner;
+        let newest = null;
+        for (const [id, d] of Object.entries(map)) {
+            if (!d || !owner || !DC.sameOwner(d.owner, owner)) continue;
+            if (!newest || String(d.at || '') > String(newest.d.at || '')) newest = { id, d };
+        }
+        if (newest) legacy[newest.id] = { ...newest.d, mirror: true };
+        await platform.storage.local.set({
+            [DC.WINDOW_DRAFTS_KEY]: Object.keys(map).length ? map : null,
+            [DC.DRAFT_KEY]: Object.keys(legacy).length ? legacy : null
+        });
     };
     const locks = webLocks();
     const p = liveChain.then(() => (locks ? locks.request(LIVE_DRAFT_LOCK, run) : run()));
@@ -4871,15 +4994,16 @@ function draftAccount() {
 }
 
 // Write this window's live draft now: the editor's text while a note is open,
-// nothing once it is not — after what it was saved into is written.
+// nothing once it is not — after what it was saved into is written. Resolves
+// true once what is stored is what this window holds, false when it is not.
 function saveLiveDraft() {
     if (draftTimer) clearTimeout(draftTimer);
     draftTimer = null;
-    if (halted() || accountChanging) return liveChain;
+    if (halted() || accountChanging) return liveChain.then(() => false);
     const drafts = editorOpen() && copyPresent() ? DC.liveDraftsFor(state.nv, draftAccount(), windowId) : null;
     const draft = drafts ? drafts[windowId] : null;
     const json = draft ? JSON.stringify({ ...draft, at: null }) : null;
-    if (json === liveWritten) return liveChain;
+    if (json === liveWritten) return liveChain.then(() => true);
     liveWritten = json;
     return updateLiveDrafts(async (map) => {
         if (draft) {
@@ -4891,73 +5015,176 @@ function saveLiveDraft() {
         if (!(await TreeStore.flush())) throw new Error('The working copy is not written yet');
         delete map[windowId];
         return true;
-    }).catch(() => {
+    }).then(() => true, () => {
         liveWritten = undefined; // written again next time
+        return false;
     });
+}
+
+// A live draft's copy: its account, or for an unstamped one where it came from.
+function stampOfLiveDraft(d) {
+    const owner = d && d.owner && d.owner.userId !== null && d.owner.userId !== undefined && d.owner.url ? d.owner : null;
+    return { owner, origin: owner ? null : (d && d.origin) || 'pre-accounts' };
 }
 
 // The live drafts of windows that are gone (closed, killed, or the last
 // release's): back into this editor when one is this copy's and someone is
-// signed in to it (the newest), else parked for their copy.
+// signed in to it (the newest), else parked for their copy. Each leaves the
+// live drafts only once it is somewhere else: this window's own live draft,
+// or the parked list. One localStorage will not take stays where it is (the
+// next start takes it again), held here meanwhile to come back with its copy.
 async function recoverLiveDrafts() {
     const alive = await livePages();
-    const taken = [];
+    const gone = (id) => id !== windowId && !(alive && alive.has(id));
+    const found = [];
     try {
-        await updateLiveDrafts((map) => {
-            for (const [id, d] of Object.entries(map)) {
-                if (id === windowId || (alive && alive.has(id))) continue;
-                delete map[id];
-                if (d && typeof d.content === 'string') taken.push(d);
+        const data = await platform.storage.local.get([DC.WINDOW_DRAFTS_KEY, DC.DRAFT_KEY]);
+        for (const key of [DC.WINDOW_DRAFTS_KEY, DC.DRAFT_KEY]) {
+            for (const [id, d] of Object.entries(asDraftMap(data && data[key]))) {
+                // The last release's copy of one of this release's notes.
+                if (key === DC.DRAFT_KEY && d && d.mirror) continue;
+                if (gone(id) && d && typeof d.content === 'string') found.push({ key, id, d });
             }
-            return taken.length > 0;
-        });
+        }
     } catch (e) {
         return;
     }
-    taken.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
-    const st = copyStatus();
-    const stamps = DC.stampsOfStatus(st);
+    if (!found.length) return;
+    found.sort((a, b) => String(b.d.at || '').localeCompare(String(a.d.at || '')));
+    // One note kept in two places (a step back and forward again) is one note.
+    const notes = [];
+    for (const f of found) {
+        const same = notes.find(n => DC.sameDraft(n.d, f.d));
+        if (same) same.places.push(f);
+        else notes.push({ d: f.d, nv: DC.nvOfParked(f.d), stamp: stampOfLiveDraft(f.d), places: [f] });
+    }
+    const stamps = DC.stampsOfStatus(copyStatus());
+    let opened = null;
     const park = [];
-    for (const d of taken) {
-        const nv = DC.nvOfParked(d);
-        if (!nv) continue;
-        const owner = d.owner && d.owner.userId !== null && d.owner.userId !== undefined && d.owner.url ? d.owner : null;
-        const stamp = { owner, origin: owner ? null : d.origin || 'pre-accounts' };
-        if (!editorOpen() && configured() && copyPresent() && copyIsMine() && DC.draftAnswersTo(stamp, stamps)) {
-            openDraftInEditor(nv);
+    for (const n of notes) {
+        if (!n.nv) continue;
+        if (!opened && !editorOpen() && configured() && copyPresent() && copyIsMine() && DC.draftAnswersTo(n.stamp, stamps)) {
+            opened = n;
+            openDraftInEditor(n.nv);
         } else {
-            park.push(DC.draftFromNv(nv, stamp, d.at || undefined));
+            park.push(n);
         }
     }
-    if (park.length) parkDrafts(park);
+    const parked = park.length ? parkInList(park.map(n => DC.draftFromNv(n.nv, n.stamp, n.d.at || undefined))) : false;
+    if (park.length && !parked) {
+        holdDrafts(park.map(n => ({ d: DC.draftFromNv(n.nv, n.stamp, n.d.at || undefined), key: n.places[0].key, id: n.places[0].id, kept: true })));
+    }
+    const done = [...(opened ? opened.places : []), ...(parked ? park.flatMap(n => n.places) : [])];
+    if (!done.length) return;
+    try {
+        await updateLiveDrafts((map, legacy) => {
+            // The one opened here goes once this window's own draft holds it.
+            const take = opened && !(windowId in map) ? done.filter(f => !opened.places.includes(f)) : done;
+            let any = false;
+            for (const f of take) {
+                const m = f.key === DC.WINDOW_DRAFTS_KEY ? map : legacy;
+                if (f.id in m) {
+                    delete m[f.id];
+                    any = true;
+                }
+            }
+            return any;
+        });
+    } catch (e) { /* they stay: the next start takes them again */ }
 }
 
 function openDraftInEditor(nv) {
     state.view = 'notes';
-    state.nv = { ...freshNv(), ...nv, editing: true };
+    state.nv = { ...freshNv(), ...nv, editing: true, ...editorCopy() };
     navDepth++;
     history.pushState(nvHistoryState(), '', location.pathname);
     // This window's own live draft from now on.
     liveWritten = undefined;
-    saveLiveDraft();
+    return saveLiveDraft();
+}
+
+// The copy a note is opened in: its editor saves into that copy alone (see
+// saveNoteEdit), and parks for that copy's stamp.
+function editorCopy() {
+    const st = copyStatus();
+    return { copyId: st.copyId, copyStamp: stampOfStatus(st), removedElsewhere: false };
 }
 
 // --- Parked notes -------------------------------------------------------------------
+//
+// In the extension's list (tp_notes_parked_v1, localStorage). When
+// localStorage will not take one (full, or blocked), it goes into this
+// release's live drafts instead (IndexedDB), under an id no window holds — the
+// next start parks it, or opens it with its copy — and is held in this window
+// meanwhile (heldDrafts), so that it comes back with its copy here too; closing
+// the window asks first while one is held nowhere else. A note is never
+// closed into nowhere. [{ d, key, id, kept }]
+let heldDrafts = [];
 
 function parkedList() {
-    return DC.readParked(localStorage);
+    const list = DC.readParked(localStorage);
+    for (const h of heldDrafts) if (!list.some(x => DC.sameDraft(x, h.d))) list.push(h.d);
+    return list;
 }
 
-function parkDrafts(drafts) {
-    const list = parkedList();
+// Into the extension's list: true once there (or there already).
+function parkInList(drafts) {
+    const list = DC.readParked(localStorage);
+    let added = false;
     for (const d of drafts) {
-        if (d && !list.some(x => DC.sameDraft(x, d))) list.push(d);
+        if (d && !list.some(x => DC.sameDraft(x, d))) {
+            list.push(d);
+            added = true;
+        }
     }
-    if (!DC.writeParked(localStorage, list)) {
-        showToast(`An unsaved note could not be kept on this ${deviceWord()} — it stays open here only.`);
-        return false;
-    }
-    return true;
+    return !added || DC.writeParked(localStorage, list);
+}
+
+// Park notes on the device for their copy. True when they went into the
+// list; false when they are kept as above instead.
+function parkDrafts(drafts) {
+    const list = drafts.filter(Boolean);
+    if (!list.length || parkInList(list)) return true;
+    holdDrafts(list.map(d => ({ d, key: DC.WINDOW_DRAFTS_KEY, id: 'parked-' + DC.newId(), kept: false })));
+    return false;
+}
+
+function holdDrafts(list) {
+    const fresh = list.filter(h => h.d && !heldDrafts.some(x => DC.sameDraft(x.d, h.d)));
+    if (!fresh.length) return;
+    heldDrafts.push(...fresh);
+    const unwritten = fresh.filter(h => !h.kept);
+    if (!unwritten.length) return;
+    updateLiveDrafts((map) => {
+        for (const h of unwritten) map[h.id] = { ...h.d, at: h.d.parkedAt || new Date().toISOString() };
+        return true;
+    }).then(() => {
+        for (const h of unwritten) h.kept = true;
+    }, () => {
+        showToast(`An unsaved note could not be kept on this ${deviceWord()} — it waits in this window for its copy. Copy its text before closing the app.`);
+    });
+}
+
+// A parked note back in its editor, or discarded: out of the list, and out of
+// wherever it was held.
+function dropParked(d) {
+    const stored = DC.readParked(localStorage);
+    const left = stored.filter(x => !DC.sameDraft(x, d));
+    if (left.length !== stored.length) DC.writeParked(localStorage, left);
+    const held = heldDrafts.filter(h => DC.sameDraft(h.d, d));
+    if (!held.length) return;
+    heldDrafts = heldDrafts.filter(h => !held.includes(h));
+    updateLiveDrafts((map, legacy) => {
+        let any = false;
+        for (const h of held) {
+            const m = h.key === DC.DRAFT_KEY ? legacy : map;
+            if (h.id in m) {
+                delete m[h.id];
+                any = true;
+            }
+        }
+        return any;
+    }).catch(() => {});
 }
 
 // The stamp a copy goes by (TreeStore.status()).
@@ -4968,18 +5195,17 @@ let lastStamp = null;
 
 // The note open in the editor, parked under the copy it was written in, and
 // the editor closed: its copy is going (a sign-out, another account signing
-// in, a copy set aside). Its import link, if any, rides with it. True when
-// one was parked.
+// in, a copy set aside, another copy brought in). Its import link, if any,
+// rides with it. True when one was parked (or, localStorage refusing, kept
+// as parkDrafts says: never closed into nowhere).
 function parkOpenDraft(st = copyStatus(), { onlyChanged = false } = {}) {
     if (!editorOpen()) return false;
     const nv = state.nv;
     const changed = editorDirty();
     if (onlyChanged && !changed) return false;
-    let parked = false;
-    if (changed || nv.importId) {
-        parked = parkDrafts([DC.draftFromNv(nv, stampOfStatus(st))]);
-    }
-    if (parked) {
+    const keep = changed || Boolean(nv.importId);
+    if (keep) {
+        parkDrafts([DC.draftFromNv(nv, stampOfStatus(st))]);
         // Its import link stays held by the parked note, not dropped.
         Object.assign(state.nv, { editing: false, isNew: false, draft: null, loaded: null, newParentId: null, pendingNotebookName: null, importId: null });
     } else {
@@ -4987,7 +5213,7 @@ function parkOpenDraft(st = copyStatus(), { onlyChanged = false } = {}) {
     }
     liveWritten = undefined;
     saveLiveDraft();
-    return parked;
+    return keep;
 }
 
 // The parked notes this copy brings back: parked under it, or under a stamp
@@ -5005,21 +5231,17 @@ function parkedImportIds() {
 // is ready and signed in to, and the editor free. One at a time.
 function reopenParkedDraft() {
     if (editorOpen() || !configured() || !copyPresent() || !copyIsMine()) return false;
-    const st = copyStatus();
-    const list = parkedList();
-    const stamps = DC.stampsOfStatus(st);
-    const i = list.findIndex(d => DC.draftAnswersTo(d, stamps));
-    if (i === -1) return false;
-    const [d] = list.splice(i, 1);
+    const stamps = DC.stampsOfStatus(copyStatus());
+    const d = parkedList().find(x => DC.draftAnswersTo(x, stamps));
+    if (!d) return false;
     const nv = DC.nvOfParked(d);
     if (!nv) {
-        DC.writeParked(localStorage, list);
+        dropParked(d);
         return false;
     }
-    openDraftInEditor(nv);
-    // Out of the list once it is the live draft: never both lost, at worst both kept.
-    liveWritten = undefined;
-    saveLiveDraft().then(() => DC.writeParked(localStorage, parkedList().filter(x => !DC.sameDraft(x, d))));
+    // Out of the list once it is the live draft: never both lost, at worst
+    // both kept.
+    openDraftInEditor(nv).then((kept) => { if (kept) dropParked(d); });
     renderView();
     return true;
 }
@@ -5211,10 +5433,13 @@ function answerLastRelease() {
 }
 
 // Hold 'tp-primary' with this release's other windows (shared), for the
-// page's life: at once or not at all, or waiting up to `wait` ms.
-function holdSharedPrimary(locks, { wait = 0 } = {}) {
+// page's life: at once or not at all, or waiting up to `wait` ms. Taken from
+// this window later (a steal: a window of the last release that asked it to
+// let go and heard nothing, this one being frozen), `onLost` hears it.
+function holdSharedPrimary(locks, { wait = 0, onLost = null } = {}) {
     return new Promise((resolve) => {
         let settled = false;
+        let held = false;
         let timer = null;
         const done = (v) => {
             if (settled) return;
@@ -5231,9 +5456,16 @@ function holdSharedPrimary(locks, { wait = 0 } = {}) {
                     done(false);
                     return undefined;
                 }
+                held = true;
                 done(true);
                 return new Promise(() => {});
-            })).catch(() => done(false));
+            })).catch(() => {
+                if (held) {
+                    if (onLost) onLost();
+                } else {
+                    done(false);
+                }
+            });
         } catch (e) {
             done(false);
         }
@@ -5274,7 +5506,7 @@ function askLastRelease() {
 let lastReleaseHolds = null;
 async function takeOverFromLastRelease(locks) {
     answerLastRelease();
-    if (await holdSharedPrimary(locks)) return { ok: true };
+    if (await holdSharedPrimary(locks, { onLost: sharedHoldLost })) return { ok: true };
     const answer = typeof BroadcastChannel === 'function' ? await askLastRelease() : { t: 'silent' };
     if (answer.t === 'refused') return { ok: false, reason: answer.reason || null };
     if (answer.t === 'silent') {
@@ -5282,13 +5514,84 @@ async function takeOverFromLastRelease(locks) {
         // and its next write meets this window's claim.
         try { await locks.request(DC.LOCK_NAME, { steal: true }, () => {}); } catch (e) { /* taken meanwhile */ }
     }
-    if (await holdSharedPrimary(locks, { wait: SYNC_WAIT_MS })) return { ok: true };
+    if (await holdSharedPrimary(locks, { wait: SYNC_WAIT_MS, onLost: sharedHoldLost })) return { ok: true };
     return { ok: false, reason: 'busy' };
+}
+
+// This window's hold on 'tp-primary' was taken. By a window of this release
+// that took it from a silent one of the last release, this one being silent
+// too: held again in a moment, and nothing else changed. By a window of the
+// last release: that one edits now, writing what it holds without reading
+// first — this one stops before anything of it is written over or writes
+// over that (lostToLastRelease). Its claim stops this window's writes
+// meanwhile (fenceId), should this be heard late.
+async function sharedHoldLost() {
+    if (lostToLast || restarting) return;
+    const locks = webLocks();
+    if (locks && await holdSharedPrimary(locks, { wait: 1000, onLost: sharedHoldLost }) && await claimStillMine()) return;
+    lostToLastRelease();
+}
+
+function lostToLastRelease() {
+    if (lostToLast || restarting) return;
+    lostToLast = true;
+    clearCopyTimers();
+    // What is not written yet is refused from here (the platform's gate):
+    // counted now, and kept in memory for when the copy comes back.
+    try { TreeStore.flush().catch(() => {}); } catch (e) { /* counted at the next try */ }
+    bootGen++;
+    lastReleaseHolds = 'took';
+    if (booted) for (const id of ['settings-sheet', 'inbox-sheet', 'user-sheet', 'move-sheet', 'nb-sheet', 'import-sheet']) hide($(id));
+    showLastReleaseCard('took');
+}
+
+// Use here, after a window of the last release took the copy from this one:
+// that window wrote down what it holds and let go (takeOverFromLastRelease),
+// and this one claims the copy again, so any write of that one's still on its
+// way is stopped. With nothing of its own unwritten, this window starts again
+// from what is kept (whose start takes in what that window wrote, as at an
+// upgrade). Otherwise it carries on with it in place: what that window wrote
+// is taken in first (as at a start: migrateKept), and this window's own work
+// is made again on top of it — or, it being another copy by now, kept with
+// the copy it was made in, set aside (TreeStore).
+async function resumeAfterLastRelease() {
+    await claimCopy();
+    if (!lostToLast) return;
+    // Still refused: whatever this window holds unwritten is counted, and
+    // the place in line it holds the copy at is learnt.
+    let held = null;
+    try { held = await TreeStore.currentCopy(); } catch (e) { held = null; }
+    if (!unkeptWork()) {
+        restarting = true;
+        location.reload();
+        return;
+    }
+    try {
+        await withCopyLockAtStart(() => migrateKept({ seqFloor: held ? Number(held.seq) || 0 : 0 }));
+    } catch (e) {
+        console.warn('[TabPaladin] Could not take in what the last release kept', e);
+    }
+    lostToLast = false;
+    refusedWhileLost = false;
+    lastReleaseHolds = null;
+    hide($('primary-guard'));
+    setGuardNote('');
+    try { await TreeStore.flush(); } catch (e) { /* said by the write */ }
+    noteCopySwitched();
+    await recoverLiveDrafts();
+    renderView();
+    openLinkInUrl();
 }
 
 async function startApp() {
     const locks = webLocks();
-    if (locks) {
+    // Every window edits the one copy only where they share it: kept in
+    // memory (a browser that keeps nothing between starts here), each
+    // window's copy is its own, so one window edits at a time, as without Web
+    // Locks — under the lock, as the last release did.
+    let memory = false;
+    try { memory = (await platform.backendKind()) === 'memory'; } catch (e) { memory = false; }
+    if (locks && !memory) {
         const took = await takeOverFromLastRelease(locks);
         if (!took.ok) {
             lastReleaseHolds = took.reason || 'busy';
@@ -5302,7 +5605,7 @@ async function startApp() {
     }
     try {
         guard = DC.createPrimaryGuard({
-            locks: null,
+            locks: memory ? locks : null,
             BroadcastChannel: typeof BroadcastChannel === 'function' ? BroadcastChannel : null,
             secure: globalThis.isSecureContext,
             id: windowId,
@@ -5336,17 +5639,21 @@ async function startApp() {
 }
 
 // A window of the last release would not let go of the copy (it holds
-// what it could not save), or did not let go in time.
+// what it could not save), or did not let go in time — or took it from this
+// one ('took').
 function showLastReleaseCard(reason) {
     const box = guardOverlay();
     const title = $('primary-guard-title');
     const text = $('primary-guard-text');
     if (title) title.textContent = 'TabPaladin is open in a tab from before an update';
     if (text) {
-        text.textContent = 'That tab edits the copy on this device the old way, so this one waits for it. '
-            + 'Push what it holds there, then reload it — or close it — and try again here.';
+        text.textContent = reason === 'took'
+            ? 'That tab took over the copy on this device while this one could not answer, so this one stopped: nothing it holds is lost. '
+                + 'Use here has that tab save what it holds and let go, then this one carries on with both.'
+            : 'That tab edits the copy on this device the old way, so this one waits for it. '
+                + 'Push what it holds there, then reload it — or close it — and try again here.';
     }
-    setGuardNote(reason && reason !== 'busy' && reason !== 'newer' ? refusalNote(reason) : '');
+    setGuardNote(reason && reason !== 'busy' && reason !== 'newer' && reason !== 'took' ? refusalNote(reason) : '');
     const btn = $('primary-take');
     if (btn) btn.disabled = false;
     show(box);
@@ -5357,9 +5664,14 @@ function showLastReleaseCard(reason) {
 // answering, this one goes on editing — unless one claimed the copy
 // meanwhile and has gone since: what this window holds is then from before
 // that one's work, and it starts again from what is kept, as a window
-// coming back to a lock taken meanwhile does (resumeHere).
+// coming back to a lock taken meanwhile does (resumeHere). With Web Locks, a
+// window of the last release that claimed the copy meanwhile stops this one
+// (should the lock itself not have said so).
 async function recheckCopy() {
-    if (!guard) return;
+    if (!guard) {
+        if (webLocks() && booted && !halted() && claimedAt && !(await claimStillMine())) lostToLastRelease();
+        return;
+    }
     try { await guard.recheck(); } catch (e) { return; }
     if (guard.mode !== 'channel' || !guard.isPrimary() || moving || restarting) return;
     if (await claimStillMine()) return;
@@ -5495,6 +5807,12 @@ async function useHere() {
             if (!took.ok) {
                 if (btn) btn.disabled = false;
                 setGuardNote(took.reason && took.reason !== 'busy' && took.reason !== 'newer' ? refusalNote(took.reason) : 'It could not be moved here. Try again.');
+                return;
+            }
+            if (lostToLast) {
+                // It took the copy from this window: taken back, with what
+                // this window held.
+                await resumeAfterLastRelease();
                 return;
             }
             lastReleaseHolds = null;
@@ -5888,8 +6206,7 @@ async function discardSetAside(s, all) {
     if (!gone) {
         showToast('That copy changed or is gone already — nothing was discarded.');
     } else {
-        const out = new Set(drafts.map(d => JSON.stringify(d)));
-        DC.writeParked(localStorage, parkedList().filter(d => !out.has(JSON.stringify(d))));
+        for (const d of drafts) dropParked(d);
         showToast('Discarded.');
     }
     await refreshStorageUi();
