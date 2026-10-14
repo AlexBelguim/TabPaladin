@@ -27,7 +27,8 @@
 // first checks, in the same IndexedDB transaction, that no other window has
 // claimed the copy since this one did, so a window that lost the lock without
 // noticing (frozen in the background, then robbed) never writes over the copy
-// another window has taken on.
+// another window has taken on; and a claim never replaces one made since, so
+// of two windows that claimed at once exactly one goes on writing.
 //
 // Nothing here touches the DOM: app.js wires it in, and the tests drive it
 // with stand-ins for IndexedDB, Web Locks and BroadcastChannel.
@@ -183,9 +184,27 @@ export function createKv(factory, { name = DB_NAME, store = STORE } = {}) {
         }).then(out => ({ fenced: Boolean(out.fenced), holder: out.holder || null }));
     }
 
-    // This window edits the copy from now on: { id, at }.
+    // This window edits the copy from now on: { id, at }. In the same
+    // transaction, a claim another window made since stands: two windows
+    // that claimed at once (without Web Locks) never both go on editing,
+    // whichever committed last. Resolves { claimed, holder }: claimed false,
+    // having written nothing, when another's stands — this window then
+    // stops. A claim from the future is the clock set back since, not a
+    // later window: it is written over.
     function claim(c) {
-        return write({ [CLAIM_KEY]: { id: c.id, at: Number(c.at) || Date.now() } });
+        const mine = { id: c.id, at: Number(c.at) || Date.now() };
+        return run('readwrite', (os, out) => {
+            const r = os.get(CLAIM_KEY);
+            r.onsuccess = () => {
+                const cur = r.result;
+                if (claimedSince(cur, mine) && !(Number(cur.at) > Date.now())) {
+                    out.holder = cur;
+                    return;
+                }
+                os.put(mine, CLAIM_KEY);
+                out.claimed = true;
+            };
+        }).then(out => ({ claimed: Boolean(out.claimed), holder: out.holder || null }));
     }
 
     return { open, get, getMany, write, claim };
@@ -354,9 +373,19 @@ const timeOf = (rec) => {
 //     rather than lose it (stashEntry).
 // `tpWrittenAt`: the savedAt this release last wrote into tp-data (kept in
 // localStorage), or null when it never did or cannot say.
-export function chooseKept({ kv, tp, tpWrittenAt = null }) {
-    const kvRec = kv || null;
-    const tpRec = tp && tp.v === 1 && Array.isArray(tp.roots) ? tp : null;
+// `clearedAt`: left by a clear (a sign-out, another account signing in over
+// a clean copy, a deliberate discard) that one of the two places refused —
+// IndexedDB failing while Cache Storage works, say. Whatever either holds
+// that was kept then or before was cleared, and never comes back.
+export function chooseKept({ kv, tp, tpWrittenAt = null, clearedAt = null }) {
+    const cleared = clearedAt ? Date.parse(clearedAt) : NaN;
+    const live = (rec) => {
+        if (!rec || Number.isNaN(cleared)) return rec;
+        const t = timeOf(rec);
+        return t !== null && t > cleared ? rec : null;
+    };
+    const kvRec = live(kv || null);
+    const tpRec = live(tp && tp.v === 1 && Array.isArray(tp.roots) ? tp : null);
     if (kvRec && tpRec) {
         const a = timeOf(kvRec);
         const b = timeOf(tpRec);
@@ -375,11 +404,12 @@ export function chooseKept({ kv, tp, tpWrittenAt = null }) {
 // copy in the shared core's format (treeStore.js writeStash: the key
 // 'tpTreeStash:<url>|<userId>', listed in 'tpTreeStashIndex'), where the
 // release that moves the web app onto it lists it to restore or discard. The
-// web app's own parts ride along. `index`: the keys taken already.
+// web app's own parts ride along. `index`: the keys taken already; `why`:
+// what set it aside.
 export const STASH_PREFIX = 'tpTreeStash:';
 export const STASH_INDEX_KEY = 'tpTreeStashIndex';
 
-export function stashEntry(kvRec, drafts, index = [], now = Date.now()) {
+export function stashEntry(kvRec, drafts, index = [], now = Date.now(), why = 'cleared-by-previous-release') {
     const owner = kvRec.owner ? ownerOf(kvRec.owner) : null;
     const url = String(owner ? owner.url : '').replace(/\/$/, '');
     const base = STASH_PREFIX + `${url}|${owner ? owner.userId : 'legacy'}`;
@@ -410,7 +440,7 @@ export function stashEntry(kvRec, drafts, index = [], now = Date.now()) {
             serverIds: Array.isArray(kvRec.serverIds) ? kvRec.serverIds : [],
             keptDraft: kvRec.keptDraft || null,
             liveDrafts: drafts && typeof drafts === 'object' ? drafts : null,
-            why: 'cleared-by-previous-release'
+            why
         }
     };
 }
@@ -422,6 +452,8 @@ export function stashEntry(kvRec, drafts, index = [], now = Date.now()) {
 //   replaces may still be letting go), then says the app is open elsewhere.
 // mode 'channel': no Web Locks (not a secure context). A starting window asks
 //   over BroadcastChannel whether one is editing, and edits when none answers.
+//   Two asking at the same moment hear each other, and the one with the
+//   lower id edits: never both.
 // mode 'none': neither (an old browser): every window edits, as before.
 //
 // take() makes this window the one. It asks the holder to write down what it
@@ -450,6 +482,10 @@ export function createPrimaryGuard(env) {
     let yielding = false;
     let channel = null;
     const waiters = new Set();
+    // Channel mode: asking whether a window edits, and the others asking
+    // at the same moment.
+    let probing = false;
+    const rivals = new Set();
 
     if (mode !== 'none' && Channel) {
         try {
@@ -487,7 +523,15 @@ export function createPrimaryGuard(env) {
         if (!msg || typeof msg !== 'object' || msg.from === id) return;
         if (msg.to && msg.to !== id) return;
         for (const w of [...waiters]) if (w.types.has(msg.t)) w.done(msg);
-        if (msg.t === 'probe' && primary) post({ t: 'here', to: msg.from });
+        if (msg.t === 'probe') {
+            if (primary) post({ t: 'here', to: msg.from });
+            else if (probing) {
+                // Asking too: each learns of the other, whichever asked first.
+                rivals.add(msg.from);
+                post({ t: 'probing', to: msg.from });
+            }
+        }
+        if (msg.t === 'probing' && probing) rivals.add(msg.from);
         if (msg.t === 'yield' && primary) {
             post({ t: 'busy', to: msg.from });
             if (!yielding) yieldTo(msg.from);
@@ -572,6 +616,25 @@ export function createPrimaryGuard(env) {
         return { result, stop };
     }
 
+    // Channel mode: does a window edit? 'here' when one answers; 'rival'
+    // when none does but another asked at the same moment and goes first
+    // (the lower id); else 'free', and this window edits from now on.
+    async function probe() {
+        probing = true;
+        rivals.clear();
+        try {
+            const here = waitFor('here', wait.probe);
+            post({ t: 'probe' });
+            if (await here) return 'here';
+            if ([...rivals].some(r => String(r) < String(id))) return 'rival';
+            primary = true;
+            return 'free';
+        } finally {
+            probing = false;
+            rivals.clear();
+        }
+    }
+
     async function start({ take: takeOver = false } = {}) {
         if (mode === 'none') return 'primary';
         if (mode === 'locks') {
@@ -582,13 +645,14 @@ export function createPrimaryGuard(env) {
             return 'secondary';
         }
         // channel
-        const here = waitFor('here', wait.probe);
-        post({ t: 'probe' });
-        if (!(await here)) {
-            primary = true;
-            return 'primary';
+        const seen = await probe();
+        if (seen === 'free') return 'primary';
+        if (takeOver) {
+            // The window that went first edits once its own asking is over:
+            // asked before then, it would not answer.
+            if (seen === 'rival') await new Promise(r => later(r, wait.probe + 100));
+            return (await take()).ok ? 'primary' : 'secondary';
         }
-        if (takeOver) return (await take()).ok ? 'primary' : 'secondary';
         return 'secondary';
     }
 
@@ -660,13 +724,7 @@ export function createPrimaryGuard(env) {
     async function takeIfFree() {
         if (primary) return true;
         if (mode === 'locks') return acquire({ ifAvailable: true }).result;
-        if (mode === 'channel') {
-            const here = waitFor('here', wait.probe);
-            post({ t: 'probe' });
-            if (await here) return false;
-            primary = true;
-            return true;
-        }
+        if (mode === 'channel') return (await probe()) === 'free';
         primary = true;
         return true;
     }
