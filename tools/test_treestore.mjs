@@ -60,7 +60,27 @@
 //      edits at once instead of on the debounce: an extension update reloads
 //      every page, and closing a tab ends it, before the timer fires.
 //
-// Run: node tools/test_treestore.mjs
+// The whole suite runs twice: on the extension's storage (a chrome fake), and
+// on the web app's platform (pwa/platform.js over an in-memory store, with
+// Node's BroadcastChannel and Web Locks), where the shared core runs from
+// pwa/lib/. The second run adds what only the web app has:
+//  19. Two windows, each with its own platform over the one store: an edit
+//      in one reaches the other over the channel; two editing at once keep
+//      both; a switch made in one is a switch in the other; edits made in one
+//      on a copy the other has since set aside go to that copy; a broadcast
+//      that never arrives is made good by the next locked read.
+//  20. The platform itself: settings never store the session token, what a
+//      page decorates a write with is written, a fenced window writes
+//      nothing, and without IndexedDB the store is Cache Storage, then memory.
+//
+// Run: node tools/test_treestore.mjs           both runs
+//      node tools/test_treestore.mjs --web     the web app's run only
+//      node tools/test_treestore.mjs --chrome  the extension's run only
+
+const WEB = process.argv.includes('--web');
+const ONLY = WEB || process.argv.includes('--chrome');
+const LIB = WEB ? '../pwa/lib' : '../src/utils';
+console.log(WEB ? '\n=== On the web app\'s platform (pwa/platform.js, pwa/lib/) ===' : '\n=== On the extension\'s storage (src/utils/) ===');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -251,13 +271,42 @@ globalThis.fetch = async (url, opts = {}) => {
 
 const cfg = { url: 'https://server.test', token: 'tok' };
 
+// --- the web app's platform -------------------------------------------------
+//
+// Every module instance of the run shares one page's platform (as every page
+// of the extension shares chrome.storage): writes are heard at once in this
+// page. The test's own reads and writes (`chrome.storage.local`, standing in
+// for another page or the background) go through it too, and `storageData` is
+// the store underneath it, as IndexedDB is underneath the real one.
+const realBookmarks = globalThis.chrome.bookmarks;
+let webPlatform = null;
+let Platform = null;
+if (WEB) {
+    Platform = await import('../pwa/platform.js');
+    webPlatform = Platform.createPlatform({
+        backend: Platform.memoryBackend(storageData),
+        BroadcastChannel: globalThis.BroadcastChannel,
+        id: 'page-under-test'
+    });
+    // The browser's bookmarks, as a helper staged them.
+    webPlatform.bookmarks.getTree = realBookmarks.getTree;
+    // A storage event that reaches a page late (eventDelay), as in the fake.
+    const addListener = webPlatform.storage.onChanged.addListener;
+    webPlatform.storage.onChanged.addListener = (fn) => addListener((c, a) => {
+        if (eventDelay) setTimeout(() => fn(c, a), eventDelay);
+        else fn(c, a);
+    });
+    globalThis.__tpPlatform = webPlatform;
+    globalThis.chrome = { storage: webPlatform.storage, bookmarks: webPlatform.bookmarks };
+}
+
 // --- run ------------------------------------------------------------------
 
-const { TreeStore } = await import('../src/utils/treeStore.js');
-const { NotesManager } = await import('../src/utils/notesManager.js');
-const { PinsManager } = await import('../src/utils/pinsManager.js');
-const { StorageManager } = await import('../src/utils/storageManager.js');
-const { ExpandState, OPEN_TABS_KEY } = await import('../src/utils/expandState.js');
+const { TreeStore } = await import(`${LIB}/treeStore.js`);
+const { NotesManager } = await import(`${LIB}/notesManager.js`);
+const { PinsManager } = await import(`${LIB}/pinsManager.js`);
+const { StorageManager } = await import(`${LIB}/storageManager.js`);
+const { ExpandState, OPEN_TABS_KEY } = await import(`${LIB}/expandState.js`);
 
 console.log('\n1. Pull populates the working copy');
 await TreeStore.sync.pull(cfg);
@@ -541,7 +590,7 @@ check('Opera/Vivaldi trash is skipped', !flat.includes('deleted.example'));
 
 console.log('\n8. Saving a workflow survives the page closing right after');
 {
-    const { StorageManager } = await import('../src/utils/storageManager.js');
+    const { StorageManager } = await import(`${LIB}/storageManager.js`);
     storageData.delete('tpTree');
     const wf = await StorageManager.saveWorkflow('Research', [
         { url: 'https://a.example', title: 'A' }, { url: 'https://b.example', title: 'B' }
@@ -806,14 +855,14 @@ console.log('\n11. A copy made while nobody was signed in');
     // How a fresh install and an upgraded one first load: a separate module
     // instance, so ensureLoaded runs again against what is in storage.
     storageData.delete('tpTree');
-    const { TreeStore: FreshInstall } = await import('../src/utils/treeStore.js?fresh-install');
+    const { TreeStore: FreshInstall } = await import(`${LIB}/treeStore.js?fresh-install`);
     await FreshInstall.load();
     check('a fresh install starts with a copy made here', FreshInstall.status().origin === 'local' && FreshInstall.status().owner === null);
     await FreshInstall.createNode({ parentId: null, kind: 'folder', title: 'Saved before sign-in' });
     await FreshInstall.flush();
     check('  and stores it as such', storageData.get('tpTree').origin === 'local' && storageData.get('tpTree').owner === null);
     storageData.set('tpTree', { baseVersion: 3, roots: [{ id: 'upg', kind: 'folder', title: 'Upgraded', children: [] }], dirty: false });
-    const { TreeStore: Upgraded } = await import('../src/utils/treeStore.js?upgraded');
+    const { TreeStore: Upgraded } = await import(`${LIB}/treeStore.js?upgraded`);
     await Upgraded.load();
     check('an install upgraded from before accounts loads its copy as the owner\'s', Upgraded.status().origin === 'pre-accounts');
 }
@@ -917,7 +966,7 @@ console.log('\n12. A pull never replaces another account\'s copy');
     await TreeStore.flush();
     await chrome.storage.local.set({ tpTree: { ...storageData.get('tpTree'), rev: 'another-page-write' } });
     check('  and another page writing the copy keeps it', TreeStore.status().restoredFrom.length === 2);
-    const { TreeStore: Reopened } = await import('../src/utils/treeStore.js?reopened');
+    const { TreeStore: Reopened } = await import(`${LIB}/treeStore.js?reopened`);
     await Reopened.load();
     check('  as does the next page to open', JSON.stringify(Reopened.status().restoredFrom) === JSON.stringify(roundTrips));
     await chrome.storage.local.set({ tpTree: {
@@ -940,7 +989,7 @@ console.log('\n13. Another page switching accounts while a pull waits on the ser
     const asAlex = { url: MAIN, token: 'tok' };
     const asSam = { url: MAIN, token: 'tok-b' };
     // Another TabPaladin page: its own TreeStore over the same storage.
-    const { TreeStore: OtherPage } = await import('../src/utils/treeStore.js?race-other-page');
+    const { TreeStore: OtherPage } = await import(`${LIB}/treeStore.js?race-other-page`);
     await OtherPage.load();
     // alex's tree on the server, recognisable wherever it lands.
     server.roots = [{ id: 'alex-server-mark', kind: 'folder', title: 'Alex on the server', children: [] }];
@@ -1030,7 +1079,7 @@ console.log('\n14. One lock for the working copy, in every page');
     const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
     const lee = { url: MAIN, userId: 3, username: 'lee', serverId: 'srv-main', tenancyOwner: false };
     const asAlex = { url: MAIN, token: 'tok' };
-    const { TreeStore: OtherPage } = await import('../src/utils/treeStore.js?lock-other-page');
+    const { TreeStore: OtherPage } = await import(`${LIB}/treeStore.js?lock-other-page`);
     await OtherPage.load();
     const wait = (ms = 0) => new Promise(r => setTimeout(r, ms));
     const stored = () => storageData.get('tpTree');
@@ -1449,17 +1498,18 @@ console.log('\n17. A page can install its own platform before the store loads');
         }
     };
     try {
-        const { TreeStore: OnPlatform } = await import('../src/utils/treeStore.js?platform');
-        const { StorageManager: SettingsOnPlatform } = await import('../src/utils/storageManager.js?platform');
+        const { TreeStore: OnPlatform } = await import(`${LIB}/treeStore.js?platform`);
+        const { StorageManager: SettingsOnPlatform } = await import(`${LIB}/storageManager.js?platform`);
         await OnPlatform.load();
         check('treeStore.js reads its copy from globalThis.__tpPlatform', Boolean(await OnPlatform.getNode('on-platform')) && reads.includes('tpTree'));
         check('storageManager.js reads settings from it too', eq((await SettingsOnPlatform.getSettings()).focusedFolderIds, ['on-platform']));
-        const { ExpandState: ExpandOnPlatform } = await import('../src/utils/expandState.js?platform');
+        const { ExpandState: ExpandOnPlatform } = await import(`${LIB}/expandState.js?platform`);
         await ExpandOnPlatform.load();
         check('expandState.js reads open folders from it too', ExpandOnPlatform.isOpen('on-platform') && reads.includes('tpUiExpanded'));
         check('  and the browser storage of the other pages is untouched', !has(storageData.get('tpTree'), 'on-platform'));
     } finally {
-        delete globalThis.__tpPlatform;
+        if (WEB) globalThis.__tpPlatform = webPlatform;
+        else delete globalThis.__tpPlatform;
     }
 }
 
@@ -1473,7 +1523,7 @@ console.log('\n18. A page that is hidden or going away writes its edits at once'
         addEventListener: (t, fn) => { (docListeners[t] ||= []).push(fn); }
     };
     globalThis.window = { addEventListener: (t, fn) => { (winListeners[t] ||= []).push(fn); } };
-    const { TreeStore: Page } = await import('../src/utils/treeStore.js?hide-page');
+    const { TreeStore: Page } = await import(`${LIB}/treeStore.js?hide-page`);
     delete globalThis.document;
     delete globalThis.window;
     await Page.load();
@@ -1501,5 +1551,178 @@ console.log('\n18. A page that is hidden or going away writes its edits at once'
     await TreeStore.flush();
 }
 
-console.log(failures === 0 ? '\nAll tree-store tests passed.\n' : `\n${failures} test(s) failed.\n`);
-process.exit(failures === 0 ? 0 : 1);
+if (WEB) {
+    console.log('\n19. Two windows of the web app, each on its own platform');
+    const MAIN = 'https://server.test';
+    const alex = { url: MAIN, userId: 1, username: 'alex', serverId: 'srv-main', tenancyOwner: true };
+    const sam = { url: MAIN, userId: 2, username: 'sam', serverId: 'srv-main', tenancyOwner: false };
+    const asAlex = { url: MAIN, token: 'tok' };
+    const wait = (ms = 0) => new Promise(r => setTimeout(r, ms));
+    const until = async (cond, ms = 3000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+            if (await cond()) return true;
+            await wait(5);
+        }
+        return Boolean(await cond());
+    };
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    const stored = () => storageData.get('tpTree');
+    const stashWith = (text) => [...storageData.entries()].filter(([k]) => k.startsWith('tpTreeStash:')).map(([, v]) => v).find(s => has(s.roots, text));
+    // Another window: its own platform over the same store (IndexedDB is one
+    // per origin), its own BroadcastChannel (or none), its own TreeStore.
+    const openWindow = async (name, { channel = true } = {}) => {
+        const platform = Platform.createPlatform({
+            backend: Platform.memoryBackend(storageData),
+            BroadcastChannel: channel ? globalThis.BroadcastChannel : null,
+            id: name
+        });
+        globalThis.__tpPlatform = platform;
+        try {
+            const { TreeStore: T } = await import(`${LIB}/treeStore.js?window=${name}`);
+            await T.load();
+            return { platform, T };
+        } finally {
+            globalThis.__tpPlatform = webPlatform;
+        }
+    };
+    for (const st of await TreeStore.listStashes()) await TreeStore.discardStash(st.key);
+    await TreeStore.switchAccount({ ...alex });
+    server.opsLog = [];
+    server.roots = [{ id: 'bm-19', kind: 'folder', role: 'bookmarks', title: 'Bookmarks', children: [] }];
+    await TreeStore.sync.pull(asAlex);
+    await TreeStore.flush();
+    const b = await openWindow('window-b');
+    check('(another window opens on the same copy)', b.T.status().copyId === TreeStore.status().copyId && Boolean(await b.T.getNode('bm-19')));
+
+    const made = await b.T.createNode({ parentId: 'bm-19', kind: 'folder', title: 'MADE IN B' });
+    await b.T.flush();
+    check('an edit in one window reaches the other over the channel', await until(async () => Boolean(await TreeStore.getNode(made.id)))
+        && TreeStore.status().dirty);
+
+    await TreeStore.createNode({ parentId: 'bm-19', kind: 'folder', title: 'EDIT IN A' });
+    await b.T.createNode({ parentId: 'bm-19', kind: 'folder', title: 'EDIT IN B' });
+    await Promise.all([TreeStore.flush(), b.T.flush()]);
+    const bothEverywhere = async () => has(stored(), 'EDIT IN A') && has(stored(), 'EDIT IN B')
+        && has(await TreeStore.bookmarks.getTree(), 'EDIT IN B') && has(await b.T.bookmarks.getTree(), 'EDIT IN A');
+    check('two windows editing at once: both edits are kept, in the store and in both windows', await until(bothEverywhere)
+        && has(stored(), 'MADE IN B'), JSON.stringify(stored().roots));
+
+    const heard = [];
+    const stopHearing = TreeStore.onChanged((kind) => heard.push(kind));
+    await b.T.switchAccount({ ...sam, previousUsername: 'alex' });
+    check('a switch made in one window is a switch in the other', await until(() => TreeStore.status().owner && TreeStore.status().owner.userId === 2)
+        && heard.includes('switch') && TreeStore.status().copyId === b.T.status().copyId && Boolean(stashWith('EDIT IN A')), JSON.stringify(heard));
+    stopHearing();
+
+    await TreeStore.switchAccount({ ...alex, previousUsername: 'sam' });
+    await until(() => b.T.status().owner && b.T.status().owner.userId === 1);
+    check('(alex\'s copy comes back, both edits in it, in both windows)', TreeStore.status().dirty && has(await TreeStore.bookmarks.getTree(), 'EDIT IN B')
+        && b.T.status().owner.userId === 1);
+    // An edit here, not yet written, while the other window sets the copy aside.
+    await TreeStore.createNode({ parentId: 'bm-19', kind: 'folder', title: 'ORPHANED IN A' });
+    await b.T.switchAccount({ ...sam, previousUsername: 'alex' });
+    await TreeStore.flush();
+    await until(() => TreeStore.status().owner && TreeStore.status().owner.userId === 2);
+    const alexAside = stashWith('ORPHANED IN A');
+    check('an edit made in one window on a copy the other has since set aside goes to that copy, never into the one that came in',
+        !has(stored(), 'ORPHANED IN A') && stored().owner.userId === 2 && alexAside && alexAside.owner.userId === 1 && alexAside.dirty
+        && has(alexAside.roots, 'EDIT IN B') && (await TreeStore.listStashes()).filter(s => s.userId === 1).length === 1,
+        JSON.stringify((await TreeStore.listStashes()).map(s => [s.userId, s.items])));
+
+    // A window whose broadcasts never arrive (none at all, here).
+    const c = await openWindow('window-c', { channel: false });
+    await until(() => b.T.status().copyId === TreeStore.status().copyId);
+    const lost = await c.T.createNode({ parentId: null, kind: 'folder', title: 'BROADCAST LOST' });
+    await c.T.flush();
+    await wait(50);
+    const notHeard = !(await TreeStore.getNode(lost.id));
+    const heardLate = [];
+    const stopLate = TreeStore.onChanged((kind) => heardLate.push(kind));
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'AFTER THE LOST ONE' });
+    await TreeStore.flush();
+    stopLate();
+    check('a broadcast that never arrives is made good by the next locked read: nothing lost, nothing written over',
+        notHeard && Boolean(await TreeStore.getNode(lost.id)) && has(stored(), 'BROADCAST LOST') && has(stored(), 'AFTER THE LOST ONE')
+        && heardLate.includes('external'), JSON.stringify({ notHeard, heardLate }));
+    b.platform.close();
+    c.platform.close();
+    const before = stored().rev;
+    await b.T.createNode({ parentId: null, kind: 'folder', title: 'FROM A CLOSED WINDOW' }).catch(() => null);
+    await b.T.flush().catch(() => false);
+    check('a window that has closed writes nothing more', stored().rev === before && !has(stored(), 'FROM A CLOSED WINDOW'));
+    for (const st of await TreeStore.listStashes()) await TreeStore.discardStash(st.key);
+
+    console.log('\n20. The platform\'s storage');
+    {
+        const store = new Map();
+        let session = { url: 'https://server.test', token: 'secret-token' };
+        const p = Platform.createPlatform({ backend: Platform.memoryBackend(store), session: () => session, id: 'p20' });
+        await p.storage.local.set({ settings: { focusedFolderIds: ['x'], backend: { url: 'https://server.test', token: 'secret-token' } } });
+        check('settings are written without the session token', !JSON.stringify(store.get('settings')).includes('secret-token')
+            && store.get('settings').focusedFolderIds[0] === 'x', JSON.stringify(store.get('settings')));
+        const got = (await p.storage.local.get('settings')).settings;
+        check('  and read with the session overlaid from where the app keeps it', got.backend.token === 'secret-token'
+            && got.backend.url === 'https://server.test' && got.focusedFolderIds[0] === 'x');
+        session = null;
+        check('  none when signed out', !((await p.storage.local.get('settings')).settings.backend || {}).token);
+        p.setDecorator((k, v) => (k === 'tpTree' ? { ...v, savedAt: 'stamped' } : v));
+        await p.storage.local.set({ tpTree: { roots: [] } });
+        check('what the page adds to a write is written', store.get('tpTree').savedAt === 'stamped');
+        const events = [];
+        p.storage.onChanged.addListener((ch, area) => events.push([ch, area]));
+        await p.storage.local.set({ k: 1 });
+        await p.storage.local.set({ k: 2 });
+        await p.storage.local.remove('k');
+        check('onChanged says what changed, before and after, in "local", once written', events.length === 3
+            && events[1][0].k.oldValue === 1 && events[1][0].k.newValue === 2 && events[2][0].k.newValue === undefined
+            && events.every(e => e[1] === 'local'));
+        check('get takes a key, a list, or defaults', (await p.storage.local.get({ missing: 7 })).missing === 7
+            && Object.keys(await p.storage.local.get(['tpTree', 'nope'])).join() === 'tpTree');
+        await p.claim({ id: 'other-window', at: Date.now() });
+        p.setFence(() => ({ id: 'p20', at: Date.now() - 1000 }));
+        let fenced = null;
+        let told = null;
+        p.onFenced((holder) => { told = holder; });
+        try { await p.storage.local.set({ k: 3 }); } catch (e) { fenced = e; }
+        check('a window another has claimed the copy from since writes nothing, and is told', fenced && fenced.name === 'FencedError'
+            && !store.has('k') && told && told.id === 'other-window');
+        p.setFence(null);
+        const cacheMaps = new Map();
+        const cachesFake = {
+            async open(name) {
+                if (!cacheMaps.has(name)) cacheMaps.set(name, new Map());
+                const m = cacheMaps.get(name);
+                return {
+                    match: async (k) => { const r = m.get(k); return r ? r.clone() : undefined; },
+                    put: async (k, v) => { m.set(k, v); },
+                    delete: async (k) => m.delete(k)
+                };
+            }
+        };
+        const pc = Platform.createPlatform({ indexedDB: undefined, caches: cachesFake });
+        await pc.storage.local.set({ a: { b: 1 } });
+        check('without IndexedDB the store is Cache Storage (tp-data), one entry a key', (await pc.backendKind()) === 'cache'
+            && (await pc.storage.local.get('a')).a.b === 1 && cacheMaps.get('tp-data').has('/__tp_kv/a'));
+        const blocked = { open() { throw Object.assign(new Error('blocked'), { name: 'SecurityError' }); } };
+        const pb = Platform.createPlatform({ indexedDB: blocked, caches: cachesFake });
+        check('  so it is when IndexedDB will not open (site data blocked)', (await pb.backendKind()) === 'cache'
+            && (await pb.storage.local.get('a')).a.b === 1);
+        check('  and memory without either', (await Platform.createPlatform({}).backendKind()) === 'memory');
+        p.close();
+        let closedRead = null;
+        try { await p.storage.local.get('tpTree'); } catch (e) { closedRead = e; }
+        check('a page that has closed reads nothing more', closedRead !== null);
+    }
+}
+
+console.log(failures === 0 ? `\nAll tree-store tests passed (${WEB ? 'web app' : 'extension'}).\n` : `\n${failures} test(s) failed (${WEB ? 'web app' : 'extension'}).\n`);
+let exitCode = failures === 0 ? 0 : 1;
+if (!ONLY) {
+    // The same suite on the web app's platform.
+    const { spawnSync } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const run = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--web'], { stdio: 'inherit' });
+    if (run.status !== 0) exitCode = 1;
+}
+process.exit(exitCode);
