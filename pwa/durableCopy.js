@@ -32,6 +32,19 @@
 //
 // Nothing here touches the DOM: app.js wires it in, and the tests drive it
 // with stand-ins for IndexedDB, Web Locks and BroadcastChannel.
+//
+// Since the web app runs on the shared core (pwa/lib/treeStore.js over
+// pwa/platform.js), the record in 'tpTree' is TreeStore's own, written by
+// TreeStore under its lock 'tp-working-copy' from any number of windows. It
+// stays a superset of the last release's (decorateCoreRecord: savedAt,
+// importIds, serverIds, pathIds, keptDraft), so stepping back finds the copy
+// as it left it, and tp-data's '/__tp_tree' is still written beside it in the
+// last release's shape (toV1Record). The first start of this release turns
+// what the last one kept into TreeStore's record (planMigration): the copy,
+// a newer one in tp-data after a step back, a note set aside by a sign-out
+// (now a parked draft, as the extension parks them: tp_notes_parked_v1), and
+// the drafts kept with set-aside copies. Single-window mode (the guard below)
+// remains where Web Locks are missing.
 
 export const DB_NAME = 'tabpaladin';
 export const STORE = 'kv';
@@ -443,6 +456,312 @@ export function stashEntry(kvRec, drafts, index = [], now = Date.now(), why = 'c
             why
         }
     };
+}
+
+// --- The shared core's record (this release) --------------------------------------
+//
+// TreeStore writes 'tpTree' itself; the page adds to each write what the last
+// release reads (decorateCoreRecord, through the platform's decorator), and
+// mirrors it into tp-data in the last release's shape (toV1Record). `pwa`
+// says a record was written on the shared core: one without it was written by
+// the last release (the first start of this one, or after a step back).
+
+export const PWA_RECORD = 33;
+
+const arr = (v) => (Array.isArray(v) ? v.slice() : []);
+const trimUrl = (u) => String(u || '').replace(/\/+$/, '');
+const nameKey = (n) => String(n || '').normalize('NFKC').toLowerCase();
+
+export function isCoreRecord(kv) {
+    return Boolean(kv && typeof kv === 'object' && Number(kv.pwa) >= PWA_RECORD && Array.isArray(kv.roots));
+}
+
+// A copy kept only so that nothing is lost — one an earlier release cleared
+// after a step back (it pushed it, or let it go on purpose), or one another
+// window of that release set aside — never comes back on its own: set aside
+// under nobody's stamp, so TreeStore never picks it to bring back when its
+// account signs in (and offers it to the server's owner alone), with the
+// account it was kept for beside it (`ownerWas`), for Settings to offer it
+// back to that account by hand, or to export or discard.
+export function keptAsideOnly(value) {
+    if (!value || typeof value !== 'object' || !value.owner) return value;
+    return { ...value, ownerWas: value.owner, owner: null, origin: 'set-aside' };
+}
+
+const asideStash = (entry) => (entry ? { key: entry.key, value: keptAsideOnly(entry.value) } : entry);
+
+// The last release's kept copy ('v: 1': what fromKvRecord gives, or tp-data
+// holds) as TreeStore's record. Its account is the copy's owner; a copy that
+// never learned its account's id (a session from before ids) takes it from
+// `identity` (who this device's session is) when the address and the name
+// agree, and is otherwise a copy from before accounts — the server owner's to
+// adopt, set aside for anyone else, never anyone's by guess. `seq`: the place
+// in line of the record it replaces.
+export function toCoreRecord(rec, { identity = null, seq = 0 } = {}) {
+    const acct = rec && rec.account ? rec.account : {};
+    const url = trimUrl(acct.url);
+    let userId = acct.userId === null || acct.userId === undefined || acct.userId === '' ? null : Number(acct.userId);
+    if ((userId === null || !Number.isFinite(userId)) && identity && identity.userId !== null && identity.userId !== undefined
+        && url && trimUrl(identity.url) === url && nameKey(acct.username) && nameKey(acct.username) === nameKey(identity.username)) {
+        userId = Number(identity.userId);
+    }
+    const owner = url && userId !== null && Number.isFinite(userId)
+        ? { url, userId, username: acct.username || null, serverId: acct.serverId || null }
+        : null;
+    const dirty = Boolean(rec.dirty);
+    return {
+        baseVersion: Number(rec.version) || 0,
+        roots: Array.isArray(rec.roots) ? rec.roots : [],
+        dirty,
+        lastSyncAt: rec.lastSyncAt || null,
+        lastSyncKind: rec.lastSyncKind || null,
+        owner,
+        origin: owner ? null : 'pre-accounts',
+        editCount: dirty ? Math.max(1, Number(rec.editCount) || 0) : 0,
+        copyId: rec.copyId || newId(),
+        restoredFrom: [],
+        rev: newId(),
+        seq: (Number(seq) || 0) + 1,
+        baseId: newId(),
+        meta: { importIds: arr(rec.importIds), serverIds: arr(rec.serverIds) },
+        savedAt: rec.savedAt || null,
+        pathIds: arr(rec.pathIds),
+        keptDraft: null,
+        pwa: PWA_RECORD
+    };
+}
+
+// What every write of the working copy carries for the last release, which
+// reads these fields of it (fromKvRecord) after a step back. `keptDraft`: a
+// note parked with this copy (the newest), which the last release puts back
+// into its editor as it did the one a sign-out set aside — it never reads the
+// parked list.
+export function decorateCoreRecord(rec, { savedAt, pathIds = [], keptDraft = null } = {}) {
+    if (!rec || typeof rec !== 'object') return rec;
+    const meta = rec.meta && typeof rec.meta === 'object' ? rec.meta : {};
+    return {
+        ...rec,
+        savedAt: savedAt || rec.savedAt || new Date().toISOString(),
+        pwa: PWA_RECORD,
+        importIds: arr(meta.importIds),
+        serverIds: arr(meta.serverIds),
+        pathIds: arr(pathIds),
+        keptDraft: keptDraft && keptDraft.editing ? { ...keptDraft } : null
+    };
+}
+
+// The same copy in the last release's tp-data shape, or null for one that
+// holds nothing of anyone's (an empty copy nobody owns: what a clean
+// sign-out leaves, which the last release kept as no copy at all).
+export function toV1Record(rec, { nv = null } = {}) {
+    if (!rec || !Array.isArray(rec.roots)) return null;
+    if (!rec.owner && !rec.roots.length && !rec.dirty) return null;
+    const meta = rec.meta && typeof rec.meta === 'object' ? rec.meta : {};
+    return {
+        v: 1,
+        savedAt: rec.savedAt || new Date().toISOString(),
+        account: ownerOf(rec.owner || {}),
+        roots: rec.roots,
+        version: Number(rec.baseVersion) || 0,
+        dirty: Boolean(rec.dirty),
+        editCount: Number(rec.editCount) || 0,
+        importIds: arr(meta.importIds),
+        serverIds: arr(meta.serverIds),
+        nv: nv && nv.editing ? { ...nv } : null,
+        keptDraft: rec.keptDraft && rec.keptDraft.editing ? { ...rec.keptDraft } : null,
+        pathIds: arr(rec.pathIds),
+        copyId: rec.copyId || null,
+        seq: Number(rec.seq) || 0,
+        lastSyncAt: rec.lastSyncAt || null,
+        lastSyncKind: rec.lastSyncKind || null
+    };
+}
+
+// What a start does with what is kept, before TreeStore reads it:
+//   { action: 'none' }                       the shared core's record, current
+//   { action: 'convert', record, from, nv, keptDraft, account }
+//       the last release's copy (from IndexedDB, or tp-data written later
+//       after a step back), as TreeStore's record; the note open in it
+//       (`nv`, only tp-data's carries one: IndexedDB's is in tpLiveDraft
+//       already) and one a sign-out set aside, to be parked
+//   { action: 'drop', stash }                the last release cleared tp-data
+//       after this one wrote it with that very record: not brought back, but
+//       set aside (stash: {key, value}) when it held work
+//   { action: 'clear' }                      a record the last release
+//       cleared (its clearedAt mark): never brought back
+// The rules for which copy are the last release's (chooseKept).
+export function planMigration({ kvRaw = null, drafts = null, tp = null, tpWrittenAt = null, clearedAt = null, stashIndex = [], identity = null, now = Date.now() } = {}) {
+    const tpRec = tp && tp.v === 1 && Array.isArray(tp.roots) ? tp : null;
+    if (isCoreRecord(kvRaw)) {
+        // Written by this release. tp-data later still: the last release
+        // ran after a step back with IndexedDB failing, and kept it there.
+        // Cleared by the last release, where IndexedDB refused the clear
+        // (its mark), or by an older one that knew only tp-data (gone,
+        // although this release last wrote it with this very record): not
+        // brought back — set aside, when it holds work.
+        const pick = chooseKept({ kv: { ...kvRaw, v: 1 }, tp: tpRec, tpWrittenAt, clearedAt });
+        if (pick.drop) {
+            const holdsWork = Boolean(kvRaw.dirty || (drafts && Object.keys(drafts).length));
+            return { action: 'drop', stash: holdsWork ? asideStash(stashEntry(kvRaw, drafts, stashIndex, now)) : null };
+        }
+        if (!pick.rec) return { action: 'clear' };
+        if (pick.from === 'tp-data' && tpRec && tpRec.savedAt !== kvRaw.savedAt) {
+            return { action: 'convert', record: toCoreRecord(tpRec, { identity, seq: kvRaw.seq }), from: 'tp-data',
+                nv: tpRec.nv || null, keptDraft: tpRec.keptDraft || null, account: tpRec.account || null };
+        }
+        return { action: 'none' };
+    }
+    const fromKv = fromKvRecord(kvRaw, drafts);
+    const pick = chooseKept({ kv: fromKv, tp: tpRec, tpWrittenAt, clearedAt });
+    if (pick.drop) {
+        const holdsWork = Boolean(fromKv && (fromKv.dirty || fromKv.nv || fromKv.keptDraft));
+        return { action: 'drop', stash: holdsWork ? asideStash(stashEntry(kvRaw, drafts, stashIndex, now)) : null };
+    }
+    if (pick.rec) {
+        return {
+            action: 'convert',
+            record: toCoreRecord(pick.rec, { identity, seq: kvRaw && kvRaw.seq }),
+            from: pick.from,
+            nv: pick.from === 'tp-data' ? pick.rec.nv || null : null,
+            keptDraft: pick.rec.keptDraft || null,
+            account: pick.rec.account || null
+        };
+    }
+    return kvRaw ? { action: 'clear' } : { action: 'none' };
+}
+
+// A copy the last release set aside (stashEntry) carried the web app's own
+// parts beside it: its import links and server ids, which go into its meta,
+// and the notes being written in it, which are parked with its owner so they
+// come back when it does. Null for one that needs nothing (TreeStore's own,
+// or one done already).
+export function migrateStash(value) {
+    if (!value || typeof value !== 'object' || Number(value.pwa) >= PWA_RECORD) return null;
+    const own = ['importIds', 'serverIds', 'keptDraft', 'liveDrafts', 'why', 'savedAt'].some(k => value[k] !== undefined);
+    if (!own) return null;
+    const owner = value.owner || value.ownerWas || null;
+    const stamp = { owner, origin: owner ? null : value.origin || 'pre-accounts' };
+    const drafts = [];
+    const at = value.setAsideAt || new Date().toISOString();
+    const nvs = [];
+    if (value.keptDraft && value.keptDraft.editing) nvs.push(value.keptDraft);
+    if (value.liveDrafts && typeof value.liveDrafts === 'object') {
+        for (const d of Object.values(value.liveDrafts)) {
+            const nv = nvOfDraft(d);
+            if (nv) nvs.push(nv);
+        }
+    }
+    for (const nv of nvs) {
+        const d = draftFromNv(nv, stamp, at);
+        if (d) drafts.push(d);
+    }
+    const meta = value.meta && typeof value.meta === 'object' ? { ...value.meta } : {};
+    if (!meta.importIds) meta.importIds = arr(value.importIds);
+    if (!meta.serverIds) meta.serverIds = arr(value.serverIds);
+    const out = { ...value, meta, pwa: PWA_RECORD };
+    return { value: value.why ? keptAsideOnly(out) : out, drafts };
+}
+
+// --- Parked drafts ------------------------------------------------------------------
+//
+// A note being written when its copy goes — signed out of, set aside for
+// another account, replaced in another window — is parked on the device under
+// the copy's stamp ({owner, origin}), in the extension's format
+// (tp_notes_parked_v1 in this origin's localStorage), with the app's own editor
+// state beside it (`nv`). It comes back into the editor, unsaved, when that
+// copy is the working copy again: for its account, or with the copy brought
+// back from being set aside under that stamp (TreeStore's restoredFrom).
+
+export const PARKED_KEY = 'tp_notes_parked_v1';
+export const PARKED_AT_KEY = 'tp_notes_parked_at_v1';
+
+function ownerKey(owner) {
+    let url = trimUrl(owner && owner.url);
+    try {
+        const u = new URL(url);
+        url = u.origin + u.pathname.replace(/\/$/, '');
+    } catch (e) { /* as typed */ }
+    return `${url}|${Number(owner && owner.userId)}`;
+}
+
+function sameStampOwner(a, b) {
+    if (!a || !b) return !a && !b;
+    if (a.serverId && b.serverId && a.serverId !== b.serverId) return false;
+    return ownerKey(a) === ownerKey(b);
+}
+
+// Stamps as notesView.js compares them: an account, or for an unstamped copy
+// where it came from.
+export function sameStamp(a, b) {
+    if (a.owner || b.owner) return sameStampOwner(a.owner, b.owner);
+    return !a.origin || !b.origin || a.origin === b.origin;
+}
+
+// The stamps the working copy answers to (TreeStore.status()): its own, then
+// those it was set aside under before.
+export function stampsOfStatus(st) {
+    if (!st) return [];
+    const own = { owner: st.owner || null, origin: st.owner ? null : st.origin || null };
+    const earlier = (st.restoredFrom || []).map(s => (s.userId === null || s.userId === undefined
+        ? { owner: null, origin: s.origin || null }
+        : { owner: { url: s.url, userId: s.userId, serverId: s.serverId || null }, origin: null }));
+    return [own, ...earlier];
+}
+
+export function draftAnswersTo(draft, stamps) {
+    const own = { owner: draft && draft.owner ? draft.owner : null, origin: draft ? draft.origin || null : null };
+    return (stamps || []).some(s => sameStamp(own, s));
+}
+
+// The editor (`nv`) as a parked draft of the copy stamped `stamp`.
+export function draftFromNv(nv, stamp, at = new Date().toISOString()) {
+    if (!nv || !nv.editing) return null;
+    const content = nv.draft == null ? '' : String(nv.draft);
+    const owner = stamp && stamp.owner ? stamp.owner : null;
+    return {
+        owner: owner ? { url: trimUrl(owner.url), userId: owner.userId, username: owner.username || null, serverId: owner.serverId || null } : null,
+        origin: owner ? null : (stamp && stamp.origin) || 'pre-accounts',
+        noteId: nv.isNew ? null : nv.noteId || null,
+        notebookId: nv.newParentId || null,
+        title: '',
+        content,
+        loaded: { title: '', content: nv.loaded == null ? '' : String(nv.loaded) },
+        parkedAt: at,
+        nv: { ...nv, editing: true }
+    };
+}
+
+// The editor a parked draft puts back.
+export function nvOfParked(d) {
+    return nvOfDraft(d);
+}
+
+export function readParked(ls) {
+    try {
+        const list = JSON.parse((ls && ls.getItem(PARKED_KEY)) || '[]');
+        return Array.isArray(list) ? list.filter(d => d && typeof d.content === 'string') : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+// False when localStorage refused it.
+export function writeParked(ls, list) {
+    try {
+        if (list.length) ls.setItem(PARKED_KEY, JSON.stringify(list));
+        else ls.removeItem(PARKED_KEY);
+        ls.setItem(PARKED_AT_KEY, JSON.stringify(Date.now()));
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// The same draft parked twice (a start that stopped halfway, a step back and
+// forward again) is one draft.
+export function sameDraft(a, b) {
+    return Boolean(a && b) && a.content === b.content && (a.noteId || null) === (b.noteId || null)
+        && sameStamp({ owner: a.owner || null, origin: a.origin || null }, { owner: b.owner || null, origin: b.origin || null });
 }
 
 // --- One window edits the copy ----------------------------------------------------
