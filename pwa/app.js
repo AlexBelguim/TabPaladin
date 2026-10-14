@@ -204,12 +204,12 @@ function idsOfRoots(roots) {
 // a push, another copy brought in).
 // undefined until the start has read the copy: a copy's id may itself be null.
 let lastCopyId;
-TreeStore.onChanged((kind) => {
+TreeStore.onChanged((kind, info) => {
     metaCache = null;
     if (kind === 'meta') return;
     viewStamp++;
     state.treeRev++;
-    onCopyChanged(kind);
+    onCopyChanged(kind, info || {});
 });
 
 function show(el) { if (el) el.classList.remove('hidden'); }
@@ -886,9 +886,10 @@ function toWire(node) {
 // out (yieldCopy): what they bring back is this window's to write down.
 let syncBusy = 0;
 
-// What TreeStore's requests go with: this page's server and session.
+// What TreeStore's requests go with: this page's server and session, and
+// who pushes (the server's history and a forced push's note name it).
 function syncConfig() {
-    return { url: (state.config.url || '').replace(/\/+$/, ''), token: state.config.token || '' };
+    return { url: (state.config.url || '').replace(/\/+$/, ''), token: state.config.token || '', deviceId: 'pwa' };
 }
 
 // TreeStore meets a dead session the way api() does, and it is said the same
@@ -920,14 +921,17 @@ async function pullSnapshot({ expect = null } = {}) {
         const into = expect || await TreeStore.currentCopy();
         let res;
         try {
-            res = await asLocalSwitch(() => TreeStore.sync.pull(syncConfig(), { expect: into }));
+            res = await TreeStore.sync.pull(syncConfig(), { expect: into });
         } catch (e) {
             if (sessionRefused(e, used)) throw Object.assign(new Error('Signed out'), { status: 401 });
             throw e;
         }
         // What the pull threw away never got anywhere: the links held in it
-        // wait again. Everything in it now, the server has.
-        await TreeStore.updateMeta((m) => ({ ...m, importIds: [], serverIds: idsOfRoots(TreeStore.roots()) }));
+        // wait again. Everything in it now, the server has — as it is now:
+        // the step is made again on whatever another window writes before
+        // this one's is written, whose new items the server does not have.
+        const pulledIds = idsOfRoots(TreeStore.roots());
+        await TreeStore.updateMeta((m) => ({ ...m, importIds: [], serverIds: pulledIds }));
         state.pathIds = [ROOT_ID];
         noteSync('pull');
         renderView();
@@ -1661,7 +1665,7 @@ function renderWorkflowsSection(root) {
                 setStatus('');
             } catch (err) {
                 setStatus('');
-                showToast('Delete failed: ' + err.message + ' — use ⬆️ to retry.');
+                showToast(pushFailedText(err, `the workflow is deleted on this ${deviceWord()} — use ⬆️ to retry.`));
             }
         });
         section.appendChild(row);
@@ -1856,12 +1860,25 @@ async function commitNotesEdit(label = 'Saving…', doneToast = '') {
         return true;
     } catch (e) {
         setStatus('');
-        showToast(`Push failed: ${e.message} — kept on this ${deviceWord()}, use ⬆️ to retry.`);
+        showToast(pushFailedText(e, `kept on this ${deviceWord()}, use ⬆️ to retry.`));
         return false;
     } finally {
         updatePushBtnState();
         syncBottomNav();
     }
+}
+
+// What became of an edit whose push did not go through, said as it is. A 409
+// answered by pulling the server's tree discarded it with the copy's other
+// unpushed edits (pushOnce's e.pulledInstead), and a 412 set the whole copy
+// aside for the account it belongs to (e.setAside): neither is kept here to
+// push again. Otherwise it is, and `kept` says so.
+function pushFailedText(e, kept) {
+    if (e && e.pulledInstead) {
+        return `Not pushed — the server’s tree was pulled instead, and this change was discarded with this ${deviceWord()}’s other unpushed edits.`;
+    }
+    if (e && e.setAside) return e.message;
+    return `Push failed: ${(e && e.message) || e} — ${kept}`;
 }
 
 // An edit of the copy, through TreeStore: false, and said why, when it could
@@ -2022,7 +2039,8 @@ function stopEditing() {
         loaded: null,
         newParentId: null,
         pendingNotebookName: null,
-        importId: null
+        importId: null,
+        removedElsewhere: false
     });
     // The kept draft goes once the copy is written with whatever the editor
     // saved: never before it (saveLiveDraft).
@@ -2169,7 +2187,8 @@ async function startNewNote({ parentId = null, content = '', from, pendingNotebo
     const patch = {
         pane: 'note', noteId: null, isNew: true, editing: true,
         newParentId: parentId, pendingNotebookName,
-        draft: content, loaded: content, importId
+        draft: content, loaded: content, importId,
+        ...editorCopy()
     };
     if (from) patch.from = from;
     openNotes(patch, { history: 'push' });
@@ -2196,6 +2215,7 @@ function validateNv(lib) {
         if (nv.editing && nv.draft != null) {
             // The note vanished under an edit: keep the text as a new note.
             nv.isNew = true;
+            nv.removedElsewhere = true;
             showToast('This note was removed elsewhere — ✓ Done keeps your text as a new note.');
         } else {
             stopEditing();
@@ -2536,7 +2556,7 @@ function startEditing() {
     const hit = findNotesNode(state.nv.noteId);
     if (!hit) return;
     const content = decodeNote(hit.node).content;
-    Object.assign(state.nv, { editing: true, isNew: false, draft: content, loaded: content });
+    Object.assign(state.nv, { editing: true, isNew: false, draft: content, loaded: content, ...editorCopy() });
     renderView();
     focusNoteEditor();
 }
@@ -2598,9 +2618,29 @@ async function ensureNotebookByName(name) {
 async function saveNoteEdit() {
     const nv = state.nv;
     if (!nv.editing) return;
+    // Written in another copy than the one here now (another window brought
+    // this one in while it was open, and the word had not reached it): never
+    // saved into this one — another account's, maybe. It waits with its own
+    // copy, parked under its stamp.
+    if (nv.copyId !== undefined && nv.copyId !== copyStatus().copyId) {
+        const stamp = nv.copyStamp || lastStamp || {};
+        parkOpenDraft({ ...copyStatus(), owner: stamp.owner || null, origin: stamp.origin || null, restoredFrom: [] });
+        showToast('This note was written in another copy than the one here now — it is kept on this device, and comes back with that copy.');
+        renderView();
+        return;
+    }
     // Only a new note needs the folder made; an existing one is already in it.
-    const found = await ensureNotesFolder({ create: nv.isNew });
+    let found = await ensureNotesFolder({ create: nv.isNew });
     if (!found) return;
+    // The note was removed under the edit (in another window, by a pull):
+    // the text is kept as a new note, as validateNv says it will be.
+    let rescued = Boolean(nv.removedElsewhere);
+    if (!nv.isNew && !findNotesNode(nv.noteId)) {
+        Object.assign(nv, { isNew: true, noteId: null, newParentId: null });
+        rescued = true;
+        found = await ensureNotesFolder({ create: true });
+        if (!found) return;
+    }
     const content = nv.draft == null ? '' : nv.draft;
     const now = new Date().toISOString();
     if (nv.isNew) {
@@ -2669,7 +2709,7 @@ async function saveNoteEdit() {
     }
     saveNotesPrefs();
     renderView();
-    await commitNotesEdit('Saving…', 'Note saved.');
+    await commitNotesEdit('Saving…', rescued ? 'That note was removed elsewhere — your text is saved as a new note.' : 'Note saved.');
     renderView();
 }
 
@@ -3720,7 +3760,11 @@ async function applyImportBatch() {
         showToast(pushed ? done : `${done} ⬆️ Push when ready.`);
         setStatus('');
     } catch (e) {
-        alert('Import failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
+        // Discarded by a pull, or set aside with the copy: the link waits to
+        // be imported again (the pull, or the copy, gave it back).
+        alert(e && (e.pulledInstead || e.setAside)
+            ? `${pushFailedText(e)}\nThe link waits on this ${deviceWord()} to be imported again.`
+            : 'Import failed: ' + e.message + '\nLocal changes preserved; use ⬆️ to retry.');
         setStatus('');
     }
     renderView();
@@ -3851,7 +3895,9 @@ function syncBottomNav() {
             : state.view === 'notes' && !fromHome ? 'notes' : 'home';
     if (nav) {
         for (const b of nav.querySelectorAll('button[data-nav]')) b.classList.toggle('on', b.dataset.nav === active);
-        const badge = nav.querySelector('.bn-badge');
+        // Notes' own badge: the first .bn-badge in the bar is Home's count of
+        // unpushed edits (updateSyncUi).
+        const badge = nav.querySelector('button[data-nav=notes] .bn-badge');
         if (badge) {
             const n = state.proposals.length;
             badge.textContent = n > 99 ? '99+' : String(n);
@@ -4030,13 +4076,15 @@ async function pushOnce({ force, expect }) {
         noteSync('push');
         return pushed;
     }
-    const st = copyStatus();
+    // Everything in the copy, when nothing was edited during the push;
+    // otherwise what was in it when the push went, and what it had. Taken
+    // now, not in the step: that is made again on whatever another window
+    // writes before it is written, whose new items the server does not have.
+    const idsNow = copyStatus().dirty ? null : idsOfRoots(TreeStore.roots());
     await TreeStore.updateMeta((m) => ({
         ...m,
         importIds: (m.importIds || []).filter(id => !carried.includes(id)),
-        // Everything in the copy, when nothing was edited during the push;
-        // otherwise what was in it when the push went, and what it had.
-        serverIds: st.dirty ? [...new Set([...(m.serverIds || []), ...idsAtStart])] : idsOfRoots(TreeStore.roots())
+        serverIds: idsNow || [...new Set([...(m.serverIds || []), ...idsAtStart])]
     }));
     noteSync('push');
     return pushed;
@@ -4079,7 +4127,7 @@ async function answerWrongAccount(err) {
     parkOpenDraft(copyStatus());
     let reset;
     try {
-        reset = await asLocalSwitch(() => TreeStore.setAsideAndReset({ ...me, expect: err.copy || null }));
+        reset = await TreeStore.setAsideAndReset({ ...me, expect: err.copy || null });
     } catch (e) {
         if (e.code === 'account-changed') throw new Error('Account changed meanwhile — nothing was set aside or pulled.');
         throw e;
@@ -5275,18 +5323,6 @@ async function accountFromServer() {
 // open in it parked, and this account's own set-aside copy comes back (or an
 // empty one, to pull into). Null when the server has not said who this is:
 // nothing is decided on a guess.
-// Another copy brought in by this window (a switch, a pull or a refused push
-// that set the copy aside, a clean sign-out): not another window's doing.
-let switchingHere = 0;
-async function asLocalSwitch(fn) {
-    switchingHere++;
-    try {
-        return await fn();
-    } finally {
-        switchingHere--;
-    }
-}
-
 async function ensureAccountCopy({ previousUsername = null } = {}) {
     const me = signedInAccount();
     if (!me) return null;
@@ -5301,19 +5337,17 @@ async function ensureAccountCopy({ previousUsername = null } = {}) {
     }
     let r;
     try {
-        r = await asLocalSwitch(async () => {
-            if (leaving) {
-                // Nothing drawn from the copy going (the note open in it, the
-                // notebook or folder it showed, even a back label) is drawn
-                // over the one coming in.
-                parkOpenDraft(before);
-                state.nv = freshNv();
-                state.view = 'home';
-                state.pathIds = [ROOT_ID];
-                state.importBatch = null;
-            }
-            return TreeStore.switchAccount({ ...me, previousUsername: previousUsername || (before.owner && before.owner.username) || null });
-        });
+        if (leaving) {
+            // Nothing drawn from the copy going (the note open in it, the
+            // notebook or folder it showed, even a back label) is drawn
+            // over the one coming in.
+            parkOpenDraft(before);
+            state.nv = freshNv();
+            state.view = 'home';
+            state.pathIds = [ROOT_ID];
+            state.importBatch = null;
+        }
+        r = await TreeStore.switchAccount({ ...me, previousUsername: previousUsername || (before.owner && before.owner.username) || null });
     } catch (e) {
         console.warn('[TabPaladin] Could not make the copy this account\'s', e);
         return null;
@@ -5331,7 +5365,7 @@ async function ensureAccountCopy({ previousUsername = null } = {}) {
             const back = mine.filter(s => raw[s.key] && !raw[s.key].why)
                 .sort((a, b) => String(b.setAsideAt || '').localeCompare(String(a.setAsideAt || '')))[0];
             if (back) {
-                await asLocalSwitch(() => TreeStore.restoreStash(back.key, me));
+                await TreeStore.restoreStash(back.key, me);
                 r = { ...r, action: 'restored' };
                 restoredAt = back.setAsideAt || null;
             }
@@ -5355,15 +5389,21 @@ function noteCopySwitched() {
 }
 
 // TreeStore heard a change (onChanged): an edit here or in another window, a
-// pull, a push, another copy brought in.
+// pull, a push, another copy brought in. `info.elsewhere`: another window
+// did it (TreeStore took its write in) — told apart by TreeStore itself, so
+// a switch another window makes while this one's own pull or push is on its
+// way is still another window's.
 let renderQueued = false;
-function onCopyChanged(kind) {
+function onCopyChanged(kind, info = {}) {
     const st = copyStatus();
     const switched = kind === 'switch' && lastCopyId !== undefined && st.copyId !== lastCopyId;
-    if (switched && !switchingHere) {
-        // Another window brought another copy in: the note open here was
-        // written in the last one, and waits with it.
-        if (editorOpen()) parkOpenDraft({ ...st, owner: lastStamp && lastStamp.owner, origin: lastStamp && lastStamp.origin, restoredFrom: [] });
+    // The note open here was written in the copy that went (another window
+    // brought another in, or a pull here brought another account's tree into
+    // a copy of its own): it waits with that copy, parked under its stamp,
+    // and is never saved into this one. (A switch made here on purpose parks
+    // it first.)
+    if (switched && editorOpen()) parkOpenDraft({ ...st, owner: lastStamp && lastStamp.owner, origin: lastStamp && lastStamp.origin, restoredFrom: [] });
+    if (switched && info.elsewhere) {
         state.nv = freshNv();
         state.view = 'home';
         state.pathIds = [ROOT_ID];
@@ -5374,6 +5414,9 @@ function onCopyChanged(kind) {
         queueMicrotask(() => { if (configured() && copyIsMine()) reopenParkedDraft(); });
     }
     if (switched || kind === 'switch') noteCopySwitched();
+    // The same copy, stamped now (claimed, or adopted): a note open in it
+    // parks under the stamp it has.
+    if (!switched && editorOpen() && state.nv.copyId === st.copyId) state.nv.copyStamp = stampOfStatus(st);
     updateSyncUi();
     if (shareSheet) shareSheet.refresh();
     if (!booted || halted()) return;
@@ -5381,9 +5424,34 @@ function onCopyChanged(kind) {
     renderQueued = true;
     queueMicrotask(() => {
         renderQueued = false;
-        // Not under an open note: the editor would lose its place.
+        // Not under an open note: the editor would lose its place. What is
+        // around it is brought up to date instead.
         if (!editorOpen()) renderView();
+        else refreshAroundEditor();
     });
+}
+
+// Another window's change under an open note: the note it edits may be gone
+// (✓ Done then keeps the text as a new note: validateNv), and on a computer
+// the notebook and list panes beside the editor are drawn again; the editor
+// itself is left as it is.
+function refreshAroundEditor() {
+    if (state.view !== 'notes' || !state.snapshot || !copyIsMine()) return;
+    const lib = notesLibrary();
+    validateNv(lib);
+    if (!isDesktop()) return;
+    const swap = (cls, make) => {
+        const old = document.querySelector(`.nv-${cls}`);
+        if (old && typeof old.replaceWith === 'function') old.replaceWith(make(lib));
+    };
+    const scroll = (cls) => { const el = document.querySelector(`.nv-${cls}`); return el ? el.scrollTop : 0; };
+    const keep = { side: scroll('side'), list: scroll('list') };
+    swap('side', renderNvSide);
+    swap('list', renderNvList);
+    for (const p of ['side', 'list']) {
+        const el = document.querySelector(`.nv-${p}`);
+        if (el && keep[p]) el.scrollTop = keep[p];
+    }
 }
 
 // --- One window edits the copy, where Web Locks are missing -----------------------
@@ -5946,8 +6014,10 @@ async function carryOnHere() {
 // this device (another account's, or this one's from before), each to bring
 // back, export or discard. And whether this device pushes after each change.
 
+// The device as this app speaks of it: the same word for as long as it is
+// the same device (phoneLike), whatever the window's width.
 function deviceWord() {
-    return isDesktop() ? 'computer' : 'phone';
+    return phoneLike() ? 'phone' : 'computer';
 }
 
 function settingsOpen() {
@@ -6075,10 +6145,12 @@ async function renderSetAsideCopies() {
         list = await TreeStore.listStashes(signedInAccount());
         raw = list.length ? await platform.getRaw(list.map(s => s.key)) : {};
     } catch (e) { list = []; }
-    // A copy kept aside only says whose it was.
+    // A copy kept aside only says whose it was, and is that account's alone
+    // to bring back: carrying no stamp, TreeStore would offer it to the
+    // server's owner as one from before accounts (keptAside).
     list = list.map(s => {
         const was = raw[s.key] && raw[s.key].ownerWas;
-        return was ? { ...s, username: s.username || was.username || null, keptForMe: keptForMe(raw[s.key]) } : s;
+        return was ? { ...s, username: s.username || was.username || null, keptAside: true, keptForMe: keptForMe(raw[s.key]) } : s;
     });
     if (block) block.classList.toggle('hidden', list.length === 0);
     const rows = list.map((s) => {
@@ -6104,7 +6176,7 @@ async function renderSetAsideCopies() {
         ].filter(Boolean).join(' · ');
         const actions = document.createElement('div');
         actions.className = 'import-actions';
-        if (s.match === 'same' || s.match === 'moved' || s.keptForMe) {
+        if (s.keptAside ? s.keptForMe : (s.match === 'same' || s.match === 'moved')) {
             const restore = document.createElement('button');
             restore.type = 'button';
             restore.textContent = 'Bring back';
@@ -6160,23 +6232,29 @@ async function exportSetAside(s) {
 async function restoreSetAside(s) {
     const me = signedInAccount();
     if (!me) { showToast('Sign in as the account this copy belongs to first.'); return; }
-    if (s.match === 'moved' && !confirm(`This copy is ${stashLabel(s)}: the same server, reached at another address.\n\n`
+    // A copy kept aside only (DC.keptAsideOnly) is its own account's alone
+    // to bring back — never anyone else's, the server's owner included, whom
+    // TreeStore would let have it as a copy from before accounts.
+    let raw = null;
+    try { raw = (await platform.getRaw([s.key]))[s.key] || null; } catch (e) { raw = null; }
+    if (!raw) { showToast('That set-aside copy is gone.'); return; }
+    const keptAside = Boolean(raw.ownerWas);
+    if (keptAside && !keptForMe(raw)) { showToast('Sign in as the account this copy belongs to first.'); return; }
+    if (!keptAside && s.match === 'moved' && !confirm(`This copy is ${stashLabel(s)}: the same server, reached at another address.\n\n`
         + 'Bring it back here? Only if it is the same server, moved — a copy of its database answers the same.')) return;
     const st = copyStatus();
     if (st.dirty && !confirm(`The copy here has ${st.editCount} unpushed edit${st.editCount === 1 ? '' : 's'}. It is set aside in its place, not discarded. Go on?`)) return;
     try {
-        await asLocalSwitch(async () => {
-            parkOpenDraft(st);
-            if (s.keptForMe && s.match !== 'same' && s.match !== 'moved') {
-                // Kept aside only, for this account: its stamp back, then
-                // brought back as any of its set-aside copies is.
-                const raw = (await platform.getRaw([s.key]))[s.key];
-                if (!raw || !keptForMe(raw)) throw new Error('That set-aside copy is gone.');
-                const { ownerWas, ...rest } = raw;
-                await platform.storage.local.set({ [s.key]: { ...rest, owner: ownerWas, origin: null } });
-            }
-            await TreeStore.restoreStash(s.key, me, { moved: s.match === 'moved' });
-        });
+        parkOpenDraft(st);
+        if (keptAside) {
+            // Its stamp back, then brought back as any of its set-aside
+            // copies is.
+            const now = (await platform.getRaw([s.key]))[s.key];
+            if (!now || !now.ownerWas || !keptForMe(now)) throw new Error('That set-aside copy is gone.');
+            const { ownerWas, ...rest } = now;
+            await platform.storage.local.set({ [s.key]: { ...rest, owner: ownerWas, origin: null } });
+        }
+        await TreeStore.restoreStash(s.key, me, { moved: !keptAside && s.match === 'moved' });
     } catch (e) {
         showToast(e.message);
         return;
@@ -6228,15 +6306,35 @@ function draftsMarkdown(drafts) {
 // anyway. A computer keeps its edits until ⬆️ Push, as the extension does. Either
 // way round, by the device's own choice in Settings.
 const PUSH_POLICY_KEY = 'tp_push_after_change';
+// Whether this device is a phone ('phone') or a computer ('computer'), as
+// decided the first time it was asked and kept: never again from the width
+// of the window, which turning a phone or narrowing a window changes.
+const DEVICE_KIND_KEY = 'tp_device_kind';
 
 function phoneLike() {
-    if (!isDesktop()) return true;
     try {
-        const standalone = window.matchMedia('(display-mode: standalone)').matches;
-        return Boolean(standalone && /Android|iPhone|iPad|Mobile/i.test((navigator && navigator.userAgent) || ''));
-    } catch (e) {
-        return false;
-    }
+        const kept = localStorage.getItem(DEVICE_KIND_KEY);
+        if (kept === 'phone') return true;
+        if (kept === 'computer') return false;
+    } catch (e) { /* decided again each time */ }
+    const phone = looksLikePhone();
+    try { localStorage.setItem(DEVICE_KIND_KEY, phone ? 'phone' : 'computer'); } catch (e) { /* the same answer next time */ }
+    return phone;
+}
+
+// From what does not change with the window: the browser's own word, then a
+// touch-only screen (an iPad asks for the desktop site and calls itself a
+// Mac). Only a browser that says neither is judged by its width.
+function looksLikePhone() {
+    let ua = '';
+    try { ua = String((navigator && navigator.userAgent) || ''); } catch (e) { ua = ''; }
+    if (/Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(ua)) return true;
+    const media = (q) => {
+        try { return Boolean(window.matchMedia(q).matches); } catch (e) { return false; }
+    };
+    if (media('(pointer: coarse)') && !media('(any-pointer: fine)')) return true;
+    if (ua) return false;
+    return !isDesktop();
 }
 
 function pushAfterEachChange() {
@@ -6996,7 +7094,7 @@ async function signOut() {
     mirrorConfigToSW();
     if (!keepEdits) {
         try {
-            await asLocalSwitch(() => TreeStore.clearCleanCopy());
+            await TreeStore.clearCleanCopy();
         } catch (e) {
             // Not cleared (a full disk): it is this account's, all of it on
             // the server, and stays hidden while nobody is signed in.
@@ -7497,7 +7595,7 @@ window.addEventListener('DOMContentLoaded', () => {
             showToast(pushed ? `Folder "${trimmed}" created successfully!` : `Folder "${trimmed}" created on this ${deviceWord()} — ⬆️ Push when ready.`);
             setStatus('');
         } catch (err) {
-            alert('Failed to save folder: ' + err.message);
+            alert(pushFailedText(err, `the folder is kept on this ${deviceWord()}, use ⬆️ to retry.`));
             setStatus('');
         }
     });
@@ -7637,7 +7735,7 @@ window.addEventListener('DOMContentLoaded', () => {
             renderView();
         } catch (err) {
             setStatus('');
-            showToast('Push failed: ' + err.message + ' — the import is kept locally, use ⬆️ to retry.');
+            showToast(pushFailedText(err, 'the import is kept locally, use ⬆️ to retry.'));
             renderView();
         }
     });

@@ -38,7 +38,8 @@
 //      edits or a note open in the editor, since the approval's pull would
 //      replace them: the app says to push (or save) first, offers ⬆️ Push,
 //      and the proposal keeps waiting. With the copy clean it approves and
-//      pulls as before.
+//      pulls as before. The bottom bar counts each on its own tab: proposals
+//      on Notes, unpushed edits on Home (index.html's bar, in its order).
 //   9. An import link is kept on the phone the moment it arrives, never in
 //      the URL or a history entry, until it is imported or dismissed: tapped
 //      while signed out (with Notes opened before the sign-in), on a start
@@ -160,10 +161,44 @@ const drawnSince = (mark, text) => created.slice(mark)
 // The note editor's text as last drawn.
 const lastEditorText = () => [...created].reverse().find(e => e.tagName === 'TEXTAREA')?.value ?? null;
 
+// The bottom tab bar as index.html draws it, so that the app's selectors find
+// what a browser's would, in document order: Home's badge (the count of
+// unpushed edits) comes before Notes' (proposals waiting for approval), and
+// both are .bn-badge.
+function makeBottomNav() {
+    const html = fs.readFileSync(path.join(REPO, 'pwa', 'index.html'), 'utf8');
+    const markup = (html.match(/<nav id="bottom-nav">([\s\S]*?)<\/nav>/) || [])[1] || '';
+    const nav = makeElement('bottom-nav', 'nav');
+    const buttons = [];
+    const spans = [];
+    for (const m of markup.matchAll(/<button\b[^>]*data-nav="([^"]+)"[^>]*>([\s\S]*?)<\/button>/g)) {
+        const b = makeElement(null, 'button');
+        b.dataset.nav = m[1];
+        buttons.push(b);
+        for (const s of m[2].matchAll(/<span class="([^"]*)"/g)) {
+            const classes = s[1].split(/\s+/).filter(Boolean);
+            const el = makeElement(null, 'span');
+            el.className = s[1];
+            el.classList.add(...classes);
+            spans.push({ nav: m[1], el, classes });
+        }
+    }
+    // '.a.b' or 'button[data-nav=x] .a', as the app asks.
+    const matching = (sel) => {
+        const m = String(sel).trim().match(/^(?:button\[data-nav=["']?([\w-]+)["']?\]\s+)?((?:\.[\w-]+)+)$/);
+        if (!m) throw new Error(`the bottom bar's stand-in does not know the selector ${sel}`);
+        const want = m[2].split('.').filter(Boolean);
+        return spans.filter(s => (!m[1] || s.nav === m[1]) && want.every(c => s.classes.includes(c))).map(s => s.el);
+    };
+    nav.querySelector = (sel) => matching(sel)[0] || null;
+    nav.querySelectorAll = (sel) => (/^button\[data-nav\]$/.test(String(sel).trim()) ? buttons : matching(sel));
+    return nav;
+}
+
 const elements = new Map();
 const byId = (id) => {
     if (!elements.has(id)) {
-        const el = makeElement(id);
+        const el = id === 'bottom-nav' ? makeBottomNav() : makeElement(id);
         // Sheets and blocks start hidden, as in index.html.
         if (/sheet$|^users-block$|^auth-discard$|^menu$/.test(id)) el.classList.add('hidden');
         elements.set(id, el);
@@ -358,7 +393,10 @@ async function typeNote(text) {
     await byId('content').fire('input', { target: { id: 'note-body-input', value: text, style: {}, scrollHeight: 0 } });
 }
 const bodyHas = (c) => document.body.classList.contains(c);
-const badgeShown = () => !byId('bottom-nav').querySelector('.bn-badge').classList.contains('hidden');
+// The bottom bar's badges: Notes' (proposals waiting), Home's (unpushed edits).
+const badgeShown = () => !byId('bottom-nav').querySelector('button[data-nav=notes] .bn-badge').classList.contains('hidden');
+const syncBadge = () => byId('bottom-nav').querySelector('.sync-badge');
+const syncBadgeShown = () => !syncBadge().classList.contains('hidden');
 const lastToast = () => [...document.body.children].reverse().find(c => c.id === 'tp-toast')?.textContent || '';
 // Every toast shown since a mark (a count of document.body's toasts).
 const toastCount = () => document.body.children.filter(c => c.id === 'tp-toast').length;
@@ -637,6 +675,9 @@ try {
     await propose(alexNew, { title: 'From the LLM', content: '# From the LLM\n\nproposed text', notebook: 'LLM inbox' });
     await signIn('alex', 'new horse battery');
     check('alex\'s proposal and inbox show on the phone', badgeShown() && !byId('inbox-fab').classList.contains('hidden'));
+    check('  the proposal is counted on the Notes tab, and Home\'s count of unpushed edits stays hidden over a clean copy',
+        byId('bottom-nav').querySelector('button[data-nav=notes] .bn-badge').textContent === '1' && !syncBadgeShown() && !dirtyShown(),
+        JSON.stringify({ notes: byId('bottom-nav').querySelector('button[data-nav=notes] .bn-badge').textContent, home: syncBadge().textContent, homeShown: syncBadgeShown() }));
 
     await byId('notesBtn').fire('click');
     await clickNv('open-note', 'alex-diary');
@@ -750,8 +791,12 @@ try {
     answers.prompt.push('Offline folder');
     await byId('newFolderBtn').fire('click');
     await settle();
-    check('an edit that could not be pushed stays on the phone', !(await treeTitles(alexTok)).includes('Offline folder')
-        && dirtyShown() && dialogs.alert.some(m => /Failed to save folder/.test(m)));
+    check('an edit that could not be pushed stays on the phone, and says so', !(await treeTitles(alexTok)).includes('Offline folder')
+        && dirtyShown() && dialogs.alert.some(m => /^Push failed: .*the folder is kept on this phone, use ⬆️ to retry/.test(m)), JSON.stringify(dialogs.alert.slice(-1)));
+    check('  Home\'s badge counts it (one unpushed edit), whatever the proposals waiting on the Notes tab',
+        syncBadgeShown() && syncBadge().textContent === '1' && badgeShown()
+        && byId('bottom-nav').querySelector('button[data-nav=notes] .bn-badge').textContent === '2',
+        JSON.stringify({ home: syncBadge().textContent, homeShown: syncBadgeShown(), notes: byId('bottom-nav').querySelector('button[data-nav=notes] .bn-badge').textContent }));
     await byId('notesBtn').fire('click');
     check('alex\'s note and order proposals wait in Notes, under a word to push first, with a ⬆️ Push',
         Boolean(findProposal('From the LLM')) && Boolean(findProposal('🔀 Reorder notes'))

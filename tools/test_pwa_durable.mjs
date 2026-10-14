@@ -94,6 +94,21 @@
 //      copy and loses nothing it made, and Use here carries on with both.
 //  20. Where the copy can only be kept in memory (each window's its own), one
 //      window edits at a time, even with Web Locks.
+//  21. A copy kept aside for another account (the last release set it
+//      aside) is offered back to that account alone — not to the server's
+//      owner, whom a copy with no stamp would otherwise answer to.
+//  22. Another window bringing another account's copy in while a pull here
+//      waits on the server parks the note open here for its account: it is
+//      never left open over, nor saved into, the other account's copy.
+//  23. A note removed in another window while it is edited here: the editor
+//      says ✓ Done keeps the text as a new note, and it does.
+//  24. What the server has (meta.serverIds), as a pull records it, never
+//      counts what another window adds as the pull lands; and the web app's
+//      pushes are its own ('pwa') in the server's history.
+//  25. A 409 answered by pulling the server's tree says the edit was
+//      discarded, never that it is kept to retry.
+//  26. Push after each change is decided once for the device (a phone, or a
+//      computer), never from the window's width.
 //
 // Run: node tools/test_pwa_durable.mjs [--port 18987]
 
@@ -2172,6 +2187,183 @@ try {
     globalThis.indexedDB = idb.factory;
     globalThis.caches = cachesBefore20;
     await coldStart(`${BASE}/`, { tag: 'w20b' });
+    // =================================================================================
+    console.log('\n21. A copy kept aside for another account is that account\'s alone to bring back');
+    // sam's copy the last release set aside (section 14) is kept aside only:
+    // no stamp of its own, sam's beside it (ownerWas).
+    const keptKey21 = (idb.peek('tpTreeStashIndex') || []).find((k) => {
+        const s = idb.peek(k);
+        return s && !s.owner && s.ownerWas && s.ownerWas.username === 'sam' && has(s, 'Sam set aside');
+    });
+    check('(sam\'s copy the last release set aside waits on the device, kept aside, with its unpushed edit)', Boolean(keptKey21) && idb.peek(keptKey21).dirty);
+    const stashRow = (mark, key) => [...created.slice(mark)].reverse().find(e => typeof e.className === 'string' && e.className.includes('stash-row') && e.dataset.key === key);
+    const actionsOf = (row) => (row && row.children[2] ? row.children[2].children.map(b => b.dataset && b.dataset.stashAct).filter(Boolean) : []);
+    let mark21 = created.length;
+    await byId('settingsBtn').fire('click');
+    await settle();
+    await sleep(50);
+    let row21 = stashRow(mark21, keptKey21);
+    check('alex — the server\'s owner, to whom a copy with no stamp from before accounts would belong — is offered no Bring back for it',
+        Boolean(row21) && /sam/.test(row21.children[0].children[0].textContent) && same(actionsOf(row21), ['export', 'discard']), JSON.stringify(actionsOf(row21)));
+    byId('settings-sheet').classList.add('hidden');
+    check('  and alex\'s working copy is his own', kvTree().owner.username === 'alex' && !has(kvTree(), 'Sam set aside'));
+    await signIn('sam', 'sam-password-1');
+    mark21 = created.length;
+    await byId('settingsBtn').fire('click');
+    await settle();
+    await sleep(50);
+    row21 = stashRow(mark21, keptKey21);
+    const back21 = row21 && row21.children[2].children.find(b => b.dataset && b.dataset.stashAct === 'restore');
+    check('sam is offered it back', Boolean(back21), JSON.stringify(actionsOf(row21)));
+    if (kvTree().dirty) answers.confirm.push(true); // the copy here has unpushed edits: set aside in its place
+    await back21.fire('click');
+    await settle();
+    await pastCopyWrite();
+    check('  and has it back, its unpushed edit and all, as his', kvTree().owner.username === 'sam' && has(kvTree(), 'Sam set aside')
+        && kvTree().dirty && !idb.peek(keptKey21), JSON.stringify({ owner: kvTree().owner, dirty: kvTree().dirty }));
+    byId('settings-sheet').classList.add('hidden');
+    await signIn('alex', PASSWORD);
+    check('(alex back, with his own copy)', kvTree().owner.username === 'alex' && !has(kvTree(), 'Sam set aside'));
+
+    // =================================================================================
+    console.log('\n22. Another window brings another account\'s copy in while a pull here waits on the server');
+    if (!document.body.classList.contains('view-notes')) await byId('notesBtn').fire('click');
+    await clickNv('new-note');
+    await typeNote('# During a pull\n\nWRITTEN WHILE A PULL WAITS');
+    await pastDraftWrite();
+    const x22 = await otherCoreWindow('x22');
+    const sam22 = (await api('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json;
+    slow = { re: /^GET \/api\/tree$/, ms: 1200 };
+    const reqMark22 = requests.length;
+    const pulling22 = byId('pullBtn').fire('click');
+    await until(() => requests.slice(reqMark22).includes('GET /api/tree'), 3000);
+    await x22.T.switchAccount({ ...accountOf(sam22), previousUsername: 'alex' });
+    await x22.T.flush();
+    await pulling22;
+    slow = null;
+    await settle();
+    const parked22 = () => parkedNotes().find(d => /WRITTEN WHILE A PULL WAITS/.test(d.content));
+    check('the note open here is parked for alex: not left open over sam\'s copy, so never saved into it',
+        Boolean(parked22()) && parked22().owner && parked22().owner.username === 'alex' && !bodyHasEditing()
+        && kvTree().owner.username === 'sam' && !has(kvTree(), 'WRITTEN WHILE A PULL WAITS'),
+        JSON.stringify({ editing: bodyHasEditing(), owner: kvTree().owner.username, parked: parkedNotes().map(d => d.owner && d.owner.username) }));
+    await x22.T.switchAccount({ ...accountOf(alexLogin), previousUsername: 'sam' });
+    await until(() => bodyHasEditing() && /WRITTEN WHILE A PULL WAITS/.test(lastEditorText() || '') && !parked22(), 3000);
+    check('  and it comes back into its editor with alex\'s copy', bodyHasEditing() && /WRITTEN WHILE A PULL WAITS/.test(lastEditorText() || '')
+        && kvTree().owner.username === 'alex' && !parked22(), JSON.stringify({ editing: bodyHasEditing(), editor: lastEditorText(), owner: kvTree().owner.username,
+            parked: parkedNotes().map(d => [d.owner && d.owner.username, d.content.slice(0, 30)]), st: statusText() }));
+    answers.confirm.push(true); // Discard unsaved changes?
+    await clickNv('cancel-edit');
+    x22.close();
+
+    // =================================================================================
+    console.log('\n23. A note removed in another window while it is being edited here');
+    await clickNv('new-note');
+    await typeNote('# Loose\n\nLOOSE NOTE');
+    await clickNv('done');
+    await pastCopyWrite();
+    const loose23 = find(kvTree().roots, n => n.title === 'Loose');
+    check('(a note to edit)', Boolean(loose23));
+    await clickNvId('open-note', loose23.id);
+    await clickNv('edit');
+    await typeNote('# Loose\n\nEDIT TYPED HERE');
+    const x23 = await otherCoreWindow('x23');
+    const toasts23 = toastMark();
+    await x23.T.removeNode(loose23.id);
+    await x23.T.flush();
+    await until(() => toastsSince(toasts23).some(m => /removed elsewhere/.test(m)), 3000);
+    check('the editor stays, saying ✓ Done keeps the text as a new note', bodyHasEditing() && !has(kvTree(), 'LOOSE NOTE')
+        && toastsSince(toasts23).some(m => /removed elsewhere — ✓ Done keeps your text as a new note/.test(m)), JSON.stringify(toastsSince(toasts23)));
+    await clickNv('done');
+    await pastCopyWrite();
+    check('  and ✓ Done does: kept as a new note, and pushed', !bodyHasEditing() && JSON.stringify(kvTree().roots).includes('EDIT TYPED HERE')
+        && toastsSince(toasts23).some(m => /saved as a new note/.test(m)) && !toastsSince(toasts23).some(m => /This note is gone/.test(m))
+        && JSON.stringify((await tree(A)).roots).includes('EDIT TYPED HERE'), JSON.stringify(toastsSince(toasts23)));
+    x23.close();
+
+    // =================================================================================
+    console.log('\n24. What the server has, as a pull here records it, while another window adds to the copy');
+    // Another device pushed: the pull here brings a tree whose ids the copy
+    // records afresh.
+    const t24 = await tree(A);
+    await api('/api/tree', { method: 'PUT', token: A, body: { roots: [...t24.roots, { id: 'aaaaaaaaaaaa0019', kind: 'folder', title: 'Pushed before the pull', children: [] }],
+        baseVersion: t24.version, deviceId: 'laptop' } });
+    const Page24 = await pageTreeStore();
+    const x24 = await otherCoreWindow('x24');
+    let made24 = null;
+    let armed24 = true;
+    const stop24 = Page24.onChanged((kind) => {
+        if (kind !== 'pull' || !armed24) return;
+        armed24 = false;
+        x24.T.createNode({ parentId: null, kind: 'folder', title: 'Made as the pull lands' })
+            .then((n) => { made24 = n; return x24.T.flush(); });
+    });
+    await byId('pullBtn').fire('click');
+    await settle();
+    await pastCopyWrite();
+    stop24();
+    const serverIds24 = () => ((kvTree().meta || {}).serverIds || []);
+    check('(another window adds a folder as the pull here lands, before what the server has is written)', Boolean(made24)
+        && has(kvTree(), 'Made as the pull lands') && serverIds24().includes('aaaaaaaaaaaa0019'));
+    check('  that folder is not taken for one the server has, here or as kept', !serverIds24().includes(made24.id)
+        && !(Page24.meta().serverIds || []).includes(made24.id), JSON.stringify({ made: made24 && made24.id, kept: serverIds24().includes(made24 && made24.id) }));
+    await byId('pushBtn').fire('click');
+    await settle();
+    const history24 = (await api('/api/history', { token: A })).json.snapshots || [];
+    check('the web app\'s push is its own in the server\'s history (\'pwa\'), not the extension\'s', history24[0] && history24[0].device_id === 'pwa',
+        JSON.stringify(history24.slice(0, 2)));
+    x24.close();
+
+    // =================================================================================
+    console.log('\n25. A push refused for another device\'s, answered by pulling: what became of the edit is said as it is');
+    const t25 = await tree(A);
+    const roots25 = JSON.parse(JSON.stringify(t25.roots));
+    roots25.push({ id: 'aaaaaaaaaaaa0020', kind: 'folder', title: 'Pushed by the laptop', children: [] });
+    await api('/api/tree', { method: 'PUT', token: A, body: { roots: roots25, baseVersion: t25.version, deviceId: 'laptop' } });
+    await clickNv('new-note');
+    await typeNote('# Precious\n\nMY PRECIOUS TEXT');
+    const toasts25 = toastMark();
+    answers.confirm.push(true); // OK = Pull the server's tree now (the unpushed edit is discarded)
+    await clickNv('done');
+    await pastCopyWrite();
+    check('the toast says the change was discarded with the pull, not that it is kept to retry',
+        toastsSince(toasts25).some(m => /server’s tree was pulled instead, and this change was discarded/.test(m))
+        && !toastsSince(toasts25).some(m => /kept on this|retry/.test(m)) && !has(kvTree(), 'MY PRECIOUS TEXT')
+        && has(kvTree(), 'Pushed by the laptop') && !kvTree().dirty, JSON.stringify(toastsSince(toasts25)));
+
+    // =================================================================================
+    console.log('\n26. Push after each change: decided once for the device, never from the window\'s width');
+    const pushPolicy26 = async () => {
+        await byId('settingsBtn').fire('click');
+        await settle();
+        await sleep(50);
+        const out = { on: byId('push-after-change').checked, hint: byId('push-after-change-hint').textContent };
+        byId('settings-sheet').classList.add('hidden');
+        return out;
+    };
+    for (const k of ['tp_device_kind', 'tp_push_after_change']) localStorageShim.removeItem(k);
+    userAgent = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+    wide = true; // turned on its side: 915px wide
+    await coldStart(`${BASE}/`, { tag: 'w26' });
+    let policy26 = await pushPolicy26();
+    check('a phone in a browser tab, turned on its side, still pushes after each change, and is still a phone', policy26.on
+        && /this phone/.test(policy26.hint), JSON.stringify(policy26));
+    wide = false;
+    userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    policy26 = await pushPolicy26();
+    check('  and stays one, whatever the browser says later', policy26.on && /this phone/.test(policy26.hint), JSON.stringify(policy26));
+    localStorageShim.removeItem('tp_device_kind');
+    await coldStart(`${BASE}/`, { tag: 'w26b' });
+    policy26 = await pushPolicy26();
+    check('a computer\'s window narrowed below 900px keeps its edits until Push, and is still a computer', !policy26.on
+        && /this computer until ⬆️ Push/.test(policy26.hint), JSON.stringify(policy26));
+    wide = true;
+    policy26 = await pushPolicy26();
+    check('  and so it is wide again', !policy26.on && /this computer/.test(policy26.hint), JSON.stringify(policy26));
+    wide = false;
+    userAgent = null;
+    for (const k of ['tp_device_kind', 'tp_push_after_change']) localStorageShim.removeItem(k);
+
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog.slice(-2000));
