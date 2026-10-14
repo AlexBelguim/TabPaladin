@@ -307,13 +307,13 @@ async function main() {
     }
     {
         const caches = makeCaches();
-        caches.fetchForAdd = async (u) => new Response('x', { status: u === '/notesModel.js' ? 404 : 200 });
+        caches.fetchForAdd = async (u) => new Response('x', { status: u === '/lib/notesModel.js' ? 404 : 200 });
         const w = loadWorker({ caches, fetchImpl: async () => new Response('x') });
         const ext = [];
         w.listeners.install({ waitUntil: (p) => ext.push(p) });
         await Promise.all(ext);
         const keys = [...caches.stores.get(SHELL_NAME).keys()];
-        check('install caches every other shell file when one fails', keys.length >= 8 && !keys.includes('/notesModel.js')
+        check('install caches every other shell file when one fails', keys.length >= 8 && !keys.includes('/lib/notesModel.js')
             && keys.includes(`/app.js?v=${V}`) && keys.includes(`/shareCore.js?v=${V}`), JSON.stringify(keys));
         for (const name of [`tp-shell-v${V - 1}`, `tp-shell-v${V - 2}`, `tp-shell-v${Number(V) + 5}`, 'tp-injected', 'tp-config', 'tp-outbox', 'tp-data', 'other-app-cache']) {
             await caches.open(name);

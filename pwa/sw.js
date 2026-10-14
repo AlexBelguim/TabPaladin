@@ -22,7 +22,7 @@ const SHELL = [
     '/shareCore.js?v=32',
     '/shareSheet.js',
     '/bookmarksHtml.js',
-    '/notesModel.js',
+    '/lib/notesModel.js',
     '/durableCopy.js',
     '/manifest.webmanifest',
     '/icons/icon192.png'

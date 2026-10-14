@@ -1,5 +1,5 @@
 // Unit tests for the shared notes model (src/utils/notesModel.js and its
-// byte-identical twin pwa/notesModel.js).
+// byte-identical twin pwa/lib/notesModel.js).
 //
 // What this locks down:
 //   1. The two copies are byte-identical — the extension and the PWA must
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import * as NM from '../src/utils/notesModel.js';
-import * as PWA_NM from '../pwa/notesModel.js';
+import * as PWA_NM from '../pwa/lib/notesModel.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -34,8 +34,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 console.log('\n1. The twins are byte-identical');
 const extBytes = readFileSync(path.join(here, '../src/utils/notesModel.js'));
-const pwaBytes = readFileSync(path.join(here, '../pwa/notesModel.js'));
-check('src/utils/notesModel.js === pwa/notesModel.js', Buffer.compare(extBytes, pwaBytes) === 0,
+const pwaBytes = readFileSync(path.join(here, '../pwa/lib/notesModel.js'));
+check('src/utils/notesModel.js === pwa/lib/notesModel.js', Buffer.compare(extBytes, pwaBytes) === 0,
     'copy one over the other');
 check('no BOM', extBytes[0] !== 0xef);
 check('LF line endings only', !extBytes.includes(0x0d));

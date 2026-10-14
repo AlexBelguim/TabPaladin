@@ -2,14 +2,17 @@
 //
 // The web app is served on its own and cannot import from src/, so the code
 // both clients run lives twice: the canonical copy under src/utils and a copy
-// under pwa/. Edit the canonical one, then run this to copy it over:
+// under pwa/lib/. Edit the canonical one, then run this to copy it over:
 //
 //   node tools/sync_shared.mjs           copy every canonical file over its twin
 //   node tools/sync_shared.mjs --check   change nothing; exit 1 when any differ
 //
-// tools/test_shared_sync.mjs fails the moment a pair differs. When the web
-// app moves onto the shared core, the pwa/lib/ copies are added to TWINS (and
-// become the canonical ones when src/ goes).
+// tools/test_shared_sync.mjs fails the moment a pair differs. The pwa/lib/
+// copies become the canonical ones when src/ goes.
+//
+// The web app runs them on its own platform (pwa/platform.js, installed as
+// globalThis.__tpPlatform before they load): each picks it with the one line
+// that otherwise picks the browser's extension API.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,7 +22,12 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 
 // [canonical, copy], relative to the repository root.
 export const TWINS = [
-    ['src/utils/notesModel.js', 'pwa/notesModel.js']
+    ['src/utils/notesModel.js', 'pwa/lib/notesModel.js'],
+    ['src/utils/treeStore.js', 'pwa/lib/treeStore.js'],
+    ['src/utils/expandState.js', 'pwa/lib/expandState.js'],
+    ['src/utils/storageManager.js', 'pwa/lib/storageManager.js'],
+    ['src/utils/pinsManager.js', 'pwa/lib/pinsManager.js'],
+    ['src/utils/notesManager.js', 'pwa/lib/notesManager.js']
 ];
 
 // Each pair as {canonical, copy, same, missing}.
@@ -37,9 +45,17 @@ function main() {
     const check = process.argv.includes('--check');
     let differ = 0;
     for (const t of compareTwins()) {
-        if (t.missing.length) {
+        const canonicalMissing = t.missing.includes(path.relative(ROOT, path.join(ROOT, t.canonical)));
+        if (t.missing.length && (check || canonicalMissing)) {
             console.error(`missing: ${t.missing.join(', ')}`);
             differ++;
+            continue;
+        }
+        if (t.missing.length) {
+            // A new twin: made from the canonical file.
+            fs.mkdirSync(path.dirname(path.join(ROOT, t.copy)), { recursive: true });
+            fs.copyFileSync(path.join(ROOT, t.canonical), path.join(ROOT, t.copy));
+            console.log(`  created  ${t.canonical} -> ${t.copy}`);
             continue;
         }
         if (t.same) {

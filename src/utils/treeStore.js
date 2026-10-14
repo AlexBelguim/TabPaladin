@@ -74,6 +74,12 @@
 // page brought another copy in, they go to the copy they were made in, which
 // was set aside (adoptStored, saveOrphan). An edit is never written over
 // another page's copy, and never lost to one.
+//
+// A copy can carry a little data of a client's own beside its tree (`meta`,
+// see updateMeta): the web app keeps there which of its import links a copy
+// holds and which of its ids the server has. It goes wherever the copy goes —
+// set aside, brought back, edited in two pages at once — and the extension
+// never writes any.
 
 import { ExpandState } from './expandState.js';
 
@@ -130,8 +136,14 @@ const state = {
     restoredFrom: [],   // stamps of the set-aside copies this one came back from, latest first (see stampOf)
     rev: null,          // stamp of the stored version this memory holds (last write here or adopted)
     seq: 0,             // that version's place in line: every write is one more than the one before
-    baseId: null        // new with each pull, push and copy: edits since then are this copy's own
+    baseId: null,       // new with each pull, push and copy: edits since then are this copy's own
+    meta: {}            // a client's own data about this copy (updateMeta); travels with it
 };
+
+function metaOf(stored) {
+    const m = stored && stored.meta;
+    return m && typeof m === 'object' && !Array.isArray(m) ? m : {};
+}
 
 // Edits made here and not written yet, each as a step that applies it again
 // (see recordEdit). Cleared by a write.
@@ -212,6 +224,7 @@ function applyStored(stored) {
     state.rev = stored.rev || null;
     state.seq = Number(stored.seq) || 0;
     state.baseId = stored.baseId || null;
+    state.meta = metaOf(stored);
     state.loaded = true;
     reindex();
 }
@@ -273,7 +286,8 @@ function record() {
         restoredFrom: state.restoredFrom,
         rev: state.rev,
         seq: state.seq,
-        baseId: state.baseId
+        baseId: state.baseId,
+        ...(Object.keys(state.meta).length ? { meta: state.meta } : {})
     };
 }
 
@@ -374,16 +388,19 @@ function replay(ops) {
     return { kept, applied };
 }
 
-// The same, on another tree (a set-aside copy's), leaving state as it was.
-function replayOnto(roots, ops) {
-    const saved = { roots: state.roots, index };
+// The same, on another tree (a set-aside copy's, with its meta), leaving
+// state as it was.
+function replayOnto(roots, ops, meta = {}) {
+    const saved = { roots: state.roots, index, meta: state.meta };
     state.roots = roots;
+    state.meta = meta;
     reindex();
     try {
         const { applied } = replay(ops);
-        return { roots: state.roots, applied };
+        return { roots: state.roots, applied, meta: state.meta };
     } finally {
         state.roots = saved.roots;
+        state.meta = saved.meta;
         index = saved.index;
     }
 }
@@ -399,13 +416,14 @@ async function saveOrphan(orphan) {
         || keys.find(k => data[k] && orphan.rev && data[k].fromRev === orphan.rev);
     if (key) {
         const stash = data[key];
-        const { roots, applied } = replayOnto(Array.isArray(stash.roots) ? stash.roots : [], orphan.ops);
+        const { roots, applied, meta } = replayOnto(Array.isArray(stash.roots) ? stash.roots : [], orphan.ops, metaOf(stash));
         await api.storage.local.set({
             [key]: {
                 ...stash,
                 roots,
                 dirty: Boolean(stash.dirty) || applied > 0,
-                editCount: (Number(stash.editCount) || 0) + applied
+                editCount: (Number(stash.editCount) || 0) + applied,
+                ...(Object.keys(meta).length ? { meta } : {})
             }
         });
         return key;
@@ -939,7 +957,8 @@ async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds
             pendingRemovals,
             restoredFrom: copy.restoredFrom,
             copyId: copy.copyId || null,
-            fromRev: copy.rev || null
+            fromRev: copy.rev || null,
+            ...(Object.keys(metaOf(copy)).length ? { meta: metaOf(copy) } : {})
         },
         [STASH_INDEX_KEY]: [...keys, key]
     });
@@ -979,8 +998,9 @@ async function takeStashFor(target, { legacy = false } = {}) {
 // stamp it was set aside under, so the copy it becomes still knows it once
 // stamped `owner` — the server's owner adopting a copy from before accounts,
 // or an account restoring its copy from a server's old address. Returns the
-// copy it made (see copyToken). Under the lock only.
-async function loadCopy(stash, owner) {
+// copy it made (see copyToken). With no owner, `origin` says where the new
+// unstamped copy comes from. Under the lock only.
+async function loadCopy(stash, owner, { origin = null } = {}) {
     // Edits made here to the outgoing copy after it was set aside go with it.
     const orphan = pendingOps.length ? { copyId: state.copyId, rev: state.rev, ops: pendingOps, copy: record() } : null;
     pendingOps = [];
@@ -996,9 +1016,10 @@ async function loadCopy(stash, owner) {
     state.lastSyncAt = stash ? stash.lastSyncAt || null : null;
     state.lastSyncKind = null;
     state.owner = owner;
-    state.origin = null;
+    state.origin = owner ? null : origin;
     state.restoredFrom = stash ? stampsIn([stampOf(stash), ...stampsIn(stash.restoredFrom)]) : [];
     state.baseId = newId();
+    state.meta = stash ? clone(metaOf(stash)) : {};
     reindex();
     if (orphan) await saveOrphan(orphan);
     const settings = await readSettings();
@@ -1251,6 +1272,38 @@ export const TreeStore = {
         };
     },
 
+    // The top-level nodes of the working copy, raw (not views), for a client
+    // that draws the whole tree at once. Empty until loaded. Do not mutate
+    // what this returns: every change goes through the methods below.
+    roots() {
+        return state.roots;
+    },
+
+    // This copy's own data of a client's (see the header): a copy of it.
+    meta() {
+        return clone(state.meta);
+    },
+
+    // Change it: `fn` gets a copy and returns the new value (or undefined to
+    // leave it). Kept as a step like any edit, so another page writing the
+    // copy meanwhile never loses it, and it goes with the copy it was made in.
+    // Not an edit of the tree: the copy stays as clean or dirty as it was.
+    // Resolves whether anything changed.
+    async updateMeta(fn) {
+        await ensureLoaded();
+        const step = () => {
+            const next = fn(clone(state.meta));
+            if (!next || typeof next !== 'object' || Array.isArray(next)) return false;
+            if (JSON.stringify(next) === JSON.stringify(state.meta)) return false;
+            state.meta = next;
+            return true;
+        };
+        if (!step()) return false;
+        recordEdit(step, { dirty: false });
+        emit('meta');
+        return true;
+    },
+
     // --- Accounts ---------------------------------------------------------
 
     // Would signing in as {url, userId, serverId, tenancyOwner} set this copy
@@ -1322,6 +1375,27 @@ export const TreeStore = {
             const setAside = await stashCurrent({ fallbackUrl: url });
             const copy = await loadCopy(null, accountOf({ url, userId, username, serverId }));
             return { setAside, copy };
+        });
+    },
+
+    // Let a copy with nothing unpushed go, for an empty one that belongs to
+    // nobody yet: what a clean sign-out leaves, so the next person to pick up
+    // the device finds nothing of the last one's on it. Everything it held is
+    // on the server, so nothing is set aside. A copy with unpushed edits is
+    // never let go of here: resolves {cleared: false} and changes nothing.
+    // With `expect`, only that copy (err.code 'account-changed' otherwise).
+    // Resolves {cleared, copy}.
+    async clearCleanCopy({ expect = null } = {}) {
+        await ensureLoaded();
+        return withCopyLock(async () => {
+            await reconcile();
+            if (expect && !sameCopy(copyToken(), expect)) {
+                throw stopped('account-changed', 'Account changed — nothing was cleared.');
+            }
+            await applyPendingRemovals();
+            if (state.dirty || pendingOps.length) return { cleared: false, copy: copyToken() };
+            const copy = await loadCopy(null, null, { origin: 'local' });
+            return { cleared: true, copy };
         });
     },
 
@@ -1430,6 +1504,21 @@ export const TreeStore = {
         await ensureLoaded();
         if (!isTopLevelParent(parentId)) assertWritable(parentId);
         return insertNode(makeNode({ kind, title, url, payload }), parentId, at);
+    },
+
+    // A whole subtree in one edit — a bookmarks file brought in, say — as
+    // {kind, title, url?, payload?, children?}, every node with a new id.
+    // Returns the raw node made.
+    async createTree({ parentId, tree, index: at }) {
+        await ensureLoaded();
+        if (!isTopLevelParent(parentId)) assertWritable(parentId);
+        const build = (n) => {
+            const kind = n && (n.kind === 'folder' || n.kind === 'note') ? n.kind : 'bookmark';
+            const node = makeNode({ kind, title: n.title, url: n.url, payload: n.payload ? clone(n.payload) : undefined });
+            if (kind === 'folder') node.children = (n.children || []).filter(Boolean).map(build);
+            return node;
+        };
+        return insertNode(build(tree), parentId, at);
     },
 
     async updateNode(id, { title, url, payload }) {
@@ -1661,6 +1750,43 @@ export const TreeStore = {
                 state.baseId = newId();
                 await writeCopy();
                 emit('pull');
+                return { ...result, version: state.baseVersion, copy: copyToken() };
+            });
+        },
+
+        // A link this client filed from its share sheet (or took back), as the
+        // server answered the filing: {kind: 'append', nodes} or {kind:
+        // 'unappend', items}, with the account it went into ({userId,
+        // serverId}) and the versions it went from and to. Folded into the
+        // copy by applyServerOps' rules — only when the copy is that
+        // account's (`owner`, the account the client filed as), never into
+        // another's — and when the copy was based on the version the filing
+        // started from, it is based on the filing's version now, its own
+        // unpushed edits, if any, still on top. Not an edit of the copy's own:
+        // nothing is marked dirty. Returns {applied, relocated, removed,
+        // skipped, version, copy}, or null when it was not this copy's.
+        async foldFiling(filing, { owner } = {}) {
+            await ensureLoaded();
+            return withCopyLock(async () => {
+                await reconcile();
+                if (!filing || !owner || !state.owner || !sameAccount(state.owner, accountOf(owner))) return null;
+                if (filing.userId !== undefined && filing.userId !== null && Number(filing.userId) !== Number(state.owner.userId)) return null;
+                if (filing.serverId && state.owner.serverId && filing.serverId !== state.owner.serverId) return null;
+                const op = filing.kind === 'unappend'
+                    ? { kind: 'unappend', payload: { items: filing.items || [] } }
+                    : { kind: 'append', payload: { nodes: filing.nodes || [] } };
+                const result = applyServerOps([op]);
+                const from = Number(filing.baseVersion);
+                const to = Number(filing.version);
+                const moved = Number.isFinite(from) && Number.isFinite(to) && from === state.baseVersion && to > from;
+                if (moved) {
+                    state.baseVersion = to;
+                    state.baseId = newId();
+                }
+                if (moved || result.applied || result.removed) {
+                    await writeCopy();
+                    emit('pull');
+                }
                 return { ...result, version: state.baseVersion, copy: copyToken() };
             });
         },

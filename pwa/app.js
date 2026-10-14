@@ -14,7 +14,7 @@
 // append (POST /api/shares/:sid/file) rather than a push of this whole copy.
 
 import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
-import * as NM from './notesModel.js';
+import * as NM from './lib/notesModel.js';
 import { createShareSheet } from './shareSheet.js';
 import * as DC from './durableCopy.js';
 

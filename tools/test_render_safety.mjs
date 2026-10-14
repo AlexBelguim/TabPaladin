@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as NM from '../src/utils/notesModel.js';
-import * as PWA_NM from '../pwa/notesModel.js';
+import * as PWA_NM from '../pwa/lib/notesModel.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
@@ -401,8 +401,8 @@ check('a clicked note link is checked with safeHref before it opens', /const url
 
 // --- 6. Twins -----------------------------------------------------------------------
 console.log('\n6. Twins');
-check('src/utils/notesModel.js and pwa/notesModel.js are byte-identical',
-    Buffer.compare(fs.readFileSync(path.join(ROOT, 'src/utils/notesModel.js')), fs.readFileSync(path.join(ROOT, 'pwa/notesModel.js'))) === 0);
+check('src/utils/notesModel.js and pwa/lib/notesModel.js are byte-identical',
+    Buffer.compare(fs.readFileSync(path.join(ROOT, 'src/utils/notesModel.js')), fs.readFileSync(path.join(ROOT, 'pwa/lib/notesModel.js'))) === 0);
 
 console.log(failures === 0 ? '\nAll render-safety tests passed.\n' : `\n${failures} test(s) failed.\n`);
 process.exit(failures === 0 ? 0 : 1);

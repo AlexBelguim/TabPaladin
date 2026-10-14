@@ -4,9 +4,11 @@
 // What this locks down:
 //   1. Every pair in TWINS exists and is byte-identical.
 //   2. Each shared file is plain UTF-8 with LF line endings and no BOM, and
-//      imports nothing (the web app serves its copy on its own).
-//   3. The twin of every file in TWINS is listed once, and the known twins
-//      (notesModel.js) are in the list.
+//      imports nothing but its fellow twins (the web app serves its copies
+//      from pwa/lib/ on their own).
+//   3. The twin of every file in TWINS is listed once, and the shared core
+//      the web app runs on (treeStore.js, expandState.js, notesModel.js and
+//      the managers) is in the list, under pwa/lib/.
 //   4. sync_shared.mjs --check agrees, and copying restores a twin that was
 //      changed by hand.
 //
@@ -29,18 +31,24 @@ for (const t of compareTwins()) {
     check(`${t.copy} === ${t.canonical}`, t.same, t.missing.length ? `missing ${t.missing.join(', ')}` : 'run node tools/sync_shared.mjs');
 }
 
-console.log('\n2. Plain files that import nothing');
+console.log('\n2. Plain files that import only each other');
 for (const [canonical] of TWINS) {
     const bytes = fs.readFileSync(path.join(ROOT, canonical));
     check(`${canonical}: no BOM, LF only`, bytes[0] !== 0xef && !bytes.includes(0x0d));
-    check(`${canonical}: imports nothing`, !/^\s*import\s/m.test(bytes.toString('utf8')));
+    // Only a fellow twin, by a relative path: never anything of either client's.
+    const imports = [...bytes.toString('utf8').matchAll(/^\s*import\s[^'"]*['"]([^'"]+)['"]/gm)].map(m => m[1]);
+    check(`${canonical}: imports only its fellow twins`,
+        imports.every(i => /^\.\/[A-Za-z]+\.js$/.test(i) && TWINS.some(([a]) => a === 'src/utils/' + i.slice(2))), imports.join(', '));
 }
 
 console.log('\n3. The list');
 const copies = TWINS.map(([, c]) => c);
 check('each copy is listed once', new Set(copies).size === copies.length);
-check('notesModel.js is a listed twin', TWINS.some(([a, b]) => a === 'src/utils/notesModel.js' && b === 'pwa/notesModel.js'));
-check('canonical copies live in src/utils, twins in pwa/', TWINS.every(([a, b]) => a.startsWith('src/utils/') && b.startsWith('pwa/')));
+for (const f of ['notesModel.js', 'treeStore.js', 'expandState.js', 'storageManager.js', 'pinsManager.js', 'notesManager.js']) {
+    check(`${f} is a listed twin, under pwa/lib/`, TWINS.some(([a, b]) => a === `src/utils/${f}` && b === `pwa/lib/${f}`));
+}
+check('canonical copies live in src/utils, twins in pwa/lib/', TWINS.every(([a, b]) => a.startsWith('src/utils/') && b.startsWith('pwa/lib/')));
+check('no older twin is left at pwa/notesModel.js', !fs.existsSync(path.join(ROOT, 'pwa', 'notesModel.js')));
 
 console.log('\n4. The sync tool');
 const script = path.join(ROOT, 'tools', 'sync_shared.mjs');
