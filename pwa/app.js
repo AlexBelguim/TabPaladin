@@ -283,8 +283,15 @@ async function api(path, opts = {}) {
 
 // --- Initial load ---
 let booted = false;
+// Bumped whenever this window stops editing the copy (enterSecondary): a
+// start on its way then goes no further — no pull, no prompt, nothing
+// opened behind the card for a copy another window has now.
+let bootGen = 0;
 
 async function bootstrap() {
+    const gen = bootGen;
+    const gone = () => gen !== bootGen || halted();
+    if (gone()) return;
     // Existing installs already hold a token in localStorage and will never
     // sign in again, so mirror on every start rather than only on change —
     // otherwise the worker has no config and every share waits for the app.
@@ -300,7 +307,9 @@ async function bootstrap() {
     // A share that opened the app is in the outbox (or, from the old
     // redirect, in the URL, and goes in there now) before anything else.
     await migrateLegacyShares();
+    if (gone()) return;
     const shared = await handleShareEntry();
+    if (gone()) return;
 
     // On the first start of this page: the working copy kept on the device,
     // so a reload, a share that reloaded the window, or the phone closing the
@@ -309,10 +318,12 @@ async function bootstrap() {
     // account, which has it back once that account is the one signing in.
     const restored = !booted || (foreignKeptCopy && configured()) ? await restoreTreeCache() : null;
     booted = true;
+    if (gone()) return;
 
     // The sheet's pins and statistics as kept on the phone, before it draws:
     // its chips are drawn once and never reordered.
     await loadKeptShareData();
+    if (gone()) return;
     if (shared) shareSheet.open(shared, { fromShare: true });
 
     if (!configured()) {
@@ -324,6 +335,7 @@ async function bootstrap() {
         return;
     }
     await refreshWhoAmI();
+    if (gone()) return;
     if (!configured()) {
         // The server has just said the kept session is over (api() says so
         // and opens the sign-in): nothing to pull, and the link is nobody's.
@@ -340,7 +352,9 @@ async function bootstrap() {
     // nobody, or someone else, was signed in are asked about, never sent on
     // their own.
     await flushShares();
+    if (gone()) return;
     await offerUnclaimedShares();
+    if (gone()) return;
     // A pull replaces the working copy, so it never runs over unpushed edits
     // — after a sign-out and back in, or a reload, they are still here.
     if (state.dirty && state.snapshot) {
@@ -353,17 +367,20 @@ async function bootstrap() {
         // when the server has moved on.
         renderView();
         try {
-            const v = await api('/api/tree/version');
             const copy = state.snapshot;
-            if (Number(v.version) !== state.treeVersion && state.snapshot === copy && !state.dirty) await pullSnapshot();
+            const v = await api('/api/tree/version');
+            if (!gone() && Number(v.version) !== state.treeVersion && state.snapshot === copy && !state.dirty) await pullSnapshot();
         } catch (e) { /* offline: the kept copy stands */ }
     } else {
         try { await pullSnapshot(); } catch (e) { /* status already set */ }
     }
+    if (gone()) return;
     loadShareStats();
     loadSharePrefs();
     await refreshInbox();
+    if (gone()) return;
     if (!shareSheet.isOpen()) await afterShareSheet();
+    if (gone()) return;
     await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
 }
 
@@ -3433,6 +3450,25 @@ async function pushNow() {
 // What the last push folded in from links filed elsewhere, for its message.
 let lastFold = null;
 
+// Every push asks first whether this window still edits the copy. One that
+// lost it without hearing so yet — held up in a dialog (a folder name, a
+// confirm) while another window took the copy, which now edits from what was
+// kept — sends nothing: its tree would land on the server over that window's
+// work. The wait lets word of a lock taken meanwhile arrive; a claim another
+// window made since says the same.
+async function ensureStillEditing() {
+    if (guard && guard.mode !== 'none') {
+        const mine = !halted() && await claimStillMine();
+        if (!mine && !halted()) lostCopy();
+    }
+    if (halted()) {
+        const e = new Error('TabPaladin is open in another tab, which edits the copy now — nothing was pushed from this one.');
+        e.halted = true;
+        throw e;
+    }
+    if (!state.snapshot) throw new Error('No snapshot loaded to push.');
+}
+
 async function pushSnapshot(opts) {
     syncBusy++;
     try {
@@ -3443,13 +3479,17 @@ async function pushSnapshot(opts) {
 }
 
 async function pushSnapshotOnce({ force = false, attempt = 0 } = {}) {
-    const roots = (state.snapshot.children || []).map(toWire).filter(Boolean);
+    await ensureStillEditing();
+    let roots = (state.snapshot.children || []).map(toWire).filter(Boolean);
     // Pushing an empty tree erases everything server-side for every device —
     // never do that without a very explicit yes.
     if (roots.length === 0 && (state.treeVersion || 0) > 0) {
         if (!confirm('This would push an EMPTY tree and erase all bookmarks on the server. Really continue?')) {
             throw new Error('Push cancelled — tree is empty.');
         }
+        // The dialog held this window up: another may have taken the copy.
+        await ensureStillEditing();
+        roots = (state.snapshot.children || []).map(toWire).filter(Boolean);
     }
     const baseUserId = state.snapshotUserId ?? null;
     const baseServerId = state.snapshotServerId || null;
@@ -3928,10 +3968,12 @@ const LIVE_DRAFT_MS = 500;
 // How long a hand-over to another window waits for a pull or push on its way.
 const SYNC_WAIT_MS = 8000;
 // The savedAt of the record this release last wrote into tp-data (see
-// DC.chooseKept), and this window's claim on the copy where IndexedDB cannot
-// hold it.
+// DC.chooseKept), this window's claim on the copy where IndexedDB cannot
+// hold it, and the mark a clear leaves when one of the two places refused it
+// (DC.chooseKept's clearedAt).
 const TP_DATA_AT_KEY = 'tp_copy_tpdata_at';
 const CLAIM_LS_KEY = 'tp_copy_claim';
+const CLEARED_AT_KEY = 'tp_copy_cleared_at';
 
 // Reading indexedDB itself throws where site data is blocked.
 const kv = DC.createKv((() => { try { return globalThis.indexedDB; } catch (e) { return null; } })());
@@ -3947,6 +3989,23 @@ let keptIn = null;
 let copyWriteError = null;
 let copyTimer = null;
 let draftTimer = null;
+// The latest savedAt this window has stamped or seen kept (ms): every record
+// it writes is stamped after it, so one written after a clear is never taken
+// for what the clear removed, even with the clock set back.
+let copyMark = Date.now();
+// The savedAt of the record this window last kept, or started from: what it
+// knows the device holds of its own.
+let lastKeptAt = null;
+
+function stampSavedAt() {
+    copyMark = Math.max(Date.now(), copyMark + 1);
+    return new Date(copyMark).toISOString();
+}
+
+function noteKeptTime(iso) {
+    const t = iso ? Date.parse(iso) : NaN;
+    if (Number.isFinite(t)) copyMark = Math.max(copyMark, t);
+}
 
 function noteSync(kind) {
     copyMeta.lastSyncAt = new Date().toISOString();
@@ -4057,7 +4116,7 @@ function saveTreeCache() {
     }
     const record = {
         v: 1,
-        savedAt: new Date().toISOString(),
+        savedAt: stampSavedAt(),
         account,
         roots: (snap.children || []).map(toWire).filter(Boolean),
         version: state.treeVersion || 0,
@@ -4104,7 +4163,10 @@ function saveLiveDraft() {
 function clearTreeCache() {
     if (foreignKeptCopy || halted()) return treeCacheWrite;
     clearCopyTimers();
-    treeCacheWrite = treeCacheWrite.then(() => writeKept({ [DC.TREE_KEY]: null, [DC.DRAFT_KEY]: null }, null));
+    // What it clears: everything kept up to now. A write after it is
+    // stamped later (stampSavedAt).
+    const upTo = new Date(copyMark).toISOString();
+    treeCacheWrite = treeCacheWrite.then(() => writeKept({ [DC.TREE_KEY]: null, [DC.DRAFT_KEY]: null }, null, upTo));
     return treeCacheWrite;
 }
 
@@ -4112,7 +4174,14 @@ function clearTreeCache() {
 // copy this release starts from, then into tp-data. A write that finds
 // another window's claim on the copy writes nothing, and this window stops
 // editing. True once it is kept somewhere.
-async function writeKept(entries, record) {
+//
+// A clear that one of the two places refuses (IndexedDB failing while Cache
+// Storage works, say) leaves a mark saying everything kept up to `clearedUpTo`
+// is cleared: what the refusing place still holds — an older copy, maybe
+// with unpushed edits that were pushed or discarded since, maybe another
+// account's — never comes back at the next start (DC.chooseKept). The mark
+// goes once a write reaches both places.
+async function writeKept(entries, record, clearedUpTo = null) {
     const fence = fenceId();
     let inKv = false;
     let error = null;
@@ -4139,6 +4208,18 @@ async function writeKept(entries, record) {
             else localStorage.removeItem(TP_DATA_AT_KEY);
         } catch (e) { /* only the step-back check misses it */ }
     }
+    // Refused, as against not there to write to (no IndexedDB, no Cache
+    // Storage): what that place holds is still what it held.
+    const kvRefused = !inKv && Boolean(error);
+    const tpRefused = !inTp && Boolean(dataWriteError);
+    try {
+        if (!record && (kvRefused || tpRefused)) {
+            localStorage.setItem(CLEARED_AT_KEY, clearedUpTo || new Date(copyMark).toISOString());
+        } else if (!kvRefused && !tpRefused) {
+            localStorage.removeItem(CLEARED_AT_KEY);
+        }
+    } catch (e) { /* localStorage refused too: nothing more to do here */ }
+    if (inKv || inTp) lastKeptAt = record ? record.savedAt : null;
     noteCopyWrite({ inKv, inTp, error: error || dataWriteError, keeping: Boolean(record) });
     return inKv || inTp;
 }
@@ -4178,17 +4259,34 @@ function claimedElsewhere(fence) {
 }
 
 // This window edits the copy from now on: its claim goes where every write
-// checks it.
+// checks it. A claim another window made since stands (two windows that
+// started together without Web Locks): this one stops at once, before it
+// holds anything.
 async function claimCopy() {
     if (!guard || !guard.fence()) return;
     claimedAt = Date.now();
     const fence = fenceId();
     try { localStorage.setItem(CLAIM_LS_KEY, JSON.stringify(fence)); } catch (e) { /* IndexedDB holds it */ }
-    try { await kv.claim(fence); } catch (e) { /* no IndexedDB: localStorage holds it */ }
+    let res = null;
+    try { res = await kv.claim(fence); } catch (e) { /* no IndexedDB: localStorage holds it */ }
+    if (res && res.claimed === false) {
+        try { localStorage.setItem(CLAIM_LS_KEY, JSON.stringify(res.holder)); } catch (e) { /* IndexedDB holds it */ }
+        lostCopy();
+    }
 }
 
 function lostCopy() {
     if (guard) guard.lost('fenced');
+}
+
+// Work in this window that the device could not keep: the last write
+// failed (a full disk), or a copy with work in it is kept for another
+// account, which this one's is never written over. Only this window has it,
+// so it never lets go of it unasked, and losing the copy does not drop it
+// (enterSecondary).
+function unkeptWork() {
+    if (!copyWriteError && !foreignKeptCopy) return false;
+    return Boolean(state.snapshot && state.dirty) || editorDirty() || Boolean(state.keptDraft);
 }
 
 // Going where it cannot answer — the back-forward cache, frozen in the
@@ -4196,11 +4294,14 @@ function lostCopy() {
 // write on its way still lands: it is fenced by this window's claim, which
 // stands until another window claims the copy). It keeps what it holds in
 // memory: back, it edits on in place when nobody claimed the copy meanwhile
-// (resumeIfFree).
+// (resumeIfFree). It keeps the copy instead when what it holds could not be
+// written down (or a sign-out is on its way): another window taking it then
+// would start from older than this one holds. The cases yieldCopy refuses.
 let awayFromCopy = false;
 
 function letGoWhileAway() {
-    if (!guard || !guard.isPrimary() || guard.mode !== 'locks') return;
+    if (!guard || !guard.isPrimary() || guard.mode === 'none') return;
+    if (accountChanging || copyWriteError || unkeptWork()) return;
     awayFromCopy = true;
     guard.lost('away');
 }
@@ -4227,8 +4328,17 @@ async function readKeptCopy() {
     } catch (e) { /* no IndexedDB here */ }
     const tp = await readData(TREE_KEY);
     let tpWrittenAt = null;
-    try { tpWrittenAt = localStorage.getItem(TP_DATA_AT_KEY); } catch (e) { /* unknown */ }
-    const pick = DC.chooseKept({ kv: fromKv, tp, tpWrittenAt });
+    let clearedAt = null;
+    try {
+        tpWrittenAt = localStorage.getItem(TP_DATA_AT_KEY);
+        clearedAt = localStorage.getItem(CLEARED_AT_KEY);
+    } catch (e) { /* unknown */ }
+    // From here, this window stamps what it writes later than anything kept,
+    // and than a clear left unfinished.
+    noteKeptTime(clearedAt);
+    noteKeptTime(fromKv && fromKv.savedAt);
+    noteKeptTime(tp && tp.savedAt);
+    const pick = DC.chooseKept({ kv: fromKv, tp, tpWrittenAt, clearedAt });
     if (pick.drop) {
         // The previous release cleared the copy after a step back: it pushed
         // what was in it, or let it go on purpose. Not brought back over
@@ -4301,6 +4411,7 @@ async function restoreTreeCache() {
     state.treeRev++;
     copyMeta.copyId = rec.copyId || null;
     copyMeta.seq = Number(rec.seq) || 0;
+    lastKeptAt = rec.savedAt || null;
     copyMeta.lastSyncAt = rec.lastSyncAt || null;
     copyMeta.lastSyncKind = rec.lastSyncKind || null;
     if (Array.isArray(rec.importIds) && rec.importIds.length) state.snapshot._importIds = rec.importIds.slice();
@@ -4371,7 +4482,32 @@ async function startApp() {
         return;
     }
     await claimCopy();
+    // Another window's claim stood, or one asked for the copy meanwhile:
+    // this one waits behind the card.
+    if (halted()) return;
     await bootstrap();
+}
+
+// Back in the foreground. Without Web Locks, a window that edited while
+// this one was frozen answers, and this one stops (guard.recheck). None
+// answering, this one goes on editing — unless one claimed the copy
+// meanwhile and has gone since: what this window holds is then from before
+// that one's work, and it starts again from what is kept, as a window
+// coming back to a lock taken meanwhile does (resumeHere).
+async function recheckCopy() {
+    if (!guard) return;
+    try { await guard.recheck(); } catch (e) { return; }
+    if (guard.mode !== 'channel' || !guard.isPrimary() || moving || restarting) return;
+    if (await claimStillMine()) return;
+    if (!guard.isPrimary() || moving || restarting) return;
+    moving = true;
+    try {
+        await resumeHere();
+    } catch (e) {
+        /* stays as it is */
+    } finally {
+        moving = false;
+    }
 }
 
 // Another window asks for the copy: what is on its way lands first, then
@@ -4386,7 +4522,8 @@ async function yieldCopy() {
     }
     // A sign-out still on its way writes what it keeps when it lands.
     if (accountChanging) return { ok: false, reason: 'busy' };
-    const holdsWork = Boolean(state.snapshot && state.dirty) || editorDirty();
+    // What unkeptWork counts: a note set aside by a sign-out too.
+    const holdsWork = Boolean(state.snapshot && state.dirty) || editorDirty() || Boolean(state.keptDraft);
     const kept = await saveTreeCache();
     if (kept === false) return { ok: false, reason: 'storage' };
     if (kept === null && foreignKeptCopy && holdsWork) return { ok: false, reason: 'foreign' };
@@ -4395,9 +4532,15 @@ async function yieldCopy() {
 
 // This window no longer edits the copy: it stops writing, lets go of what it
 // held (written down, and the other window's now), and says where the app is.
+// A start on its way goes no further (bootGen). Work the device could not
+// keep (unkeptWork) is not let go of — it is nowhere else: it stays behind
+// the card, closing the tab asks first, and Use here brings the copy back to
+// it (carryOnHere) to push it.
 function enterSecondary(reason) {
     clearCopyTimers();
-    if (booted) {
+    bootGen++;
+    const holding = booted && unkeptWork();
+    if (booted && !holding) {
         state.snapshot = null;
         state.dirty = false;
         state.editCount = 0;
@@ -4409,6 +4552,12 @@ function enterSecondary(reason) {
         for (const id of ['settings-sheet', 'inbox-sheet', 'user-sheet', 'move-sheet', 'nb-sheet', 'import-sheet']) hide($(id));
     }
     showGuard(reason);
+    if (holding) setGuardNote(unkeptNote());
+}
+
+function unkeptNote() {
+    return `This tab still has unpushed changes this ${deviceWord()} could not keep — the other tab does not have them. `
+        + 'Use here to bring the copy back to this tab, and ⬆️ Push them first.';
 }
 
 function guardOverlay() {
@@ -4480,6 +4629,7 @@ function refusalNote(reason) {
 async function useHere() {
     if (!guard || guard.isPrimary() || moving) return;
     moving = true;
+    linkDuringMove = false;
     const btn = $('primary-take');
     if (btn) btn.disabled = true;
     setGuardNote('Asking the other tab to save what it holds…');
@@ -4494,8 +4644,16 @@ async function useHere() {
         await resumeHere();
     } finally {
         moving = false;
+        // A link that arrived meanwhile: the move took it along (a start
+        // again, or carrying on here, opens it), or, the move failed, it
+        // stays in the address bar for the next one.
+        linkDuringMove = false;
     }
 }
+
+// An import link tapped while a move was on its way (resumeIfFree), which
+// useHere let be: taken up once the move is done.
+let linkDuringMove = false;
 
 // Back to a window that does not edit, without asking anyone: behind the
 // card, once the window that edited is gone (closed after filing a share,
@@ -4505,22 +4663,41 @@ async function useHere() {
 async function resumeIfFree() {
     if (!guard || guard.isPrimary() || moving) return;
     moving = true;
+    linkDuringMove = false;
+    let inPlace = false;
     try {
         const free = await guard.takeIfFree();
         if (awayFromCopy) {
             awayFromCopy = false;
-            if (free && await claimStillMine()) return;
-            if (!free) {
-                enterSecondary('lost');
-                return;
-            }
+            if (free && await claimStillMine()) inPlace = true;
+            else if (!free) enterSecondary('lost');
+            else await resumeHere();
+        } else if (free) {
+            await resumeHere();
         }
-        if (free) await resumeHere();
     } catch (e) {
         /* stays as it is */
     } finally {
         moving = false;
     }
+    // An import link that arrived on the way back (its hashchange came
+    // while this was under way): opened here now that this window edits on
+    // in place, or it moves the copy here, as any link tapped behind the
+    // card does. A start again (reload) takes it along in the address bar.
+    const linked = linkDuringMove;
+    linkDuringMove = false;
+    if (restarting) return;
+    if (!halted()) {
+        if (inPlace) openLinkInUrl();
+    } else if (linked && IMPORT_HASH_RE.test(location.hash)) {
+        useHere();
+    }
+}
+
+// An import link still in the address bar, opened by a window that edits on
+// in place rather than starting again (which would take it up itself).
+function openLinkInUrl() {
+    if (!halted() && IMPORT_HASH_RE.test(location.hash)) processImportHashIfAny();
 }
 
 // Starting again from what is kept: nothing in this page's memory is
@@ -4528,16 +4705,68 @@ async function resumeIfFree() {
 let restarting = false;
 
 // This window edits now. One that let go of the copy before starts again
-// from what is kept, its memory being from before.
+// from what is kept, its memory being from before — unless it holds work
+// the device could not keep, which it carries on with here instead.
 async function resumeHere() {
     if (booted) {
+        if (unkeptWork()) {
+            await carryOnHere();
+            return;
+        }
         restarting = true;
         location.reload();
         return;
     }
     await claimCopy();
+    // Asked for the copy again while claiming it (a third window): it is
+    // that one's, and this one stays behind the card.
+    if (halted()) return;
     hide($('primary-guard'));
     await bootstrap();
+}
+
+// Back to editing what this window holds in memory, work the device could
+// not keep: no start again, which would lose it. A copy another window kept
+// meanwhile with work of its own in it is set aside first, never written
+// over (one kept for another account stays where it is, as at a start).
+async function carryOnHere() {
+    await claimCopy();
+    if (halted()) return;
+    await setAsideKeptCopy();
+    if (halted()) return;
+    hide($('primary-guard'));
+    setGuardNote('');
+    renderView();
+    saveTreeCache();
+    openLinkInUrl();
+}
+
+async function setAsideKeptCopy() {
+    // What this window writes from here is stamped later than anything kept
+    // meanwhile, or cleared.
+    try { noteKeptTime(localStorage.getItem(CLEARED_AT_KEY)); } catch (e) { /* unknown */ }
+    let got = {};
+    try {
+        got = await kv.getMany([DC.TREE_KEY, DC.DRAFT_KEY, DC.STASH_INDEX_KEY]);
+    } catch (e) {
+        return; // no IndexedDB: nothing kept there to set aside
+    }
+    const raw = got[DC.TREE_KEY];
+    const rec = DC.fromKvRecord(raw, got[DC.DRAFT_KEY]);
+    if (!rec || !rec.savedAt || rec.savedAt === lastKeptAt) return; // none, or this window's own
+    noteKeptTime(rec.savedAt);
+    if (!(rec.dirty || rec.nv || rec.keptDraft)) return; // on the server already
+    if (!DC.sameOwner(rec.account, keptAccount())) {
+        // Another account's: kept for it, never written over.
+        foreignKeptCopy = rec;
+        return;
+    }
+    const index = Array.isArray(got[DC.STASH_INDEX_KEY]) ? got[DC.STASH_INDEX_KEY] : [];
+    const stash = DC.stashEntry(raw, got[DC.DRAFT_KEY], index, Date.now(), 'set-aside-by-another-window');
+    try {
+        const res = await kv.write({ [stash.key]: stash.value, [DC.STASH_INDEX_KEY]: [...index, stash.key] }, { fence: fenceId() });
+        if (res.fenced) lostCopy();
+    } catch (e) { /* the device refuses writes: this window's next one is refused too */ }
 }
 
 // --- Settings › Storage ------------------------------------------------------
@@ -5823,8 +6052,9 @@ window.addEventListener('DOMContentLoaded', () => {
     // sign-out, or unpushed edits, kept for their account or not.
     window.addEventListener('beforeunload', (e) => {
         // Another window edits the copy, or this one starts again from what
-        // is kept: nothing here is this page's to lose.
-        if (halted() || restarting) return;
+        // is kept: nothing here is this page's to lose — unless it is work
+        // the device could not keep, which stays here behind the card.
+        if (restarting || (halted() && !unkeptWork())) return;
         if (!editorDirty() && !state.keptDraft && !(state.dirty && state.snapshot)) return;
         e.preventDefault();
         e.returnValue = '';
@@ -5950,9 +6180,9 @@ window.addEventListener('DOMContentLoaded', () => {
         if (document.visibilityState === 'hidden') saveTreeCache();
         else if (document.visibilityState === 'visible') {
             // Without Web Locks, a window that edited while this one was
-            // frozen makes this one stop (durableCopy.js). A window behind
-            // the card edits again once the one that edited is gone.
-            if (guard) guard.recheck().catch(() => {});
+            // frozen makes this one stop (recheckCopy). A window behind the
+            // card edits again once the one that edited is gone.
+            recheckCopy();
             if (halted()) resumeIfFree();
             if (configured() && !halted()) {
                 flushShares().then(res => { if (res && (res.uploaded.length || res.filed.length)) refreshInbox(); }).catch(() => {});
@@ -5969,8 +6199,15 @@ window.addEventListener('DOMContentLoaded', () => {
         saveTreeCache();
         letGoWhileAway();
     });
-    window.addEventListener('pageshow', (e) => { if (e && e.persisted) resumeIfFree(); });
-    document.addEventListener('resume', () => { if (halted()) resumeIfFree(); });
+    window.addEventListener('pageshow', (e) => {
+        if (!e || !e.persisted) return;
+        if (halted()) resumeIfFree();
+        else recheckCopy();
+    });
+    document.addEventListener('resume', () => {
+        if (halted()) resumeIfFree();
+        else recheckCopy();
+    });
     window.addEventListener('online', () => {
         if (!configured() || halted()) return;
         flushShares().then(() => refreshInbox()).catch(() => {});
@@ -6006,10 +6243,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // Import links tapped while the app is already open. One tapped in a
     // window that does not edit the copy moves the copy there: that is
-    // where the person is.
+    // where the person is. One tapped while this window is on its way back
+    // (resumeIfFree) is taken up once it is: Use here waits for that.
     window.addEventListener('hashchange', () => {
         if (!halted()) processImportHashIfAny();
-        else if (IMPORT_HASH_RE.test(location.hash)) useHere();
+        else if (IMPORT_HASH_RE.test(location.hash)) {
+            if (moving) linkDuringMove = true;
+            useHere();
+        }
     });
 
     if ('serviceWorker' in navigator) {
