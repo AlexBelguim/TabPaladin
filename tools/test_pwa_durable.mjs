@@ -48,7 +48,23 @@
 //      warning; without IndexedDB the app keeps the copy in tp-data as
 //      before; Settings › Storage shows where the copy is and whether the
 //      browser may clear it, and 'Keep my data on this phone' asks from the
-//      click and says what the browser answered.
+//      click and says what the browser answered. Work the device could not
+//      keep (a full disk, or another account's copy kept) is never let go
+//      of: frozen, the window keeps the copy; robbed anyway, it keeps the
+//      work behind the card (closing asks), and Use here or the other window
+//      closing carries on with it in place, another window's kept work set
+//      aside, not written over.
+//  11. Losing the copy part-way: a start that hands the copy over stops (no
+//      pull, no question behind the card); Use here asked again while it
+//      claims stays behind the card; a window robbed while a dialog held it
+//      up pushes nothing; an import link arriving while the window comes back
+//      from being away is opened, or brings the copy back with it.
+//  12. A clear that did not reach both places (IndexedDB refusing, or Cache
+//      Storage) never brings that copy back at the next start.
+//  13. Without Web Locks (a plain-http address): two windows that claimed at
+//      once never both write; one back after another claimed the copy and
+//      closed starts again from what is kept; back with nobody having
+//      claimed it, it edits on in place.
 //
 // Run: node tools/test_pwa_durable.mjs [--port 18987]
 
@@ -95,10 +111,11 @@ const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 // and an upgrade step, object stores of out-of-line keys, and transactions
 // that run one at a time, see their own writes, and commit all or nothing.
 // `ctl.quotaFull` makes every write's commit fail as a full disk does;
-// `ctl.failOpen` makes opening fail.
+// `ctl.failOpen` makes opening fail; `ctl.delay` holds every transaction up
+// that many ms, as a busy disk does.
 function makeFakeIndexedDB() {
     const dbs = new Map();
-    const ctl = { quotaFull: false, failOpen: null, commits: 0 };
+    const ctl = { quotaFull: false, failOpen: null, commits: 0, delay: 0 };
     const conns = new Set();
     let line = Promise.resolve();
     const err = (name, message = name) => Object.assign(new Error(message), { name });
@@ -192,7 +209,7 @@ function makeFakeIndexedDB() {
         tx.objectStore = () => store;
         tx.abort = () => abortNow(null);
         touch();
-        line = line.then(() => new Promise((resolve) => soon(async () => {
+        line = line.then(() => new Promise((resolve) => setTimeout(async () => {
             touch();
             try {
                 while (pending.length && !finished) {
@@ -213,7 +230,7 @@ function makeFakeIndexedDB() {
                 touch();
                 resolve();
             }
-        })));
+        }, ctl.delay || 0)));
         return tx;
     }
 
@@ -395,6 +412,22 @@ console.log('\n1. The store');
     const newer = await kv.write({ t: 3 }, { fence: { id: 'w3', at: 3000 } });
     check('an older claim (one this window could not write over) does not stop it', !newer.fenced && (await kv.get('t')) === 3);
 
+    // Two windows claimed at once (no Web Locks): the later claim committed
+    // first. The earlier one, committing last, does not replace it.
+    const idbC = makeFakeIndexedDB();
+    const kc = DC.createKv(idbC.factory);
+    const late = await kc.claim({ id: 'late', at: 5000 });
+    const early = await kc.claim({ id: 'early', at: 4000 });
+    check('a claim never replaces one another window made since: it says so, and writes nothing', late.claimed && !early.claimed
+        && early.holder && early.holder.id === 'late' && (await kc.get('tpPrimary')).id === 'late', JSON.stringify({ late, early }));
+    const wLate = await kc.write({ x: 1 }, { fence: { id: 'late', at: 5000 } });
+    const wEarly = await kc.write({ x: 2 }, { fence: { id: 'early', at: 4000 } });
+    check('  so of two windows that claimed at once, only one writes', !wLate.fenced && wEarly.fenced && (await kc.get('x')) === 1);
+    check('  a later claim takes over as before', (await kc.claim({ id: 'early', at: 6000 })).claimed && (await kc.get('tpPrimary')).id === 'early');
+    idbC.poke('tpPrimary', { id: 'future', at: Date.now() + 3600e3 });
+    check('  and one from the future (the clock set back since) does not stand in the way',
+        (await kc.claim({ id: 'now', at: Date.now() })).claimed && (await kc.get('tpPrimary')).id === 'now');
+
     let missing = null;
     try { await DC.createKv(undefined).get('a'); } catch (e) { missing = e; }
     check('no IndexedDB at all is said plainly', missing && missing.name === 'NotSupportedError');
@@ -472,6 +505,19 @@ console.log('\n2. The record');
         && st.value.dirty && same(st.value.roots, rec.roots) && st.value.owner.userId === 1 && st.value.liveDrafts === drafts
         && Array.isArray(st.value.pendingRemovals) && typeof st.value.setAsideAt === 'string');
     check('nothing kept, nothing taken', DC.chooseKept({ kv: null, tp: null }).rec === null);
+
+    // A clear one of the two places refused: what either kept up to it was
+    // cleared, and never comes back.
+    const clearedAt = '2026-10-13T10:30:00.000Z';
+    p = DC.chooseKept({ kv: kvOld, tp: null, clearedAt });
+    check('a clear IndexedDB refused: what it kept up to then does not come back', p.rec === null && !p.drop);
+    p = DC.chooseKept({ kv: null, tp: { ...tp, savedAt: '2026-10-13T10:00:00.000Z' }, clearedAt });
+    check('  nor what tp-data kept, when it refused', p.rec === null);
+    p = DC.chooseKept({ kv: kvOld, tp: tpNew, clearedAt });
+    check('  what was kept after it does', p.rec === tpNew && p.from === 'tp-data' && p.seed);
+    p = DC.chooseKept({ kv: { ...back, savedAt: '2026-10-13T12:00:00.000Z' }, tp: { ...tp, savedAt: '2026-10-13T10:00:00.000Z' }, clearedAt });
+    check('  from IndexedDB too', p.from === 'kv' && p.rec.savedAt === '2026-10-13T12:00:00.000Z');
+    check('  and a record that cannot say when it was written counts as cleared', DC.chooseKept({ kv: { ...back, savedAt: null }, tp: null, clearedAt }).rec === null);
 }
 
 const W = { probe: 200, grace: 200, answer: 400, busy: 3000 };
@@ -562,6 +608,45 @@ console.log('\n3. One window edits');
     c3.close();
     check('  but does once it is gone', await c2.takeIfFree());
     for (const g of [c1, c2, c3]) g.close();
+
+    // Two windows starting at the same moment, each asking while the other
+    // does: one edits, never both — the lower id, whichever asked first.
+    for (const [first, second] of [['c4', 'c5'], ['c7', 'c6']]) {
+        const a = makeGuard(hub, bc, first, { secure: false, locks: false });
+        const pa = a.start();
+        await sleep(W.probe / 2);
+        const b = makeGuard(hub, bc, second, { secure: false, locks: false });
+        const pb = b.start();
+        const roles = [await pa, await pb];
+        const winner = [first, second].sort()[0];
+        check(`  two windows starting at once (${first} asking first): one edits, never both`, roles.filter(r => r === 'primary').length === 1
+            && a.isPrimary() !== b.isPrimary() && (a.isPrimary() ? first : second) === winner, JSON.stringify(roles));
+        a.close();
+        b.close();
+    }
+    // Two behind the card, looking at once whether they may edit: one does.
+    const d0 = makeGuard(hub, bc, 'd0', { secure: false, locks: false });
+    await d0.start();
+    const d1 = makeGuard(hub, bc, 'd1', { secure: false, locks: false });
+    const d2 = makeGuard(hub, bc, 'd2', { secure: false, locks: false });
+    check('  (two windows wait behind the card)', (await d1.start()) === 'secondary' && (await d2.start()) === 'secondary');
+    d0.close();
+    const looks = await Promise.all([d2.takeIfFree(), d1.takeIfFree()]);
+    check('  the one editing gone, two looking at once: one edits', looks.filter(Boolean).length === 1 && d1.isPrimary() && !d2.isPrimary(),
+        JSON.stringify(looks));
+    // One opened with work in it, starting while another asks at the same
+    // moment: it waits for that one to edit, then has it let go.
+    const e8 = makeGuard(hub, bc, 'e1', { secure: false, locks: false });
+    d1.close();
+    d2.close();
+    const pe8 = e8.start();
+    await sleep(W.probe / 2);
+    const e9 = makeGuard(hub, bc, 'e2', { secure: false, locks: false });
+    const r9 = await e9.start({ take: true });
+    await pe8;
+    check('  one opened with work in it, starting as another does: that one edits first, then lets go to it', r9 === 'primary'
+        && e9.isPrimary() && !e8.isPrimary() && e8.events.join() === 'yield,yielded', JSON.stringify({ r9, ev: e8.events }));
+    for (const g of [e8, e9]) g.close();
 
     const none = DC.createPrimaryGuard({ locks: null, BroadcastChannel: bc.classFor('n'), id: 'n', onYield: async () => true });
     check('neither (an old browser, or no secure-context answer): every window edits, unfenced', none.mode === 'none'
@@ -675,8 +760,9 @@ const historyShim = {
 };
 
 // Cache Storage, for tp-data and the share outbox. `cachesFull` makes every
-// put fail, as a full disk does.
+// put fail, as a full disk does; `cachesFailDelete` every delete.
 let cachesFull = false;
+let cachesFailDelete = false;
 const cacheStores = new Map();
 const cachesShim = {
     async open(name) {
@@ -690,7 +776,10 @@ const cachesShim = {
                 if (cachesFull) throw Object.assign(new Error('Quota exceeded'), { name: 'QuotaExceededError' });
                 m.set(key(k), v);
             },
-            delete: async (k) => m.delete(key(k)),
+            delete: async (k) => {
+                if (cachesFailDelete) throw Object.assign(new Error('The operation failed'), { name: 'UnknownError' });
+                return m.delete(key(k));
+            },
             keys: async () => [...m.keys()]
         };
     },
@@ -730,8 +819,17 @@ Object.assign(globalThis, {
     caches: cachesShim,
     indexedDB: idb.factory,
     isSecureContext: true,
-    confirm: (msg) => { dialogs.confirm.push(msg); return answers.confirm.length ? answers.confirm.shift() : false; },
-    prompt: (msg) => { dialogs.prompt.push(msg); return answers.prompt.length ? answers.prompt.shift() : null; },
+    // An answer may be a function: what happens while the dialog is up.
+    confirm: (msg) => {
+        dialogs.confirm.push(msg);
+        const a = answers.confirm.length ? answers.confirm.shift() : false;
+        return typeof a === 'function' ? a(msg) : a;
+    },
+    prompt: (msg) => {
+        dialogs.prompt.push(msg);
+        const a = answers.prompt.length ? answers.prompt.shift() : null;
+        return typeof a === 'function' ? a(msg) : a;
+    },
     alert: (msg) => { dialogs.alert.push(msg); },
     scrollTo() {},
     innerHeight: 800,
@@ -749,11 +847,13 @@ new Function('self', fs.readFileSync(path.join(REPO, 'pwa', 'shareCore.js'), 'ut
 const Share = globalThis.TPShare;
 
 // Each window has its own navigator (its Web Locks) and BroadcastChannel.
+// `withLocks` false: a plain-http address, where there are no Web Locks.
 let currentTag = null;
 let withStorageManager = true;
+let withLocks = true;
 function enterWindow(tag) {
     Object.defineProperty(globalThis, 'navigator', {
-        value: { clipboard: null, locks: lockHub.forTag(tag), ...(withStorageManager ? { storage: storageManager } : {}) },
+        value: { clipboard: null, ...(withLocks ? { locks: lockHub.forTag(tag) } : {}), ...(withStorageManager ? { storage: storageManager } : {}) },
         configurable: true
     });
     globalThis.BroadcastChannel = channelHub.classFor(tag);
@@ -763,12 +863,17 @@ const requests = [];
 const realFetch = globalThis.fetch;
 let inFlight = 0;
 let offline = null;
+// { re, ms }: requests matching `re` answer `ms` later, as a slow network.
+let slow = null;
 globalThis.fetch = async (url, opts = {}) => {
     const line = `${(opts.method || 'GET').toUpperCase()} ${String(url).replace(BASE, '')}`;
     requests.push(line);
     if (offline && offline.test(line)) throw new TypeError('Failed to fetch');
     inFlight++;
-    try { return await realFetch(url, opts); } finally { inFlight--; lastActivity = Date.now(); }
+    try {
+        if (slow && slow.re.test(line)) await sleep(slow.ms);
+        return await realFetch(url, opts);
+    } finally { inFlight--; lastActivity = Date.now(); }
 };
 async function settle() {
     for (let i = 0; i < 100; i++) {
@@ -912,14 +1017,24 @@ async function coldStart(url, { tag = `w${starts + 1}`, wait = true } = {}) {
     if (wait) await settle();
 }
 
+// A window of the app without Web Locks: it asks over the channel first, a
+// wait settle() cannot see, so this waits for the claim it makes once it edits.
+async function coldStartChannel(url, opts) {
+    const before = JSON.stringify(idb.peek('tpPrimary') || null);
+    await coldStart(url, opts);
+    await until(() => JSON.stringify(idb.peek('tpPrimary') || null) !== before, 3000);
+    await settle();
+}
+
 // Another window, as only its claim on the copy: it asks for the lock the way
-// the app does, and writes the copy down (or cannot) when asked.
-function otherWindow(tag) {
+// the app does, and writes the copy down (or cannot) when asked. `channel`:
+// without Web Locks.
+function otherWindow(tag, { channel = false } = {}) {
     const events = [];
     const g = DC.createPrimaryGuard({
-        locks: lockHub.forTag(tag),
+        locks: channel ? null : lockHub.forTag(tag),
         BroadcastChannel: channelHub.classFor(tag),
-        secure: true,
+        secure: !channel,
         id: tag,
         onYield: () => { events.push('yield'); return g.answer(); },
         onYielded: () => events.push('yielded'),
@@ -1309,8 +1424,36 @@ try {
     check('  so asked for the copy while sam has unpushed edits, this window refuses, saying why', !r9.ok && r9.how === 'refused'
         && r9.reason === 'foreign' && !guardShown() && lockHub.holder() === 'w9c' && kvTree().owner.username === 'alex', JSON.stringify(r9));
     x9.close();
+    // Frozen while it holds them, it keeps the copy: a window started
+    // meanwhile would start from without them, and nobody asks this one.
+    fireDocument('freeze');
+    await sleep(50);
+    check('  frozen while it holds them, it keeps the copy', lockHub.holder() === 'w9c' && !guardShown());
+    fireDocument('resume');
+    await sleep(50);
+    check('  and edits on when back', lockHub.holder() === 'w9c' && !guardShown() && unloadAsks());
+    // Robbed anyway (frozen, it could not answer): they stay here.
+    channelHub.freeze('w9c');
+    const x9b = otherWindow('x9b');
+    const r9b = await x9b.take();
+    channelHub.freeze('w9c', false);
+    await sleep(20);
+    check('  robbed of the copy anyway, it keeps them behind the card, saying so, and closing asks first', r9b.ok && r9b.how === 'taken'
+        && guardShown() && /could not keep/.test(byId('primary-guard-note').textContent) && unloadAsks(),
+        JSON.stringify({ r9b, note: byId('primary-guard-note').textContent }));
+    x9b.close();
+    lockHub.closeTag('x9b');
+    channelHub.closeTag('x9b');
+    reloadsBefore = reloads;
+    fireWindow('focus');
+    await until(() => !guardShown(), 3000);
+    check('  the other window gone, it carries on with them in place, rather than start again without them', !guardShown()
+        && reloads === reloadsBefore && lockHub.holder() === 'w9c' && unloadAsks() && kvTree().owner.username === 'alex'
+        && has(kvTree(), 'Alex elsewhere'));
     await byId('pushBtn').fire('click');
     await settle();
+    const S9 = (await api('/api/login', { method: 'POST', body: { username: 'sam', password: 'sam-password-1' } })).json.token;
+    check('  and pushes them', Boolean(byTitle((await tree(S9)).roots, 'Sam unpushed')));
     await byId('auth-signout').fire('click');
     await settle();
     check('  sam\'s clean sign-out leaves them', kvTree() && kvTree().owner.username === 'alex' && draftTexts().includes('ALEX DRAFT ELSEWHERE'));
@@ -1360,6 +1503,23 @@ try {
     const fullToasts = toastsSince(mark10).filter(m => /out of storage/.test(m));
     check('a full disk is said, once', fullToasts.length === 1 && !has(kvTree(), 'Edit on a full disk'), JSON.stringify(toastsSince(mark10)));
     check('  the edits stay in this window, and closing it asks first', unloadAsks());
+    fireDocument('freeze');
+    await sleep(50);
+    check('  frozen meanwhile, it keeps the copy: what it holds is nowhere else', lockHub.holder() === currentTag);
+    fireDocument('resume');
+    channelHub.freeze(currentTag);
+    const x10 = otherWindow('x10');
+    const r10 = await x10.take();
+    channelHub.freeze(currentTag, false);
+    await sleep(20);
+    check('  robbed anyway (frozen, it could not answer), it keeps them behind the card, saying so', r10.ok && guardShown()
+        && /could not keep/.test(byId('primary-guard-note').textContent) && unloadAsks());
+    reloadsBefore = reloads;
+    await byId('primary-take').fire('click');
+    await until(() => !guardShown(), 4000);
+    check('  Use here brings the copy back to them, in place', !guardShown() && reloads === reloadsBefore
+        && lockHub.holder() === currentTag && x10.events.includes('yielded'), JSON.stringify(x10.events));
+    x10.close();
     await byId('settingsBtn').fire('click');
     await settle();
     await sleep(50);
@@ -1380,6 +1540,39 @@ try {
     await sleep(50);
     check('  in Settings too', byId('storage-error').classList.contains('hidden'));
     byId('settings-sheet').classList.add('hidden');
+
+    // Away with a write still to come that then fails (nothing had failed
+    // when it let go): back after another window claimed the copy, kept an
+    // edit of its own and closed, it carries on with what it holds rather
+    // than start again without it, and sets that window's edit aside.
+    idb.ctl.quotaFull = true;
+    cachesFull = true;
+    offline = /^PUT \/api\/tree$/;
+    answers.prompt.push('Held through going away');
+    await byId('newFolderBtn').fire('click');
+    offline = null;
+    fireDocument('freeze');
+    await sleep(100);
+    check('(it let go of the copy while away, and the write failed)', lockHub.holder() === null && !has(kvTree(), 'Held through going away'));
+    const others10 = JSON.parse(JSON.stringify(kvTree().roots));
+    others10.find(r => r.role === 'bookmarks').children.push({ id: 'aaaaaaaaaaaa0010', kind: 'folder', title: 'Kept by the other window', children: [] });
+    idb.poke('tpTree', DC.toKvRecord({ v: 1, savedAt: new Date().toISOString(), account: accountOf(alexLogin), roots: others10,
+        version: kvTree().baseVersion, dirty: true, editCount: 1, importIds: [], serverIds: kvTree().serverIds, pathIds: [] }, { seq: 1 }));
+    idb.poke('tpPrimary', { id: 'meanwhile10', at: Date.now() });
+    idb.ctl.quotaFull = false;
+    cachesFull = false;
+    reloadsBefore = reloads;
+    const stashesBefore = (idb.peek('tpTreeStashIndex') || []).length;
+    fireDocument('resume');
+    await until(() => lockHub.holder() === currentTag, 2000);
+    await pastCopyWrite();
+    const index10 = idb.peek('tpTreeStashIndex') || [];
+    const stash10 = index10.length > stashesBefore ? idb.peek(index10[index10.length - 1]) : null;
+    check('  back after another window claimed the copy: it carries on with what it holds, not starting again', reloads === reloadsBefore
+        && !guardShown() && has(kvTree(), 'Held through going away') && !has(kvTree(), 'Kept by the other window'),
+        JSON.stringify({ reloads: reloads - reloadsBefore, guard: guardShown() }));
+    check('  that window\'s kept edit is set aside, not written over', index10.length === stashesBefore + 1 && stash10
+        && stash10.dirty && has(stash10, 'Kept by the other window') && stash10.why === 'set-aside-by-another-window', JSON.stringify(index10));
 
     // IndexedDB failing, Cache Storage not: kept in tp-data, and the next
     // start takes it from there.
@@ -1428,8 +1621,195 @@ try {
     await byId('pushBtn').fire('click');
     await settle();
     t = await tree((await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token);
-    check('everything kept through it pushes', ['Edit on a full disk', 'Second edit on a full disk', 'After space came back', 'Only in tp-data', 'Without IndexedDB']
-        .every(title => Boolean(byTitle(t.roots, title))));
+    check('everything kept through it pushes', ['Edit on a full disk', 'Second edit on a full disk', 'After space came back',
+        'Held through going away', 'Only in tp-data', 'Without IndexedDB'].every(title => Boolean(byTitle(t.roots, title))));
+
+    // =================================================================================
+    console.log('\n11. Losing the copy part-way');
+    // A link shared while nobody was signed in: a start asks about it.
+    const unclaimed11 = Share.makeEntry({ fields: { title: '', text: '', url: 'https://example.com/shared-signed-out' }, account: null, source: 'share' });
+    await Share.cacheOutbox(cachesShim).put(unclaimed11);
+    pullsBefore = pulls();
+    const confirms11 = dialogs.confirm.length;
+    const reqMark11 = requests.length;
+    slow = { re: /^GET \/api\/auth\/me$/, ms: 600 };
+    await coldStart(`${BASE}/`, { tag: 'b11', wait: false });
+    await until(() => requests.slice(reqMark11).includes('GET /api/auth/me'), 4000);
+    const x11 = otherWindow('x11');
+    const took11 = await x11.take();
+    await sleep(700);
+    slow = null;
+    await settle();
+    check('a start that hands the copy over before it is done goes no further: no pull, no question, behind the card', took11.ok
+        && guardShown() && pulls() === pullsBefore && dialogs.confirm.length === confirms11 && lockHub.holder() === 'x11',
+        JSON.stringify({ took11, pulls: pulls() - pullsBefore, confirms: dialogs.confirm.slice(confirms11), guard: guardShown() }));
+    await Share.cacheOutbox(cachesShim).remove(unclaimed11.sid);
+
+    // A window that never edited, Use here, and while it claims the copy a
+    // third window asks for it: it stays behind the card.
+    await coldStart(`${BASE}/`, { tag: 'q11' });
+    await until(() => guardShown(), 3000);
+    check('(a window starts behind the card)', guardShown() && lockHub.holder() === 'x11');
+    idb.ctl.delay = 300;
+    const using11 = byId('primary-take').fire('click');
+    await until(() => lockHub.holder() === 'q11', 4000);
+    const x11c = otherWindow('x11c');
+    const took11c = await x11c.take();
+    await using11;
+    idb.ctl.delay = 0;
+    await settle();
+    check('Use here, asked for the copy again while it claims it: it stays behind the card, and starts nothing', took11c.ok
+        && guardShown() && lockHub.holder() === 'x11c' && pulls() === pullsBefore, JSON.stringify({ took11c, guard: guardShown(),
+            holder: lockHub.holder(), pulls: pulls() - pullsBefore }));
+    for (const g of [x11, x11c]) g.close();
+    lockHub.closeTag('x11c');
+
+    // A dialog holds the window up while another takes the copy (it could
+    // not answer): nothing it then does goes to the server.
+    await coldStart(`${BASE}/`, { tag: 'p11' });
+    check('(a window edits)', lockHub.holder() === 'p11' && !guardShown());
+    const putsBefore11 = requests.filter(r => r === 'PUT /api/tree').length;
+    answers.prompt.push(() => {
+        lockHub.forTag('thief').request('tp-primary', { steal: true }, () => new Promise(() => {}));
+        const claim = { id: 'thief', at: Date.now() };
+        idb.poke('tpPrimary', claim);
+        localStorageShim.setItem('tp_copy_claim', JSON.stringify(claim));
+        return 'Made while robbed';
+    });
+    await byId('newFolderBtn').fire('click');
+    await settle();
+    const A11 = (await api('/api/login', { method: 'POST', body: { username: 'alex', password: PASSWORD } })).json.token;
+    check('a window robbed of the copy while a dialog held it up pushes nothing when the dialog returns',
+        requests.filter(r => r === 'PUT /api/tree').length === putsBefore11 && !byTitle((await tree(A11)).roots, 'Made while robbed'));
+    check('  and stops, behind the card, keeping nothing of it', guardShown() && !has(kvTree(), 'Made while robbed'));
+    lockHub.closeTag('thief');
+
+    // An import link that arrives while the window is on its way back from
+    // being frozen (its hashchange comes before the lock has answered).
+    await coldStart(`${BASE}/`, { tag: 'r11' });
+    check('(a window edits)', lockHub.holder() === 'r11' && !guardShown());
+    fireDocument('freeze');
+    await sleep(50);
+    check('(frozen, it lets go of the copy)', lockHub.holder() === null);
+    reloadsBefore = reloads;
+    fireDocument('resume');
+    historyShim.pushState(null, '', `${BASE}/#note=` + encodeURIComponent('# Linked on the way back\n\nLINKED WHILE COMING BACK'));
+    fireWindow('hashchange');
+    await until(() => /LINKED WHILE COMING BACK/.test(lastEditorText() || ''), 3000);
+    await settle();
+    check('an import link arriving while the window comes back is opened once it is back', /LINKED WHILE COMING BACK/.test(lastEditorText() || '')
+        && !location.hash && reloads === reloadsBefore && lockHub.holder() === 'r11' && !guardShown(),
+        JSON.stringify({ hash: location.hash, reloads: reloads - reloadsBefore, holder: lockHub.holder(), pending: localStorageShim.getItem('tp_pending_import') }));
+    answers.confirm.push(true); // Discard unsaved changes?
+    await clickNv('cancel-edit');
+    fireDocument('freeze');
+    await sleep(50);
+    const x11d = otherWindow('x11d');
+    check('(frozen again, and another window takes the copy)', (await x11d.take()).ok);
+    reloadsBefore = reloads;
+    fireDocument('resume');
+    historyShim.pushState(null, '', `${BASE}/#note=` + encodeURIComponent('# Moves it\n\nLINK MOVES THE COPY BACK'));
+    fireWindow('hashchange');
+    await until(() => reloads > reloadsBefore, 5000);
+    check('  one arriving while another window took the copy meanwhile brings the copy back, the link with it', reloads === reloadsBefore + 1
+        && x11d.events.includes('yielded') && lockHub.holder() === 'r11' && /LINK MOVES THE COPY BACK/.test(decodeURIComponent(location.hash)),
+        JSON.stringify({ reloads: reloads - reloadsBefore, ev: x11d.events, hash: location.hash }));
+    x11d.close();
+    lockHub.closeTag('x11d');
+
+    // =================================================================================
+    console.log('\n12. A clear that did not reach both places');
+    await coldStart(`${BASE}/`, { tag: 'w12' });
+    offline = /^PUT \/api\/tree$/;
+    await newFolder('Stale in IndexedDB');
+    offline = null;
+    await pastCopyWrite();
+    check('(an unpushed edit kept in IndexedDB)', kvTree().dirty && has(kvTree(), 'Stale in IndexedDB'));
+    idb.ctl.quotaFull = true;
+    await byId('pushBtn').fire('click');
+    await settle();
+    check('(pushed while IndexedDB fails: tp-data has the clean copy, IndexedDB still the dirty one)', !(await tpData()).dirty && kvTree().dirty);
+    await byId('auth-signout').fire('click');
+    await settle();
+    idb.ctl.quotaFull = false;
+    check('(a clean sign-out: tp-data cleared, IndexedDB refused to)', (await tpData()) === null && kvTree() && kvTree().dirty
+        && Boolean(localStorageShim.getItem('tp_copy_cleared_at')));
+    await coldStart(`${BASE}/`, { tag: 'w12b' });
+    check('the next start does not bring back what the clear could not remove from IndexedDB', !/Restored unpushed changes/.test(statusText())
+        && !guardShown(), statusText());
+    await signIn('sam', 'sam-password-1');
+    check('  nor does it keep anyone else from signing in', Boolean(localStorageShim.getItem('tp_pwa_token'))
+        && !/for alex/.test(byId('auth-error').textContent), byId('auth-error').textContent);
+    await pastCopyWrite();
+    check('  and the first write reaching both places replaces it, the mark gone', kvTree() && kvTree().owner.username === 'sam'
+        && !kvTree().dirty && localStorageShim.getItem('tp_copy_cleared_at') === null);
+
+    // The other way round: IndexedDB clears, Cache Storage refuses — a
+    // deliberate discard of sam's unpushed edits.
+    offline = /^PUT \/api\/tree$/;
+    await newFolder('Sam discards this');
+    offline = null;
+    answers.confirm.push(true); // Sign out anyway?
+    await byId('auth-signout').fire('click');
+    await settle();
+    check('(sam\'s unpushed edit kept over a sign-out)', kvTree().dirty && kvTree().owner.username === 'sam' && (await tpData()).dirty);
+    await signIn('alex', PASSWORD);
+    check('(alex cannot sign in over it)', /for sam/.test(byId('auth-error').textContent) && !byId('auth-discard').classList.contains('hidden'));
+    cachesFailDelete = true;
+    answers.prompt.push('sam');
+    await byId('auth-discard').fire('click');
+    await settle();
+    cachesFailDelete = false;
+    check('(discarded: IndexedDB cleared, tp-data refused to)', kvTree() === undefined && (await tpData()) && (await tpData()).dirty
+        && Boolean(localStorageShim.getItem('tp_copy_cleared_at')));
+    await coldStart(`${BASE}/`, { tag: 'w12c' });
+    check('the next start does not bring back the copy discarded on purpose, from tp-data either', !/Restored unpushed changes/.test(statusText())
+        && kvTree() === undefined, statusText());
+    await signIn('alex', PASSWORD);
+    check('  and alex signs in', Boolean(localStorageShim.getItem('tp_pwa_token')) && !/for sam/.test(byId('auth-error').textContent),
+        byId('auth-error').textContent);
+
+    // =================================================================================
+    console.log('\n13. Without Web Locks (a plain-http address)');
+    withLocks = false;
+    globalThis.isSecureContext = false;
+    await coldStartChannel(`${BASE}/`, { tag: 'h13' });
+    check('without Web Locks the app edits, the channel standing in', !guardShown() && Boolean(kvTree()) && !kvTree().dirty
+        && (idb.peek('tpPrimary') || {}).id !== undefined);
+    // Another window took the copy while this one could not answer, claimed
+    // it and closed; no freeze event came: back, nobody answers, but the claim
+    // is not this window's — it starts again rather than lose its next edit.
+    idb.poke('tpPrimary', { id: 'other13', at: Date.now() });
+    reloadsBefore = reloads;
+    visibility = 'visible';
+    fireDocument('visibilitychange');
+    await until(() => reloads > reloadsBefore, 3000);
+    check('back after another window claimed the copy and closed: it starts again from what is kept', reloads === reloadsBefore + 1);
+    await coldStartChannel(`${BASE}/`, { tag: 'h13b' });
+    fireWindow('pagehide', { persisted: true });
+    await pastCopyWrite();
+    const o13 = otherWindow('o13', { channel: true });
+    check('into the back-forward cache, it lets go of the copy: a window starting meanwhile edits', (await o13.start()) === 'primary');
+    idb.poke('tpPrimary', { id: 'o13', at: Date.now() });
+    o13.close();
+    reloadsBefore = reloads;
+    fireWindow('pageshow', { persisted: true });
+    await until(() => reloads > reloadsBefore, 3000);
+    check('  back, that one having claimed the copy and closed: it starts again from what is kept', reloads === reloadsBefore + 1);
+    await coldStartChannel(`${BASE}/`, { tag: 'h13c' });
+    fireWindow('pagehide', { persisted: true });
+    await pastCopyWrite();
+    reloadsBefore = reloads;
+    fireWindow('pageshow', { persisted: true });
+    await sleep(700);
+    offline = /^PUT \/api\/tree$/;
+    await newFolder('Edited on in place without Web Locks');
+    offline = null;
+    await pastCopyWrite();
+    check('  back with nobody having claimed it: it edits on in place', reloads === reloadsBefore && !guardShown()
+        && has(kvTree(), 'Edited on in place without Web Locks'));
+    withLocks = true;
+    globalThis.isSecureContext = true;
 } catch (e) {
     failures++;
     console.error('FAIL  run stopped:', e, '\n' + serverLog.slice(-2000));
