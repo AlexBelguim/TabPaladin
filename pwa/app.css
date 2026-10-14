@@ -2104,3 +2104,38 @@ body.share-open .sheet:not(.share-sheet) { z-index: 35; }
   padding: 8px;
   resize: vertical;
 }
+
+/* ---------- one window edits the copy ---------- */
+/* Another tab or window of the app edits this device's copy: this one waits
+   behind a card with 'Use here' (app.js showGuard). Over every sheet, under
+   the toasts. */
+.primary-guard {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: var(--bg);
+}
+.primary-guard-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 380px;
+  padding: 24px;
+  text-align: center;
+  white-space: normal;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+.primary-guard-card strong { font-size: 1.05rem; }
+.primary-guard-card .hint { margin: 0; }
+.primary-guard-card .primary { width: 100%; justify-content: center; padding: 12px; }
+
+/* ---------- settings: storage ---------- */
+#storage-block .hint { display: block; margin: 4px 0; }

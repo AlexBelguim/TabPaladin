@@ -690,6 +690,7 @@ node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, le
 node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block, suggested changes on Home
 node tools/test_llm_api.mjs  # the LLM share link: page, pages, search, bookmark proposals, staleness, approval, tenancy (starts a server: --port)
 node tools/test_mcp.mjs      # the MCP endpoint: tokens, protocol, tools, auth failures, isolation, limits, the stdio bridge (starts a server: --port)
+node tools/test_pwa_durable.mjs   # the PWA's copy kept in IndexedDB: seeding from tp-data, reloads, live drafts, one window editing, accounts, a full disk, persist() (starts a server: --port)
 ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off MAX_PROPOSALS_PER_USER=3 DATA_DIR=/tmp/tp node server/index.js &
 node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server
 ```
@@ -723,9 +724,20 @@ cannot read `localStorage`, so the app window holding the session mirrors
 the server URL, session token and account into a `tp-config` Cache Storage
 entry, cleared on sign-out.
 
-The share reloads the app's window, so the app keeps its working copy and a
-half-written note in Cache Storage (`tp-data`) whenever it goes to the
-background, and brings them back — without pulling over unpushed edits.
+The share reloads the app's window, so the app keeps its working copy on the
+device — in IndexedDB (database `tabpaladin`, store `kv`, key `tpTree`), a
+moment after every change and at once when it goes to the background — and
+the note being written as it is typed (`tpLiveDraft`), and brings them back
+without pulling over unpushed edits. For one more release the same copy is
+also written to Cache Storage (`tp-data`), where the previous release looks
+for it; the first start of this one fills IndexedDB from there. Settings ›
+Storage shows where the copy is kept and whether the browser may clear it to
+make room, and asks it not to (**Keep my data on this phone**).
+
+One window of the app edits the copy at a time (the Web Lock `tp-primary`):
+another tab or window says *TabPaladin is open in another tab* and offers
+**Use here**, which has the first one write down what it holds and let go. A
+window a share or an import link opened takes over at once.
 
 When the outbox cannot be written, the worker falls back to the old redirect
 `/?share=1&url=…&title=…&text=…` and the app keeps the share instead. `POST
