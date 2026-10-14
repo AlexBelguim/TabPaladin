@@ -163,10 +163,13 @@ function reindex() {
     state.roots.forEach((r, i) => walk(r, null, i));
 }
 
+// Listeners hear (kind, info). `info.elsewhere` says another page did it:
+// its write was taken in (adoptStored) — for a 'switch', another page
+// brought another copy in, as against this page doing so itself (loadCopy).
 const listeners = new Set();
-function emit(kind) {
+function emit(kind, info = {}) {
     for (const fn of listeners) {
-        try { fn(kind); } catch (e) { console.warn('[TabPaladin] tree listener failed', e); }
+        try { fn(kind, info); } catch (e) { console.warn('[TabPaladin] tree listener failed', e); }
     }
 }
 
@@ -336,11 +339,21 @@ async function reconcile() {
         const data = await api.storage.local.get(STORE_KEY);
         stored = (data && data[STORE_KEY]) || null;
     } catch (e) { /* storage unreadable: memory is all there is */ }
-    if (stored && (stored.rev || null) !== state.rev) {
+    if (stored && (stored.rev || null) !== state.rev && !olderThanHeld(stored)) {
         const orphan = adoptStored(stored);
         if (orphan) await saveOrphan(orphan);
     }
     if (pendingOps.length) await writeCopy();
+}
+
+// A version older than the one this page holds — every write is one more in
+// line (seq) than the version it was written over: a storage event that
+// arrived after this page read a later one, or a place that missed later
+// writes (the web app's IndexedDB, full, while they went to Cache Storage).
+// Never taken in over what this page holds; this page's next write is later
+// still. A version from before seq was kept counts as none.
+function olderThanHeld(stored) {
+    return Number(stored.seq) > 0 && Number(stored.seq) < state.seq;
 }
 
 // Take in a version of the copy that another page wrote. This page's
@@ -368,7 +381,7 @@ function adoptStored(stored) {
         }
         if (kept.length) schedulePersist();
     }
-    emit(switched ? 'switch' : 'external');
+    emit(switched ? 'switch' : 'external', { elsewhere: true });
     return orphan;
 }
 
@@ -445,7 +458,7 @@ if (api.storage && api.storage.onChanged) {
         if (!next || (next.rev || null) === state.rev) return;
         // Older than what this page already read from storage under the lock:
         // the event arrived after that read.
-        if (Number(next.seq) > 0 && Number(next.seq) < state.seq) return;
+        if (olderThanHeld(next)) return;
         const orphan = adoptStored(next);
         if (orphan) {
             withCopyLock(() => saveOrphan(orphan))
@@ -1669,7 +1682,9 @@ export const TreeStore = {
                     baseVersion: state.baseVersion,
                     ...(state.owner ? { baseUserId: state.owner.userId } : {}),
                     ...(state.owner && state.owner.serverId ? { baseServerId: state.owner.serverId } : {}),
-                    deviceId: 'extension',
+                    // Who pushed, for the server's history and the note on a
+                    // share a forced push reopens: the client's own word.
+                    deviceId: config.deviceId || 'extension',
                     force
                 });
                 return { copy: now, payload };

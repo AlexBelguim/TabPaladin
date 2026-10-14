@@ -59,6 +59,11 @@
 //  14. A page that is hidden, or going away (pagehide), writes its unwritten
 //      edits at once instead of on the debounce: an extension update reloads
 //      every page, and closing a tab ends it, before the timer fires.
+//  15. A push names the device that made it: the extension unless the client
+//      says otherwise (the web app: 'pwa'); listeners are told whether a
+//      change was another page's doing (info.elsewhere) — a switch this page
+//      makes itself never is; and a locked read that finds a version older
+//      than the one a page holds (seq) never takes it in over it.
 //
 // The whole suite runs twice: on the extension's storage (a chrome fake), and
 // on the web app's platform (pwa/platform.js over an in-memory store, with
@@ -615,6 +620,11 @@ console.log('\n9. A working copy belongs to one account');
     await Tree.create({ parentId: 'f1', title: 'alex edit', url: 'https://alex-edit.example' });
     await TreeStore.sync.push(cfg);
     check('a push names the account it belongs to', lastPutBody && lastPutBody.baseUserId === 1);
+    check('  and, unless told otherwise, the extension as the device that pushed', lastPutBody.deviceId === 'extension', lastPutBody.deviceId);
+    await Tree.create({ parentId: 'f1', title: 'pushed by the phone', url: 'https://phone-push.example' });
+    await TreeStore.sync.push({ ...cfg, deviceId: 'pwa' });
+    check('  a client names itself (the web app: \'pwa\'), for the server\'s history and a forced push\'s note',
+        lastPutBody.deviceId === 'pwa', lastPutBody.deviceId);
 
     // Alex has unpushed edits, focused folders, folder cards left open and
     // closed, and a tab-close removal the background queued while no page was
@@ -727,13 +737,23 @@ console.log('\n9. A working copy belongs to one account');
     // Another page editing or pulling is 'external' here; another page
     // bringing another copy in is the same 'switch' it heard itself.
     const heard = [];
-    const stopHearing = TreeStore.onChanged((kind) => heard.push(kind));
+    const said = (kind, info) => kind + (info && info.elsewhere ? ':elsewhere' : '');
+    const stopHearing = TreeStore.onChanged((kind, info) => heard.push(said(kind, info)));
     const here = TreeStore.status().copyId;
     await chrome.storage.local.set({ tpTree: { baseVersion: 6, roots: [], dirty: false, owner: { url: URL_A, userId: 2, username: 'sam' }, copyId: here, rev: 'other-page-edit' } });
     await chrome.storage.local.set({ tpTree: { baseVersion: 3, roots: [], dirty: false, owner: { url: URL_A, userId: 4, username: 'lee' }, copyId: 'other-copy', rev: 'other-page-switch' } });
     stopHearing();
-    check('another page\'s edit is \'external\' here, its account switch \'switch\'',
-        JSON.stringify(heard) === '["external","switch"]' && TreeStore.status().copyId === 'other-copy', JSON.stringify(heard));
+    check('another page\'s edit is \'external\' here, its account switch \'switch\' — each said to be another page\'s doing',
+        JSON.stringify(heard) === '["external:elsewhere","switch:elsewhere"]' && TreeStore.status().copyId === 'other-copy', JSON.stringify(heard));
+    // A switch this page makes itself is a 'switch' too, but its own: a page
+    // tells the two apart by that alone, even while a pull or push of its own
+    // is on its way when another page's comes in.
+    const ownHeard = [];
+    const stopOwn = TreeStore.onChanged((kind, info) => ownHeard.push(said(kind, info)));
+    await TreeStore.switchAccount({ url: URL_A, userId: 5, username: 'pat', tenancyOwner: false, previousUsername: 'lee' });
+    stopOwn();
+    check('  while a switch this page makes itself is never said to be another page\'s', ownHeard.includes('switch')
+        && !ownHeard.some(k => k.endsWith(':elsewhere')) && TreeStore.status().owner.userId === 5, JSON.stringify(ownHeard));
 
     // Another context switching accounts: this page adopts the stamp too.
     await chrome.storage.local.set({ tpTree: { baseVersion: 7, roots: [], dirty: false, owner: { url: URL_A, userId: 9, username: 'kim' }, rev: 'other-page' } });
@@ -1549,6 +1569,28 @@ console.log('\n18. A page that is hidden or going away writes its edits at once'
     await new Promise(r => setTimeout(r, 30));
     check('with nothing unwritten, hiding writes nothing', storageData.get('tpTree').rev === rev);
     await TreeStore.flush();
+}
+
+console.log('\n18b. A version older than the one a page holds is never taken in over it');
+{
+    const stored = () => storageData.get('tpTree');
+    const has = (v, text) => JSON.stringify(v || null).includes(text);
+    const made = await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'HELD AND NEWER' });
+    await TreeStore.flush();
+    const held = await TreeStore.currentCopy();
+    // A place that missed this page's later writes hands an older version back
+    // (the web app's IndexedDB, full, while they went to Cache Storage), and
+    // nothing says so.
+    storageData.set('tpTree', { ...stored(), roots: stored().roots.filter(r => r.id !== made.id), seq: held.seq - 1, rev: 'an-older-version' });
+    await TreeStore.createNode({ parentId: null, kind: 'folder', title: 'AFTER THE OLDER READ' });
+    await TreeStore.flush();
+    check('a locked read that finds an older version (its seq) keeps what this page holds, and writes on from it, later still',
+        has(stored().roots, 'HELD AND NEWER') && has(stored().roots, 'AFTER THE OLDER READ') && stored().seq > held.seq
+        && Boolean(await TreeStore.getNode(made.id)), JSON.stringify({ seq: stored().seq, held: held.seq }));
+    // One from before seq was kept is taken in, as ever.
+    storageData.set('tpTree', { ...stored(), roots: [...stored().roots, { id: 'no-seq-folder', kind: 'folder', title: 'FROM BEFORE SEQ', children: [] }], seq: undefined, rev: 'no-seq' });
+    await TreeStore.flush();
+    check('  while one from before seq was kept is taken in as before', Boolean(await TreeStore.getNode('no-seq-folder')));
 }
 
 if (WEB) {
