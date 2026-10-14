@@ -158,6 +158,67 @@ function unopenable(e) {
     return Boolean(e) && ['NotSupportedError', 'SecurityError', 'InvalidStateError', 'UnknownError', 'NotFoundError'].includes(e.name);
 }
 
+// The working copy, and its place in line: every write of it is one more
+// than the version it was written over (TreeStore's seq).
+const TREE_KEY = 'tpTree';
+const seqOf = (v) => (v && typeof v === 'object' ? Number(v.seq) || 0 : -1);
+
+// What an IndexedDB store takes in from Cache Storage when it opens: what
+// was kept there while IndexedDB could not be opened, or (the working copy)
+// could not be written. The later working copy wins; a key IndexedDB lacks
+// comes over; the live drafts and the list of set-aside copies are merged;
+// anything else IndexedDB holds stays as it is.
+async function foldInFromCache(b, cacheStorage) {
+    if (!cacheStorage || typeof cacheStorage.open !== 'function') return { tree: false };
+    let c;
+    let keys;
+    try {
+        c = await cacheStorage.open(DATA_CACHE);
+        if (typeof c.keys !== 'function') return { tree: false };
+        keys = (await c.keys())
+            .map(k => (typeof k === 'string' ? k : new URL(k.url).pathname))
+            .filter(k => k.startsWith(CACHE_PREFIX))
+            .map(k => decodeURIComponent(k.slice(CACHE_PREFIX.length)));
+    } catch (e) {
+        return { tree: false };
+    }
+    if (!keys.length) return { tree: false };
+    const cached = await cacheBackend(cacheStorage).getMany(keys);
+    const have = await b.getMany(keys);
+    const entries = {};
+    for (const k of keys) {
+        const v = cached[k];
+        if (v === undefined || k === CLAIM_KEY) continue;
+        const cur = have[k];
+        if (k === TREE_KEY) {
+            if (cur === undefined || seqOf(v) > seqOf(cur)) entries[k] = v;
+        } else if (k === 'tpLiveDraft' && cur && typeof cur === 'object' && v && typeof v === 'object') {
+            entries[k] = { ...v, ...cur };
+        } else if (k === 'tpTreeStashIndex' && Array.isArray(cur) && Array.isArray(v)) {
+            entries[k] = [...cur, ...v.filter(x => !cur.includes(x))];
+        } else if (cur === undefined) {
+            entries[k] = v;
+        }
+    }
+    try {
+        if (Object.keys(entries).length) await b.write(entries);
+    } catch (e) {
+        // Not taken in: it stays where it is, and the copy is read from it
+        // whenever it is the later one (see get).
+        return { tree: TREE_KEY in cached };
+    }
+    for (const k of keys) {
+        try { await c.delete(CACHE_PREFIX + encodeURIComponent(k)); } catch (e) { /* next time */ }
+    }
+    return { tree: false };
+}
+
+function isQuota(e) {
+    if (!e) return false;
+    const name = String(e.name || '');
+    return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED' || /quota/i.test(String(e.message || ''));
+}
+
 // --- The platform ---------------------------------------------------------------
 //
 // env: { indexedDB, caches, BroadcastChannel, backend (a backend to use as
@@ -178,6 +239,10 @@ export function createPlatform(env = {}) {
     // Which backend: the one given, else IndexedDB, else Cache Storage, else
     // memory. Chosen at the first use and kept for the page's life.
     let chosen = null;
+    // A working copy kept in Cache Storage because IndexedDB refused it (a
+    // full disk): read whenever it is the later one, until IndexedDB takes a
+    // later one again.
+    let treeFallback = false;
     function backend() {
         if (!chosen) {
             chosen = (async () => {
@@ -190,6 +255,7 @@ export function createPlatform(env = {}) {
                     const b = idbBackend(factory);
                     try {
                         await b.open();
+                        treeFallback = (await foldInFromCache(b, env.caches)).tree;
                         return b;
                     } catch (e) {
                         if (!unopenable(e)) throw e;
@@ -225,6 +291,8 @@ export function createPlatform(env = {}) {
                 }
                 fire(changes);
             };
+            // (Node: a channel does not keep a test's process alive.)
+            if (typeof channel.unref === 'function') channel.unref();
         } catch (e) {
             channel = null;
         }
@@ -276,12 +344,23 @@ export function createPlatform(env = {}) {
         return { ...value, backend: rest };
     }
 
+    async function getMany(b, list) {
+        const got = await b.getMany(list);
+        if (treeFallback && list.includes(TREE_KEY) && b.kind === 'indexeddb') {
+            try {
+                const kept = (await cacheBackend(env.caches).getMany([TREE_KEY]))[TREE_KEY];
+                if (kept !== undefined && seqOf(kept) > seqOf(got[TREE_KEY])) got[TREE_KEY] = kept;
+            } catch (e) { /* IndexedDB's, then */ }
+        }
+        return got;
+    }
+
     async function get(keys) {
         if (closed) throw closedError();
         const b = await backend();
         const list = keysOf(keys);
         if (list === null) throw new Error('Listing every key is not offered here.');
-        const got = await b.getMany(list);
+        const got = await getMany(b, list);
         const out = {};
         for (const k of list) {
             if (got[k] !== undefined) {
@@ -296,16 +375,41 @@ export function createPlatform(env = {}) {
         return out;
     }
 
+    // The working copy, refused by a full IndexedDB, kept in Cache Storage
+    // instead where that still has room. True once it is kept there.
+    async function keepTreeAside(b, entries) {
+        const keys = Object.keys(entries);
+        if (b.kind !== 'indexeddb' || keys.length !== 1 || keys[0] !== TREE_KEY || !entries[TREE_KEY]) return false;
+        if (!env.caches || typeof env.caches.open !== 'function') return false;
+        try {
+            await cacheBackend(env.caches).write(entries);
+            treeFallback = true;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
     async function write(entries) {
         if (closed) throw closedError();
         const b = await backend();
         const f = fence();
         let res;
+        let aside = false;
         try {
             res = await b.write(entries, { fence: f });
         } catch (e) {
-            for (const fn of writeHooks) { try { fn({ entries, error: e, backend: b.kind }); } catch (x) { /* hook */ } }
-            throw e;
+            aside = isQuota(e) && await keepTreeAside(b, entries);
+            if (!aside) {
+                for (const fn of writeHooks) { try { fn({ entries, error: e, backend: b.kind }); } catch (x) { /* hook */ } }
+                throw e;
+            }
+            res = { fenced: false, holder: null };
+        }
+        if (!aside && treeFallback && b.kind === 'indexeddb' && entries[TREE_KEY]) {
+            // IndexedDB has the later copy again.
+            treeFallback = false;
+            try { await (await env.caches.open(DATA_CACHE)).delete(CACHE_PREFIX + encodeURIComponent(TREE_KEY)); } catch (e) { treeFallback = true; }
         }
         if (res && res.fenced) {
             for (const fn of fencedHooks) { try { fn(res.holder); } catch (x) { /* hook */ } }
@@ -318,7 +422,7 @@ export function createPlatform(env = {}) {
             if (v === null || v === undefined) known.delete(k);
             else known.set(k, v);
         }
-        for (const fn of writeHooks) { try { fn({ entries, error: null, backend: b.kind }); } catch (x) { /* hook */ } }
+        for (const fn of writeHooks) { try { fn({ entries, error: null, backend: b.kind, aside }); } catch (x) { /* hook */ } }
         fire(changes);
         if (channel) {
             const msg = {};
@@ -388,7 +492,8 @@ export function createPlatform(env = {}) {
         // Read without the settings overlay or a listener hearing of it.
         async getRaw(keys) {
             if (closed) throw closedError();
-            return (await backend()).getMany(keysOf(keys) || []);
+            const b = await backend();
+            return getMany(b, keysOf(keys) || []);
         },
         // Write as is: no decorator, no fence. For moving what an earlier
         // release kept into place before anything else reads it.
