@@ -1,6 +1,6 @@
 # TabPaladin Privacy Policy
 
-_Last updated: 13 October 2026_
+_Last updated: 14 October 2026_
 
 TabPaladin is a browser extension and a companion web app for saving tab sessions
 ("workflows"), organising bookmarks, and keeping notes. It is self-hosted software:
@@ -57,12 +57,29 @@ TabPaladin only contacts these when you use the matching feature:
 - No data is sent to the developer.
 - Your browsing history is never read.
 
-## Sharing notes with an AI assistant
+## Sharing your notes and bookmarks with an AI chat
 
-The sync server can create a temporary link that lets an AI assistant read your notes and
-suggest changes. The link expires after one hour, and suggested changes are only applied
-once you approve them. Anyone who has the link can read your notes until it expires, so
-share it only with the assistant you intend.
+TabPaladin has no AI of its own. Only if you choose to, your sync server lets an AI chat you
+use read your notes and bookmarks and suggest changes, in two ways:
+
+- **A temporary link.** Settings or Notes make a link that works for one hour. Anyone who
+  has it can read all your notes and your bookmarks (folder names, titles and addresses)
+  until it expires, so give it only to the chat you intend. Changing your password ends
+  every link at once.
+- **MCP tokens**, for Claude Code, Claude Desktop and other MCP clients. You make one in
+  Settings; a chat holding it can read your notes and bookmarks and suggest changes for as
+  long as the token exists. The server stores only a fingerprint (hash) of each token, with
+  its name and when it was made and last used. Revoke a token in Settings at any time;
+  changing your password revokes all of them, and ends your temporary links too. A token
+  cannot reach anything else on your server.
+
+What the chat reads goes to the company that runs that chat (for example Anthropic or
+OpenAI), under its own privacy terms, not TabPaladin's. The chat fetches it from your
+server; TabPaladin sends nothing to them by itself.
+
+A chat's suggestions are kept on your server, with the reason it gave and where it came
+from, until you approve or reject them. Nothing changes before you approve; approving
+keeps the previous version of your tree in the server's history.
 
 ## Deleting your data
 

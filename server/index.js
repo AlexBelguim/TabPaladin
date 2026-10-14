@@ -24,6 +24,9 @@ import { loadOrCreateIdentity, attachIdentity, IDENTITY_APP, IDENTITY_FILE } fro
 import { attachWorkflowRoutes } from './workflows.js';
 import { attachUserAdmin } from './admin.js';
 import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
+import { migrateProposals, makeProposalsStore, attachProposalRoutes } from './proposals.js';
+import { attachLlmShareRoutes } from './llmShare.js';
+import { migrateMcpTokens, attachMcp } from './mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -78,8 +81,9 @@ db.pragma('journal_mode = WAL');
 //   3. the schema: CREATE IF NOT EXISTS and additive ALTERs only;
 //   4. the first admin, so a token-only database has an owner to migrate to;
 //   5. the ownership migration, one transaction, refused rather than guessed,
-//      then the share inbox's columns and the tree's ops floors (additive,
-//      idempotent, after the ownership migration has named every row's owner);
+//      then the share inbox's columns and the tree's ops floors, then the AI
+//      access tables (proposal columns, MCP tokens) — all additive,
+//      idempotent, after the ownership migration has named every row's owner;
 //   6. the schema version and, the first time, a post-migration copy;
 //   7. ownership warnings, then the owner's own boot steps;
 //   8. routes and the import scheduler, then listen.
@@ -213,6 +217,18 @@ try {
     console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
     process.exit(1);
 }
+// AI chats (schema 5): the proposals' new columns and the MCP tokens. The
+// same rule: additive, one transaction each, refused rather than half-done.
+try {
+    const props = migrateProposals(db);
+    if (props.added.length) console.log(`[TabPaladin] AI proposals: added ${props.added.join(', ')} to note_proposals.`);
+    migrateMcpTokens(db);
+} catch (e) {
+    const marker = writeRefusal(DATA_DIR, e, schemaBackup);
+    console.error(`[TabPaladin] AI access migration refused, nothing changed, backup at ${schemaBackup || '(none)'}: ${e.message}`);
+    console.error(`[TabPaladin] Fix the cause, delete ${marker}, and restart.`);
+    process.exit(1);
+}
 setSchemaVersion(db);
 if (tenancy.migrated) {
     // A frozen copy of the database right after the migration, before any
@@ -299,10 +315,12 @@ app.use(securityHeaders());
 // extension calls cross-origin from chrome-extension:// / moz-extension://
 // with a bearer token, so those are always allowed; any other origin (a
 // separately hosted client) must be listed in CORS_ORIGIN. No cookies are
-// used, so credentials stay off.
+// used, so credentials stay off. /mcp is not covered here: it answers its own
+// preflights, for the origins MCP_ALLOWED_ORIGINS lists (mcp.js).
 const CORS_ORIGINS = new Set((process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean));
 const EXTENSION_ORIGIN = /^(chrome-extension|moz-extension|safari-web-extension):\/\/[\w.-]+$/;
 app.use(cors((req, cb) => {
+    if (req.path === '/mcp') return cb(null, { origin: false });
     const origin = req.headers.origin;
     let allowed = !origin || EXTENSION_ORIGIN.test(origin) || CORS_ORIGINS.has(origin);
     if (!allowed) {
@@ -317,10 +335,12 @@ app.use(cors((req, cb) => {
 
 // Small bodies everywhere except a tree push, which carries the whole tree,
 // and a saved workflow, which may carry 500 long URLs (its route parses it).
+// The MCP endpoint parses its own, after checking the token (mcp.js).
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonTree = express.json({ limit: process.env.TREE_BODY_LIMIT || '50mb' });
 const ownBodyParser = (req) => (req.method === 'PUT' && req.path === '/api/tree')
-    || (req.method === 'POST' && req.path === '/api/workflows');
+    || (req.method === 'POST' && req.path === '/api/workflows')
+    || req.path === '/mcp';
 app.use((req, res, next) => (ownBodyParser(req) ? next() : jsonSmall(req, res, next)));
 
 // Defensive: ensure intermediaries (Cloudflare, etc.) don't cache sync responses.
@@ -479,6 +499,10 @@ app.post('/api/auth/password', requireAuth, async (req, res) => {
             if (!now || now.password_hash !== row.password_hash || !stillSignedIn(req)) return null;
             db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, row.id);
             db.prepare('DELETE FROM sessions WHERE username = ?').run(row.username);
+            // AI chats' tokens and share links too: a new password is how
+            // you lock everyone out.
+            db.prepare('DELETE FROM mcp_tokens WHERE user_id = ?').run(row.id);
+            db.prepare('DELETE FROM share_tokens WHERE user_id = ?').run(row.id);
             return issueSession(row.username);
         })();
         if (!session) return res.status(401).json({ error: 'Your password or session changed meanwhile. Sign in again.' });
@@ -521,6 +545,7 @@ const { store: importsStore } = attachImports(app, {
 // After the importers, because X and Instagram shares go to their archive.
 const shares = makeSharesStore(db, { items, importsStore, maxPending: MAX_INBOX_PER_USER });
 attachShareRoutes(app, { store: shares, items, requireAuth, serverId: SERVER_ID });
+const proposals = makeProposalsStore(db, { items, maxPending: MAX_PROPOSALS_PER_USER });
 
 // --- Saved workflows ---
 // One workflow appended under the account's workflows root, without the rest
@@ -639,7 +664,7 @@ app.post('/api/push', requireAuth, goneHandler);
 app.get('/api/pull', requireAuth, goneHandler);
 
 app.get('/api/history', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC LIMIT 100')
+    const rows = db.prepare('SELECT id, timestamp, device_id FROM snapshots WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT 100')
         .all(req.user.id);
     res.json({ ok: true, snapshots: rows });
 });
@@ -656,168 +681,14 @@ app.get('/api/history/:id', requireAuth, (req, res) => {
 
 const SHARE_TTL_MS = Math.max(1, Number(process.env.SHARE_TTL_MINUTES || 60)) * 60 * 1000;
 
-// The token and the account it shares. A token whose account was deleted is
-// as dead as an expired one.
-function getValidShareToken(req, res) {
-    const row = db.prepare(`
-        SELECT t.token, t.expires_at, t.user_id FROM share_tokens t JOIN users u ON u.id = t.user_id
-        WHERE t.token = ?`).get(req.params.token);
-    if (!row || Date.parse(row.expires_at) <= Date.now()) {
-        res.status(410).json({ error: 'Share link expired or invalid.' });
-        return null;
-    }
-    return row;
-}
-
-// --- LLM share links ---
-// POST /api/share creates a 1-hour link the user can paste into any LLM chat.
-// GET /llm/:token (no auth) serves the notes + instructions as plain text.
-// POST /llm/:token/propose (no auth, also POST /llm/:token) queues a note for human approval.
-app.post('/api/share', requireAuth, (req, res) => {
-    // Every account's expired tokens: they are dead whoever they belonged to.
-    db.prepare('DELETE FROM share_tokens WHERE expires_at <= ?').run(new Date().toISOString());
-    const token = crypto.randomUUID();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + SHARE_TTL_MS);
-    db.prepare('INSERT INTO share_tokens (token, created_at, expires_at, user_id) VALUES (?, ?, ?, ?)')
-        .run(token, now.toISOString(), expiresAt.toISOString(), req.user.id);
-    res.json({ ok: true, url: `${req.protocol}://${req.get('host')}/llm/${token}`, expiresAt: expiresAt.toISOString() });
-});
-
-app.get('/llm/:token', (req, res) => {
-    const share = getValidShareToken(req, res);
-    if (!share) return;
-    // Straight out of the items table — notes used to be decoded out of a
-    // pushed browser-tree blob here. Only the notes of the account that made
-    // the link.
-    const notes = items.forUser(share.user_id).listNotes();
-    // Group notebooks together, loose notes first, keeping each group's order.
-    // A nested notebook is headed by its path ('Work / Meetings'), so two
-    // 'Meetings' under different parents no longer merge into one group; a
-    // top-level one is headed exactly as before.
-    const groupOrder = [];
-    const groups = new Map();
-    for (const n of notes) {
-        const key = (n.notebookPath && n.notebookPath.length ? n.notebookPath.join(' / ') : n.notebook) || '';
-        if (!groups.has(key)) { groups.set(key, []); groupOrder.push(key); }
-        groups.get(key).push(n);
-    }
-    groupOrder.sort((a, b) => (a === '') === (b === '') ? 0 : (a === '' ? -1 : 1));
-
-    const origin = `${req.protocol}://${req.get('host')}`;
-    const proposeUrl = `${origin}/llm/${req.params.token}/propose`;
-
-    // Plain text, not text/markdown: some LLM fetch tools refuse text/markdown responses.
-    let md = `# TabPaladin Notes — shared context for an LLM assistant\n\n`;
-    md += `!!! TO CREATE OR EDIT A NOTE, SEND THIS REQUEST (the only way to write automatically) !!!\n\n`;
-    md += `POST ${proposeUrl}\n`;
-    md += `Content-Type: application/json\n\n`;
-    md += `{"title": "Note Title", "content": "# Note Title\\n\\n...full note body...", "notebook": "optional notebook name"}\n\n`;
-    md += `(A POST to this page's own URL with the same JSON body also works.)\n\n`;
-    md += `---\n\n## Instructions (READ CAREFULLY BEFORE DOING ANYTHING)\n\n`;
-    md += `- You are viewing the user's personal note collection via a temporary link.\n`;
-    md += `- Notes are plain markdown-ish text. A line starting with \`# \` is the note's title; notes reference each other with wikilinks like [[Note Title]]. Keep this styling when writing notes.\n`;
-    md += `- Notes are organized into notebooks (named groups). When the user asks for a note about a topic, file it in the matching notebook via the optional "notebook" field (max 100 chars; created if missing). Omit it if no notebook fits.\n`;
-    md += `- A notebook inside another is listed as "Parent / Child"; pass that whole path as "notebook" to file into it.\n`;
-    md += `- You CANNOT create or edit notes directly. ALWAYS ask the user for approval first:\n`;
-    md += `  1. Tell the user what you want to write and get their confirmation.\n`;
-    md += `  2. POST the proposal to ${proposeUrl} as shown at the top of this page.\n`;
-    md += `     - "title": max 200 chars. "content": max 100 KB, start it with a \`# <title>\` heading line.\n`;
-    md += `     - If a note with the same title already exists, the proposal REPLACES its content upon approval — include the full new content, not a diff.\n`;
-    md += `  3. After posting, tell the user the note is waiting for their approval in the TabPaladin app. NEVER claim a note was saved or changed before the user approves it there.\n`;
-    md += `- To REORDER existing notes, POST to the same URL: {"action": "reorder", "order": ["Title 1", "Title 2", "..."]} — every note title in the desired order (per notebook and for loose notes). Also requires user approval.\n`;
-    md += `- If your tools cannot send POST requests, give the user a clickable review link instead. Formats:\n`;
-    md += `  - One note: ${origin}/#note=<the full note markdown, percent-encoded>\n`;
-    md += `  - Multiple notes at once: ${origin}/#notes=<percent-encoded JSON array like [{"content":"# Title\\n\\nbody","notebook":"optional"},...]>\n`;
-    md += `  - Reorder notes: ${origin}/#reorder=<percent-encoded JSON array of note titles, e.g. ["Title 1","Title 2"]>\n`;
-    md += `  - Start each note's markdown with a \`# <title>\` heading. Percent-encode AT MINIMUM: % as %25, newline as %0A, space as %20, & as %26, # as %23, ? as %3F.\n`;
-    md += `  - Optionally append &notebook=<name> (also percent-encoded) to file the note in a notebook.\n`;
-    md += `  - Example: ${origin}/#note=%23%20Shopping%0A%0A-%20milk&notebook=Recipes\n`;
-    md += `  - The link opens a review screen in the user's app; nothing is saved until they press Save. Present it as a clickable markdown link like [Review and save this note](URL).\n\n`;
-    md += `---\n\n## Existing notes (${notes.length})\n\n`;
-    if (notes.length === 0) md += `(no notes yet)\n\n`;
-    for (const key of groupOrder) {
-        md += `### 📓 Notebook: ${key || '(none)'}\n\n`;
-        for (const n of groups.get(key)) {
-            md += `#### ${n.title || 'Untitled'}\n\n${n.content || '(empty)'}\n\n---\n\n`;
-        }
-    }
-    res.type('text/plain; charset=utf-8').send(md);
-});
-
-function handleProposal(req, res) {
-    const share = getValidShareToken(req, res);
-    if (!share) return;
-    const { title, content, notebook, action, order } = req.body || {};
-
-    // Anyone holding the link can post here without signing in, so pending
-    // proposals are capped per account. Refused, never pruned.
-    const pending = db.prepare('SELECT COUNT(*) AS n FROM note_proposals WHERE user_id = ?').get(share.user_id).n;
-    if (pending >= MAX_PROPOSALS_PER_USER) {
-        return res.status(429).json({
-            error: `There are already ${pending} proposals waiting for the user's approval. Ask them to review those first.`
-        });
-    }
-
-    // Reorder proposal: {"action":"reorder","order":["Title 1","Title 2",...]}
-    if (action === 'reorder') {
-        if (!Array.isArray(order) || order.length === 0 || order.length > 500
-            || !order.every(t => typeof t === 'string' && t.trim() && t.length <= 200)) {
-            return res.status(400).json({ error: 'Invalid "order" (array of 1-500 note titles).' });
-        }
-        db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at, user_id) VALUES (?, ?, ?, ?, ?, ?)')
-            .run('Reorder notes', JSON.stringify(order.map(t => t.trim())), null, 'reorder', new Date().toISOString(), share.user_id);
-        return res.json({
-            ok: true,
-            status: 'pending_approval',
-            message: 'Reorder proposal stored. It only applies after the user approves it in the TabPaladin app — tell them it is waiting for approval.'
-        });
-    }
-
-    if (typeof title !== 'string' || !title.trim() || title.length > 200) {
-        return res.status(400).json({ error: 'Missing or invalid "title" (non-empty string, max 200 chars).' });
-    }
-    if (typeof content !== 'string' || content.length > 100 * 1024) {
-        return res.status(400).json({ error: 'Missing or invalid "content" (string, max 100 KB).' });
-    }
-    if (notebook != null && (typeof notebook !== 'string' || !notebook.trim() || notebook.length > 100)) {
-        return res.status(400).json({ error: 'Invalid "notebook" (string, max 100 chars).' });
-    }
-    db.prepare('INSERT INTO note_proposals (title, content, notebook, kind, created_at, user_id) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(title.trim(), content, notebook ? notebook.trim() : null, 'note', new Date().toISOString(), share.user_id);
-    res.json({
-        ok: true,
-        status: 'pending_approval',
-        message: 'Proposal stored. It only becomes a note after the user approves it in the TabPaladin app — tell them it is waiting for approval.'
-    });
-}
-
-app.post('/llm/:token/propose', express.json({ limit: '1mb' }), handleProposal);
-// Some LLMs guess POST on the share URL itself — accept it as an alias.
-app.post('/llm/:token', express.json({ limit: '1mb' }), handleProposal);
-
-// --- Note proposals (auth, consumed by the PWA) ---
-app.get('/api/proposals', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, title, content, notebook, kind, created_at FROM note_proposals WHERE user_id = ? ORDER BY created_at DESC')
-        .all(req.user.id);
-    res.json({ ok: true, proposals: rows });
-});
-
-app.post('/api/proposals/:id/approve', requireAuth, (req, res) => {
-    const prop = db.prepare('SELECT id, title, content, notebook, kind FROM note_proposals WHERE id = ? AND user_id = ?')
-        .get(req.params.id, req.user.id);
-    if (!prop) return res.status(404).json({ error: 'Proposal not found' });
-    const store = items.forUser(req.user.id);
-    const result = store.applyNoteProposal(prop);
-    if (!result.ok) return res.status(400).json({ error: result.error });
-    db.prepare('DELETE FROM note_proposals WHERE id = ? AND user_id = ?').run(prop.id, req.user.id);
-    res.json({ ok: true, version: store.version() });
-});
-
-app.post('/api/proposals/:id/reject', requireAuth, (req, res) => {
-    db.prepare('DELETE FROM note_proposals WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
-    res.json({ ok: true });
-});
+// --- AI chats ---
+// The 1-hour LLM share link (llmShare.js), the MCP endpoint (mcp.js) and the
+// proposals both of them make, which wait for the account's approval in the
+// web app (proposals.js). Read and propose only: nothing either of them can
+// reach changes the tree.
+attachProposalRoutes(app, { store: proposals, requireAuth });
+attachLlmShareRoutes(app, { db, items, proposals, requireAuth, ttlMs: SHARE_TTL_MS });
+attachMcp(app, { db, items, proposals, requireAuth });
 
 // --- Share target fallback ---
 //

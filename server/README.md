@@ -16,7 +16,7 @@ snapshot into the items table automatically — notes, pins, workflows and all.
 Nothing is lost; old history rows stay readable.
 
 **Several people, one server.** Every account has its own tree, notes,
-workflows, inbox, history, LLM share links, import archives and preferences.
+workflows, inbox, history, LLM share links, MCP tokens, import archives and preferences.
 Nothing of one account is ever shown to, or overwritten by, another — see
 [Accounts](#accounts).
 
@@ -46,7 +46,10 @@ the network.
 | `TABPALADIN_TOKEN` | *(off)* | Legacy shared token, passed to the server as `AUTH_TOKEN`. Requests bearing it (`Authorization: Bearer` or `X-API-Key`) act as the account that owned the data before accounts were separated — for scripts, and for clients that predate logins. It cannot manage accounts. At least 32 characters; the old example value from this README is refused. Also the admin password on a first start without `ADMIN_PASSWORD`. |
 | `TENANCY_OWNER` | *(unset)* | Only for the [upgrade to separate accounts](#upgrading-to-separate-accounts-schema-3), and only when the database already holds more than one account: the username (or id) whose data it all is. |
 | `IMPORTS_SCHEDULER` | *(on)* | `off` stops the import scheduler — for rehearsing on a copy of a real database. |
-| `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the links waiting in the shared-links inbox and on pending LLM proposals. Past them new rows get `429`; nothing is pruned. |
+| `MAX_INBOX_PER_USER` / `MAX_PROPOSALS_PER_USER` | `5000` / `200` | Per-account caps on the links waiting in the shared-links inbox and on pending AI proposals (share link and MCP together). Past them new rows get `429`; nothing is pruned. |
+| `MCP_RATE_LIMIT_PER_MINUTE` | `120` | [MCP](#mcp-ai-chats-with-a-token) requests allowed per token per minute before `429`. |
+| `MCP_AUTH_MAX_FAILURES` | `20` | Wrong MCP tokens allowed per client address per 15 minutes before `429`. |
+| `MCP_ALLOWED_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call `/mcp` (a request with any other `Origin` header gets `403`); a listed one gets CORS, preflights included, from `/mcp` itself (`CORS_ORIGIN` plays no part there). MCP clients send none. |
 | `IMPORT_SECRET` | *(off)* | Encrypts importer OAuth refresh tokens at rest. |
 | `TRUST_PROXY` | `loopback, uniquelocal` | Express `trust proxy`: which proxies may set `X-Forwarded-For` / `-Proto`. Set `1` or `true` if your proxy reaches the server from a public address. |
 | `CORS_ORIGIN` | *(off)* | Extra comma-separated origins allowed to call the API cross-origin. The server's own origin and browser-extension origins (`chrome-extension://`, `moz-extension://`) are always allowed. |
@@ -108,7 +111,7 @@ image:
 The first admin comes from `ADMIN_USERNAME` / `ADMIN_PASSWORD`. Admins add
 further accounts from **Settings › Users**, in the extension or the PWA. Each
 account starts with an empty tree and has its own of everything: tree and
-history, notes, workflows, inbox, LLM share links and proposals, Reddit / X /
+history, notes, workflows, inbox, LLM share links, MCP tokens and proposals, Reddit / X /
 Instagram archives, and preferences. Every row in the database names the
 account it belongs to, and the database itself refuses a row whose account
 does not exist, so a forgotten check is an error, not a leak.
@@ -229,6 +232,24 @@ Running it again is a no-op. Rolling back to the previous image means
 restoring `sync.db.pre-v4-*` (the previous image refuses a schema-4 database);
 links shared or filed since are lost with it, so export what you need first.
 
+### Upgrading to AI chats (schema 5)
+
+The first start of this version takes `sync.db.pre-v5-<timestamp>`, then, in
+one transaction each, after the share inbox's step:
+
+- adds columns to `note_proposals` (`payload`, `reason`, `source`,
+  `token_id`, `base_version`), each only when it is missing. Every waiting
+  proposal keeps every value it had and stays a note or order proposal, and
+  `GET /api/proposals` answers exactly as before;
+- creates `mcp_tokens` (the MCP tokens' hashes, names and dates), guarded
+  like every per-account table and deleted with its account.
+
+The boot log says `AI proposals: added …`. A failure rolls the step back,
+writes `data/MIGRATION_REFUSED` and stops. Running it again is a no-op.
+Nothing in the tree changes. Rolling back to the previous image means
+restoring `sync.db.pre-v5-*` (the previous image refuses a schema-5
+database); proposals and tokens made since are lost with it.
+
 ## The tree
 
 `GET /api/tree` returns `{ version, roots, userId, serverId }` — an array of
@@ -295,7 +316,7 @@ can only be changed through the explicit import verbs below.
 
 ## Endpoints
 
-All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health`, `/api/identity`, the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead) and the Reddit OAuth callback and confirm pages. Everything acts on the caller's own account.
+All endpoints require `Authorization: Bearer <session token>` (from `/api/login`; or the legacy `TABPALADIN_TOKEN`) except `/api/auth/status`, `/api/login`, `/api/health`, `/api/identity`, the `/llm/...` share-link routes (those are protected by an unguessable, expiring token in the URL instead), `/mcp` (an MCP token, and nothing else) and the Reddit OAuth callback and confirm pages. Everything acts on the caller's own account.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -331,12 +352,21 @@ All endpoints require `Authorization: Bearer <session token>` (from `/api/login`
 | GET | `/api/shared` | legacy: the waiting links, `{ links: [{ id, url, title, created_at }] }` |
 | POST | `/api/shared` | legacy: add `{ url, title? }` (http(s) only) |
 | DELETE | `/api/shared/:id`, `/api/shared` | legacy: dismiss one, or every waiting link of yours (nothing is deleted) |
-| POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`) |
-| GET | `/api/proposals` | list pending LLM note proposals |
-| POST | `/api/proposals/:id/approve` | apply a proposal to the tree (bumps the version) |
+| POST | `/api/share` | create an LLM share link (returns `{ url, expiresAt }`); a password change or reset ends every link of the account |
+| GET | `/api/proposals` | pending note and reorder proposals, as it always answered (`{ id, title, content, notebook, kind, created_at }`) |
+| GET | `/api/proposals/review` | every pending proposal, newest first: `{ id, kind: 'note'\|'reorder'\|'tree', title, createdAt, source: 'link'\|'mcp', tokenName, reason, status: 'pending'\|'stale', stale: [why], preview: [{ op, text, danger? }], counts, danger, reviewKey }`, bookmark changes planned against the tree as it is now: `title` says what one would do now (what it was proposed as, once stale), `danger` whether it deletes anything |
+| POST | `/api/proposals` | file bookmark changes `{ changes, reason? }` (or one `{ action, … }`) for review — what the web app does with a `#changes=` review link; nothing is applied |
+| POST | `/api/proposals/:id/approve` | apply a proposal: one transaction for the account (the change, a version bump, a history snapshot, the proposal's removal); body `{ reviewed? }`, the `reviewKey` of the preview the user was shown; **409** `code: 'stale'` with `stale: [why]` when something it names changed since, **409** `code: 'changed'` when it would now do something other than the preview `reviewed` names — nothing applied either way |
 | POST | `/api/proposals/:id/reject` | discard a proposal |
-| GET | `/llm/:token` | **no auth** — notes + LLM instructions as markdown; 410 when expired |
-| POST | `/llm/:token/propose` | **no auth** — LLM submits `{ title, content, notebook? }` for approval |
+| GET | `/llm/:token` | **no auth** — instructions, every bookmark folder (id and path), the first bookmarks and every note, as plain text; 410 when expired or the account is gone |
+| GET | `/llm/:token/bookmarks?page=N` | **no auth** — every bookmark, 500 per page |
+| GET | `/llm/:token/folder/:id?offset=N` | **no auth** — one folder's subfolders and bookmarks |
+| GET | `/llm/:token/search?q=…` | **no auth** — bookmarks, folders and notes holding every word |
+| POST | `/llm/:token/propose` | **no auth** — a proposal for approval: a note `{ title, content, notebook? }`, an order `{ action: 'reorder', order }`, or bookmark changes `{ action: 'create_folder'\|'add_bookmarks'\|'move'\|'rename'\|'delete'\|'changes', …, reason? }` (also `POST /llm/:token`) |
+| GET | `/api/mcp/tokens` | signed-in session — the account's MCP tokens `{ id, name, prefix, scope, createdAt, lastUsedAt }` and the endpoint |
+| POST | `/api/mcp/tokens` | signed-in session — `{ name }` → the token, **shown once**; at most 20 per account |
+| DELETE | `/api/mcp/tokens/:id` | signed-in session — revoke one |
+| POST | `/mcp` | **MCP token** (`Authorization: Bearer tpm_…`) — the MCP endpoint (Streamable HTTP, stateless, JSON); GET and DELETE answer 405 |
 | GET | `/api/imports` | list import sources with counts and last-run state; `?includeRemoved=1` adds removed ones |
 | POST | `/api/imports` | create `{ provider, clientId, clientSecret, intervalMinutes? }` |
 | PATCH | `/api/imports/:id` | enable/disable, change interval or credentials |
@@ -397,15 +427,61 @@ session's token never files one account's share into another's tree.
 
 ## LLM share links
 
-The PWA's "🔗 Share with LLM" button calls `POST /api/share` and copies a link
-like `https://<host>/llm/<token>`. Paste it into any LLM chat with web access:
-the LLM can read all notes plus instructions (note styling, `[[wikilinks]]`, and
-that it must **never edit directly** — it can only `POST .../propose`). The
-proposal lands in the PWA's *Pending approval* block; approving writes the note
-straight into the items table (creating or replacing the note with that title).
+The web app's "🔗 Share notes & bookmarks with an AI chat" button (Notes, and
+Settings → AI chats) calls `POST /api/share` and copies a link like
+`https://<host>/llm/<token>`. Paste it into any AI chat with web access. The
+page tells the chat what it may do and lists, as plain text:
+
+- every bookmark folder with its id and path (`[ab12cd34] Bookmarks / Tech`),
+  Pinned and Workflows marked read-only;
+- the first 300 bookmarks under their folders (`- [id] Title — address`),
+  with a **TRUNCATED** note and the links to read the rest:
+  `/llm/<token>/bookmarks?page=N` (500 per page), `/llm/<token>/folder/<id>`
+  and `/llm/<token>/search?q=<words>`;
+- every note, grouped by notebook, as before.
+
+The chat can never change anything: it can only `POST .../propose`, and the
+proposal waits for the user. Bookmark proposals name nodes by id:
+
+| action | body |
+|---|---|
+| `create_folder` | `{ parentId, path: 'Name' or 'A / B' }` — missing levels are made, existing ones reused |
+| `add_bookmarks` | `{ folderId, bookmarks: [{ title, url }] }` — http(s), at most 100; one already in the folder is skipped |
+| `move` | `{ ids, toFolderId }` — bookmarks and folders (with everything in them) |
+| `rename` | `{ id, title }` |
+| `delete` | `{ ids }` — shown to the user flagged as a DELETE; a folder goes with what it holds; at most 200 deleted per proposal |
+| `changes` | `{ changes: [{ op, … }] }` — up to 50 of the above, applied together; a `create_folder` may set `ref`, and later ones use `parentRef` / `folderRef` / `toFolderRef` |
+
+Every body may carry a `reason`, shown to the user. Only the bookmark side
+can change: never a role folder (Bookmarks, Notes, Workflows, Pinned) itself,
+nothing inside Notes, Workflows or Pinned, no note, and not the imported
+archive. A proposal is checked against the tree when it is made (a bad one is
+refused with the reasons, at most 50 of them) and again whenever it is listed
+or approved: every node it names was fingerprinted (kind, title, parent,
+address), a folder it deletes also by what it holds (every id below it), and
+one that changed since makes it **stale** — shown with why, never applied. At
+most `MAX_PROPOSALS_PER_USER` wait per account, link and MCP together.
+
+The preview has a line per change. Every DELETE line is in it; past 60 other
+lines the rest are counted (`… and N more, none of them a deletion`).
+`danger` is set when anything at all is deleted. A body that carries a note's
+`content` is a note proposal whatever its `action` says (unless it is a
+`reorder` or has a `changes` list), as the link took it before bookmark
+changes.
+
+Approving a bookmark proposal applies all of it in one transaction for the
+account, bumps the version (clients pull, as after any proposal), writes a
+history snapshot (`device_id: 'ai-proposal'`) and removes the proposal; one
+that deletes anything first snapshots the tree as it was
+(`device_id: 'before-ai-proposal'`), so links filed since the last snapshot
+are in a history version too. The web app sends the `reviewKey` of the
+preview it showed, and the server refuses (409 `changed`) when the plan now
+reads otherwise. A note proposal writes the note straight into the items
+table (creating or replacing the note with that title), as always.
 
 Links expire after 1 hour by default; override with `SHARE_TTL_MINUTES`.
-Unauthenticated routes expose only the notes, never the full tree.
+Changing the account's password, or an admin resetting it, ends them at once.
+The imported archive (Reddit, X, Instagram) is not on the page.
 
 Notes are grouped into **notebooks** (subfolders of the notes root);
 proposals can include an optional `"notebook"` field and the share page lists
@@ -414,7 +490,84 @@ notes grouped by notebook.
 For LLM chats that cannot POST, the share page also teaches a universal
 review link: `https://<host>/#note=<percent-encoded markdown>[&notebook=<name>]`.
 The fragment never reaches the server — the PWA opens the note in its editor
-for review and only stores it when the user presses Save.
+for review and only stores it when the user presses Save. Bookmark changes
+have one too, `https://<host>/#changes=<percent-encoded {"changes": […]}>`:
+the signed-in app asks, then files them with `POST /api/proposals` as a
+suggestion waiting on Home; the link applies nothing.
+
+## MCP (AI chats with a token)
+
+`POST /mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server for MCP clients — Claude Code directly, Claude Desktop through
+`tools/mcp_bridge.mjs`, any other client that can send a header. Setup for
+each is in the [main README](../README.md#-use-tabpaladin-with-ai-chats).
+
+- **Transport:** Streamable HTTP, stateless (no `Mcp-Session-Id`), JSON
+  responses, served by the official SDK (`@modelcontextprotocol/sdk`,
+  pinned). Protocol versions 2024-11-05 to 2025-11-25, the `initialize`
+  era; a client of the 2026-07-28 revision falls back to that, as that
+  revision prescribes. GET and DELETE answer 405.
+- **Tools:** `search_bookmarks`, `list_folders`, `list_folder` (by id or
+  path), `get_bookmark`, `list_notes`, `read_note`, `search_notes`;
+  `propose_create_folder`, `propose_add_bookmarks`, `propose_move`,
+  `propose_rename`, `propose_delete`, `propose_changes`, `propose_note`,
+  `propose_note_order` — the share link's proposals: same checks, same
+  queue, same approval; `list_my_proposals` — this token's, still waiting,
+  with whether each is stale.
+- **Tokens:** made, listed and revoked in the web app (Settings → AI chats),
+  only by a signed-in session. `tpm_` and 43 more characters, shown once;
+  the server keeps its SHA-256 hash, a name, when it was made and last used,
+  and the scope `read propose`. Sent as `Authorization: Bearer tpm_…`, never
+  in the URL. A token opens `/mcp` and nothing else, and `/mcp` takes
+  nothing else. It stops working when revoked, when its account's password
+  is changed or reset, or when the account is deleted.
+- **Limits:** `MCP_RATE_LIMIT_PER_MINUTE` requests per token (default 120),
+  `MCP_AUTH_MAX_FAILURES` wrong tokens per client address per 15 minutes
+  (default 20), a 256 KB body, and every tool answer, errors included, at
+  most 100 KB of UTF-8 (lists, `list_my_proposals` too, are paged with
+  `offset` / `limit`; a long note comes in parts: `read_note` answers
+  `nextOffset` until the end, and takes `offset`).
+- **Origin:** a request with an `Origin` header (a web page) is refused with
+  403 unless `MCP_ALLOWED_ORIGINS` (comma-separated) lists it — the MCP
+  transport's DNS-rebinding rule. MCP clients send none. A listed origin (the
+  MCP Inspector in a browser, say) gets CORS from `/mcp` itself: its
+  preflight is answered (`POST`; `Content-Type`, `Authorization`,
+  `Mcp-Protocol-Version`, `Mcp-Session-Id`, `Last-Event-ID`), and every
+  answer carries `Access-Control-Allow-Origin`.
+
+**Not yet: claude.ai custom connectors with OAuth.** The hosted Claude apps
+(claude.ai, Claude Desktop's Connectors, mobile) reach a remote MCP server
+from Anthropic's cloud and sign in with OAuth 2.1 (Dynamic Client
+Registration or a Client ID Metadata Document); a fixed bearer token there
+("Request headers") is a beta for a limited set of organizations.
+TabPaladin has no OAuth server yet. The follow-up, when wanted:
+
+1. `/.well-known/oauth-protected-resource` (and `…/mcp`):
+   `{ resource: "https://<host>/mcp", authorization_servers: ["https://<host>"], scopes_supported: ["read", "propose"], bearer_methods_supported: ["header"] }`;
+   `/mcp`'s 401 gains `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource", scope="read propose"`.
+2. `/.well-known/oauth-authorization-server`: `issuer`, `authorization_endpoint`
+   (`/oauth/authorize`), `token_endpoint` (`/oauth/token`, form-urlencoded),
+   `registration_endpoint` (`/oauth/register`, JSON, RFC 7591),
+   `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`,
+   `code_challenge_methods_supported: ["S256"]`, `token_endpoint_auth_methods_supported: ["none"]`,
+   `client_id_metadata_document_supported: true`, `authorization_response_iss_parameter_supported: true`.
+3. Clients: a global `oauth_clients` table (capped, registration
+   rate-limited); redirect URIs limited to `https://claude.ai/api/mcp/auth_callback`
+   and the loopback `http://localhost/callback` / `http://127.0.0.1/callback`
+   on any port (Claude Code); CIMD documents fetched with SSRF guards.
+4. Consent: `/oauth/authorize` cannot see the web app's session (it lives in
+   the app's storage, not a cookie), so it hands over to the app
+   (`/#oauth=<request id>`), which shows the client's name and redirect
+   host, asks, and posts its session to `/api/oauth/approve`; the server
+   then redirects with a single-use 60-second code, `state` and `iss`.
+5. Tokens: PKCE S256 required; `resource` must be this `/mcp`; access
+   tokens (1 hour) and rotated refresh tokens (`invalid_grant` once used or
+   revoked), stored hashed in a per-account table guarded and deleted with
+   the account like `mcp_tokens`, listed and revocable in Settings, revoked
+   by a password change; every answer well under Claude's 10-second limit.
+6. A schema step, tests for discovery, registration, PKCE, redirect and
+   resource mismatches, code reuse, refresh rotation and revocation, and the
+   server reachable from Anthropic's addresses (`160.79.104.0/21`).
 
 ## Importers
 
@@ -534,7 +687,9 @@ node tools/test_shared_sync.mjs   # the files the extension and the PWA share ar
 node tools/test_users.mjs     # users migration, first-admin bootstrap, backups
 node tools/test_tenancy.mjs   # ownership migration, per-account isolation, deletion, SQL scan, end-to-end upgrade of an old server's data
 node tools/test_shares.mjs    # share inbox: migration, intake, filing, undo, legacy routes, forced-push safety net, and an upgrade rehearsal on a database the schema-3 server wrote (starts servers: --port, --old-port)
-node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block
+node tools/test_pwa_accounts.mjs  # the PWA against a real server: queued shares, unpushed edits across sign-ins, Users block, suggested changes on Home
+node tools/test_llm_api.mjs  # the LLM share link: page, pages, search, bookmark proposals, staleness, approval, tenancy (starts a server: --port)
+node tools/test_mcp.mjs      # the MCP endpoint: tokens, protocol, tools, auth failures, isolation, limits, the stdio bridge (starts a server: --port)
 ADMIN_USERNAME=tester ADMIN_PASSWORD='correct horse battery' AUTH_MAX_FAILURES=8 IMPORTS_SCHEDULER=off MAX_PROPOSALS_PER_USER=3 DATA_DIR=/tmp/tp node server/index.js &
 node tools/test_auth.mjs --url http://127.0.0.1:18921 [--legacy <token>]   # against a live server
 ```

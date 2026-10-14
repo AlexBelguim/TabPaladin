@@ -16,7 +16,9 @@
 //   4. Deleting an account removes exactly its data, and its id is never
 //      handed out again.
 //   5. No SQL statement in the server touches an account-owned table without
-//      naming user_id, except an explicit allowlist, each entry with a reason.
+//      naming user_id, except an explicit allowlist, each entry with a reason;
+//      and the statements a password change and a reset revoke MCP tokens
+//      and LLM share links with are still there.
 //   6. End to end: the pre-multi-user server, checked out of git history, fills
 //      a data directory through its own API; this server upgrades it, serves
 //      the same data to the right account, verify_tenancy.js proves the
@@ -514,10 +516,10 @@ async function isolationTests() {
 // listed with the reason they are safe; an exception that no longer matches
 // anything fails too, so the list cannot rot.
 
-const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops)\b/i;
+const OWNED = /\b(?:FROM|INTO|UPDATE|JOIN)\s+"?(items|snapshots|shared_links|share_filings|share_tokens|note_proposals|import_sources|user_tree_meta|user_prefs|tree_ops|mcp_tokens)\b/i;
 const SCAN_SKIP = new Set(['server/tenancy.js']); // operates across accounts by design: the migration, deletion, stats
 const ALLOWED = [
-    ['server/index.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],
+    ['server/llmShare.js', 'DELETE FROM share_tokens WHERE expires_at <= ?', 'expiry sweep: dead tokens are dead whoever owned them'],
     ['server/imports/store.js', 'SELECT * FROM import_sources WHERE deleted_at IS NULL ORDER BY id', 'listAllSources: the scheduler and the boot warning'],
     ['server/imports/store.js', 'SELECT * FROM import_sources WHERE id = ?', 'getSourceUnscoped: OAuth callback, authenticated by its one-shot state'],
     ['server/imports/store.js', 'SELECT credentials FROM import_sources WHERE id = ?', 'by primary key, after getSource(id, userId) or listAllSources'],
@@ -528,6 +530,14 @@ const ALLOWED = [
     ['server/imports/store.js', 'UPDATE import_sources SET pending_credentials = NULL, pending_username = NULL, pending_nonce_hash = NULL WHERE id = ?', 'clears a pending connection already resolved by nonce'],
     ['server/imports/store.js', 'SELECT 1 FROM import_sources WHERE id = ? AND deleted_at IS NULL', 'upsertItem: is the source still there at all']
 ].map(([file, sql, why]) => ({ file, sql, why, used: 0 }));
+// Account-scoped statements that must stay where they are: what a password
+// change or an admin reset revokes besides the sessions.
+const REQUIRED = [
+    ['server/index.js', 'DELETE FROM mcp_tokens WHERE user_id = ?', 'a password change revokes the MCP tokens'],
+    ['server/index.js', 'DELETE FROM share_tokens WHERE user_id = ?', 'a password change ends the LLM share links'],
+    ['server/admin.js', 'DELETE FROM mcp_tokens WHERE user_id = ?', 'a reset revokes the MCP tokens'],
+    ['server/admin.js', 'DELETE FROM share_tokens WHERE user_id = ?', 'a reset ends the LLM share links']
+].map(([file, sql, why]) => ({ file, sql, why, found: 0 }));
 
 function sqlLiterals(src) {
     const out = [];
@@ -568,6 +578,7 @@ function staticScan() {
         const src = fs.readFileSync(path.join(REPO, file), 'utf8');
         for (const { sql, line } of sqlLiterals(src)) {
             scanned++;
+            for (const r of REQUIRED) if (r.file === file && r.sql === sql) r.found++;
             if (!OWNED.test(sql) || /\buser_id\b/.test(sql)) continue;
             const allowed = ALLOWED.find(a => a.file === file && a.sql === sql);
             if (allowed) { allowed.used++; continue; }
@@ -578,6 +589,9 @@ function staticScan() {
     check('no statement touches an owned table without user_id', violations.length === 0, '\n      ' + violations.join('\n      '));
     const stale = ALLOWED.filter(a => a.used === 0);
     check('every allowlist entry still matches a statement', stale.length === 0, stale.map(a => a.sql).join(' | '));
+    const missing = REQUIRED.filter(r => r.found === 0);
+    check('a password change and a reset still revoke MCP tokens and share links', missing.length === 0,
+        missing.map(r => `${r.file}: ${r.sql} (${r.why})`).join(' | '));
 }
 
 // --- 4. End to end ----------------------------------------------------------------
@@ -771,11 +785,12 @@ async function endToEnd() {
         }
         check('import sources identical (removed ones hidden by default)',
             JSON.stringify(withoutKeys(newView.imports, ['removed', 'removedAt'])) === JSON.stringify(oldView.imports));
-        // The page gained one instruction line about nested notebooks; every
-        // note, heading and the rest of the instructions must be unchanged.
-        const NESTED_HINT = '- A notebook inside another is listed as "Parent / Child"; pass that whole path as "notebook" to file into it.\n';
+        // The page has since gained instructions and the bookmarks (the AI
+        // chats release); every note and notebook heading must be unchanged.
+        const notesPart = (page) => page.slice(page.indexOf('## Existing notes ('));
         check('the LLM share page serves the same notes',
-            newView.llm.split(srv.base).join('BASE').replace(NESTED_HINT, '') === oldView.llm.split(old.base).join('BASE'));
+            oldView.llm.includes('## Existing notes (') && newView.llm.includes('## Existing notes (')
+            && notesPart(newView.llm).split(srv.base).join('BASE') === notesPart(oldView.llm).split(old.base).join('BASE'));
         const removed = (await http(srv.base, '/api/imports?includeRemoved=1', { token: tok })).json.sources.filter(s => s.removed);
         check('the orphaned X archive is back, as a removed source', removed.length === 1 && removed[0].provider === 'x' && removed[0].items === 1,
             JSON.stringify(removed));

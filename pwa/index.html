@@ -123,6 +123,33 @@
         <label class="check-row"><input id="imports-show-removed" type="checkbox"> Show removed sources</label>
         <button id="imports-add" class="ghost-block">+ Connect Reddit</button>
 
+        <hr class="sep">
+
+        <strong class="block-title">AI chats</strong>
+        <p class="hint">Let an AI chat read your bookmarks and notes and suggest changes. Nothing changes until you
+          approve it under Home › Suggested changes (notes: in Notes).</p>
+        <button id="ai-share-link" class="ghost-block">🔗 1-hour link for a chat that can browse</button>
+        <div id="mcp-block" class="hidden">
+          <p class="hint">MCP, for Claude Code, Claude Desktop and other MCP clients: server
+            <code id="mcp-endpoint"></code>. A token can read and suggest, nothing else. Changing your
+            password revokes every token and ends every 1-hour link.</p>
+          <div id="mcp-tokens-list"></div>
+          <label class="field">
+            <span>New token's name</span>
+            <input id="mcp-token-name" type="text" maxlength="60" autocomplete="off" spellcheck="false" placeholder="e.g. Laptop · Claude Code">
+          </label>
+          <button id="mcp-token-create" class="ghost-block">+ New MCP token</button>
+          <div id="mcp-token-made" class="mcp-made hidden">
+            <p class="hint"><strong>Copy it now: it is shown only this once.</strong></p>
+            <input id="mcp-token-value" type="text" readonly spellcheck="false">
+            <button id="mcp-token-copy" class="ghost-block">Copy token</button>
+            <p class="hint">Claude Code, in a terminal:</p>
+            <textarea id="mcp-token-cmd" readonly rows="4" spellcheck="false"></textarea>
+            <button id="mcp-token-cmd-copy" class="ghost-block">Copy command</button>
+          </div>
+          <small id="mcp-error" class="hint error hidden"></small>
+        </div>
+
         <div id="users-block" class="hidden">
           <hr class="sep">
           <strong class="block-title">Users</strong>

@@ -18,11 +18,12 @@ import path from 'node:path';
 export const OWNED_TABLES = ['items', 'snapshots', 'shared_links', 'share_tokens', 'note_proposals', 'import_sources'];
 
 // Every table holding one account's data, including those born per-user:
-// tree metadata, prefs, the tree's ops log and where shared links were filed.
-// import_items, import_dismissed and import_oauth_state are scoped through
-// their source_id instead: a source row is never hard-deleted except by an
-// explicit purge, which takes its archive with it.
-export const PER_USER_TABLES = [...OWNED_TABLES, 'user_tree_meta', 'user_prefs', 'tree_ops', 'share_filings'];
+// tree metadata, prefs, the tree's ops log, where shared links were filed and
+// the AI chats' MCP tokens. import_items, import_dismissed and
+// import_oauth_state are scoped through their source_id instead: a source row
+// is never hard-deleted except by an explicit purge, which takes its archive
+// with it.
+export const PER_USER_TABLES = [...OWNED_TABLES, 'user_tree_meta', 'user_prefs', 'tree_ops', 'share_filings', 'mcp_tokens'];
 
 // Everything that existed before accounts were separated. The migration may
 // only add columns to these; their content must come out byte-identical.
@@ -551,6 +552,7 @@ export function userStats(db, userId) {
         archived: one('SELECT COUNT(*) AS n FROM import_items WHERE source_id IN (SELECT id FROM import_sources WHERE user_id = ?)', userId),
         inbox: one(inboxSql, userId),
         proposals: one('SELECT COUNT(*) AS n FROM note_proposals WHERE user_id = ?', userId),
+        mcpTokens: hasColumn(db, 'mcp_tokens', 'user_id') ? one('SELECT COUNT(*) AS n FROM mcp_tokens WHERE user_id = ?', userId) : 0,
         history: one('SELECT COUNT(*) AS n FROM snapshots WHERE user_id = ?', userId),
         prefs: one('SELECT COUNT(*) AS n FROM user_prefs WHERE user_id = ?', userId)
     };
@@ -558,7 +560,7 @@ export function userStats(db, userId) {
 
 // Removes exactly one account: its archive (every source it ever had, removed
 // ones included, with their tombstones and OAuth state), its tree and history,
-// inbox, share links, proposals, prefs and sessions, then the account itself,
+// inbox, share links, proposals, MCP tokens, prefs and sessions, then the account itself,
 // leaving a tombstone so the id and name are never handed out again. One
 // transaction. Returns the per-table counts.
 export function deleteUserData(db, userId, { deletedBy = null } = {}) {
@@ -583,6 +585,7 @@ export function deleteUserData(db, userId, { deletedBy = null } = {}) {
         run('tree_ops', 'DELETE FROM tree_ops WHERE user_id = ?', userId);
         run('share_tokens', 'DELETE FROM share_tokens WHERE user_id = ?', userId);
         run('note_proposals', 'DELETE FROM note_proposals WHERE user_id = ?', userId);
+        run('mcp_tokens', 'DELETE FROM mcp_tokens WHERE user_id = ?', userId);
         run('user_prefs', 'DELETE FROM user_prefs WHERE user_id = ?', userId);
         run('sessions', 'DELETE FROM sessions WHERE username = ?', user.username);
         run('users', 'DELETE FROM users WHERE id = ?', userId);

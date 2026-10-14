@@ -16,7 +16,7 @@
 // admin change decided by who is acting when it lands, a push stamped with
 // another server refused, and a delete removing exactly that account; the
 // share inbox's routes (tokens required, the legacy /api/shared contract, the
-// /share fallback); and —
+// /share fallback); a reset ending that account's LLM share links; and —
 // last, because it locks this IP out — the login rate limit (expects
 // AUTH_MAX_FAILURES between 8 and 20).
 
@@ -267,6 +267,9 @@ await new Promise(r => setTimeout(r, 150));
 const reset = await call(`/api/users/${SAM_ID}`, { method: 'PUT', token, body: { password: 'sam-password-2', currentPassword: NEWPASS } });
 await Promise.all(racers);
 check('a reset signs that account out', reset.status === 200 && (await call('/api/tree', { token: samTok })).status === 401);
+check('  and ends its LLM share links, not the owner\'s', (await call(`/llm/${samLlm}`)).status === 410
+    && (await call(`/llm/${samLlm}/propose`, { method: 'POST', body: { title: 'x', content: 'y' } })).status === 410
+    && (await call(`/llm/${ownerLlm}`)).status === 200);
 let survivors = 0;
 for (const t of raced) if ((await call('/api/auth/me', { token: t })).status === 200) survivors++;
 check('no sign-in with the old password outlives the reset, even one racing it', raced.length > 0 && survivors === 0,

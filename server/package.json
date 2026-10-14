@@ -7,8 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "better-sqlite3": "^11.1.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }

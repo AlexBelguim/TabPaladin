@@ -46,3 +46,8 @@ services:
       # Per-account caps; they refuse new rows and never prune old ones.
       - MAX_INBOX_PER_USER=${MAX_INBOX_PER_USER:-5000}
       - MAX_PROPOSALS_PER_USER=${MAX_PROPOSALS_PER_USER:-200}
+      # The MCP endpoint (/mcp) for AI chats: requests per token per minute
+      # (default 120), and browser origins allowed to call it (default none:
+      # MCP clients send no Origin header).
+      - MCP_RATE_LIMIT_PER_MINUTE=${MCP_RATE_LIMIT_PER_MINUTE:-}
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}

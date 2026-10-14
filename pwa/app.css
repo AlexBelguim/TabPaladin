@@ -2045,3 +2045,62 @@ body.share-open .sheet:not(.share-sheet) { z-index: 35; }
   .share-row { min-height: 52px; }
   .share-chip:hover:not(:disabled) { border-color: var(--primary); }
 }
+
+/* --- Suggested changes from AI chats (Home) --- */
+.proposals.changes { margin-top: 12px; }
+.changes-intro { margin: -4px 0 6px; }
+.change {
+  padding: 9px 0;
+  border-top: 1px solid rgba(245, 158, 11, 0.2);
+}
+.change-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.change-head .title { font-weight: 600; font-size: 0.88rem; overflow-wrap: anywhere; flex: 1 1 200px; }
+.change-src { color: var(--muted); font-size: 0.72rem; white-space: nowrap; }
+.change-reason { color: var(--muted); font-size: 0.78rem; font-style: italic; margin-top: 3px; overflow-wrap: anywhere; }
+.change-preview {
+  margin: 6px 0 8px;
+  padding-left: 18px;
+  font-size: 0.8rem;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.change-preview li { margin: 2px 0; overflow-wrap: anywhere; }
+.change-preview li.op-skip,
+.change-preview li.op-more { color: var(--muted); }
+.change-preview li.danger { color: var(--danger); font-weight: 600; }
+.change.danger { border-left: 3px solid var(--danger); padding-left: 8px; }
+.change.stale .change-head .title,
+.change.stale .change-preview { opacity: 0.6; }
+.change-stale { color: #fbbf24; font-size: 0.78rem; margin-bottom: 8px; overflow-wrap: anywhere; }
+.change .proposal-actions button.danger { background: var(--danger); }
+.change .proposal-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* --- MCP tokens (Settings) --- */
+#mcp-endpoint { overflow-wrap: anywhere; color: var(--text); }
+.mcp-made {
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: var(--radius);
+  background: rgba(245, 158, 11, 0.07);
+}
+.mcp-made input,
+.mcp-made textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+}
+.mcp-made textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  resize: vertical;
+}
