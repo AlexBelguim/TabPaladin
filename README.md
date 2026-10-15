@@ -61,9 +61,12 @@ See [server/README.md](server/README.md#importers) for setup.
 
 ## 📦 Installation
 
-Two clients, one tree. The **extension** remains the primary desktop client. The **web app** (served by the sync server) works on
-phones and PCs; connecting the helper also lets it save and reopen workflow
-windows, track individual tab closes, and pin the current tab.
+The **web app** (served by the sync server) is TabPaladin, on phones and PCs.
+From 1.9.0 the **extension** is its helper: connecting it lets the web app save
+and reopen workflow windows, track individual tab closes, and pin the current
+tab. Its toolbar button opens the web app. An extension updated from an
+earlier version first moves what its old interface kept into the web app
+(see [Moving to the web app](#moving-to-the-web-app-190)).
 
 ### Extension (desktop)
 
@@ -88,8 +91,48 @@ everything this browser holds, minus your sign-in session.
 
 TabPaladin does not run in private (incognito) windows.
 
-TabPaladin is moving into the sync server's web app; the extension will become
-a small helper for the tab features. Push your edits before each update.
+#### Moving to the web app (1.9.0)
+
+From 1.9.0 the extension's old interface is replaced by the web app. What it
+kept moves over once, on a page the extension shows you:
+
+1. **Before updating**, open the old interface one last time: **Push** your
+   edits, save or close any note you are editing, and use **Settings → Backup →
+   Download a backup**.
+2. **Update in place**, as above: `git pull` in the same folder and **Reload**
+   (Firefox: build and reload the package). Never remove and add the extension
+   again: a new id starts with empty storage, and the move would find nothing.
+3. The toolbar button shows **MOVE** and opens the move page. There:
+   **Download a backup file** first; connect your server if the helper is not
+   connected yet; check what moves and what stays; then click **Move to
+   <your server>**.
+4. The web app opens. Click **Bring in** within ten minutes, and sign in if it
+   asks (your password and session never pass through the extension).
+
+What happens to your data:
+
+- Every copy arrives **set aside first**. The extension's working copy becomes
+  the web app's current copy only when the web app's copy is empty, or when it
+  has unpushed edits and the web app's copy has none, or when both are clean
+  and it is the later one; the web app's copy is then set aside, never
+  discarded. Otherwise it waits in **Settings › Set-aside copies**, labelled
+  "From the browser extension", to switch to, export or discard.
+- Note drafts come back with their copy. Keywords, category order and the
+  notes view fill in only what the web app lacks.
+- Copies made for **another server** stay in the extension; the move page
+  downloads each one as JSON and bookmarks.html.
+- Workflow windows the old interface opened keep updating their workflow.
+- Once the web app is signed in, the old interface's own sign-in is signed
+  out on the server and removed from the extension. A shared server token
+  pasted into the old interface is left as it is.
+- **Nothing is deleted** from the extension. Interrupted? Run it again from the
+  move page (**Send again**): nothing is brought in twice. The web app keeps
+  what it received until you remove it in **Settings › Moved from the
+  extension**. Without a working helper, the backup file goes in through the web
+  app's **Settings › Bring in an extension backup**.
+- **Going back:** check out 1.1.0 (or 1.2.0) in the same folder and **Reload**:
+  the old interface comes back over its untouched data. Sign in there again
+  and pull what the web app pushed.
 
 #### Packaging for the stores
 
@@ -116,9 +159,10 @@ and cannot use tab features offline. Sign in in the web app; the helper never
 receives your password or session token. Signing out disconnects its bridge;
 reconnect through helper Settings before using tab features again.
 
-The toolbar click opens the desktop extension app. Its right-click menu adds
-**Open TabPaladin**, **Save tabs as workflow**, **Reopen tabs TabPaladin closed**,
-and **Settings**. Saving from the menu opens a review in the web app; confirm
+From 1.9.0 the toolbar click opens or focuses the web app (the move page until
+the move is done, helper Settings until a server is connected). Its
+right-click menu has **Open TabPaladin**, **Save tabs as workflow**, **Reopen
+tabs TabPaladin closed**, and **Settings**. Saving from the menu opens a review in the web app; confirm
 there. Saved tabs close only after the local workflow is durably stored.
 Server-origin tabs are kept open by both clients' Save & Close actions.
 
@@ -145,7 +189,8 @@ From 900px the web app has Home, Board, Workflows, Organize and Settings views.
 Pins, keyword grouping, reviewed organizer moves, folder/workflow/keyword JSON
 exchange and the desktop Notes editor work on its own local TreeStore copy.
 Desktop edits wait for Push; phones keep their existing push-after-change default.
-The extension's original UI remains available from its toolbar button.
+From 1.9.0 the extension's original UI is no longer opened; its data moves in
+(see [Moving to the web app](#moving-to-the-web-app-190)).
 
 With the helper connected, dirty copies are mirrored every 30 seconds and on hide,
 in verified chunks, into extension storage: up to three copies of 64 MiB per
@@ -156,7 +201,8 @@ copy aside. Helper safety copies clear after a clean sync or an explicit vault
 clear. When a vault is available, sign-out asks to push or set local edits aside
 before clearing that account's vault. Uninstalling the helper deletes its vault.
 Settings can also bring in an extension backup as separate, reviewable copies;
-credentials from the file are ignored. Nothing moves out of the old extension.
+credentials from the file are ignored. The extension's own data comes over with
+the move in 1.9.0.
 
 ### Web app (phone + anywhere else)
 
@@ -170,9 +216,9 @@ HTML file in **Settings → Import bookmarks** — works with any browser.
 
 ## 🎮 How to Use
 
-1. **Click the TabPaladin icon** in your toolbar to open the app
-2. **Create Workflow** — Save all your current tabs (extension)
-3. **View Workflows** — Restore, open, or delete saved sessions (both clients)
+1. **Click the TabPaladin icon** in your toolbar to open the web app
+2. **Create Workflow** — Save all your current tabs (with the helper connected)
+3. **View Workflows** — Restore, open, or delete saved sessions
 4. **Organize Bookmarks** — Sort folders by keyword, reviewing every move first
 5. **Push / Pull** — git-style sync; edit offline, push when ready
 

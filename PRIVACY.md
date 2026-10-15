@@ -54,9 +54,9 @@ favicon and explicitly connected services described below still apply.
   the extension's local storage. In the web app, your server address and sign-in session
   are kept in that browser's storage. TabPaladin has no built-in AI any more: a Gemini API
   key entered in an earlier version is deleted from your device when the extension updates.
-- **In a backup file, if you make one.** **Settings → Backup** saves a file to your computer
-  with everything the extension holds. Your sign-in session is left out of it. The file is
-  not sent anywhere.
+- **In a backup file, if you make one.** **Settings → Backup** (from 1.9.0, **Download a
+  backup file** on the move page) saves a file to your computer with everything the
+  extension holds. Your sign-in session is left out of it. The file is not sent anywhere.
 - **On your own sync server, if you set one up.** TabPaladin can sync with a server that
   *you* host (for example in Docker on a home NAS). When you sign in and push, your
   bookmark tree, workflows and notes are sent to that server and stored in its database,
@@ -81,6 +81,28 @@ copies. Removing the extension deletes its vault. An imported extension backup
 is kept as separate local copies for review, including matching note drafts;
 credentials in the file are ignored. Neither feature sends data to the developer
 or migrates the old extension's working copy automatically.
+
+## Moving from the extension's old interface (1.9.0)
+
+When you click **Move** on the extension's move page and then **Bring in** in
+the web app, the extension hands what its old interface kept to the web app
+in this browser: the working copy and set-aside copies made for that server
+(or before you signed in anywhere), note drafts for those copies, and device
+preferences (keyword categories, category order, the notes view, open cards).
+It goes from the extension's storage to the web app's storage on this device,
+checked piece by piece; nothing goes to the server until you push, as before.
+Copies made for another server, and their drafts, stay in the extension.
+
+No sign-in session, password or key is handed over; an old AI key still stored
+in the extension never is either. Once the web app is signed in, the old
+interface's own session is signed out on its server and removed from the
+extension. A shared server token pasted into the old interface is left as it
+is. The move page offers a backup file first, without sessions or keys.
+
+Nothing is deleted: the extension keeps everything its old interface stored,
+so reinstalling the previous version brings it back. The web app keeps what it
+received until you remove it in Settings. The extension records where and when
+it handed data over.
 
 ## Third-party services
 
