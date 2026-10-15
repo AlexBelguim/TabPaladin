@@ -1,18 +1,17 @@
-import { el, button, walk, visibleRoots, download, nodeCount, sameAccount } from './desktopCore.js';
+import { el, button, walk, visibleRoots, download, nodeCount, sameAccount, folderPaths } from './desktopCore.js';
 import { BookmarkOrganizer } from './lib/bookmarkOrganizer.js';
-function folders(roots){const out=[];const visit=(nodes,path=[])=>{for(const node of nodes||[])if(node.kind==='folder'&&!node.virtual&&!node.readOnly){const parts=[...path,node.title];out.push({node,path:parts.join(' > ')});visit(node.children,parts);}};visit(roots);return out;}
 function exportNode(n){if(n.kind==='folder')return{type:'folder',title:n.title,children:(n.children||[]).filter(c=>!c.virtual&&!c.readOnly).map(exportNode)};if(n.kind==='note')return{type:'bookmark',title:n.title,url:'data:application/json,'+encodeURIComponent(JSON.stringify(n.payload))};return{type:'bookmark',title:n.title,url:n.url};}
 export function createOrganize(ctx){
     let selected=new Set(),proposal=null,previewAccount=null,rootId=null,splitNext=null,rootRef=null;
     function reset(){selected=new Set();proposal=null;previewAccount=null;}
     async function analyze(ids){
-        const account=ctx.account();await ctx.assertAccount(account);const raw=await BookmarkOrganizer.proposeSmartOrganization(ids);
+        const account=ctx.account();await ctx.assertAccount(account);const scope=new Set();for(const id of ids){if(id.startsWith('loose-'))scope.add(id);else{const n=await ctx.store.getNode(id);if(n)for(const f of walk([n]).filter(x=>x.kind==='folder'&&!x.virtual&&!x.readOnly))scope.add('loose-'+f.id);}}const raw=await BookmarkOrganizer.proposeSmartOrganization([...scope]);
         await ctx.assertAccount(account);previewAccount=account;proposal=[];
         for(const g of raw.groups||[]){const items=[];for(const item of g.items||[]){const n=await ctx.store.getNode(item.id);if(n?.kind==='bookmark'&&!n.virtual&&!n.readOnly)items.push({...item,title:n.title,url:n.url});}if(items.length)proposal.push({...g,items,checked:true});}
         ctx.refresh();
     }
     async function destination(text,group){
-        const all=folders(ctx.store.roots()),exact=all.find(f=>f.path.toLowerCase()===text.trim().toLowerCase());if(exact)return exact.node.id;
+        const all=folderPaths(ctx.store.roots()),exact=all.find(f=>f.path.toLowerCase()===text.trim().toLowerCase());if(exact)return exact.node.id;
         const parts=text.split('>').map(p=>p.trim()).filter(Boolean);if(!parts.length)throw new Error('Choose a destination path.');
         let parent=group.targetId&&await ctx.store.getNode(group.targetId);let index=0;
         const prefix=all.filter(f=>text.toLowerCase().startsWith(f.path.toLowerCase()+' > ')).sort((a,b)=>b.path.length-a.path.length)[0];
@@ -35,13 +34,13 @@ export function createOrganize(ctx){
         if(data.version!==1||data.type!=='folder')throw new Error('Choose a version 1 folder export.');const tree=convert(data);const existing=ctx.store.roots().find(n=>n.kind==='folder'&&n.title===tree.title&&!n.role&&!n.virtual);let replace=false;
         if(existing){replace=confirm('Replace '+existing.title+' ('+nodeCount(existing)+' items)? Cancel offers renaming.');if(!replace){const name=prompt('Import under a different folder name',tree.title+' (imported)');if(!name)return;tree.title=name;}else if(!confirm('Confirm replacement. The existing working copy will first be kept aside as a backup.'))return;}
         if(!confirm('Import '+count+' items into '+tree.title+'?'))return;
-        await ctx.edit(async account=>{if(replace)await ctx.store.importBackupCopy({roots:ctx.store.roots(),...ctx.store.status()},{account});const made=await ctx.store.createTree({parentId:null,tree});if(replace)await ctx.store.removeNode(existing.id);const settings=await ctx.storage.getSettings();await ctx.storage.saveSettings({...settings,focusedFolderIds:[...new Set([...(settings.focusedFolderIds||[]),made.id])]});});
+        await ctx.edit(async account=>{if(replace)await ctx.store.importBackupCopy({roots:ctx.store.roots(),...ctx.store.status()},{account});const made=await ctx.store.createTree({parentId:null,tree});if(replace)await ctx.store.removeNode(existing.id);const settings=await ctx.storage.getSettings();await ctx.store.saveCopySettings({focusedFolderIds:[...new Set([...(settings.focusedFolderIds||[]),made.id])]},{account});});
         ctx.toast('Folder imported locally.');
     }
     const api={split(id){splitNext=id;proposal=null;},async render(root,id=null){
         rootRef=root;if(previewAccount&&!sameAccount(previewAccount,ctx.account()))reset();if(rootId!==id){rootId=id;selected=new Set();if(!splitNext)proposal=null;}
         root.append(el('h1',{},'Organize'));
-        const settings=await ctx.storage.getSettings(),all=folders(ctx.store.roots());
+        const settings=await ctx.storage.getSettings(),all=folderPaths(ctx.store.roots());
         const current=id?await ctx.store.getNode(id):null;
         if(current&&(current.virtual||current.readOnly)){root.append(el('p',{},'The archive is managed on the Board; choose a writable source.'));return;}
         const tools=el('div',{className:'desktop-inline'},button('Sources',()=>{proposal=null;ctx.navigate('organize');}),button('+ New folder',async()=>{const title=prompt('Folder name');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:current?.id||null,kind:'folder',title:title.trim()}));}));
@@ -62,7 +61,7 @@ export function createOrganize(ctx){
             }
             root.append(button('Apply selected changes',()=>apply(proposal.filter(g=>g.checked)),'primary'),button('Back to sources',()=>{proposal=null;ctx.refresh();}));return;
         }
-        const breadcrumb=el('div',{className:'desktop-inline'},button('All sources',()=>ctx.navigate('organize')));if(current){const path=all.find(f=>f.node.id===current.id)?.path;breadcrumb.append(el('span',{},path||current.title));}root.append(breadcrumb);
+        const breadcrumb=el('div',{className:'desktop-inline'},button('All sources',()=>ctx.navigate('organize')));if(current){const entry=all.find(f=>f.node.id===current.id);for(const folder of entry?.trail||[current])breadcrumb.append(button(folder.title||'Untitled',()=>ctx.navigate('organize',folder.id)));}root.append(breadcrumb);
         const sources=current?(current.children||[]).filter(n=>n.kind==='folder'&&!n.readOnly&&!n.virtual):visibleRoots(ctx.store.roots(),settings).filter(n=>!n.virtual&&!n.readOnly);
         const grid=el('div',{className:'organize-sources'});
         for(const source of sources){const check=el('input',{type:'checkbox',checked:selected.has(source.id)});check.addEventListener('change',()=>check.checked?selected.add(source.id):selected.delete(source.id));const tile=el('article',{},el('label',{},check,' '+source.title),el('p',{},(source.children||[]).filter(n=>n.kind==='bookmark').length+' loose bookmarks'),button('Browse ›',()=>ctx.navigate('organize',source.id)),button('Split loose bookmarks',()=>analyze(['loose-'+source.id])));grid.append(tile);}

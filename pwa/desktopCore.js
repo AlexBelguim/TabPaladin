@@ -38,3 +38,5 @@ export function visibleRoots(roots, settings = {}) {
 }
 export function sameAccount(a,b) { return (!a && !b) || !!(a && b && a.url === b.url && String(a.userId) === String(b.userId) && a.serverId === b.serverId); }
 export function nodeCount(n) { return 1 + (n.children || []).reduce((sum,c) => sum + nodeCount(c),0); }
+
+export function folderPaths(roots){const out=[];const visit=(nodes,path=[],trail=[])=>{for(const node of nodes||[])if(node.kind==='folder'&&!node.virtual&&!node.readOnly){const parts=[...path,node.title],parents=[...trail,node];out.push({node,path:parts.join(' > '),trail:parents});visit(node.children,parts,parents);}};visit(roots);return out;}

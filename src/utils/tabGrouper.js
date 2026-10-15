@@ -69,7 +69,7 @@ function getContext(item, keywordMap = CONTEXT_KEYWORDS) {
         const match = keywords.some(keyword => {
             if (keyword.length < 4) {
                 // Regex boundary check
-                const regex = new RegExp(`\\b${keyword}\\b`, 'i');
+                const escaped = [...keyword].map(c => '\\^$.*+?()[]{}|'.includes(c) ? '\\' + c : c).join(''); const regex = new RegExp('\\b' + escaped + '\\b', 'i');
                 return regex.test(text);
             }
             return text.includes(keyword);
@@ -96,7 +96,7 @@ export const TabGrouper = {
             }
             groups[domain].push(item);
             return groups;
-        }, {});
+        }, Object.create(null));
     },
 
     /**
@@ -119,10 +119,10 @@ export const TabGrouper = {
             ]
             : knownCats;
 
-        const mergedMap = {};
+        const mergedMap = Object.create(null);
         for (const cat of orderedCats) {
-            const defaults = CONTEXT_KEYWORDS[cat] || [];
-            const custom = customKeywords[cat] || [];
+            const defaults = Object.hasOwn(CONTEXT_KEYWORDS, cat) ? CONTEXT_KEYWORDS[cat] : [];
+            const custom = Object.hasOwn(customKeywords, cat) && Array.isArray(customKeywords[cat]) ? customKeywords[cat].filter(word => typeof word === 'string') : [];
             const merged = [...new Set([...defaults, ...custom])];
             if (merged.length > 0) mergedMap[cat] = merged;
         }
@@ -132,7 +132,7 @@ export const TabGrouper = {
             if (!groups[context]) groups[context] = [];
             groups[context].push(item);
             return groups;
-        }, {});
+        }, Object.create(null));
     },
 
     /**

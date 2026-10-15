@@ -34,7 +34,9 @@ for (const t of compareTwins()) {
 console.log('\n2. Plain files that import only each other');
 for (const [canonical] of TWINS) {
     const bytes = fs.readFileSync(path.join(ROOT, canonical));
-    check(`${canonical}: no BOM, LF only`, bytes[0] !== 0xef && !bytes.includes(0x0d));
+    const crlf = ['src/utils/bookmarkOrganizer.js', 'src/utils/tabGrouper.js'].includes(canonical);
+    const endings = crlf ? !bytes.toString('utf8').replace(/\r\n/g, '').includes('\n') : !bytes.includes(0x0d);
+    check(`${canonical}: no BOM, preserved ${crlf ? 'CRLF' : 'LF'}`, bytes[0] !== 0xef && endings);
     // Only a fellow twin, by a relative path: never anything of either client's.
     const imports = [...bytes.toString('utf8').matchAll(/^\s*import\s[^'"]*['"]([^'"]+)['"]/gm)].map(m => m[1]);
     check(`${canonical}: imports only its fellow twins`,

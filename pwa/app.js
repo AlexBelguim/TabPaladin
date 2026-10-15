@@ -43,6 +43,7 @@ import { createSettings } from './settings.js';
 import { createOrganize } from './organize.js';
 import { createNoteExtras } from './notesExtras.js';
 import { createVaultMirror } from './vault.js';
+import { housekeeping } from './housekeeping.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -498,6 +499,8 @@ async function bootstrap({ previousUsername = null, switched: switchedAtSignIn =
     refreshHelperState();
     retryHelperWorkflows();
     vaultMirror?.check();
+    housekeeping(desktopContext()).catch(e=>console.warn('Copy housekeeping:',e.message));
+    desktopRouteFromHash();
 }
 
 // What waits while the share sheet is up: the proposals (which would redraw
@@ -956,6 +959,7 @@ async function pullSnapshot({ expect = null } = {}) {
         await TreeStore.updateMeta((m) => ({ ...m, importIds: [], serverIds: pulledIds }));
         state.pathIds = [ROOT_ID];
         noteSync('pull');
+        await housekeeping(desktopContext(),{pulled:true}).catch(e=>console.warn('Copy housekeeping:',e.message));
         renderView();
         if (res && res.setAside) showToast('The copy on this device was another account’s: it is set aside here, not pulled over.');
         if (shareSheet) shareSheet.refresh();
@@ -1044,8 +1048,10 @@ let lastRender = { view: 'home', pane: null, noteId: null, scope: null };
 const nvScroll = { library: 0, list: 0, listScope: null };
 
 function renderView() {
+    desktopUi?.captureScroll($('content'));
     setStatus('');
     const notes = state.view === 'notes';
+    if(isDesktop()&&desktopUi){if(notes&&desktopUi.route!=='notes')desktopUi.setRoute('notes');else if(!notes&&desktopUi.route==='notes')desktopUi.setRoute('home');}
     const prev = lastRender;
     const cur = { view: state.view, pane: state.nv.pane, noteId: state.nv.noteId, scope: state.nv.scope };
     const desktop = isDesktop();
@@ -1884,7 +1890,7 @@ function desktopContext() {
         },
         refresh: renderView, toast: showToast, navigate: navigateDesktop,
         split:id=>{organizePort?.split(id);navigateDesktop('organize',id);},
-        openWorkflow: node=>node&&openWorkflowTabs(fromWire(node)),
+        openWorkflow: node=>{if(!node)return;const view=fromWire(node);const all=[];const collect=nodes=>{for(const n of nodes||[]){if(n.kind==='bookmark')all.push(fromWire(n));collect(n.children);}};collect(node.children);view.children=all;return openWorkflowTabs(view);},
         capture:()=>{offerHelperSave();captureHelperTabs();}, pinCurrent:pinHelperTab,
         async publishWorkflow(id){
             const account=helperAccount();await assertHelperAccount(account);
@@ -1911,8 +1917,15 @@ function navigateDesktop(route,id=null) {
     history.replaceState({tp:'desktop',account:accountKey(),route},'', '#/'+route+(id?'/'+encodeURIComponent(id):''));
     renderView();
 }
+function desktopRouteFromHash(){
+    if(!desktopUi||!isDesktop()||!booted||location.hash.startsWith('#/workflows/save'))return;
+    const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);if(!match)return;
+    let id;try{id=match[2]?decodeURIComponent(match[2]):null;}catch{return;}
+    if(match[1]==='notes'&&id){if(confirmDiscardEdit())openNoteById(id,{from:'Home'});return;}
+    navigateDesktop(match[1],id);
+}
 function wireDesktop() {
-    noteExtras=createNoteExtras({desktop:isDesktop,getMode:()=>NM.readNotesUi(notesStorage()).mode,setMode:mode=>NM.writeNotesUi(notesStorage(),{...NM.readNotesUi(notesStorage()),mode}),startEdit:startEditing,refresh:renderView,push:pushNow,renderPreview:(content,title)=>renderNotePreview(document,content,title)});
+    noteExtras=createNoteExtras({desktop:isDesktop,getMode:()=>NM.readNotesUi(notesStorage()).mode,setMode:mode=>NM.writeNotesUi(notesStorage(),{...NM.readNotesUi(notesStorage()),mode}),startEdit:startEditing,refresh:renderView,push:pushNow,account:signedInAccount,renderPreview:(content,title)=>renderNotePreview(document,content,title)});
     desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
     desktopUi.register('board',createBoard(desktopContext()));
     desktopUi.register('workflows',createWorkflows(desktopContext()));
@@ -1924,8 +1937,8 @@ function wireDesktop() {
         async saveDraft(){if(editorDirty()){if(!confirm('Save the open note before signing out?'))return false;await saveNoteEdit();}return !editorDirty();},
         async confirmAccount(){const before=signedInAccount();if(!before)return null;const data=await api('/api/auth/me');return sameDesktopAccount(before,signedInAccount())&&Number(data.user?.id)===before.userId&&data.serverId===before.serverId?before:null;}
     });
-    const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
-    if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
+    window.addEventListener('hashchange',desktopRouteFromHash);
+    desktopRouteFromHash();
 }
 
 // --- Workflows: saved tab sessions, now first-class in the web app ---
@@ -2589,6 +2602,7 @@ function validateNv(lib) {
     const nbId = NM.notebookIdOf(nv.scope);
     if (nbId && !lib.notebooks.has(nbId)) nv.scope = 'all';
     if (nv.noteId && !nv.isNew && !lib.notes.some(n => n.id === nv.noteId)) {
+        const recovered=noteExtras?.recover(nv);if(recovered)Object.assign(nv,recovered,editorCopy());
         nv.noteId = null;
         if (nv.editing && nv.draft != null) {
             // The note vanished under an edit: keep the text as a new note.
@@ -3053,8 +3067,8 @@ async function saveNoteEdit() {
         // another window or an import brought another version in): never
         // overwrite that. The edit is saved as a note of its own right next
         // to it.
-        if (nv.loaded != null && meta.content !== nv.loaded) {
-            const title = `${note.title} (my edit)`;
+        if (nv.loaded != null && (meta.content !== nv.loaded || nv.loadedTitle != null && note.title !== nv.loadedTitle)) {
+            const title = `${nv.titleField || nv.loadedTitle || note.title} (my edit)`;
             let made = null;
             const ok = await copyEdit(async () => {
                 made = await TreeStore.createNode({

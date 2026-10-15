@@ -5,9 +5,11 @@ import { helperUrl } from './helper.js';
 let dragging = null;
 const domain = url => { try { return new URL(url).hostname.replace(/^www\./,'') || 'Local files'; } catch { return 'Other'; } };
 export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
-    const urls=nodes.filter(n=>n.kind==='bookmark'&&helperUrl(n.url)).slice(0,limit).map(n=>n.url);
+    const eligible=nodes.filter(n=>n.kind==='bookmark'&&helperUrl(n.url));
+    const urls=eligible.slice(0,limit).map(n=>n.url);
+    if(eligible.length>limit&&limit===500)ctx.toast('Opening the first 500 of '+eligible.length+' bookmarks. Open smaller folders for the rest.');
     if(!urls.length)return;
-    if(ctx.helper.supports('windows.openUrls'))await ctx.helper.request('windows.openUrls',{urls,mode});
+    if(ctx.helper.supports('windows.openUrls')){const result=await ctx.helper.request('windows.openUrls',{urls,mode});if(result.failed?.length)ctx.toast(result.failed.length+' bookmarks could not be opened. Your bookmarks are kept.');}
     else for(const url of urls){const u=new URL(url);if(['http:','https:'].includes(u.protocol))window.open(url,'_blank','noopener');}
 }
 function drag(elm,payload,ctx){elm.draggable=true;elm.addEventListener('dragstart',e=>{dragging={...payload,account:ctx.account()};e.dataTransfer.setData('text/plain','TabPaladin items');e.dataTransfer.effectAllowed='move';});elm.addEventListener('dragend',()=>{dragging=null;});}
@@ -29,13 +31,13 @@ export function createFolderCards(ctx){
         const toggle=button((open?'▾ ':'▸ ')+(node.title||'Untitled'),()=>{open=!open;ExpandState.set(node.id,open);fill();},'board-toggle');
         const actions=el('div',{className:'board-tools'});
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
-        actions.append(button('Open All',()=>openNodes(ctx,loose())),button('Open 10',()=>openNodes(ctx,loose(),10)));
+        actions.append(button(loose().length>500?'Open first 500':'Open All',()=>openNodes(ctx,loose())),button('Open 10',()=>openNodes(ctx,loose(),10)));
         head.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();openNodes(ctx,loose()).catch(x=>ctx.toast(x.message));}});
         actions.append(button('›',()=>ctx.navigate('organize',node.id)));
         if(!readOnly){
             actions.append(button('+ Folder',async()=>{const title=prompt('New subfolder');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:node.id,kind:'folder',title:title.trim()}));}));
             if(ctx.split)actions.append(button('Split',()=>ctx.split(node.id)));
-            if(!node.role)actions.append(button('Delete',async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?'))await ctx.edit(()=>ctx.store.removeNode(node.id));}));
+            if(!node.role)actions.append(button('Delete',async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}}));
             drag(toggle,{kind:'nodes',ids:[node.id]},ctx);
             box.addEventListener('dragover',e=>{if(!dragging)return;e.preventDefault();box.classList.add('drop-target');if(!open){const t=setTimeout(()=>{ExpandState.openForSession(node.id);open=true;fill();},700);timers.add(t);}});
             box.addEventListener('dragleave',()=>{box.classList.remove('drop-target');for(const t of timers)clearTimeout(t);timers.clear();});
@@ -62,13 +64,14 @@ export function createFolderCards(ctx){
             let shown=0;
             for(const [name,items]of groups){
                 const group=el('div',{className:'board-domain'}),bar=el('div',{className:'board-domain-head'},el('strong',{},name+' · '+items.length));
-                bar.append(button('All',()=>openNodes(ctx,items)),button('10',()=>openNodes(ctx,items,10)),button('Delete',()=>removeItems(ctx,items)));
+                bar.append(button(items.length>500?'First 500':'All',()=>openNodes(ctx,items)),button('10',()=>openNodes(ctx,items,10)),button('Delete',()=>removeItems(ctx,items)));
                 drag(bar,{kind:'nodes',ids:items.map(n=>n.id)},ctx);group.append(bar);
                 bar.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();openNodes(ctx,items).catch(x=>ctx.toast(x.message));}});
                 for(const item of items){
                     if(shown>=limit||pool.remaining<=0)break;shown++;pool.remaining--;
                     const row=el('div',{className:'board-bookmark'}),a=el('a',{href:item.url,target:'_blank',rel:'noopener',text:item.title||item.url});
                     if(helperUrl(item.url))row.addEventListener('auxclick',e=>{if(e.button===1&&ctx.helper.supports('windows.openUrls')){e.preventDefault();openNodes(ctx,[item],1,'background').catch(x=>ctx.toast(x.message));}});
+                    if(/^https?:/.test(item.url)){const icon=el('img',{width:'16',height:'16',alt:'',loading:'lazy'});icon.src='https://www.google.com/s2/favicons?domain='+encodeURIComponent(domain(item.url))+'&sz=16';row.append(icon);}
                     row.append(a,button('×',()=>removeItems(ctx,[item])));drag(row,{kind:'nodes',ids:[item.id]},ctx);group.append(row);
                 }body.append(group);
             }
@@ -86,8 +89,9 @@ export function createBoard(ctx){
     const localCtx={...ctx,fileTabs,split:id=>ctx.split(id)};
     const cards=createFolderCards(localCtx);
     async function fileTabs(payload,targetId){
-        if(!snapshot||snapshot.snapshotId!==payload.snapshotId||!sameAccount(accountAtSnapshot(),ctx.account()))throw new Error('Refresh the tab snapshot before filing.');
-        const selected=payload.tabs.filter(t=>snapshot.tabs.some(s=>s.tabId===t.tabId&&s.url===t.url));
+        const filingSnapshot=snapshot;
+        if(!filingSnapshot||filingSnapshot.snapshotId!==payload.snapshotId||!sameAccount(accountAtSnapshot(),ctx.account()))throw new Error('Refresh the tab snapshot before filing.');
+        const selected=payload.tabs.filter(t=>filingSnapshot.tabs.some(s=>s.tabId===t.tabId&&s.url===t.url));
         if(!selected.length||selected.length!==payload.tabs.length)throw new Error('The tab snapshot changed. No tabs were closed.');
         let savedIds=[],workflowId=null;
         await ctx.edit(async()=>{
@@ -105,7 +109,7 @@ export function createBoard(ctx){
         const record=(await ctx.platform.getRaw('tpTree')).tpTree;const nodes=walk(record?.roots||[]);
         if(!savedIds.every(s=>nodes.some(n=>n.id===s.id&&n.url===s.url)))throw new Error('Could not read back every filed bookmark; tabs remain open.');
         await ctx.assertAccount(payload.account);
-        const result=await ctx.helper.request('tabs.closeSnapshot',{snapshotId:snapshot.snapshotId,tabIds:selected.map(t=>t.tabId),expectedCount:selected.length});
+        const result=await ctx.helper.request('tabs.closeSnapshot',{snapshotId:filingSnapshot.snapshotId,tabIds:selected.map(t=>t.tabId),expectedCount:selected.length});
         if(workflowId)await ctx.publishWorkflow?.(workflowId);
         snapshot=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed. Refresh to file more.');ctx.refresh();
     }
@@ -115,7 +119,7 @@ export function createBoard(ctx){
         const got=await ctx.helper.request('tabs.snapshot',body);snapshot={...got,account};groupsOverride=null;ctx.refresh();
     }
     const board={async render(root){
-        rootRef=root;settings=await ctx.storage.getSettings();await ExpandState.load();
+        rootRef=root;if(snapshot&&!sameAccount(snapshot.account,ctx.account())){snapshot=null;groupsOverride=null;}settings=await ctx.storage.getSettings();await ExpandState.load();
         root.append(el('h1',{},'Board'));
         const toolbar=el('div',{className:'desktop-inline'});
         const refresh=button('Refresh open tabs',refreshTabs);refresh.disabled=!ctx.helper.supports('tabs.snapshot');toolbar.append(refresh);
@@ -137,7 +141,10 @@ export function createBoard(ctx){
                     if(ExpandState.isOpen(key,true))for(const t of list){const row=el('div',{className:'board-tab',text:t.title||t.url,title:t.url});drag(row,{kind:'tabs',tabs:[t],snapshotId:snapshot.snapshotId},ctx);group.append(row);}tabs.append(group);
                 }
             }
-        }columns.append(tabs);
+        }
+        tabs.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
+        tabs.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||!snapshot)return;e.preventDefault();const items=dragging.tabs;const ids=new Set(items.map(t=>t.tabId));const original=groupsOverride||TabGrouper.groupSmart(snapshot.tabs,settings.customKeywords,settings.categoryOrder);groupsOverride=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,v.filter(t=>!ids.has(t.tabId))]));groupsOverride.Ungrouped=[...(groupsOverride.Ungrouped||[]),...items];dragging=null;ctx.refresh();});
+        columns.append(tabs);
         const pool=cards.budget();for(const n of visibleRoots(ctx.store.roots(),settings))columns.append(cards.card(n,{budget:pool}));root.append(columns);
     },destroy(){cards.destroy();rootRef=null;snapshot=null;}};
     document.addEventListener('dragover',e=>{if(!dragging)return;const edge=60;if(e.clientY<edge)window.scrollBy(0,-18);else if(e.clientY>innerHeight-edge)window.scrollBy(0,18);});

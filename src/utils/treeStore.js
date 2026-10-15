@@ -947,7 +947,7 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
 
 // A set-aside copy of `copy` (as record() gives it). It says which copy it was
 // made from, and from which stored version of it, for saveOrphan.
-async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [] } = {}) {
+async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [], recoveryDrafts = [] } = {}) {
     const keys = await stashIndex();
     const base = stashKeyFor(copy.owner, fallbackUrl);
     let key = base;
@@ -968,6 +968,7 @@ async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds
             focusedFolderIds,
             expanded,
             pendingRemovals,
+            ...(recoveryDrafts.length ? { recoveryDrafts: clone(recoveryDrafts) } : {}),
             restoredFrom: copy.restoredFrom,
             copyId: copy.copyId || null,
             fromRev: copy.rev || null,
@@ -1405,7 +1406,7 @@ export const TreeStore = {
             const url = new URL(a.url); if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid recovery origin.');
             owner = { url: url.origin, userId: Number(a.userId), username: typeof a.username === 'string' ? a.username : null, serverId: typeof a.serverId === 'string' ? a.serverId : null };
         }
-        const copy = { roots, owner, origin: owner ? null : incoming.origin || 'pre-accounts', dirty: Boolean(incoming.dirty), editCount: Math.max(0, Number(incoming.editCount) || 0), baseVersion: Math.max(0,Number(incoming.baseVersion)||0), copyId: typeof incoming.copyId === 'string' ? incoming.copyId : newId(), rev: null, restoredFrom: [], meta: {} };
+        const copy = { roots, owner, origin: owner ? null : incoming.origin || 'pre-accounts', dirty: Boolean(incoming.dirty), editCount: Math.max(0, Number(incoming.editCount) || 0), baseVersion: Math.max(0,Number(incoming.baseVersion)||0), copyId: typeof incoming.copyId === 'string' ? incoming.copyId : newId(), rev: null, restoredFrom: stampsIn(incoming.restoredFrom), meta: JSON.parse(JSON.stringify(metaOf(incoming),(key,value)=>/(token|password|secret|apikey)$/i.test(key)?undefined:value)) };
         if (sourceId) copy.meta.recoverySourceId = String(sourceId);
         return withCopyLock(async () => {
             await reconcile();
@@ -1414,12 +1415,23 @@ export const TreeStore = {
                 const item = (await api.storage.local.get(key))[key];
                 if (item?.meta?.recoverySourceId === sourceId) return { key, items: count, owner: item.owner, duplicate: true };
             }
-            const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))) });
-            if (drafts.length) {
-                const stash = (await api.storage.local.get(key))[key];
-                await api.storage.local.set({ [key]: { ...stash, recoveryDrafts: clone(drafts) } });
-            }
+            const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))), recoveryDrafts: drafts });
             return { key, items: count, owner };
+        });
+    },
+
+    async saveCopySettings(patch, { account, expect = null } = {}) {
+        await ensureLoaded();
+        return withCopyLock(async () => {
+            await reconcile();
+            if (!account || !sameAccount(state.owner, accountOf(account)) || expect && !sameCopy(copyToken(), expect)) throw stopped('account-changed');
+            const settings = await readSettings();
+            const update = {};
+            if (Array.isArray(patch.focusedFolderIds)) update.focusedFolderIds = patch.focusedFolderIds.filter(id => typeof id === 'string' && index.has(id));
+            if (patch.customKeywords && typeof patch.customKeywords === 'object' && !Array.isArray(patch.customKeywords)) update.customKeywords = clone(patch.customKeywords);
+            if (Array.isArray(patch.categoryOrder)) update.categoryOrder = patch.categoryOrder.filter(name => typeof name === 'string');
+            await api.storage.local.set({ [SETTINGS_KEY]: { ...settings, ...update } });
+            return true;
         });
     },
 
@@ -1990,67 +2002,52 @@ export const TreeStore = {
 
         async deleteItems(config, nodeIds) {
             await ensureLoaded();
-            const bySource = new Map();
-            for (const id of nodeIds) {
-                const p = TreeStore.imports.parse(id);
-                if (!p) continue;
-                if (!bySource.has(p.sourceId)) bySource.set(p.sourceId, []);
-                bySource.get(p.sourceId).push({ id, externalId: p.externalId });
-            }
-            let removed = 0;
-            const gone = [];
-            for (const [sourceId, items] of bySource) {
-                await apiFetch(config, `/api/imports/${sourceId}/items/delete`, {
-                    method: 'POST',
-                    body: JSON.stringify({ externalIds: items.map(i => i.externalId) })
+            const started=await withCopyLock(async()=>{await reconcile();if(!state.owner||!sameUrl(state.owner.url,config.url))throw stopped('account-changed');return copyToken();});
+            const bySource=new Map();for(const id of nodeIds){const p=TreeStore.imports.parse(id);if(!p)throw new Error('Choose archived items, not archive folders.');if(!bySource.has(p.sourceId))bySource.set(p.sourceId,[]);bySource.get(p.sourceId).push({id,externalId:p.externalId});}
+            let removed=0;for(const[sourceId,items]of bySource){
+                await apiFetch(config,'/api/imports/'+sourceId+'/items/delete',{method:'POST',body:JSON.stringify({externalIds:items.map(i=>i.externalId)})});
+                await withCopyLock(async()=>{await reconcile();if(!sameCopy(copyToken(),started))throw stopped('account-changed');const gone=[];for(const it of items){try{detach(it.id);gone.push(String(it.id));removed++;}catch{}}
+                    reindex();if(gone.length){recordEdit(removeStep(gone,{virtual:true}),{dirty:false});await writeCopy();emit('removed');}
                 });
-                // Server accepted — mirror it locally so the row disappears now
-                // rather than on the next pull. Not a dirty edit: virtual nodes
-                // are never pushed anyway.
-                for (const it of items) {
-                    try { detach(it.id); } catch (e) { /* already gone locally */ }
-                    gone.push(String(it.id));
-                    removed++;
-                }
-            }
-            reindex();
-            recordEdit(removeStep(gone, { virtual: true }), { dirty: false });
-            emit('removed');
-            return removed;
+            }return removed;
         },
-
         async fileItems(config, nodeIds, targetFolderId) {
             await ensureLoaded();
-            assertWritable(targetFolderId);
-            const bySource = new Map();
-            for (const id of nodeIds) {
-                const p = TreeStore.imports.parse(id);
-                if (!p) continue;
-                const e = index.get(String(id));
-                if (!e) continue;
-                if (!bySource.has(p.sourceId)) bySource.set(p.sourceId, []);
-                bySource.get(p.sourceId).push({ id, externalId: p.externalId, title: e.node.title, url: e.node.url });
-            }
-            let filed = 0;
-            const steps = [];
-            for (const [sourceId, items] of bySource) {
-                await apiFetch(config, `/api/imports/${sourceId}/items/file`, {
-                    method: 'POST',
-                    body: JSON.stringify({ externalIds: items.map(i => i.externalId) })
-                });
-                for (const it of items) {
-                    const siblings = siblingsOf(targetFolderId);
-                    const node = makeNode({ kind: 'bookmark', title: it.title, url: it.url });
-                    siblings.push(node);
-                    steps.push(insertStep(node, targetFolderId));
-                    try { detach(it.id); } catch (e) { /* already gone locally */ }
-                    steps.push(removeStep([String(it.id)], { virtual: true }));
-                    filed++;
+            let started, bySource;
+            await withCopyLock(async () => {
+                await reconcile();
+                if (!state.owner || !sameUrl(state.owner.url, config.url)) throw stopped('account-changed');
+                assertWritable(targetFolderId); started = copyToken(); bySource = new Map();
+                for (const id of nodeIds) {
+                    const p = TreeStore.imports.parse(id), e = index.get(String(id));
+                    if (!p || !e || e.node.kind !== 'bookmark') throw new Error('Choose archived items, not archive folders.');
+                    if (!bySource.has(p.sourceId)) bySource.set(p.sourceId, []);
+                    bySource.get(p.sourceId).push({ id, externalId: p.externalId, title: e.node.title, url: e.node.url });
                 }
+                const steps = [];
+                for (const items of bySource.values()) for (const it of items) {
+                    const siblings = siblingsOf(targetFolderId);
+                    if (siblings.some(n => n.kind === 'bookmark' && n.url === it.url && n.title === it.title)) continue;
+                    const node = makeNode({ kind: 'bookmark', title: it.title, url: it.url });
+                    siblings.push(node); steps.push(insertStep(node, targetFolderId));
+                }
+                reindex();
+                if (steps.length) { recordEdit(() => { let changed = false; for (const step of steps) changed = step() || changed; return changed; }); await writeCopy(); }
+                if (pendingOps.length) throw new Error('The filed copies could not be saved. The server archive was kept.');
+                emit('moved');
+            });
+            let filed = 0;
+            for (const [sourceId, items] of bySource) {
+                await apiFetch(config, '/api/imports/' + sourceId + '/items/file', { method: 'POST', body: JSON.stringify({ externalIds: items.map(i => i.externalId) }) });
+                filed += items.length;
+                await withCopyLock(async () => {
+                    await reconcile();
+                    if (!sameCopy(copyToken(), started)) return; // Filed copies went with their original account's stash.
+                    const gone = [];
+                    for (const it of items) { try { detach(it.id); gone.push(String(it.id)); } catch {} }
+                    reindex(); if (gone.length) { recordEdit(removeStep(gone, { virtual: true }), { dirty: false }); await writeCopy(); emit('moved'); }
+                });
             }
-            reindex();
-            recordEdit(() => steps.map(step => step()).some(Boolean));
-            emit('moved');
             return filed;
         }
     },

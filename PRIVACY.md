@@ -64,6 +64,24 @@ favicon and explicitly connected services described below still apply.
   stored there too. Nobody else operates or can see this server unless you give them
   access.
 
+## Helper safety copies
+
+With helper 1.2.0 connected, the web app mirrors its unpushed working copy and
+that copy's parked/open note drafts to extension storage, every 30 seconds and
+on hide. Each copy is bound to the exact server origin, its pinned identity and
+account. At most three complete copies of 64 MiB each are retained per server;
+partial uploads expire after ten minutes. Digests verify the chunks. Session
+tokens and sign-in credentials are not part of the copy. This feature needs a
+secure web context.
+
+The web app offers recovery only after its own server confirms the account;
+restoring requires a click and keeps the current copy aside first. A clean sync,
+an explicit Settings action, or the vault-aware sign-out clears matching helper
+copies. Removing the extension deletes its vault. An imported extension backup
+is kept as separate local copies for review, including matching note drafts;
+credentials in the file are ignored. Neither feature sends data to the developer
+or migrates the old extension's working copy automatically.
+
 ## Third-party services
 
 TabPaladin only contacts these when you use the matching feature:

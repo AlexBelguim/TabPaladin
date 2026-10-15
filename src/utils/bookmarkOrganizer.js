@@ -257,7 +257,7 @@ export const BookmarkOrganizer = {
             let match = folders.find(f => f.title.toLowerCase() === name.toLowerCase());
 
             // 2. Synonym Match
-            if (!match && useSynonyms && TabGrouper.CONTEXT_SYNONYMS && TabGrouper.CONTEXT_SYNONYMS[name]) {
+            if (!match && useSynonyms && TabGrouper.CONTEXT_SYNONYMS && Object.hasOwn(TabGrouper.CONTEXT_SYNONYMS, name)) {
                 for (const syn of TabGrouper.CONTEXT_SYNONYMS[name]) {
                     match = folders.find(f => f.title.toLowerCase() === syn.toLowerCase());
                     if (match) break;
@@ -346,7 +346,7 @@ export const BookmarkOrganizer = {
                         if (!globalDomainMatch) {
                             // Try to find "Adult" or "Porn" globally
                             globalContextMatch = folderMap.find(f => f.title.toLowerCase() === context.toLowerCase());
-                            if (!globalContextMatch && TabGrouper.CONTEXT_SYNONYMS && TabGrouper.CONTEXT_SYNONYMS[context]) {
+                            if (!globalContextMatch && TabGrouper.CONTEXT_SYNONYMS && Object.hasOwn(TabGrouper.CONTEXT_SYNONYMS, context)) {
                                 for (const syn of TabGrouper.CONTEXT_SYNONYMS[context]) {
                                     globalContextMatch = folderMap.find(f => f.title.toLowerCase() === syn.toLowerCase());
                                     if (globalContextMatch) break;

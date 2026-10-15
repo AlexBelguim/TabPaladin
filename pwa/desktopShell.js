@@ -1,6 +1,6 @@
 import { el, button, sameAccount } from './desktopCore.js';
 export function createDesktopShell(ctx) {
-    let route='home',id=null,generation=0;
+    let route='home',id=null,generation=0,lastAccount=null;const scroll=new Map();
     const views=new Map();
     const nav=el('nav',{className:'desktop-nav','aria-label':'Workspace'});
     document.body.append(nav);
@@ -11,6 +11,7 @@ export function createDesktopShell(ctx) {
         register(name,view){views.set(name,view);drawNav();},
         setRoute(name,nodeId=null){route=name;id=nodeId;drawNav();},
         get route(){return route;},
+        captureScroll(root){if(!root||!lastAccount)return;const key=JSON.stringify(lastAccount);scroll.set(key,new Map([...root.querySelectorAll('[data-folder-id]')].map(card=>[card.dataset.folderId,card.querySelector('.board-body')?.scrollTop||0])));},
         invalidate(){generation++;},
         render(root){
             const view=views.get(route);if(!view)return false;
@@ -18,7 +19,7 @@ export function createDesktopShell(ctx) {
             root.append(el('p',{className:'desktop-loading'},'Loading workspace…'));
             Promise.resolve(view.render(stage,id)).then(()=>{
                 if(current!==generation||!sameAccount(account,ctx.account()))return;
-                root.replaceChildren(stage);
+                root.replaceChildren(stage);lastAccount=account;const kept=scroll.get(JSON.stringify(account));if(kept)for(const card of stage.querySelectorAll('[data-folder-id]')){const body=card.querySelector('.board-body');if(body)body.scrollTop=kept.get(card.dataset.folderId)||0;}
             }).catch(e=>{if(current===generation)root.replaceChildren(el('p',{},e.message));});
             return true;
         },

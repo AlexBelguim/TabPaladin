@@ -37,6 +37,7 @@ const SHELL = [
     '/organize.js',
     '/notesExtras.js',
     '/vault.js',
+    '/housekeeping.js',
     '/notesExtras.css?v=35',
     '/organize.css?v=35',
     '/settings.css?v=35',

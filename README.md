@@ -139,6 +139,25 @@ new install permissions are warning-free toolbar menus (`contextMenus` on Chrome
 The bridge runs only on the configured server origin, checks every message,
 and uses packaged code. See [PRIVACY.md](PRIVACY.md) for the disclosure.
 
+### Desktop web workspace (PWA 35 / helper 1.2.0)
+
+From 900px the web app has Home, Board, Workflows, Organize and Settings views.
+Pins, keyword grouping, reviewed organizer moves, folder/workflow/keyword JSON
+exchange and the desktop Notes editor work on its own local TreeStore copy.
+Desktop edits wait for Push; phones keep their existing push-after-change default.
+The extension's original UI remains available from its toolbar button.
+
+With the helper connected, dirty copies are mirrored every 30 seconds and on hide,
+in verified chunks, into extension storage: up to three copies of 64 MiB per
+pinned server. This needs a secure web context (HTTPS or loopback). Recovery is
+offered only after the server confirms the signed-in account, and requires a
+click. The recovered copy is first kept separately; restoring it sets the current
+copy aside. Helper safety copies clear after a clean sync or an explicit vault
+clear. When a vault is available, sign-out asks to push or set local edits aside
+before clearing that account's vault. Uninstalling the helper deletes its vault.
+Settings can also bring in an extension backup as separate, reviewable copies;
+credentials from the file are ignored. Nothing moves out of the old extension.
+
 ### Web app (phone + anywhere else)
 
 Run the sync server (see [server/README.md](server/README.md)), open

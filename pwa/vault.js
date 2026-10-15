@@ -5,6 +5,7 @@ const encode=bytes=>{let out='';for(let i=0;i<bytes.length;i+=32768)out+=String.
 const decode=value=>Uint8Array.from(atob(value),c=>c.charCodeAt(0));
 const pause=()=>new Promise(resolve=>setTimeout(resolve,25));
 export function createVaultMirror(ctx){
+    let missingAtStart=false;const startup=ctx.platform.getRaw('tpTree').then(d=>{missingAtStart=!d.tpTree?.roots?.length;}).catch(()=>{});
     let busy=false,checking=false,offer=null,lastReceipt='',message='Connect helper 1.2.0 to keep a safety copy of unpushed work.';
     const available=()=>ctx.helper.supports('vault.put')&&!!globalThis.crypto?.subtle;
     async function mirror(){
@@ -26,9 +27,10 @@ export function createVaultMirror(ctx){
         if(checking||!available()||!ctx.account())return;checking=true;
         try{
             const account=await ctx.confirmAccount();if(!account||!sameAccount(account,ctx.account())||ctx.helper.hello?.serverId!==account.serverId)return;
-            const entries=await ctx.helper.request('vault.list',{account});if(!sameAccount(account,ctx.account()))return;
+            await startup;const entries=await ctx.helper.request('vault.list',{account});if(!sameAccount(account,ctx.account()))return;
             const raw=(await ctx.platform.getRaw('tpTree')).tpTree;
-            offer=entries.filter(e=>e.dirty&&(!raw?.roots?.length||e.copyKey===raw.copyId&&e.seq>Number(raw.seq||0))).sort((a,b)=>b.at-a.at)[0]||null;
+            const localDrafts=ctx.drafts(),draftAt=Math.max(0,...localDrafts.map(d=>Number(d.at||d.parkedAt)||Date.parse(d.at||d.parkedAt)||0));
+            offer=entries.filter(e=>e.dirty&&(missingAtStart||!raw?.roots?.length||e.copyKey===raw.copyId&&(e.seq>Number(raw.seq||0)||e.seq===Number(raw.seq||0)&&e.draftCount>0&&(!localDrafts.length||e.draftAt>draftAt)))).sort((a,b)=>b.at-a.at)[0]||null;
             if(offer){message='Restore '+offer.editCount+' unpushed edits kept by the helper.';ctx.toast(message);}
         }catch(e){message=e.message;}finally{checking=false;}
     }
@@ -39,9 +41,9 @@ export function createVaultMirror(ctx){
         if(hex(await crypto.subtle.digest('SHA-256',bytes))!==wanted.sha256)throw new Error('The vault digest did not match. Nothing was restored.');
         const record=JSON.parse(new TextDecoder().decode(bytes));if(!sameAccount(record.owner,account))throw new Error('The vault owner does not match.');
         const saved=await ctx.store.importBackupCopy(record,{account,sourceId:'vault:'+wanted.sha256,drafts:record.vaultDrafts||[]});
-        const stash=(await ctx.store.listStashes(account)).find(s=>s.key===saved.key);if(stash)await ctx.restore(stash);offer=null;ctx.refresh();
+        const stash=(await ctx.store.listStashes(account)).find(s=>s.key===saved.key);if(stash)await ctx.restore(stash);offer=null;missingAtStart=false;ctx.refresh();
     }
-    const api={mirror,check,render(root){const section=el('section',{},el('h2',{},'Helper vault'),el('p',{},message),button('Mirror now',mirror),button('Check for recovery',async()=>{await check();ctx.refresh();}));if(offer)section.append(button('Restore helper copy',restore,'primary'));root.append(section);},
+    const api={mirror,check,render(root){const section=el('section',{},el('h2',{},'Helper vault'),el('p',{},message),button('Mirror now',mirror),button('Check for recovery',async()=>{await check();ctx.refresh();}));if(offer)section.append(button('Restore helper copy',restore,'primary'));section.append(button('Clear this account’s helper copies',async()=>{const account=await ctx.confirmAccount();if(!account)return;if(confirm('Delete this account’s helper safety copies? The local working copy stays.')){await ctx.helper.request('vault.clear',{account});offer=null;message='Helper copies cleared for this account.';ctx.refresh();}}));root.append(section);},
         async beforeSignOut(){
             if(!available())return true;
             if(!await ctx.saveDraft())return false;

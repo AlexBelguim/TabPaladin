@@ -37,7 +37,7 @@
         let record;try{record=JSON.parse(new TextDecoder().decode(all));}catch{H.fail('bad-args','Invalid vault JSON.');}
         if(!Array.isArray(record.roots)||!record.owner||!H.sameAccount(H.account(record.owner,ctx.config),account)||record.copyId!==body.copyKey||record.seq!==body.seq||record.rev!==body.rev||record.dirty!==true)H.fail('bad-args','The vault copy is not stamped for this account.');
         await H.assertContext(ctx);
-        const meta={...u,offsets:undefined,at:Date.now(),editCount:Number(record.editCount)||1,dirty:true};index[id]=meta;
+        const meta={...u,offsets:undefined,at:Date.now(),editCount:Number(record.editCount)||1,draftCount:Array.isArray(record.vaultDrafts)?record.vaultDrafts.length:0,draftAt:Math.max(0,...(record.vaultDrafts||[]).map(d=>Number(d.at||d.parkedAt)||Date.parse(d.at||d.parkedAt)||0)),dirty:true};index[id]=meta;
         await api.storage.local.set({[key]:{...meta,chunks},[INDEX]:index});
         await api.storage.local.remove(partKeys);delete uploads[uploadId];await api.storage.local.set({[UPLOADS]:uploads});return{complete:true,sha256:body.sha256};
     });
