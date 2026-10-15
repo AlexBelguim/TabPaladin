@@ -1896,6 +1896,7 @@ function wireMove() {
     let opened = false;
     helper.on((event) => {
         const move = helper.hello?.move;
+        if (event === 'hello' || event === 'status') moveIn.redraw();
         if (event === 'move.approved' || (event === 'hello' && move?.approvedHere && !opened)) {
             opened = true;
             moveIn.open();

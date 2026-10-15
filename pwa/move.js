@@ -656,5 +656,6 @@ export function createMoveReceiver(ctx) {
         bodies.add(body);
         await draw(body);
     }
-    return { receive, settleBundle, settlePending, removeBundle, bundles, open, close, render, unsettled, get message() { return message; } };
+    // redraw: the helper connected or went (Bring in needs it).
+    return { receive, settleBundle, settlePending, removeBundle, bundles, open, close, render, redraw: () => { if (!busy && !settling) changed(); }, unsettled, get message() { return message; } };
 }
