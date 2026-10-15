@@ -706,6 +706,17 @@ await until(() => b.updated.some(u => u.id === 50) || b.created.length);
 check('the web app tab is focused, not the move page', b.updated.some(u => u.id === 50 && u.props.active) && !b.created.some(t => t.url.includes('move.html')));
 const hello2 = await page.attach();
 check('hello no longer warns about the old copy\'s unpushed edits', hello2.legacy === null && hello2.move?.state === 'done');
+{
+    // An update, a browser start or the move page with nothing new here: the
+    // move stays done.
+    const m = await b.worker.H.detectMove({ rescan: true });
+    const started = await b.worker.H.recheckMove();
+    const st = await b.movePage('status');
+    check('looked at again with nothing new, the move stays done', m.state === 'done' && started === null && st.state === 'done' && st.reopened === null
+        && b.local.get('tpMove').state === 'done' && b.state.badge === '');
+    check('the delivery keeps marks of what it carried, not the data', Boolean(b.local.get('tpMove').deliveredTo[ORIGIN].marks?.working?.mark)
+        && !JSON.stringify(b.local.get('tpMove')).includes('Groceries'));
+}
 
 console.log('\n10. Rollback: 1.1.0 finds its data untouched');
 {
@@ -800,6 +811,80 @@ console.log('\n12. A helper restarted mid-hand-over makes each part again, and s
     code = null;
     try { await other.request('move.part', { bundleId: manifest.bundleId, partId: 'working', offset: 0 }); } catch (e) { code = e.code; }
     check('another document in the same tab cannot read the hand-over', code === 'move-not-approved', code);
+}
+
+console.log('\n13. Done is not for good: what the move did not carry brings it back');
+{
+    // Back to 1.1.0 (section 10), more edits in the old interface there, a
+    // new workflow tab tracked by it, then 1.9 again.
+    const edit = (n) => {
+        const t = clone(b.local.get('tpTree'));
+        const wf = t.roots.find(r => r.id === 'f-workflows').children.find(w => w.id === 'wf1');
+        wf.children.push({ id: 'b-w' + n, kind: 'bookmark', title: 'After going back ' + n, url: `https://w${n}.example.com/` });
+        b.local.set('tpTree', { ...t, dirty: true, editCount: (Number(t.editCount) || 0) + 1, rev: 'rev-w' + n, seq: (Number(t.seq) || 0) + 1 });
+    };
+    const sendAgain = async () => {
+        await b.movePage('approve');
+        await page.attach();
+        page.click();
+        return rx1.r.receive();
+    };
+    const isMovePage = id => b.tabs.get(id)?.url === BASE + 'src/helper/move.html';
+    edit(2);
+    b.tabs.set(104, { id: 104, url: 'https://w2.example.com/', windowId: 1, active: false, incognito: false, index: 3 });
+    b.local.set('tpOpenWorkflowTabs', { ...b.local.get('tpOpenWorkflowTabs'), 104: { workflowId: 'wf1', bookmarkId: 'b-w2', target: 'ext' } });
+    const hello3 = await page.attach();
+    check('the web app is told again of unpushed edits the move did not carry', hello3.legacy?.dirty === true && hello3.legacy.items > 0, JSON.stringify(hello3.legacy));
+    await until(() => b.local.get('tpMove')?.state === 'pending');
+    const m = b.local.get('tpMove');
+    check('and the move is pending again, for the working copy, its deliveries kept', m.state === 'pending' && m.reopened?.includes('working') && Boolean(m.deliveredTo?.[ORIGIN]),
+        JSON.stringify(m.reopened));
+    await until(() => b.state.badge === 'MOVE');
+    check('the badge is back', b.state.badge === 'MOVE', b.state.badge);
+    b.created.length = 0;
+    b.updated.length = 0;
+    b.worker.ev.clicked.fns.forEach(fn => fn({ id: 50 }));
+    await until(() => b.created.some(t => t.url === BASE + 'src/helper/move.html') || b.updated.some(u => isMovePage(u.id)));
+    check('the toolbar opens the move page again', b.created.some(t => t.url === BASE + 'src/helper/move.html') || b.updated.some(u => isMovePage(u.id)));
+    const st = await b.movePage('status');
+    check('the move page says something came since', st.state === 'pending' && st.reopened?.includes('working'));
+    b.worker.ev.removed.fns.forEach(fn => fn(104, { windowId: 1, isWindowClosing: false }));
+    await until(() => (b.local.get('tpPendingRemovals') || []).includes('b-w2'));
+    check('closing a tab the old interface tracks queues its removal again, for the copy still to move', (b.local.get('tpPendingRemovals') || []).includes('b-w2'));
+    await sendAgain();
+    let done = b.local.get('tpMove');
+    check('Send again carries it, and the move is done again', done.state === 'done' && !done.reopened && b.worker.H.moveCarried(done, b.local.get('tpTree')));
+    const hello4 = await page.attach();
+    check('and the web app is not warned any more', hello4.legacy === null, JSON.stringify(hello4.legacy));
+    check('nothing new since: an update leaves it done', (await b.worker.H.detectMove({ rescan: true })).state === 'done' && b.local.get('tpMove').state === 'done');
+
+    // A copy at an address of this server that could not prove it at the
+    // move (nothing answered there), with unpushed edits: kept here, until
+    // that address proves the pin.
+    const GONE = 'https://gone.example.net';
+    const goneKey = 'tpTreeStash:https://gone.example.net|1';
+    b.local.set(goneKey, { ...b.local.get(goneKey), dirty: true, editCount: 1 });
+    check('while the address does not answer, the move stays done (the copy is kept in this browser)', (await b.worker.H.recheckMove()) === null && b.local.get('tpMove').state === 'done');
+    servers.set(GONE, main);
+    const aged = b.local.get('tpMove');
+    aged.addressChecks[GONE].at = 0; // asked again once a while has passed
+    b.local.set('tpMove', aged);
+    b.worker.ev.startup.fns.forEach(fn => fn());
+    await until(() => b.local.get('tpMove')?.state === 'pending');
+    check('at a browser start the address proves the pin: the move is pending again for that copy', b.local.get('tpMove').state === 'pending'
+        && b.local.get('tpMove').reopened?.includes('stash:' + goneKey), JSON.stringify(b.local.get('tpMove').reopened));
+    const bundle = await sendAgain();
+    check('and Send again carries it', b.local.get('tpMove').state === 'done' && bundle.parts.some(p => p.id === 'stash:' + goneKey));
+    servers.delete(GONE);
+
+    // More edits in 1.1.0, then the update itself.
+    edit(3);
+    b.boot();
+    b.worker.ev.installed.fns.forEach(fn => fn({ reason: 'update', previousVersion: '1.1.0' }));
+    await until(() => b.local.get('tpMove')?.state === 'pending' && b.state.badge === 'MOVE');
+    done = b.local.get('tpMove');
+    check('on the update itself the move is pending again, with its badge', done.state === 'pending' && done.reopened?.includes('working') && b.state.badge === 'MOVE',
+        `${done.state} ${JSON.stringify(done.reopened)} ${b.state.badge}`);
 }
 
 console.log('\n14. The old session: only a sign-out the server took counts');

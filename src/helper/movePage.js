@@ -167,7 +167,8 @@ function render() {
     move.disabled = !ready || s.state === 'none';
     $('move-note').textContent = s.approval
         ? `Waiting for the web app: click Bring in there before ${new Date(s.approval.until).toLocaleTimeString()}.`
-        : s.state === 'none' ? 'This browser holds nothing of the old TabPaladin.' : '';
+        : s.state === 'none' ? 'This browser holds nothing of the old TabPaladin.'
+            : s.reopened ? 'Since the last move this browser holds unpushed edits or note drafts it did not carry. Move again to bring them in; nothing brought in before comes in twice.' : '';
 
     const delivered = Object.entries(s.deliveredTo || {});
     $('done').hidden = !delivered.length;

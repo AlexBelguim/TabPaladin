@@ -85,10 +85,14 @@
         }).catch(() => {});
     }
     async function legacySummary(config) {
-        // Moved: what the old UI kept is the web app's to settle now.
         const { tpTree: tree, tpMove: move } = await api.storage.local.get(['tpTree', 'tpMove']);
-        if (move && move.state === 'done') return null;
         if (!tree || !Array.isArray(tree.roots)) return null;
+        // Moved: what the move carried is the web app's to settle now.
+        // Unpushed edits at a version it did not carry (the old UI used again
+        // after going back to 1.1.0) are only here: still reported, and the
+        // move looks again (move.js recheck), so the toolbar offers it.
+        const moved = Boolean(move && move.state === 'done');
+        if (moved && (tree.dirty !== true || !H.moveCarried || H.moveCarried(move, tree))) return null;
         let username = '';
         if (tree.owner) {
             if (H.originOf(tree.owner.url) !== config.serverOrigin || tree.owner.serverId && tree.owner.serverId !== config.pin.serverId) return null;
@@ -98,6 +102,7 @@
             if (!settings || !settings.backend || H.originOf(settings.backend.url) !== config.serverOrigin) return null;
             // Unstamped trees have no reliable account owner; do not borrow a username.
         }
+        if (moved && H.recheckMove) H.recheckMove();
         let items = 0;
         const pending = [...tree.roots];
         while (pending.length && items < 1000000) {

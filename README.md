@@ -132,7 +132,9 @@ What happens to your data:
   app's **Settings › Bring in an extension backup**.
 - **Going back:** check out 1.1.0 (or 1.2.0) in the same folder and **Reload**:
   the old interface comes back over its untouched data. Sign in there again
-  and pull what the web app pushed.
+  and pull what the web app pushed. Back on 1.9.0 with unpushed edits or note
+  drafts made there since, the toolbar shows **MOVE** again: move once more
+  (nothing that came before comes in twice).
 
 #### Packaging for the stores
 

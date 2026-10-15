@@ -30,6 +30,12 @@
 // and blanked; a token the server still accepts after that is its shared
 // token, which is left exactly as it is. Nothing the old UI kept is deleted,
 // so reinstalling 1.1.0 brings the old UI back over it.
+//
+// Done is not for good. The delivery keeps marks of what it carried (each
+// copy's version, each draft's digest); when this browser later holds unpushed
+// edits or a draft for that server that it did not carry (the old UI used
+// again after going back to 1.1.0, or a copy at an address of this server that
+// proves the pin only now), the move is pending again (recheck).
 (() => {
     'use strict';
     const H = globalThis.TPHelper;
@@ -132,8 +138,9 @@
         if (Array.isArray(data.workflows) && data.workflows.length && !data.tpMigrationDone) found.push('workflows');
         return found;
     }
-    // Once pending or done, it stays so: a done move is never taken back
-    // because the old keys are still here (they always are).
+    // Once pending, it stays so. A done move is never taken back because the
+    // old keys are still here (they always are); on an update it is looked at
+    // again for what the delivery did not carry (recheck).
     H.detectMove = ({ rescan = false } = {}) => updateMove(async (cur) => {
         if (cur && (cur.state === 'pending' || cur.state === 'done')) return null;
         if (cur && cur.state === 'none' && !rescan) return null;
@@ -141,7 +148,11 @@
         return found.length
             ? { ...(cur || {}), v: 1, state: 'pending', detectedAt: now(), found }
             : { ...(cur || {}), v: 1, state: 'none', checkedAt: now() };
-    }).then((move) => { paint(move); return move; });
+    }).then(async (move) => {
+        if (rescan && move && move.state === 'done') move = (await H.recheckMove()) || move;
+        paint(move);
+        return move;
+    });
 
     // --- Opening ----------------------------------------------------------------
     async function focusOrOpen(path) {
@@ -216,6 +227,23 @@
         }
         return ids;
     }
+    // A copy's version, in a mark that does not depend on how parts are made
+    // or for which server: which copy and which stored version of it (a
+    // working copy set aside unchanged keeps its mark), its edits and size.
+    const treeMark = r => (plain(r) && Array.isArray(r.roots) ? [r.copyId || '', r.rev || r.fromRev || '', r.copyId ? '' : r.setAsideAt || '',
+        r.dirty === true ? 1 : 0, Number(r.editCount) || 0, Number(r.baseVersion) || 0, countItems(r.roots)].join('|') : '');
+    // What every delivery so far carried: copies by mark, drafts by digest.
+    function carriedBy(move) {
+        const copies = new Set(), drafts = new Set();
+        for (const d of Object.values(move && plain(move.deliveredTo) ? move.deliveredTo : {})) {
+            const m = plain(d) && plain(d.marks) ? d.marks : {};
+            if (plain(m.working) && typeof m.working.mark === 'string') copies.add(m.working.mark);
+            for (const s of Object.values(plain(m.stashes) ? m.stashes : {})) if (plain(s) && typeof s.mark === 'string') copies.add(s.mark);
+            for (const x of Array.isArray(m.drafts) ? m.drafts : []) if (typeof x === 'string') drafts.add(x);
+        }
+        return { copies, drafts };
+    }
+    H.moveCarried = (move, record) => carriedBy(move).copies.has(treeMark(record));
 
     // --- What there is ------------------------------------------------------------
     async function inventory() {
@@ -246,13 +274,16 @@
         ? Object.fromEntries(Object.entries(settings.customKeywords).filter(([name, words]) => !['__proto__', 'constructor', 'prototype'].includes(name)
             && Array.isArray(words)).map(([name, words]) => [name, words.filter(w => typeof w === 'string')])) : {});
 
-    // The parts for the pinned server, read in one go under TreeStore's locks.
+    // The parts for the pinned server, read in one go under TreeStore's locks,
+    // and the marks of what they carry (see recheck): each copy sent, with
+    // whether it holds anything the server lacks, and each draft's digest.
     async function buildParts(config, move) {
         return underCopyLocks(async () => {
             const { data, stashes } = await inventory();
             const settings = settingsOf(data);
             const legacyUrl = legacyUrlOf(data);
             const parts = [];
+            const marks = { working: null, stashes: {}, drafts: [] };
             const add = (id, kind, payload) => parts.push({ id, kind, payload: { v: 1, part: id, ...payload } });
             const cards = plain(data.tpUiExpanded) && data.tpUiExpanded.v === 1 && plain(data.tpUiExpanded.cards) ? data.tpUiExpanded.cards : {};
             const card = v => plain(v) && (v.o === 0 || v.o === 1);
@@ -273,6 +304,7 @@
                     expanded: Object.fromEntries(Object.entries(cards).filter(([k, v]) => !isUiKey(k) && ids.has(k) && card(v)))
                 });
                 workingSent = true;
+                marks.working = { mark: treeMark(tree), unpushed: tree.dirty === true || removals.length > 0 || Boolean(legacy) };
             }
             if (legacy && !workingSent) {
                 // Workflows from before the tree belong to no account: an
@@ -291,11 +323,16 @@
                     ...(record.owner ? { sameServer: null, legacyUrl: null } : unstampedAt(record.url || legacyUrl)),
                     record: scrub(record)
                 });
+                marks.stashes[key] = { mark: treeMark(record), unpushed: record.dirty === true };
             }
             const drafts = draftsOf(data);
             const mine = list => list.filter(d => sends(classify(d.owner, config, move))).map(d => scrub(d));
             const moving = { parked: mine(drafts.parked), mirrored: mine(drafts.mirrored), live: mine(drafts.live) };
             if (moving.parked.length + moving.mirrored.length + moving.live.length) add('drafts', 'drafts', moving);
+            for (const d of [...moving.parked, ...moving.mirrored, ...moving.live]) {
+                const mark = hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(d)))).slice(0, 32);
+                if (!marks.drafts.includes(mark)) marks.drafts.push(mark);
+            }
             const ls = plain(data[LEGACY_LS]) && plain(data[LEGACY_LS].keys) ? data[LEGACY_LS].keys : {};
             const accounts = parse(ls.tp_notes_ui_accounts_v1);
             const prefs = {
@@ -309,7 +346,7 @@
             };
             if (Object.keys(prefs.customKeywords).length || prefs.categoryOrder.length || Object.keys(prefs.uiExpanded).length
                 || prefs.notesUi || Object.keys(prefs.notesUiAccounts).length) add('prefs', 'prefs', prefs);
-            return parts;
+            return { parts, marks };
         });
     }
     async function encodeParts(parts) {
@@ -363,12 +400,55 @@
         });
     }
 
+    // --- After the move ---------------------------------------------------------
+    // A done move is looked at again on an update, at a browser start, when
+    // the move page opens and when the web app is told of unpushed edits here
+    // (router.js legacySummary). When this browser now holds, for the pinned
+    // server, a copy with unpushed edits at a version no delivery carried, or
+    // a note draft none carried, the move is pending again: the badge, the
+    // move page and Send again come back, the web app warns of them, and a
+    // closed old-UI tab queues its removal again. A copy with nothing
+    // unpushed is on its server already.
+    const deliveries = m => JSON.stringify(Object.entries(m && plain(m.deliveredTo) ? m.deliveredTo : {}).map(([o, d]) => [o, d && d.bundleId]));
+    async function recheck() {
+        const config = await H.getConfig();
+        if (!config.serverOrigin || !config.pin) return null;
+        const before = await readMove();
+        if (!before || before.state !== 'done') return null;
+        // An address of this server that proves the pin only now.
+        const { data, stashes } = await inventory();
+        await checkAddresses(config, addressesOf(data, stashes)).catch(() => {});
+        const { marks } = await buildParts(config, await readMove());
+        const carried = carriedBy(before);
+        const changed = [];
+        if (marks.working && marks.working.unpushed && !carried.copies.has(marks.working.mark)) changed.push('working');
+        for (const [key, m] of Object.entries(marks.stashes)) if (m.unpushed && !carried.copies.has(m.mark)) changed.push('stash:' + key);
+        if (marks.drafts.some(d => !carried.drafts.has(d))) changed.push('drafts');
+        if (!changed.length) return null;
+        // Not over a delivery that landed meanwhile.
+        const move = await updateMove(cur => (cur && cur.state === 'done' && deliveries(cur) === deliveries(before)
+            ? { ...cur, state: 'pending', reopenedAt: now(), reopened: changed } : null));
+        paint(move);
+        return move && move.state === 'pending' ? move : null;
+    }
+    let rechecking = null;
+    H.recheckMove = () => {
+        if (!rechecking) {
+            rechecking = recheck().catch((e) => { console.warn('TabPaladin move:', e && e.message); return null; })
+                .finally(() => { rechecking = null; });
+        }
+        return rechecking;
+    };
+
     // --- The move page's summary ----------------------------------------------
     async function status() {
         const config = await H.getConfig();
         const pinned = Boolean(config.serverOrigin && config.pin);
         const { data, stashes } = await inventory();
-        if (pinned) await checkAddresses(config, addressesOf(data, stashes)).catch(() => {});
+        if (pinned) {
+            await checkAddresses(config, addressesOf(data, stashes)).catch(() => {});
+            await H.recheckMove();
+        }
         const move = await readMove();
         const settings = settingsOf(data);
         const legacyUrl = legacyUrlOf(data);
@@ -410,6 +490,7 @@
             legacyWorkflowsBackup: Array.isArray(data.workflows_legacy_backup) ? data.workflows_legacy_backup.length : 0,
             localStorageCopiedAt: ls ? ls.copiedAt || null : null,
             approval: approval && approval.until > now() && pinned && approval.pinScope === H.pinScope(config) ? { tabId: approval.tabId, until: approval.until } : null,
+            reopened: move && move.state === 'pending' && Array.isArray(move.reopened) ? move.reopened : null,
             deliveredTo: move?.deliveredTo || {}, retargeted: move?.retargeted || {},
             legacyToken: move?.legacyToken ? { state: move.legacyToken.state, message: move.legacyToken.message || null, at: move.legacyToken.at || null } : null
         };
@@ -465,13 +546,14 @@
     H.handlers['move.manifest'] = (_body, ctx) => inTurn(async () => {
         await H.assertContext(ctx);
         const approval = await approvalFor(ctx, { bind: true });
-        const built = await encodeParts(await buildParts(ctx.config, await readMove()));
+        const { parts, marks } = await buildParts(ctx.config, await readMove());
+        const built = await encodeParts(parts);
         await H.assertContext(ctx);
         const bundleId = H.randomId();
         cache.clear();
         cache.set(bundleId, new Map(built.map(p => [p.id, p])));
         const bundle = { bundleId, approvalId: approval.approvalId, scope: H.scope(ctx), pinScope: H.pinScope(ctx.config), origin: ctx.config.serverOrigin,
-            parts: built.map(p => ({ id: p.id, kind: p.kind, digest: p.digest, bytes: p.bytes.length })), until: now() + APPROVAL_MS };
+            parts: built.map(p => ({ id: p.id, kind: p.kind, digest: p.digest, bytes: p.bytes.length })), marks, until: now() + APPROVAL_MS };
         await H.temporary.set({ [BUNDLE]: bundle });
         return { bundleId, serverId: ctx.config.pin.serverId, helperVersion: api.runtime.getManifest().version, parts: bundle.parts };
     });
@@ -486,7 +568,7 @@
         let part = cache.get(bundle.bundleId) && cache.get(bundle.bundleId).get(meta.id);
         if (!part) {
             // A fresh worker: made again, and served only if it is the same.
-            const built = await encodeParts(await buildParts(ctx.config, await readMove()));
+            const built = await encodeParts((await buildParts(ctx.config, await readMove())).parts);
             cache.clear();
             cache.set(bundle.bundleId, new Map(built.map(p => [p.id, p])));
             part = cache.get(bundle.bundleId).get(meta.id);
@@ -557,11 +639,17 @@
         }
         const tracked = target ? await retargetTracking(tree, target, ctx.config) : { count: 0, kept: null };
         const origin = ctx.config.serverOrigin;
-        const move = await updateMove(cur => ({
-            ...(cur || { v: 1 }), state: 'done', doneAt: (cur && cur.doneAt) || now(),
-            deliveredTo: { ...((cur && cur.deliveredTo) || {}), [origin]: { bundleId: bundle.bundleId, serverId: ctx.config.pin.serverId, at: now(), parts: bundle.parts } },
-            retargeted: { ...((cur && cur.retargeted) || {}), [origin]: { at: now(), count: tracked.count, kept: tracked.kept } }
-        }));
+        const move = await updateMove((cur) => {
+            const rest = { ...(cur || { v: 1 }) };
+            delete rest.reopened;
+            delete rest.reopenedAt;
+            return {
+                ...rest, state: 'done', doneAt: rest.doneAt || now(),
+                deliveredTo: { ...(rest.deliveredTo || {}), [origin]: { bundleId: bundle.bundleId, serverId: ctx.config.pin.serverId, at: now(), parts: bundle.parts,
+                    marks: plain(bundle.marks) ? bundle.marks : null } },
+                retargeted: { ...(rest.retargeted || {}), [origin]: { at: now(), count: tracked.count, kept: tracked.kept } }
+            };
+        });
         await H.temporary.remove([APPROVAL, BUNDLE]);
         cache.clear();
         paint(move);
@@ -678,6 +766,9 @@
 
     H.ops.push('move.manifest', 'move.part', 'move.ack');
     api.runtime.onInstalled.addListener(() => { H.detectMove({ rescan: true }).catch(e => console.warn('TabPaladin move:', e.message)); });
+    // A browser start looks at a done move again (an address of this server
+    // may answer now).
+    if (api.runtime.onStartup) api.runtime.onStartup.addListener(() => { H.recheckMove(); });
     // Any start: one that missed the update looks now, and the badge comes back.
     readMove().then(move => (move ? paint(move) : H.detectMove())).catch(() => {});
 })();
