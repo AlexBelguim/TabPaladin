@@ -1381,6 +1381,11 @@ export const TreeStore = {
 
     // Recovery is additive: validate and file a copy as a new stash. Never
     // overwrite the active tree or adopt the current sign-in as its owner.
+    // Filed once: a `sourceId` already filed (or already brought back as the
+    // working copy, whose meta keeps it) and a copy whose copyId and stored
+    // version (rev) a set-aside copy already holds come back as
+    // {duplicate: true} — with {current: true} for the working copy — and
+    // nothing is written.
     async importBackupCopy(incoming, { account, expect = null, sourceId = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [], drafts = [] } = {}) {
         await ensureLoaded();
         const ids = new Set(), roles = new Set(); let count = 0;
@@ -1406,14 +1411,16 @@ export const TreeStore = {
             const url = new URL(a.url); if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid recovery origin.');
             owner = { url: url.origin, userId: Number(a.userId), username: typeof a.username === 'string' ? a.username : null, serverId: typeof a.serverId === 'string' ? a.serverId : null };
         }
-        const copy = { roots, owner, origin: owner ? null : incoming.origin || 'pre-accounts', dirty: Boolean(incoming.dirty), editCount: Math.max(0, Number(incoming.editCount) || 0), baseVersion: Math.max(0,Number(incoming.baseVersion)||0), copyId: typeof incoming.copyId === 'string' ? incoming.copyId : newId(), rev: null, restoredFrom: stampsIn(incoming.restoredFrom), meta: JSON.parse(JSON.stringify(metaOf(incoming),(key,value)=>/(token|password|secret|apikey)$/i.test(key)?undefined:value)) };
+        const copy = { roots, owner, origin: owner ? null : incoming.origin || 'pre-accounts', dirty: Boolean(incoming.dirty), editCount: Math.max(0, Number(incoming.editCount) || 0), baseVersion: Math.max(0,Number(incoming.baseVersion)||0), copyId: typeof incoming.copyId === 'string' ? incoming.copyId : newId(), rev: typeof incoming.rev === 'string' && incoming.rev && incoming.rev.length <= 200 ? incoming.rev : null, lastSyncAt: typeof incoming.lastSyncAt === 'string' ? incoming.lastSyncAt : null, restoredFrom: stampsIn(incoming.restoredFrom), meta: JSON.parse(JSON.stringify(metaOf(incoming),(key,value)=>/(token|password|secret|apikey)$/i.test(key)?undefined:value)) };
         if (sourceId) copy.meta.recoverySourceId = String(sourceId);
         return withCopyLock(async () => {
             await reconcile();
             if (!account || !sameAccount(state.owner, accountOf(account)) || expect && !sameCopy(copyToken(), expect)) throw stopped('account-changed');
-            if (sourceId) for (const key of await stashIndex()) {
+            if (sourceId && state.meta && state.meta.recoverySourceId === String(sourceId)) return { key: null, items: count, owner: state.owner, duplicate: true, current: true };
+            if (sourceId || copy.rev) for (const key of await stashIndex()) {
                 const item = (await api.storage.local.get(key))[key];
-                if (item?.meta?.recoverySourceId === sourceId) return { key, items: count, owner: item.owner, duplicate: true };
+                if (sourceId && item?.meta?.recoverySourceId === String(sourceId)) return { key, items: count, owner: item.owner, duplicate: true };
+                if (copy.rev && item && item.copyId === copy.copyId && item.fromRev === copy.rev) return { key, items: count, owner: item.owner, duplicate: true };
             }
             const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))), recoveryDrafts: drafts });
             return { key, items: count, owner };

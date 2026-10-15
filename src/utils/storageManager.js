@@ -8,7 +8,7 @@
 // role is unique in the tree by construction, and ids are stable across sync.
 //
 // Settings stay in extension storage; they are device-local, not tree data.
-import { TreeStore } from './treeStore.js';
+import { TreeStore, newId } from './treeStore.js';
 
 // The browser's API, unless a page installed a platform first (see treeStore.js).
 const api = globalThis.__tpPlatform || (typeof browser !== 'undefined' ? browser : chrome);
@@ -45,6 +45,45 @@ function hydrateWorkflow(folderNode) {
         createdAt: payload.createdAt || new Date().toISOString(),
         tabs
     };
+}
+
+// The legacy `workflows` array (storage.local, from before workflows lived in
+// the tree) as folders under the workflows root of a copy that is not the
+// working copy here: `roots` as stored (a copy moved in from the extension).
+// The same conversion as migrateLegacyIfNeeded: each workflow a folder named
+// after it ('Migrated' without a name) under the root carrying role
+// 'workflows' (made at the top when the copy has none), each tab with an
+// address a bookmark. Returns {roots, added} and leaves `roots` as it was.
+export function legacyWorkflowFolders(roots, legacy, { now = new Date().toISOString(), makeId = newId } = {}) {
+    const out = JSON.parse(JSON.stringify(Array.isArray(roots) ? roots : []));
+    const list = (Array.isArray(legacy) ? legacy : []).filter(wf => wf && Array.isArray(wf.tabs));
+    if (!list.length) return { roots: out, added: 0 };
+    const find = (nodes) => {
+        for (const n of nodes || []) {
+            if (n && n.kind === 'folder' && n.role === 'workflows' && !n.virtual) return n;
+            const inner = n && n.kind === 'folder' ? find(n.children) : null;
+            if (inner) return inner;
+        }
+        return null;
+    };
+    let root = find(out);
+    if (!root) {
+        root = { id: makeId(), kind: 'folder', title: 'TabPaladin Workflows', role: 'workflows', children: [] };
+        out.push(root);
+    }
+    if (!Array.isArray(root.children)) root.children = [];
+    for (const wf of list) {
+        const createdAt = typeof wf.createdAt === 'string' && !Number.isNaN(Date.parse(wf.createdAt)) ? wf.createdAt : now;
+        root.children.push({
+            id: makeId(),
+            kind: 'folder',
+            title: String(wf.name || 'Migrated'),
+            payload: { createdAt },
+            children: wf.tabs.filter(t => t && typeof t.url === 'string' && t.url)
+                .map(t => ({ id: makeId(), kind: 'bookmark', title: String(t.title || t.url), url: t.url }))
+        });
+    }
+    return { roots: out, added: list.length };
 }
 
 export const StorageManager = {
