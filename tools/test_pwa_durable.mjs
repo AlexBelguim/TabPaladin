@@ -1035,7 +1035,9 @@ const putTpData = async (rec) => {
 const pulls = () => requests.filter(r => r === 'GET /api/tree').length;
 const lastToast = () => [...document.body.children].reverse().find(c => c.id === 'tp-toast')?.textContent || '';
 const toastsSince = (mark) => document.body.children.filter(c => c.id === 'tp-toast').slice(mark).map(c => c.textContent);
-const toastMark = () => document.body.children.length;
+// A count of toasts, not of everything in document.body: every start of the
+// app also puts its desktop nav rail there (the body outlives a start here).
+const toastMark = () => document.body.children.filter(c => c.id === 'tp-toast').length;
 const lastEditorText = () => [...created].reverse().find(e => e.tagName === 'TEXTAREA')?.value ?? null;
 const unloadAsks = () => fireWindow('beforeunload', { prevented: false, preventDefault() { this.prevented = true; } }).prevented;
 const guardShown = () => !byId('primary-guard').classList.contains('hidden');
