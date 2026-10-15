@@ -15,7 +15,8 @@
 //      copies stand where an earlier build refused the sign-in.)
 //   3. A clean copy switches accounts cleanly, and the per-device lists from
 //      before accounts are adopted by the server's owner only.
-//   4. Admins see the Users block; plain users do not.
+//   4. Admins see the Users block; plain users do not. A sign-in goes only to
+//      the server the app was opened from, whatever address is typed.
 //   5. A share the server refuses while you are signed in (a full inbox) is
 //      kept on the phone, the share sheet says why, and it goes up once there
 //      is room.
@@ -576,7 +577,13 @@ try {
     await byId('settingsBtn').fire('click');
     await settle();
     check('a plain user does not see it', byId('users-block').classList.contains('hidden'));
-    await signIn('alex', 'new horse battery');
+    // Another address typed into Settings is not where the app signs in: it
+    // talks only to the server it was opened from, and sends nothing (no
+    // password) to the typed one.
+    await signIn('alex', 'new horse battery', `http://localhost:${PORT}`);
+    check('a sign-in goes to the server the app was opened from, never to an address typed in Settings',
+        localStorageShim.getItem('tp_pwa_userid') === '1' && localStorageShim.getItem('tp_pwa_url') === BASE
+        && !requests.some(r => r.includes('localhost')), localStorageShim.getItem('tp_pwa_url'));
     await byId('settingsBtn').fire('click');
     await settle();
     check('an admin does', !byId('users-block').classList.contains('hidden') && /sam/.test(byId('users-list').innerHTML)
@@ -648,10 +655,21 @@ try {
     check('sam signing in sets alex\'s unpushed edits aside on the phone, never over them, and shows none of them',
         localStorageShim.getItem('tp_pwa_userid') === '2' && Boolean(await keptAt6()) && !drawnSince(mark6, 'Unpushed at sign-out'));
     // The same account id at another address is not taken on trust either.
+    // The app signs in only to the server it is opened from (P2 locked the
+    // address to location.origin; a typed one is not used), so the other
+    // address is this page's own: the app opened at localhost, with its copy
+    // kept for 127.0.0.1 beside it — as an earlier build that synced with
+    // another server left that server's copies in this origin's storage.
+    const atAddress = (origin) => {
+        const at = new URL(entry().url);
+        openAt(origin + at.pathname + at.search + at.hash, entry().state);
+    };
+    atAddress(`http://localhost:${PORT}`);
     await signIn('alex', 'new horse battery', `http://localhost:${PORT}`);
     check('nor is alex #1 at another server address given them on trust: they stay set aside for the address they came from',
         localStorageShim.getItem('tp_pwa_userid') === '1' && localStorageShim.getItem('tp_pwa_url') === `http://localhost:${PORT}`
         && Boolean(await keptAt6()) && !drawnSince(mark6, 'Unpushed at sign-out') && !dirtyShown());
+    atAddress(BASE);
     const pullsBack = requests.filter(r => r === 'GET /api/tree').length;
     await signIn('alex', 'new horse battery');
     check('alex signs back in to his edits, with no pull over them',
