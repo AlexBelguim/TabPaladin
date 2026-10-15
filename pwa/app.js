@@ -35,6 +35,9 @@ import * as DC from './durableCopy.js';
 import { pageHelper as helper, saveHelperWorkflow, sameHelperAccount, helperUrl, helperRequestId, stagedBookmarkFolder } from './helper.js';
 import { StorageManager } from './lib/storageManager.js';
 import { PinsManager } from './lib/pinsManager.js';
+import { createDesktopShell } from './desktopShell.js';
+import { createHome } from './home.js';
+import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
 
@@ -139,6 +142,7 @@ const state = {
     importBatch: null         // pending #notes / #reorder import awaiting review: {kind:'notes',items}|{kind:'reorder',order}
 };
 
+let desktopUi = null;
 const $ = (id) => document.getElementById(id);
 
 // --- The working copy, as TreeStore holds it ------------------------------------------
@@ -1120,6 +1124,7 @@ function renderBreadcrumb() {
 }
 
 function renderContent() {
+    desktopUi?.invalidate();
     const root = $('content');
     if (!root) return;
     root.innerHTML = '';
@@ -1146,6 +1151,7 @@ function renderContent() {
         renderNotesScreen(root);
         return;
     }
+    if (isDesktop() && desktopUi?.render(root)) return;
     const node = findNodeByPath(state.pathIds);
     if (!node) {
         // No snapshot yet (offline start, failed pull): Home is reachable
@@ -1854,6 +1860,44 @@ function wireHelperUi() {
     helperRoute();
 }
 
+function desktopContext() {
+    return {
+        store: TreeStore, storage: StorageManager, pins: PinsManager, helper, platform,
+        account: signedInAccount, assertAccount: assertHelperAccount, syncConfig,
+        async edit(fn) {
+            const account=signedInAccount(); await assertHelperAccount(account);
+            const before=await TreeStore.currentCopy(); const result=await fn(account);
+            await assertHelperAccount(account);
+            if(!TreeStore.sameCopy(before,await TreeStore.currentCopy())) throw new Error('The working copy changed. The edit was kept with its original copy.');
+            if(!await TreeStore.flush()) throw new Error('The edit is not written yet. Keep this page open.');
+            renderView(); await pushAfterEdit(); return result;
+        },
+        refresh: renderView, toast: showToast, navigate: navigateDesktop,
+        openWorkflow: node=>node&&openWorkflowTabs(fromWire(node)),
+        capture:()=>{offerHelperSave();captureHelperTabs();}, pinCurrent:pinHelperTab,
+        recentNotes:()=>NM.sortNotes(notesLibrary().notes,'edited'), openNote:id=>openNoteById(id,{from:'Home'}),
+        search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
+        pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},
+        restoreSetAside, discardSetAside, openLegacySettings:openSettings,
+        exportDrafts:()=>downloadFile(draftsMarkdown(parkedList()),'text/markdown','tabpaladin-note-drafts.md')
+    };
+}
+function navigateDesktop(route,id=null) {
+    if(!isDesktop()) { if(route==='notes')enterNotes();else if(route==='settings')openSettings();else goHome();return; }
+    if(!confirmDiscardEdit())return;
+    if(route==='notes'){desktopUi?.setRoute('notes');enterNotes();return;}
+    if(route==='inbox'){document.getElementById('clipBtn')?.click();return;}
+    stopEditing();closeNotesSheets();state.view='home';desktopUi?.setRoute(route,id);
+    history.replaceState({tp:'desktop',account:accountKey(),route},'', '#/'+route+(id?'/'+encodeURIComponent(id):''));
+    renderView();
+}
+function wireDesktop() {
+    desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
+    window.matchMedia('(min-width: 900px)').addEventListener?.('change',()=>renderView());
+    const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
+    if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
+}
+
 // --- Workflows: saved tab sessions, now first-class in the web app ---
 //
 // A workflow is a folder under the workflows root whose bookmark children are
@@ -2388,6 +2432,7 @@ function enterNotes() {
 }
 
 function goHome() {
+    if(isDesktop()&&desktopUi){navigateDesktop('home');return;}
     if (!confirmDiscardEdit()) return;
     stopEditing();
     closeNotesSheets();
@@ -8172,6 +8217,7 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('primary-take', 'click', useHere);
 
     wireHelperUi();
+    wireDesktop();
     startApp();
 
     // Import and suggestion links tapped while the app is already open. One
