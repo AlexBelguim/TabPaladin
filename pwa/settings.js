@@ -55,6 +55,7 @@ export function createSettings(ctx){
                 await ctx.store.importBackupCopy(copy,{account,sourceId:digest+':'+key,focusedFolderIds:copy.focusedFolderIds||data.settings?.focusedFolderIds||[],expanded:copy.expanded||data.tpUiExpanded?.cards||{},pendingRemovals:copy.pendingRemovals||(key==='tpTree'?data.tpPendingRemovals:[])||[],drafts});
             }ctx.toast('Backup copies kept separately. Review their owners before restoring.');ctx.refresh();
         }catch(e){ctx.toast(e.message);}finally{backupFile.value='';}});
+        ctx.renderVault?.(root);
         root.append(el('h2',{},'Recovery'),el('p',{},'Bring in an extension backup as separate copies. Credentials are ignored. Your current copy is kept.'),button('Bring in an extension backup',()=>backupFile.click()),backupFile);
     }};
 }

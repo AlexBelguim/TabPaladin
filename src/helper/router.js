@@ -1,9 +1,9 @@
 (() => {
     const H = globalThis.TPHelper;
     const api = H.api;
-    const readsVisible = op => op.startsWith('tabs.') || op.startsWith('windows.') || ['actions.take', 'bookmarks.take'].includes(op);
+    const readsVisible = op => op.startsWith('tabs.') || op.startsWith('windows.') || ['actions.take', 'bookmarks.take', 'vault.get'].includes(op);
     const gestureOps = new Set(['tabs.snapshot', 'tabs.active', 'tabs.closeSnapshot', 'windows.openWorkflow', 'windows.openUrls', 'windows.list', 'bookmarks.take', 'options.open']);
-    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack']);
+    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack', 'vault.put', 'vault.clear']);
     const requestRates = new Map();
     const inFlight = new Map();
     let mutationChain = Promise.resolve();

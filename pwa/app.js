@@ -42,6 +42,7 @@ import { createWorkflows } from './workflows.js';
 import { createSettings } from './settings.js';
 import { createOrganize } from './organize.js';
 import { createNoteExtras } from './notesExtras.js';
+import { createVaultMirror } from './vault.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -150,6 +151,7 @@ const state = {
 let desktopUi = null;
 let organizePort = null;
 let noteExtras = null;
+let vaultMirror = null;
 const $ = (id) => document.getElementById(id);
 
 // --- The working copy, as TreeStore holds it ------------------------------------------
@@ -495,6 +497,7 @@ async function bootstrap({ previousUsername = null, switched: switchedAtSignIn =
     reportHelperSession();
     refreshHelperState();
     retryHelperWorkflows();
+    vaultMirror?.check();
 }
 
 // What waits while the share sheet is up: the proposals (which would redraw
@@ -1895,7 +1898,7 @@ function desktopContext() {
         recentNotes:()=>NM.sortNotes(notesLibrary().notes,'edited'), openNote:id=>openNoteById(id,{from:'Home'}),
         search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
         pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},
-        restoreSetAside, discardSetAside, openLegacySettings:openSettings,
+        restoreSetAside, discardSetAside, openLegacySettings:openSettings, renderVault:root=>vaultMirror?.render(root),
         exportDrafts:()=>downloadFile(draftsMarkdown(parkedList()),'text/markdown','tabpaladin-note-drafts.md')
     };
 }
@@ -1916,6 +1919,11 @@ function wireDesktop() {
     desktopUi.register('settings',createSettings(desktopContext()));
     organizePort=createOrganize(desktopContext());desktopUi.register('organize',organizePort);
     window.matchMedia('(min-width: 900px)').addEventListener?.('change',()=>renderView());
+    vaultMirror=createVaultMirror({store:TreeStore,helper,platform,account:signedInAccount,toast:showToast,refresh:renderView,restore:restoreSetAside,push:pushNow,
+        drafts:()=>[...parkedFor(copyStatus()),...(editorDirty()?[DC.draftFromNv(state.nv,stampOfStatus(copyStatus()))]:[])].filter(Boolean),
+        async saveDraft(){if(editorDirty()){if(!confirm('Save the open note before signing out?'))return false;await saveNoteEdit();}return !editorDirty();},
+        async confirmAccount(){const before=signedInAccount();if(!before)return null;const data=await api('/api/auth/me');return sameDesktopAccount(before,signedInAccount())&&Number(data.user?.id)===before.userId&&data.serverId===before.serverId?before:null;}
+    });
     const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
     if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
 }
@@ -7425,6 +7433,7 @@ async function submitAuth() {
 // them. A copy with nothing unpushed goes with the sign-out: everything in it
 // is on the server, and whoever picks up the device next finds none of it.
 async function signOut() {
+    try{if(vaultMirror&&!await vaultMirror.beforeSignOut())return;}catch(e){showToast(e.message);return;}
     const base = currentServerUrl();
     const before = copyStatus();
     const keepEdits = Boolean(state.dirty && state.snapshot);
