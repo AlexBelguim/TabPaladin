@@ -365,7 +365,7 @@ TabPaladin/
 ├── tools/                  # Headless tests, recovery scripts, package.mjs, the MCP bridge for Claude Desktop
 ├── manifest.json           # Chrome extension manifest (v3)
 ├── firefox/                # Firefox add-on manifest (v2; packaged by tools/package.mjs)
-├── src/                    # Extension source (tab capture, workflows, organizer UI)
+├── src/                    # Extension source: the helper and the move (src/helper), the old UI's code (no longer opened)
 └── assets/                 # Shared icons and images
 ```
 
