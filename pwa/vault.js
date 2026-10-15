@@ -55,6 +55,7 @@ export function createVaultMirror(ctx){
             }
             await ctx.helper.request('vault.clear',{account});return true;
         },destroy(){clearInterval(timer);document.removeEventListener('visibilitychange',hide);}};
-    const timer=setInterval(mirror,30000);const hide=()=>{if(document.visibilityState==='hidden')mirror();};document.addEventListener('visibilitychange',hide);
+    // Like helper.js's timers: never what keeps a process (a test's Node) alive.
+    const timer=setInterval(mirror,30000);if(typeof timer?.unref==='function')timer.unref();const hide=()=>{if(document.visibilityState==='hidden')mirror();};document.addEventListener('visibilitychange',hide);
     ctx.helper.on(event=>{if(event==='hello')check();});return api;
 }
