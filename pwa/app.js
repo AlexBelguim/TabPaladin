@@ -41,6 +41,7 @@ import { createBoard } from './board.js';
 import { createWorkflows } from './workflows.js';
 import { createSettings } from './settings.js';
 import { createOrganize } from './organize.js';
+import { createNoteExtras } from './notesExtras.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -148,6 +149,7 @@ const state = {
 
 let desktopUi = null;
 let organizePort = null;
+let noteExtras = null;
 const $ = (id) => document.getElementById(id);
 
 // --- The working copy, as TreeStore holds it ------------------------------------------
@@ -1907,6 +1909,7 @@ function navigateDesktop(route,id=null) {
     renderView();
 }
 function wireDesktop() {
+    noteExtras=createNoteExtras({desktop:isDesktop,getMode:()=>NM.readNotesUi(notesStorage()).mode,setMode:mode=>NM.writeNotesUi(notesStorage(),{...NM.readNotesUi(notesStorage()),mode}),startEdit:startEditing,refresh:renderView,push:pushNow,renderPreview:(content,title)=>renderNotePreview(document,content,title)});
     desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
     desktopUi.register('board',createBoard(desktopContext()));
     desktopUi.register('workflows',createWorkflows(desktopContext()));
@@ -2373,8 +2376,9 @@ function openNotes(patch = {}, { history: mode = 'auto' } = {}) {
 function editorDirty() {
     const nv = state.nv;
     if (state.view !== 'notes' || !nv.editing || nv.draft == null) return false;
-    if (nv.isNew) return nv.draft.trim() !== '';
-    return nv.draft !== (nv.loaded == null ? '' : nv.loaded);
+    const titleChanged = typeof nv.titleField === 'string' && nv.titleField !== (nv.loadedTitle || '');
+    if (nv.isNew) return nv.draft.trim() !== '' || Boolean(nv.titleField?.trim());
+    return titleChanged || nv.draft !== (nv.loaded == null ? '' : nv.loaded);
 }
 
 // A note open in the editor, changed or not: what it saves is its own text,
@@ -2405,7 +2409,7 @@ function stopEditing() {
         newParentId: null,
         pendingNotebookName: null,
         importId: null,
-        removedElsewhere: false
+        removedElsewhere: false, titleField: null, loadedTitle: null
     });
     // The kept draft goes once the copy is written with whatever the editor
     // saved: never before it (saveLiveDraft).
@@ -2906,6 +2910,7 @@ function renderNvNote(lib) {
         page.appendChild(body);
     }
     pane.appendChild(page);
+    noteExtras?.decorate(pane,{nv,note});
     return pane;
 }
 
@@ -2922,7 +2927,7 @@ function startEditing() {
     const hit = findNotesNode(state.nv.noteId);
     if (!hit) return;
     const content = decodeNote(hit.node).content;
-    Object.assign(state.nv, { editing: true, isNew: false, draft: content, loaded: content, ...editorCopy() });
+    Object.assign(state.nv, { editing: true, isNew: false, draft: content, loaded: content, titleField: null, loadedTitle: hit.node.title || '', ...editorCopy() });
     renderView();
     focusNoteEditor();
 }
@@ -3014,7 +3019,7 @@ async function saveNoteEdit() {
         if (nv.pendingNotebookName) parentId = await ensureNotebookByName(nv.pendingNotebookName);
         else if (nv.newParentId && isFolderNode(findNotesNode(nv.newParentId)?.node)) parentId = nv.newParentId;
         if (!parentId) parentId = (findNotesFolderWithPath() || found).node._pwaId;
-        const r = NM.resolveTitleOnSave({ storedTitle: null, loadedContent: nv.loaded || '', newContent: content });
+        const r = NM.resolveTitleOnSave({ storedTitle: null, loadedContent: nv.loaded || '', newContent: content, titleField: nv.titleField ?? undefined });
         let made = null;
         const ok = await copyEdit(async () => {
             made = await TreeStore.createNode({ parentId, kind: 'note', title: r.title, payload: { content: r.content, createdAt: now, updatedAt: now } });
@@ -3062,7 +3067,7 @@ async function saveNoteEdit() {
         const r = NM.resolveTitleOnSave({
             storedTitle: note.title,
             loadedContent: nv.loaded == null ? meta.content : nv.loaded,
-            newContent: content
+            newContent: content, titleField: nv.titleField ?? undefined
         });
         const oldTitle = note.title;
         const ok = await copyEdit(() => TreeStore.updateNode(note._pwaId, {
@@ -3582,6 +3587,7 @@ function wireNotesDragAndDrop(root) {
 
 function onNotesInput(e) {
     if (state.view !== 'notes') return;
+    if(noteExtras?.input(e,state.nv)){scheduleLiveDraft();return;}
     if (e.target.id === 'nv-search') {
         onNvSearchInput(e.target);
     } else if (e.target.id === 'note-body-input') {
@@ -3605,6 +3611,7 @@ function onNotesChange(e) {
 function onNotesKeydown(e) {
     if (state.view !== 'notes') return;
     if (document.querySelector('.sheet:not(.hidden)')) return;
+    if(noteExtras?.keydown(e,state.nv))return;
     const t = e.target;
     const search = document.getElementById('nv-search');
     if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 's') {
@@ -6662,7 +6669,7 @@ function draftsMarkdown(drafts) {
         ? `${d.owner.username || `account #${d.owner.userId}`} @ ${d.owner.url}`
         : d.origin === 'local' ? 'made while signed out' : 'an older copy, from before accounts');
     return ['# Unsaved note drafts', '', `Parked on this device, exported ${new Date().toISOString().slice(0, 10)}.`, '',
-        ...drafts.map(d => ['---', '', `**${NM.leadingTitle(d.content) || d.title || 'Untitled'}** — unsaved draft (${whose(d)}${d.parkedAt ? `, parked ${String(d.parkedAt).slice(0, 10)}` : ''})`, '', String(d.content || ''), ''].join('\n'))
+        ...drafts.map(d => ['---', '', `**${d.nv?.titleField || NM.leadingTitle(d.content) || d.title || 'Untitled'}** — unsaved draft (${whose(d)}${d.parkedAt ? `, parked ${String(d.parkedAt).slice(0, 10)}` : ''})`, '', String(d.content || ''), ''].join('\n'))
     ].join('\n');
 }
 
