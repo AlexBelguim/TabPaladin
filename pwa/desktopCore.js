@@ -36,5 +36,5 @@ export function visibleRoots(roots, settings = {}) {
     return [...(roots || []).filter(n => n.role === 'workflows'), ...(candidates || []).filter(n => n.kind === 'folder'
         && !['pins','notes','workflows'].includes(n.role) && !NOISE_ROOTS.has(String(n.title || '').trim().toLowerCase()))];
 }
-export function sameAccount(a,b) { return !!(a && b && a.url === b.url && String(a.userId) === String(b.userId) && a.serverId === b.serverId); }
+export function sameAccount(a,b) { return (!a && !b) || !!(a && b && a.url === b.url && String(a.userId) === String(b.userId) && a.serverId === b.serverId); }
 export function nodeCount(n) { return 1 + (n.children || []).reduce((sum,c) => sum + nodeCount(c),0); }

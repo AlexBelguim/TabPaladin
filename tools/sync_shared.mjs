@@ -27,7 +27,9 @@ export const TWINS = [
     ['src/utils/expandState.js', 'pwa/lib/expandState.js'],
     ['src/utils/storageManager.js', 'pwa/lib/storageManager.js'],
     ['src/utils/pinsManager.js', 'pwa/lib/pinsManager.js'],
-    ['src/utils/notesManager.js', 'pwa/lib/notesManager.js']
+    ['src/utils/notesManager.js', 'pwa/lib/notesManager.js'],
+    ['src/utils/bookmarkOrganizer.js', 'pwa/lib/bookmarkOrganizer.js'],
+    ['src/utils/tabGrouper.js', 'pwa/lib/tabGrouper.js']
 ];
 
 // Each pair as {canonical, copy, same, missing}.

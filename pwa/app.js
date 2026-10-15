@@ -37,6 +37,7 @@ import { StorageManager } from './lib/storageManager.js';
 import { PinsManager } from './lib/pinsManager.js';
 import { createDesktopShell } from './desktopShell.js';
 import { createHome } from './home.js';
+import { createBoard } from './board.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -1875,6 +1876,15 @@ function desktopContext() {
         refresh: renderView, toast: showToast, navigate: navigateDesktop,
         openWorkflow: node=>node&&openWorkflowTabs(fromWire(node)),
         capture:()=>{offerHelperSave();captureHelperTabs();}, pinCurrent:pinHelperTab,
+        async publishWorkflow(id){
+            const account=helperAccount();await assertHelperAccount(account);
+            const wf=(await StorageManager.getWorkflows()).find(w=>w.id===id);const role=await TreeStore.findRoleRoot('workflows');
+            if(!wf||!role)return;
+            const pending={account,rootId:role.id,workflow:{id:wf.id,title:wf.name,createdAt:wf.createdAt,tabs:wf.tabs}};
+            await TreeStore.updateMeta(m=>({...m,helperPendingWorkflows:[...(m.helperPendingWorkflows||[]),pending]}));
+            if(!await TreeStore.flush())throw new Error('Workflow push is pending.');
+            await pushHelperWorkflow(pending);
+        },
         recentNotes:()=>NM.sortNotes(notesLibrary().notes,'edited'), openNote:id=>openNoteById(id,{from:'Home'}),
         search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
         pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},
@@ -1893,6 +1903,7 @@ function navigateDesktop(route,id=null) {
 }
 function wireDesktop() {
     desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
+    desktopUi.register('board',createBoard(desktopContext()));
     window.matchMedia('(min-width: 900px)').addEventListener?.('change',()=>renderView());
     const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
     if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
