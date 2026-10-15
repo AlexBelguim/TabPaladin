@@ -410,7 +410,8 @@
             legacyWorkflowsBackup: Array.isArray(data.workflows_legacy_backup) ? data.workflows_legacy_backup.length : 0,
             localStorageCopiedAt: ls ? ls.copiedAt || null : null,
             approval: approval && approval.until > now() && pinned && approval.pinScope === H.pinScope(config) ? { tabId: approval.tabId, until: approval.until } : null,
-            deliveredTo: move?.deliveredTo || {}, retargeted: move?.retargeted || {}, legacyToken: move?.legacyToken || null
+            deliveredTo: move?.deliveredTo || {}, retargeted: move?.retargeted || {},
+            legacyToken: move?.legacyToken ? { state: move.legacyToken.state, message: move.legacyToken.message || null, at: move.legacyToken.at || null } : null
         };
     }
 
@@ -584,29 +585,37 @@
     // --- The old UI's session ---------------------------------------------------
     // Signed out on its server once the web app has a signed-in session for
     // this server, then blanked here. The server's logout ends session tokens
-    // only; one it still accepts afterwards is its shared token, never
-    // changed by this. A server elsewhere (one that did not prove the pinned
-    // identity) is left alone.
-    async function revokeNow() {
+    // only; one it still accepts after a sign-out it took (2xx) is its shared
+    // token, never changed by this. Any other answer to the sign-out (a
+    // proxy's 502 while the server restarts, say) proves nothing: tried again
+    // later, and the move page keeps its button. A server elsewhere (one that
+    // did not prove the pinned identity) is left alone. An outcome holds for
+    // the token it was reached with (a short digest of it is kept, never the
+    // token): one signed in since, in 1.1.0 after going back, is looked at
+    // anew.
+    async function revokeNow({ force = false } = {}) {
         const config = await H.getConfig();
         const move = await readMove();
         if (!config.serverOrigin || !config.pin || !move || move.state !== 'done' || !move.deliveredTo || !move.deliveredTo[config.serverOrigin]) return { state: 'waiting' };
         const last = move.legacyToken;
-        if (last && ['revoked', 'shared-kept', 'none'].includes(last.state)) return last;
+        const settings = (await api.storage.local.get('settings')).settings;
+        const backend = plain(settings) && plain(settings.backend) ? settings.backend : {};
+        const token = typeof backend.token === 'string' ? backend.token : '';
+        const tokenMark = token ? hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('tp-legacy-token|' + token))).slice(0, 16) : '';
+        if (last && (token ? ['revoked', 'shared-kept', 'none'].includes(last.state) && last.tokenMark === tokenMark
+            : ['revoked', 'none'].includes(last.state))) return last;
         // A server that could not be reached is asked again after a while,
-        // not on every report.
-        if (last && last.state === 'failed' && now() - (Number(last.at) || 0) < 10 * 60 * 1000) return last;
+        // not on every report; the move page's button asks now.
+        if (!force && last && last.state === 'failed' && last.tokenMark === tokenMark && now() - (Number(last.at) || 0) < 10 * 60 * 1000) return last;
         const session = (await api.storage.local.get('tpHelperSession')).tpHelperSession;
         if (!session || session.signedIn !== true || session.origin !== config.serverOrigin || session.serverId !== config.pin.serverId) return { state: 'waiting' };
-        const record = async (legacyToken) => {
-            if (last && last.state === legacyToken.state && last.message === legacyToken.message && legacyToken.state !== 'failed') return last;
+        const record = async (outcome) => {
+            const legacyToken = { ...outcome, tokenMark };
+            if (last && last.state === legacyToken.state && last.message === legacyToken.message && last.tokenMark === tokenMark && legacyToken.state !== 'failed') return last;
             const value = { ...legacyToken, at: now() };
             await updateMove(cur => ({ ...(cur || { v: 1 }), legacyToken: value }));
             return value;
         };
-        const settings = (await api.storage.local.get('settings')).settings;
-        const backend = plain(settings) && plain(settings.backend) ? settings.backend : {};
-        const token = typeof backend.token === 'string' ? backend.token : '';
         if (!token) return record({ state: 'none' });
         const base = String(backend.url || '').trim().replace(/\/+$/, '');
         if (!/^https?:\/\//.test(base) || !sameServerUrl(base, config, move)) {
@@ -615,7 +624,10 @@
         const call = (path, method) => fetch(base + path, { method, headers: { Authorization: 'Bearer ' + token },
             credentials: 'omit', cache: 'no-store', redirect: 'error' });
         try {
-            await call('/api/logout', 'POST');
+            // 401: the server refuses this token already (ended or expired);
+            // checked below like one it just ended.
+            const out = await call('/api/logout', 'POST');
+            if (!out.ok && out.status !== 401) return record({ state: 'failed', message: 'The server answered ' + out.status + ' to signing out. Trying again later.' });
             const me = await call('/api/auth/me', 'GET');
             if (me.status === 401) {
                 // Blank only this token: never one the settings hold since.
@@ -625,15 +637,15 @@
                 }
                 return record({ state: 'revoked' });
             }
-            if (me.ok) return record({ state: 'shared-kept', message: 'The extension holds the server\'s shared token, which signing out does not end. It was left as it is.' });
-            return record({ state: 'failed', message: 'The server answered ' + me.status + '. Trying again later.' });
+            if (me.ok && out.ok) return record({ state: 'shared-kept', message: 'The extension holds the server\'s shared token, which signing out does not end. It was left as it is.' });
+            return record({ state: 'failed', message: me.ok ? 'The server did not confirm the sign-out. Trying again later.' : 'The server answered ' + me.status + '. Trying again later.' });
         } catch (_) {
             return record({ state: 'failed', message: 'The server could not be reached. Trying again later.' });
         }
     }
     let revoking = null;
-    H.revokeLegacyToken = () => {
-        if (!revoking) revoking = revokeNow().finally(() => { revoking = null; });
+    H.revokeLegacyToken = (opts) => {
+        if (!revoking) revoking = revokeNow(opts).finally(() => { revoking = null; });
         return revoking;
     };
     H.onSessionReport = (session) => { if (session && session.signedIn === true) H.revokeLegacyToken().catch(() => {}); };
@@ -650,7 +662,7 @@
             else if (message.op === 'configure') data = await H.configure(body.origin, body.insecureAck === true, { repin: body.repin === true });
             else if (message.op === 'approve') data = await approve();
             else if (message.op === 'open') { const tab = await H.openWebApp(''); data = { tabId: tab && tab.id }; }
-            else if (message.op === 'revoke') data = await H.revokeLegacyToken();
+            else if (message.op === 'revoke') data = await H.revokeLegacyToken({ force: body.force === true });
             else if (message.op === 'rescan') data = await H.detectMove({ rescan: true });
             else H.fail('unsupported-op', 'Unknown move page action.');
             return { ok: true, data };

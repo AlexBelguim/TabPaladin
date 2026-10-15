@@ -85,6 +85,9 @@ const other = await makeIdentity('srv-other');
 const servers = new Map([[ORIGIN, main], [OLD, main], [OTHER, other]]);
 const sessions = new Set();
 const fetchLog = [];
+// Answers a proxy gives to sign-out before the server does (a 502 while the
+// server restarts): taken one per sign-out.
+const logoutAnswers = [];
 async function fakeFetch(url, opts = {}) {
     const u = new URL(url);
     const auth = (opts.headers && (opts.headers.Authorization || opts.headers.authorization)) || '';
@@ -101,6 +104,7 @@ async function fakeFetch(url, opts = {}) {
     // As server/index.js: sign-out ends a session token; the shared token
     // (AUTH_TOKEN) is answered but never ended.
     if (u.pathname === '/api/logout') {
+        if (logoutAnswers.length) return reply(logoutAnswers.shift(), {});
         if (sessions.has(token)) { sessions.delete(token); return reply(200, { ok: true }); }
         return token === SHARED_TOKEN ? reply(200, { ok: true }) : reply(401, { error: 'Unauthorized' });
     }
@@ -796,6 +800,54 @@ console.log('\n12. A helper restarted mid-hand-over makes each part again, and s
     code = null;
     try { await other.request('move.part', { bundleId: manifest.bundleId, partId: 'working', offset: 0 }); } catch (e) { code = e.code; }
     check('another document in the same tab cannot read the hand-over', code === 'move-not-approved', code);
+}
+
+console.log('\n14. The old session: only a sign-out the server took counts');
+{
+    const v = makeBrowser();
+    seed(v);
+    const token = 'sess-' + 'c3'.repeat(24);
+    v.local.set('settings', { ...v.local.get('settings'), backend: { ...v.local.get('settings').backend, token } });
+    sessions.add(token);
+    v.boot();
+    await until(() => v.local.get('tpMove')?.state === 'pending');
+    await connect(v);
+    await copyLocalStorage(v);
+    await v.movePage('approve');
+    const vp = v.page(50, 'doc-v');
+    await vp.attach();
+    vp.click();
+    const web = await webPage();
+    await web.TreeStore.switchAccount(A);
+    await receiver(web, vp).r.receive();
+    const report = () => vp.request('session.report', { signedIn: true, username: 'alex', userId: 1 });
+    logoutAnswers.push(502);
+    await report();
+    await until(() => v.local.get('tpMove')?.legacyToken);
+    const lt = v.local.get('tpMove').legacyToken;
+    check('a sign-out a proxy answered 502 is not taken for the shared token: failed, to be tried again', v.local.get('tpMove').state === 'done' && lt.state === 'failed'
+        && v.local.get('settings').backend.token === token && sessions.has(token), JSON.stringify(lt));
+    const st = await v.movePage('status');
+    check('the move page offers the sign-out again, and shows no digest of the token', st.legacyToken?.state === 'failed' && !('tokenMark' in st.legacyToken));
+    await report();
+    await sleep(30);
+    check('a report straight after waits (asked again after a while)', sessions.has(token) && v.local.get('tpMove').legacyToken.state === 'failed');
+    const r = await v.movePage('revoke', { force: true });
+    check('"Sign the old session out now" asks at once: signed out on the server, blanked here', r.state === 'revoked' && !sessions.has(token)
+        && v.local.get('settings').backend.token === '', JSON.stringify(r));
+    // Back to 1.1.0 and signed in there again: that new token goes too.
+    const token2 = 'sess-' + 'd4'.repeat(24);
+    sessions.add(token2);
+    v.local.set('settings', { ...v.local.get('settings'), backend: { ...v.local.get('settings').backend, token: token2 } });
+    await report();
+    await until(() => !sessions.has(token2) && v.local.get('settings').backend.token === '');
+    check('a token signed in since (after going back to 1.1.0) is signed out and blanked too', !sessions.has(token2) && v.local.get('settings').backend.token === ''
+        && v.local.get('tpMove').legacyToken.state === 'revoked');
+    // One the server ended already: refused at sign-out (401), confirmed.
+    v.local.set('settings', { ...v.local.get('settings'), backend: { ...v.local.get('settings').backend, token: 'sess-' + 'e5'.repeat(24) } });
+    const r3 = await v.movePage('revoke', { force: true });
+    check('a token the server ended already is blanked (401 to the sign-out, 401 to who-am-I)', r3.state === 'revoked' && v.local.get('settings').backend.token === '');
+    check('no token, and no digest of one, ever reached the web app', !allText(web.map).includes(token) && !allText(web.map).includes('tokenMark'));
 }
 
 // A small IndexedDB: versions, an upgrade step that adds stores, and

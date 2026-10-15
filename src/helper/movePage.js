@@ -244,7 +244,7 @@ $('again').addEventListener('click', () => { startMove().catch(e => say(e.messag
 $('open').addEventListener('click', () => { call('open').catch(e => say(e.message)); });
 $('revoke').addEventListener('click', async () => {
     try {
-        const r = await call('revoke');
+        const r = await call('revoke', { force: true });
         say(r.state === 'waiting' ? 'Sign in in the web app first.' : r.message || 'Done.');
         await refresh();
     } catch (e) { say(e.message); }
