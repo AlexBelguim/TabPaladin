@@ -79,6 +79,10 @@ function serialized(fn) {
     return run;
 }
 
+// The helper and the legacy UI share one writer, but never share removals.
+const helper = globalThis.TPHelper = globalThis.TPHelper || {};
+Object.assign(helper, { serialized, getTrackMap, setTrackMap });
+
 const REMOVALS_LOCK = 'tp-pending-removals';
 function withRemovalsLock(fn) {
     const locks = typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
@@ -151,7 +155,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const map = await getTrackMap();
             for (const e of Array.isArray(msg.entries) ? msg.entries : []) {
                 if (!e || e.tabId === undefined || e.tabId === null || !e.bookmarkId) continue;
-                map[e.tabId] = { workflowId: msg.workflowId, bookmarkId: String(e.bookmarkId) };
+                if (map[e.tabId] && map[e.tabId].target === 'web') continue;
+                map[e.tabId] = { workflowId: msg.workflowId, bookmarkId: String(e.bookmarkId), target: 'ext' };
             }
             await setTrackMap(map);
         }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
@@ -162,7 +167,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         serialized(async () => {
             const map = await getTrackMap();
             for (const tabId of Object.keys(map)) {
-                if (map[tabId].workflowId === msg.workflowId) delete map[tabId];
+                if (map[tabId].target !== 'web' && map[tabId].workflowId === msg.workflowId) delete map[tabId];
             }
             await setTrackMap(map);
         }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
@@ -207,8 +212,16 @@ async function untrackClosedTab(tabId, removeInfo) {
     const entry = map[tabId];
     if (!entry) return;
     const windowClosing = Boolean(removeInfo && removeInfo.isWindowClosing);
-    if (!(windowClosing && WINDOW_CLOSE_POLICY === 'keep')) {
-        await queueTreeRemoval(entry.bookmarkId);
+    const config = helper.getConfig ? await helper.getConfig() : null;
+    const policy = config && config.windowClosePolicy === 'remove' ? 'remove' : WINDOW_CLOSE_POLICY;
+    if (!(windowClosing && policy === 'keep')) {
+        if (entry.target === 'web') {
+            // If the helper failed to load, keep the bookmark. Never send a
+            // web account's id into the legacy working copy's queue.
+            if (helper.queueWebRemoval) await helper.queueWebRemoval(entry, removeInfo);
+        } else {
+            await queueTreeRemoval(entry.bookmarkId);
+        }
     }
     delete map[tabId];
     await setTrackMap(map);
@@ -407,4 +420,11 @@ if (api.runtime.onUpdateAvailable) {
             .catch((e) => console.warn('TabPaladin: preparing for the update failed', e))
             .then(() => api.runtime.reload());
     });
+}
+
+// Firefox loads these classic scripts after this one in its manifest.
+// Chrome's worker imports them after the legacy writer has been installed.
+if (typeof importScripts === 'function') {
+    importScripts('../helper/config.js', '../helper/identity.js', '../helper/registration.js',
+        '../helper/tracking.js', '../helper/tabs.js', '../helper/menus.js', '../helper/router.js');
 }

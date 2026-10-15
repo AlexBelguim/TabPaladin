@@ -186,7 +186,17 @@ function setupEventListeners() {
             const tabs = await api.tabs.query({ currentWindow: true });
 
             // Filter out internal/extension pages — they can't be reopened anyway
-            const saveable = tabs.filter(t => t.url && /^https?:|^file:|^ftp:/.test(t.url));
+            const helperData = await api.storage.local.get(['tpHelper', 'settings']);
+            let serverOrigin = helperData.tpHelper && helperData.tpHelper.serverOrigin;
+            if (!serverOrigin) {
+                try { serverOrigin = new URL(helperData.settings && helperData.settings.backend && helperData.settings.backend.url).origin; }
+                catch (_) { /* no configured server */ }
+            }
+            const isServer = (url) => {
+                try { return Boolean(serverOrigin) && new URL(url).origin === serverOrigin; }
+                catch (_) { return false; }
+            };
+            const saveable = tabs.filter(t => !t.incognito && t.url && /^https?:|^file:|^ftp:/.test(t.url) && !isServer(t.url));
 
             if (saveable.length === 0) {
                 alert("No saveable tabs in the current window.");
@@ -218,7 +228,11 @@ function setupEventListeners() {
             // Never close the page doing the saving; only close tabs that
             // were actually saved.
             const self = api.tabs.getCurrent ? await api.tabs.getCurrent() : null;
-            const tabIds = saveable.map(t => t.id).filter(id => !self || id !== self.id);
+            // A tab may have navigated while the dialog or disk flush waited.
+            const currentTabs = await api.tabs.query({ currentWindow: true });
+            const tabIds = saveable.filter(savedTab => currentTabs.some(t => t.id === savedTab.id
+                && t.url === savedTab.url && !t.incognito && !isServer(t.url)))
+                .map(t => t.id).filter(id => !self || id !== self.id);
 
             // Fresh tab so the window doesn't close when we remove the rest
             if (!self) await api.tabs.create({});
@@ -2634,6 +2648,7 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
     const settings = await StorageManager.getSettings();
     const folders = await BookmarkOrganizer.getStructure();
     const videoSeekOn = await StorageManager.getVideoSeek();
+    const helperServerPattern = (await api.storage.local.get('tpHelper')).tpHelper?.pattern;
 
     // -- Render UI --
     container.innerHTML = `
@@ -3241,6 +3256,13 @@ document.getElementById('settingsToggleBtn').addEventListener('click', async () 
             if (on) {
                 on = await perms.request({ origins: ['<all_urls>'] });
             } else {
+                // Keep the helper's exact server grant when dropping video access.
+                // Request it before any await in this click, as Firefox requires.
+                if (helperServerPattern && !(await perms.request({ origins: [helperServerPattern] }))) {
+                    box.checked = true;
+                    alert('Grant access to the configured TabPaladin server before removing video seek access.');
+                    return;
+                }
                 await perms.remove({ origins: ['<all_urls>'] }).catch(() => {});
             }
         } catch (err) {

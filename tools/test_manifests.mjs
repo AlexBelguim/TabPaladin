@@ -35,10 +35,13 @@ check('both manifests carry the same version', chrome.version === firefox.versio
 check('the version is a plain x.y.z', /^\d+\.\d+\.\d+$/.test(chrome.version), chrome.version);
 check('Chrome: private windows are not allowed', chrome.incognito === 'not_allowed');
 check('Firefox: private windows are not allowed', firefox.incognito === 'not_allowed');
-check('Chrome: the permissions are exactly those of 1.0.0', sorted(chrome.permissions) === sorted(PERMISSIONS), sorted(chrome.permissions));
-check('Firefox: the permissions are exactly those of 1.0.0', sorted(firefox.permissions) === sorted(PERMISSIONS), sorted(firefox.permissions));
+check('Chrome: only the warning-free menu permission is added to 1.0.0', sorted(chrome.permissions) === sorted([...PERMISSIONS, 'contextMenus']), sorted(chrome.permissions));
+check('Firefox: only the warning-free menu permission is added to 1.0.0', sorted(firefox.permissions) === sorted([...PERMISSIONS, 'menus']), sorted(firefox.permissions));
 check('Chrome: all-sites access stays optional', sorted(chrome.optional_host_permissions) === '["<all_urls>"]' && !chrome.host_permissions);
 check('Firefox: all-sites access stays optional', sorted(firefox.optional_permissions) === '["<all_urls>"]');
+check('P2 sideload release is 1.1.0', chrome.version === '1.1.0');
+check('the setup page is available in both browsers', chrome.options_ui?.page === 'src/helper/options.html' && firefox.options_ui?.page === '../src/helper/options.html' && chrome.options_ui.open_in_tab && firefox.options_ui.open_in_tab);
+check('no external extension messaging or web accessible resources', JSON.stringify(chrome.externally_connectable) === '{"ids":[]}' && !chrome.web_accessible_resources && !firefox.web_accessible_resources);
 check('no static content scripts', !chrome.content_scripts && !firefox.content_scripts);
 check('the Firefox id is unchanged, so updates land in place', firefox.browser_specific_settings.gecko.id === 'tabpaladin@extension');
 

@@ -9,7 +9,7 @@
   <link rel="icon" href="icons/icon192.png">
   <!-- Version query busts browser/proxy caches on each release.
        Bump the number together with SHELL_CACHE in sw.js. -->
-  <link rel="stylesheet" href="app.css?v=33">
+  <link rel="stylesheet" href="app.css?v=34">
 </head>
 <body>
   <header id="topbar">
@@ -24,6 +24,7 @@
       <button id="sync-chip-push" type="button" class="ghost" title="Push this device's changes to the server">Push</button>
       <button id="sync-chip-pull" type="button" class="ghost" title="Pull the server's tree">Pull</button>
     </div>
+    <button id="helper-status" class="ghost helper-desktop" type="button">Get the TabPaladin helper</button>
     <button id="notesBtn" class="ghost" title="Open notes">📝</button>
     <button id="pushBtn" class="ghost" title="Push latest to sync server">⬆️</button>
     <div id="menu-wrap">
@@ -31,6 +32,8 @@
       <div id="menu" class="hidden">
         <button id="clipBtn" class="menu-item" title="Links waiting to be filed, and a copied link">📥 Inbox</button>
         <button id="newFolderBtn" class="menu-item" title="Create new folder here">📁+ New folder</button>
+        <button id="helper-create" class="menu-item helper-desktop" disabled>Create Workflow</button>
+        <button id="helper-pin" class="menu-item helper-desktop" disabled>Pin current tab</button>
         <button id="pullBtn" class="menu-item" title="Pull latest from sync server">⬇️ Pull</button>
         <button id="settingsBtn" class="menu-item" title="Settings">⚙ Settings</button>
       </div>
@@ -82,9 +85,9 @@
     <div class="sheet-body">
       <label class="field">
         <span>Server</span>
-        <input id="cfg-url" type="url" placeholder="https://sync.example.com">
+        <input id="cfg-url" type="url" readonly aria-readonly="true" placeholder="https://sync.example.com">
       </label>
-      <small class="hint">Defaults to wherever this app is served from — you only need to change it if you host the app somewhere else.</small>
+      <small class="hint">This app connects only to the server it was opened from. To use another server, open that server's web app.</small>
       <!-- Shown when the server above is not the one this app was opened
            from: a later release talks only to that one. -->
       <div id="cfg-origin-notice" class="origin-notice hidden">
@@ -108,7 +111,7 @@
 
       <div id="auth-signed-in" class="hidden">
         <p class="hint">Signed in as <strong id="auth-username-label"></strong><span id="auth-role-label"></span>.</p>
-        <button id="cfg-save" class="primary">Save server</button>
+        <button id="cfg-save" class="primary">Refresh connection</button>
         <button id="auth-change-password" class="ghost-block">Change password</button>
         <button id="auth-signout" class="ghost-block">Sign out</button>
 
@@ -165,6 +168,16 @@
         </div>
       </div>
 
+      <div class="helper-desktop">
+        <hr class="sep">
+        <strong class="block-title">TabPaladin helper</strong>
+        <p id="helper-legacy" class="hint hidden" role="status"></p>
+        <p id="helper-note" class="hint">Install the TabPaladin extension, open its Settings, and connect it to this server to save tabs as workflows and open tracked windows. The extension's toolbar still opens its existing interface.</p>
+        <button id="helper-settings" type="button" class="ghost-block">Open helper settings</button>
+        <button id="helper-recent" type="button" class="ghost-block" disabled>Reopen closed tabs</button>
+        <button id="helper-import" type="button" class="ghost-block" disabled>Import staged browser bookmarks</button>
+      </div>
+
       <!-- Where the working copy is kept on this device, and whether the
            browser may clear it to make room. Signed in or not: a copy kept
            for its account over a sign-out lives here too. -->
@@ -185,6 +198,22 @@
           <div id="stash-list"></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="helper-save-sheet" class="sheet hidden" role="dialog" aria-modal="true" aria-labelledby="helper-save-title">
+    <div class="sheet-header">
+      <strong id="helper-save-title">Create Workflow</strong>
+      <button id="helper-save-close" type="button" class="ghost" aria-label="Close">✕</button>
+    </div>
+    <div class="sheet-body">
+      <label class="field"><span>Workflow name</span><input id="helper-workflow-title" maxlength="200" autocomplete="off"></label>
+      <p id="helper-save-note" class="hint"></p>
+      <label class="field"><span>Browser window</span><select id="helper-window"><option value="">Current browser window</option></select></label>
+      <button id="helper-windows" type="button" class="ghost">Choose another window</button>
+      <button id="helper-capture" class="ghost-block" type="button">Review this window's tabs</button>
+      <div id="helper-tabs"></div>
+      <button id="helper-save-submit" class="primary" type="button" disabled>Save &amp; close selected tabs</button>
     </div>
   </div>
 
@@ -291,7 +320,7 @@
   </div>
 
   <!-- The share core is a classic script: the worker loads the same file. -->
-  <script src="shareCore.js?v=33"></script>
-  <script src="app.js?v=33" type="module"></script>
+  <script src="shareCore.js?v=34"></script>
+  <script src="app.js?v=34" type="module"></script>
 </body>
 </html>

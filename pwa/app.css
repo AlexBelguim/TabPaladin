@@ -2166,3 +2166,8 @@ body.share-open .sheet:not(.share-sheet) { z-index: 35; }
 /* Settings › Storage: set-aside copies */
 #stash-block { margin-top: 12px; }
 .stash-row .import-actions button { min-width: 0; }
+/* The helper's tab controls belong to the desktop browser interface. */
+.helper-tab { align-items: flex-start; overflow-wrap: anywhere; }
+#helper-tabs { max-height: 45vh; overflow-y: auto; margin: 12px 0; }
+#helper-status { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 899px) { .helper-desktop { display: none !important; } }

@@ -1,6 +1,6 @@
 # TabPaladin Privacy Policy
 
-_Last updated: 14 October 2026_
+_Last updated: 15 October 2026_
 
 TabPaladin is a browser extension and a companion web app for saving tab sessions
 ("workflows"), organising bookmarks, and keeping notes. It is self-hosted software:
@@ -16,8 +16,36 @@ on services you choose to connect.
 | **Bookmarks** | Only when you press **Import this browser's bookmarks**, to copy them once into TabPaladin. Your browser's own bookmarks are read, never changed. |
 | **Storage / unlimited storage** | To keep your bookmark tree, workflows, notes and settings on your device. |
 | **Downloads** | Only when you export workflows or folders to a file. |
+| **Toolbar menus** | Opens helper Settings, the web app, workflow-save review and recently closed tabs from the toolbar icon. |
+| **Server access** _(optional)_ | Runs the packaged bridge only on your configured server origin after you click Connect. Runtime checks include the exact origin and port. |
 | **Private windows** | None: TabPaladin does not run in private (incognito) windows. |
 | **Scripting + access to all sites** _(optional, off by default)_ | Only if you turn on **Scroll to seek in fullscreen videos**. It lets the mouse wheel skip through a fullscreen video. It reads nothing from the page, reads none of TabPaladin's own data, and sends nothing anywhere. Turning it off removes the permission. |
+
+## Connecting the web app to browser tabs
+
+Connecting the helper lets scripts served by your chosen TabPaladin server read
+the addresses and titles of open tabs, and open or close tabs after your actions.
+The server operator can see what the web app receives. Connect only to a server
+you trust. The helper pins the server's signed identity public key, checks it on
+later connections and refuses a changed key or invalid signature. A network
+origin permission may cover every port on a host; the bridge separately checks
+the exact configured origin and port on every request. Plain HTTP on a private
+network requires your acknowledgement and gets no offline tab features.
+
+No password or session token crosses the bridge. Signing out unregisters it;
+changing server or disconnecting also detaches it. Old queues and data stay
+bound to their original origin, server identity and account. The helper stores
+workflow tab ids, queued removals (30 days, up to 10,000), staged bookmarks
+(10 minutes), the last 50 bridge calls (origin, operation, time), and tabs it
+closed (24 hours, up to 500, for reopening). This stays in extension storage.
+Bookmark imports are handed only to the designated web-app tab and require a
+confirmation there; they never modify browser bookmarks. The existing required
+bookmarks permission stays in P2 for compatibility with the desktop UI.
+
+TabPaladin uses browsing information only for these requested tab, workflow,
+bookmark and note features. It does not sell it, use it for advertising or
+credit decisions, or transfer it to unrelated third parties. The existing
+favicon and explicitly connected services described below still apply.
 
 ## Where your data is stored
 

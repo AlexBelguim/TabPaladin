@@ -108,27 +108,14 @@ export function makeRateLimiter({ max = 10, windowMs = 15 * 60 * 1000, now = () 
 //     uploaded title is never sniffed into HTML) and Referrer-Policy
 //     no-referrer (no URL of this server leaks to the sites it links to);
 //   - the web app (every file under PWA_DIR, so the service worker too):
-//     APP_CSP enforced and APP_CSP_REPORT_ONLY reported; its HTML also gets
+//     the full APP_CSP enforced; its HTML also gets
 //     Cross-Origin-Opener-Policy same-origin (every window the app opens is
 //     noopener) and X-Frame-Options DENY;
 //   - every other HTML response, and one with no type at all: STRICT_CSP, no
 //     script at all, and X-Frame-Options DENY.
 //
-// APP_CSP enforces only what cannot break the app as it is: scripts from this
-// origin, no plugins, no <base>, forms to this origin, never framed. Where the
-// app may connect and load images from is only reported for this release
-// (connect-src 'self' would refuse a phone still set to another server's
-// address), and enforced once the app's server address is locked to its own
-// origin.
+// P2 locks the app to its own server origin, so the entire policy is enforced.
 export const APP_CSP = [
-    "script-src 'self'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "frame-ancestors 'none'"
-].join('; ');
-
-export const APP_CSP_REPORT_ONLY = [
     "default-src 'self'",
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
@@ -138,7 +125,8 @@ export const APP_CSP_REPORT_ONLY = [
     "manifest-src 'self'",
     "object-src 'none'",
     "base-uri 'none'",
-    "form-action 'self'"
+    "form-action 'self'",
+    "frame-ancestors 'none'"
 ].join('; ');
 
 export const STRICT_CSP = [
@@ -171,7 +159,6 @@ function applyDocumentPolicy(res, args) {
     const html = type.startsWith('text/html') || type.startsWith('application/xhtml+xml');
     if ((res.locals && res.locals.tpApp) || res.tpApp) {
         res.setHeader('Content-Security-Policy', APP_CSP);
-        res.setHeader('Content-Security-Policy-Report-Only', APP_CSP_REPORT_ONLY);
         if (html) {
             res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
             res.setHeader('X-Frame-Options', 'DENY');

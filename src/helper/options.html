@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TabPaladin helper settings</title><link rel="stylesheet" href="options.css"></head>
+<body><main><header><img src="../../assets/icon48.png" alt=""><div><h1>TabPaladin helper</h1><p>The desktop app stays on the toolbar. Connect your web app for tab features.</p></div></header>
+<p id="status" role="status" aria-live="polite">Loading settings…</p>
+<section><h2>Connect your server</h2><label for="origin">Server address</label><input id="origin" type="url" placeholder="https://example.com" autocomplete="url"><p id="host"></p>
+<label class="check"><input id="insecure" type="checkbox"> Unencrypted: only safe on my own network</label>
+<p id="disclosure">The TabPaladin web app at your chosen address will be able to see the addresses and titles of your open tabs and to open and close tabs. The server operator can see what the web app receives. Nothing is sent anywhere else.</p>
+<div class="buttons"><button id="connect">Connect / reconnect</button><button id="disconnect">Disconnect helper</button></div>
+<p id="identity"></p><label class="check"><input id="repin" type="checkbox"> Replace the saved identity key. Only use this after checking that my server was restored or its key changed.</label>
+<p>Signing out disconnects tab features. Reconnect here to use them again. Changing the address keeps queues and old data for their original server.</p></section>
+<section><h2>Account</h2><p id="account">Sign in through the web app. Passwords and session tokens never pass through this helper.</p><button id="signin">Open web app / sign in</button></section>
+<section><h2>Workflow tabs</h2><label for="policy">When a whole workflow window closes</label><select id="policy"><option value="keep">Keep its saved tabs</option><option value="remove">Remove its saved tabs</option></select><p>Closing a single tracked tab removes it from that copy's workflow.</p><p id="tracking"></p><button id="stopTracking">Stop tracking all workflow tabs</button><button id="reopen">Reopen the last tabs the helper closed</button><pre id="recent"></pre></section>
+<section><h2>Import browser bookmarks</h2><p>Copies this browser's bookmarks once into a dated folder in the web app. Review and confirm there. The browser's bookmarks stay untouched. The staged copy expires after ten minutes.</p><button id="import">Import this browser's bookmarks</button></section>
+<section><h2>Video scroll seek</h2><label class="check"><input id="video" type="checkbox"> Scroll to seek in fullscreen videos</label><p>This existing optional feature requests access to all sites. Tab features request only your server.</p></section>
+<section><h2>Recent helper activity</h2><pre id="calls"></pre><p>Version <span id="version"></span> · Protocol 1. The old working copy, drafts, set-aside copies and settings stay in this extension. Use the desktop app's Settings → Backup before updating.</p><a href="../../PRIVACY.md" id="privacy">Privacy details are in the repository's PRIVACY.md.</a></section>
+</main><script src="config.js"></script><script type="module" src="options.js"></script></body></html>

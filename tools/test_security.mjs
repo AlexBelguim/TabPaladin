@@ -18,7 +18,7 @@
 //      is, with no new key made, so the identity is back once it is fixed.
 //   6. A live server (on --port): the web app's files carry its CSP (script,
 //      object, base, frame-ancestors and form-action enforced; connect-src
-//      and img-src only reported), COOP and X-Frame-Options on its HTML;
+//      and img-src enforced), COOP and X-Frame-Options on its HTML;
 //      every other HTML response — the /api/imports pages, Express's 404,
 //      error and redirect pages — the strict script-free CSP; nosniff and
 //      Referrer-Policy on every response; /api/health says app and serverId;
@@ -36,7 +36,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
     authTokenProblem, hashPassword, verifyPassword, sameSecret, makeRateLimiter, escapeHtml,
-    APP_CSP, APP_CSP_REPORT_ONLY, STRICT_CSP
+    APP_CSP, STRICT_CSP
 } from '../server/security.js';
 import { loadOrCreateIdentity, identityMessage, IDENTITY_FILE, NONCE_RE } from '../server/identity.js';
 
@@ -254,17 +254,17 @@ try {
     const appFiles = ['/', '/index.html', '/app.js?v=1', '/sw.js', '/shareCore.js', '/manifest.webmanifest', '/icons/icon192.png'];
     const appRes = await Promise.all(appFiles.map(p => get(p)));
     check('every web app file is served', appRes.every(r => r.status === 200), appRes.map(r => r.status).join());
-    check('  with the app\'s CSP enforced and the full policy reported', appRes.every(r => csp(r) === APP_CSP && ro(r) === APP_CSP_REPORT_ONLY),
+    check('  with the full app\'s CSP enforced', appRes.every(r => csp(r) === APP_CSP && ro(r) === null),
         `${csp(appRes[0])} | ${ro(appRes[0])}`);
     const enforced = APP_CSP.split(';').map(d => d.trim().split(' ')[0]);
-    check('  enforced: script-src, object-src, base-uri, frame-ancestors, form-action, and not connect-src, img-src or default-src',
+    check('  enforced: full policy including connect-src, img-src and default-src',
         ['script-src', 'object-src', 'base-uri', 'frame-ancestors', 'form-action'].every(d => enforced.includes(d))
-        && !['connect-src', 'img-src', 'default-src'].some(d => enforced.includes(d))
+        && ['connect-src', 'img-src', 'default-src', 'worker-src', 'manifest-src', 'style-src'].every(d => enforced.includes(d))
         && /script-src 'self'(;|$)/.test(APP_CSP) && /object-src 'none'/.test(APP_CSP) && /base-uri 'none'/.test(APP_CSP)
         && /frame-ancestors 'none'/.test(APP_CSP) && /form-action 'self'/.test(APP_CSP), APP_CSP);
-    check('  reported: connect-src \'self\' and img-src limited to Google\'s favicon hosts',
-        /connect-src 'self'(;|$)/.test(APP_CSP_REPORT_ONLY) && /img-src 'self' data: https:\/\/www\.google\.com https:\/\/\*\.gstatic\.com(;|$)/.test(APP_CSP_REPORT_ONLY)
-        && /default-src 'self'/.test(APP_CSP_REPORT_ONLY), APP_CSP_REPORT_ONLY);
+    check('  enforced: connect-src \'self\' and img-src limited to Google\'s favicon hosts',
+        /connect-src 'self'(;|$)/.test(APP_CSP) && /img-src 'self' data: https:\/\/www\.google\.com https:\/\/\*\.gstatic\.com(;|$)/.test(APP_CSP)
+        && /default-src 'self'/.test(APP_CSP), APP_CSP);
     const shell = appRes[0];
     check('the app\'s HTML gets COOP same-origin and X-Frame-Options DENY',
         shell.headers.get('cross-origin-opener-policy') === 'same-origin' && shell.headers.get('x-frame-options') === 'DENY'

@@ -32,6 +32,9 @@ import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
 import * as NM from './lib/notesModel.js';
 import { createShareSheet } from './shareSheet.js';
 import * as DC from './durableCopy.js';
+import { pageHelper as helper, saveHelperWorkflow, sameHelperAccount, helperUrl, helperRequestId, stagedBookmarkFolder } from './helper.js';
+import { StorageManager } from './lib/storageManager.js';
+import { PinsManager } from './lib/pinsManager.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
 
@@ -119,9 +122,10 @@ const state = {
         // Falls back to wherever this PWA is served from, because that is the
         // backend — the server hosts it. Only needs setting by hand if you host
         // the PWA somewhere other than the sync server.
-        url: localStorage.getItem(LS.url)
-            || ((location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : ''),
-        token: localStorage.getItem(LS.token) || ''
+        url: defaultServerUrl(),
+        // Never send a token saved for another origin to this server.
+        token: (!localStorage.getItem(LS.url) || sameServerUrl(localStorage.getItem(LS.url), defaultServerUrl()))
+            ? localStorage.getItem(LS.token) || '' : ''
     },
     identity: storedIdentity(),   // who that token is: see shareAccount
     // snapshot, dirty, editCount, treeVersion: read from TreeStore (below)
@@ -325,6 +329,7 @@ function signedOutRefuses(message = 'Sign in first — changes go into your acco
 // sign-in leaves the new one alone.
 function sessionExpired(used) {
     if (state.config.token !== used) return;
+    if (helper.supports('session.report')) helper.request('session.report', { signedIn: false, signedOut: true }).catch(() => {});
     const stored = holdsStoredSession();
     state.config.token = '';
     if (stored) {
@@ -476,6 +481,9 @@ async function bootstrap({ previousUsername = null, switched: switchedAtSignIn =
     if (gone()) return;
     await openPendingImport({ id: arrived ? arrived.id : null, why: arrived ? 'arrived' : 'auto' });
     await offerPendingChanges();
+    reportHelperSession();
+    refreshHelperState();
+    retryHelperWorkflows();
 }
 
 // What waits while the share sheet is up: the proposals (which would redraw
@@ -1568,12 +1576,289 @@ function isNotesFolder(node) {
         && (node._role === 'notes' || node.title === NOTES_ROOT_TITLE);
 }
 
+// --- Optional helper: tab work stays in this web app's own copy ------------
+let helperSave = null;
+let helperSaveBusy = false;
+let helperRefreshBusy = false;
+let helperRetryBusy = false;
+
+function helperAccount() {
+    const a = signedInAccount();
+    return a && a.serverId ? { url: defaultServerUrl(), userId: a.userId, serverId: a.serverId } : null;
+}
+
+function reportHelperSession() {
+    if (!helper.supports('session.report')) return;
+    const a = helperAccount();
+    helper.request('session.report', { signedIn: Boolean(a), username: a ? state.identity?.username || '' : '',
+        userId: a?.userId ?? null, serverId: a?.serverId ?? null }).catch(() => {});
+}
+
+function renderHelperStatus() {
+    const label = $('helper-status');
+    if (label) label.textContent = helper.status === 'multiple' ? 'Two TabPaladin helpers are installed: remove one'
+        : helper.status === 'incompatible' ? 'Update the TabPaladin helper'
+        : helper.status === 'ready' ? `Helper ${helper.hello.helperVersion || ''}` : 'Get the TabPaladin helper';
+    const legacy = $('helper-legacy');
+    if (legacy) {
+        legacy.textContent = helper.hello?.legacy?.dirty
+            ? 'The extension has unpushed edits. Push them from its existing interface before editing this separate web copy.' : '';
+        legacy.classList.toggle('hidden', !legacy.textContent);
+    }
+    for (const [id, op] of [['helper-create', 'tabs.snapshot'], ['helper-pin', 'tabs.active'], ['helper-recent', 'options.open'], ['helper-import', 'bookmarks.take']]) {
+        const el = $(id);
+        if (el) el.disabled = !helper.supports(op);
+    }
+}
+
+async function assertHelperAccount(account) {
+    await ensureStillEditing();
+    if (!sameHelperAccount(account, helperAccount()) || !sameHelperAccount(account, copyStatus().owner)) {
+        throw new Error('The account or working copy changed. The tabs were kept.');
+    }
+    if (helper.hello && helper.hello.serverId !== account.serverId) throw new Error('The helper is pinned to a different server identity. Reconnect it in helper settings.');
+}
+
+function offerHelperSave({ windowId, actionId } = {}) {
+    if (helperSaveBusy || helperSave?.snapshot) return;
+    helperSave = { windowId, actionId, snapshot: null, account: null };
+    const picker = $('helper-window');
+    if (picker) {
+        picker.replaceChildren();
+        const option = document.createElement('option');
+        option.value = windowId == null ? '' : String(windowId);
+        option.textContent = windowId == null ? 'Current browser window' : 'Window selected from the toolbar menu';
+        picker.appendChild(option);
+    }
+    $('helper-workflow-title').value = `Workflow ${new Date().toLocaleDateString()}`;
+    $('helper-tabs').replaceChildren();
+    $('helper-save-note').textContent = 'Review the tabs, choose which to save, then Save & close. Tabs on this server are kept open.';
+    $('helper-save-submit').disabled = true;
+    show($('helper-save-sheet'));
+}
+
+async function chooseHelperWindow() {
+    try {
+        const windows = await helper.request('windows.list', {});
+        const picker = $('helper-window');
+        picker.replaceChildren();
+        for (const win of windows) {
+            const option = document.createElement('option');
+            option.value = String(win.windowId);
+            option.textContent = `${win.title || 'Browser window'} (${win.tabCount} tabs)`;
+            picker.appendChild(option);
+        }
+        $('helper-save-note').textContent = 'Choose a browser window, then click Refresh tabs to review its snapshot.';
+        if (helperSave && windows.length) helperSave.windowId = Number(picker.value);
+    } catch (e) { $('helper-save-note').textContent = e.message; }
+}
+
+async function captureHelperTabs() {
+    if (helperSaveBusy) return;
+    try {
+        const account = helperAccount();
+        if (!account) throw new Error('Sign in before saving a workflow.');
+        await assertHelperAccount(account);
+        const selection = helperSave || {};
+        const body = { purpose: 'save-window' };
+        if (Number.isInteger(selection.windowId)) body.windowId = selection.windowId;
+        const snapshot = await helper.request('tabs.snapshot', body);
+        if (!snapshot || !Array.isArray(snapshot.tabs)) throw new Error('The helper did not return a tab snapshot.');
+        await assertHelperAccount(account);
+        const tabs = snapshot.tabs.filter(t => helperUrl(t.url));
+        helperSave = { ...selection, snapshot, account, choices: [] };
+        const list = $('helper-tabs');
+        list.replaceChildren();
+        for (const tab of tabs.slice(0, 500)) {
+            const row = document.createElement('label');
+            row.className = 'check-row helper-tab';
+            const input = document.createElement('input');
+            input.type = 'checkbox'; input.checked = true;
+            const text = document.createElement('span');
+            text.textContent = `${tab.title || tab.url} — ${tab.url}`;
+            row.appendChild(input); row.appendChild(text); list.appendChild(row);
+            helperSave.choices.push({ input, tab });
+        }
+        $('helper-save-note').textContent = `${Math.min(tabs.length, 500)} tabs ready to review. Saving closes only selected tabs whose URL still matches.`;
+        $('helper-save-submit').disabled = !tabs.length;
+    } catch (e) { $('helper-save-note').textContent = e.message; }
+}
+
+async function dropPendingWorkflow(id) {
+    await TreeStore.updateMeta(m => ({ ...m, helperPendingWorkflows: (m.helperPendingWorkflows || []).filter(p => p.workflow.id !== id) }));
+    await TreeStore.flush();
+}
+
+async function pushHelperWorkflow(pending, { before = null, expect = null } = {}) {
+    if (!configured()) throw new Error('Sign in to push this saved workflow.');
+    await assertHelperAccount(pending.account);
+    const now = await TreeStore.currentCopy();
+    if (expect && !TreeStore.sameCopy(now, expect)) throw new Error('This workflow is kept with another working copy.');
+    const node = await TreeStore.getNode(pending.workflow.id);
+    if (!node) { await dropPendingWorkflow(pending.workflow.id); return false; }
+    let result;
+    try {
+        result = await api('/api/workflows', { method: 'POST', body: JSON.stringify({ workflow: pending.workflow,
+            rootId: pending.rootId, expectUserId: pending.account.userId, expectServerId: pending.account.serverId }) });
+    } catch (e) {
+        if (e.code !== 'no-root') throw e;
+        // A server without this workflows root needs the normal guarded push.
+        // A conflict stays pending: never pull over the saved workflow here.
+        await assertHelperAccount(pending.account);
+        await TreeStore.sync.pushFolding(syncConfig(), { expect: now });
+        await dropPendingWorkflow(pending.workflow.id);
+        return true;
+    }
+    await assertHelperAccount(pending.account);
+    await TreeStore.sync.acceptWorkflowAppend(result, { owner: pending.account, before, expect: expect || now });
+    await dropPendingWorkflow(pending.workflow.id);
+    updateSyncUi();
+    return true;
+}
+
+async function completeHelperSave() {
+    if (helperSaveBusy || !helperSave?.snapshot) return;
+    const selected = helperSave.choices.filter(c => c.input.checked).map(c => c.tab);
+    if (!selected.length) { $('helper-save-note').textContent = 'Select at least one tab.'; return; }
+    const selection = helperSave;
+    helperSaveBusy = true;
+    $('helper-save-submit').disabled = true;
+    try {
+        const result = await saveHelperWorkflow({ helper, platform, store: TreeStore, storage: StorageManager,
+            snapshot: selection.snapshot, tabs: selected, title: $('helper-workflow-title').value,
+            account: selection.account, assertCurrent: () => assertHelperAccount(selection.account), push: pushHelperWorkflow });
+        if (selection.actionId && helper.supports('actions.done')) await helper.request('actions.done', { actionId: selection.actionId }).catch(() => {});
+        hide($('helper-save-sheet'));
+        helperSave = null;
+        renderView();
+        const closed = Array.isArray(result.closed?.closed) ? result.closed.closed.length : 0;
+        showToast(`Workflow saved; ${closed} tabs closed. ${result.pushed ? 'Pushed to the server.' : 'Push pending: ' + (result.pushError?.message || 'use Push to retry.')}`
+            + (result.closeError ? ` Tabs kept: ${result.closeError.message}` : ''));
+    } catch (e) {
+        // A partial or failed durable save is retained, but the snapshot is
+        // discarded from the form to prevent a second save duplicating it.
+        helperSave = null;
+        $('helper-save-note').textContent = e.message;
+        renderView();
+    } finally { helperSaveBusy = false; }
+}
+
+async function retryHelperWorkflows() {
+    if (helperRetryBusy || helperSaveBusy || !booted || !configured() || halted()) return;
+    helperRetryBusy = true;
+    try {
+        for (const p of TreeStore.meta().helperPendingWorkflows || []) {
+            if (!sameHelperAccount(p.account, helperAccount())) continue;
+            try { await pushHelperWorkflow(p); } catch (e) { /* marker stays with this copy for the next retry */ }
+        }
+    } finally { helperRetryBusy = false; }
+}
+
+async function refreshHelperState() {
+    if (helperRefreshBusy || helper.status !== 'ready' || !booted || halted()) return;
+    helperRefreshBusy = true;
+    try {
+        if (helper.supports('removals.take') && helperAccount() && ['indexeddb', 'cache'].includes(await platform.backendKind())) {
+            const entries = await helper.request('removals.take', { account: helperAccount() });
+            const qids = await TreeStore.applyHelperRemovals(entries, { origin: defaultServerUrl(), serverId: helper.hello.serverId });
+            if (qids.length && await TreeStore.flush()) await helper.request('removals.ack', { qids });
+        }
+        if (document.visibilityState !== 'hidden' && helper.supports('actions.take')) {
+            const actions = await helper.request('actions.take', {});
+            if (Array.isArray(actions) && actions.length) offerHelperSave(actions[0]);
+        }
+    } catch (e) { /* events are hints; another hello or focus retries the queue */ }
+    finally { helperRefreshBusy = false; }
+}
+
+async function pinHelperTab() {
+    try {
+        const account = helperAccount();
+        if (!account) throw new Error('Sign in before pinning a tab.');
+        const tab = await helper.request('tabs.active', {});
+        if (!tab || !helperUrl(tab.url)) throw new Error('There is no saveable current tab in a browser window.');
+        await assertHelperAccount(account);
+        await PinsManager.add(tab.url, tab.title);
+        if (!(await TreeStore.flush())) throw new Error('The pin is not written yet.');
+        renderView();
+        await pushAfterEdit();
+        showToast('Current tab pinned.');
+    } catch (e) { showToast(e.message); }
+}
+
+async function importHelperBookmarks() {
+    try {
+        const account = helperAccount();
+        if (!account) throw new Error('Sign in before importing bookmarks.');
+        const staged = await helper.request('bookmarks.take', {});
+        if (!staged?.stageId) throw new Error('No staged bookmarks. Start the import in helper settings.');
+        const folder = stagedBookmarkFolder(staged.tree);
+        if (!confirm(`Import the staged browser bookmarks into "${folder.title}"?`)) return;
+        await assertHelperAccount(account);
+        if (!['indexeddb', 'cache'].includes(await platform.backendKind())) throw new Error('Durable storage is unavailable; the staged bookmarks were kept.');
+        platform.setStagedBookmarks(staged.tree);
+        const prior = (TreeStore.meta().helperBookmarkImports || []).find(r => r.stageId === staged.stageId);
+        const existing = prior ? await TreeStore.getNode(prior.folderId) : null;
+        const imported = existing ? null : await TreeStore.importFromBrowser({ title: folder.title });
+        const made = existing || (imported?.folderId ? await TreeStore.getNode(imported.folderId) : null);
+        if (!made) throw new Error('This staged tree has no importable bookmarks. The browser copy is unchanged.');
+        if (!existing) await TreeStore.updateMeta(m => ({ ...m, helperBookmarkImports: [
+            ...(m.helperBookmarkImports || []).slice(-199), { stageId: staged.stageId, folderId: made.id }
+        ] }));
+        if (!(await TreeStore.flush())) throw new Error('The import is not written yet; it remains staged.');
+        await assertHelperAccount(account);
+        const record = (await platform.getRaw('tpTree')).tpTree;
+        const contains = nodes => (nodes || []).some(n => n.id === made.id || contains(n.children));
+        if (!contains(record?.roots) || !(record?.meta?.helperBookmarkImports || []).some(r => r.stageId === staged.stageId && r.folderId === made.id)) {
+            throw new Error('The import could not be read back; it remains staged.');
+        }
+        await helper.request('bookmarks.ack', { stageId: staged.stageId });
+        platform.setStagedBookmarks(null);
+        renderView();
+        showToast('Browser bookmarks imported into a dated folder. Push when ready.');
+    } catch (e) { showToast(e.message); }
+}
+
+function helperRoute() {
+    if (location.hash.startsWith('#/workflows/save')) offerHelperSave();
+    if (location.hash.startsWith('#/import-browser')) {
+        openSettings();
+        $('helper-note').textContent = 'Browser bookmarks are staged. Click Import staged browser bookmarks to review and import them.';
+    }
+}
+
+function wireHelperUi() {
+    safeAddListener('helper-create', 'click', () => { offerHelperSave(); captureHelperTabs(); });
+    safeAddListener('helper-capture', 'click', () => {
+        if (helperSave && $('helper-window')?.value !== '') helperSave.windowId = Number($('helper-window').value);
+        captureHelperTabs();
+    });
+    safeAddListener('helper-windows', 'click', chooseHelperWindow);
+    safeAddListener('helper-save-submit', 'click', completeHelperSave);
+    safeAddListener('helper-save-close', 'click', () => { if (!helperSaveBusy) { helperSave = null; hide($('helper-save-sheet')); } });
+    safeAddListener('helper-pin', 'click', pinHelperTab);
+    safeAddListener('helper-import', 'click', importHelperBookmarks);
+    safeAddListener('helper-status', 'click', openSettings);
+    for (const [id, section] of [['helper-settings', 'settings'], ['helper-recent', 'recent']]) {
+        safeAddListener(id, 'click', () => helper.request('options.open', { section }).catch(e => showToast(e.message)));
+    }
+    helper.on((event) => {
+        renderHelperStatus();
+        if (event === 'hello') reportHelperSession();
+        if (['hello', 'removals.available', 'action.pending'].includes(event)) refreshHelperState();
+    });
+    const refresh = () => { helper.ping(); refreshHelperState(); };
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
+    renderHelperStatus();
+    helperRoute();
+}
+
 // --- Workflows: saved tab sessions, now first-class in the web app ---
 //
 // A workflow is a folder under the workflows root whose bookmark children are
-// the saved tabs. The web app can't capture open tabs (that needs the
-// extension's tabs API), but it can list, open and delete what's saved — which
-// is the part that matters on a machine without the extension.
+// the saved tabs. The helper adds capture and tracking on desktop; without
+// it the same saved workflows remain browsable and open as ordinary links.
 const WORKFLOWS_ROOT_TITLE = 'TabPaladin Workflows';
 
 function isWorkflowsFolder(node) {
@@ -1604,9 +1889,22 @@ function workflowTabs(folder) {
 // allow pop-ups for this site once. Count what got through and say so. A tab
 // that is not an http(s) page (file:, a browser's own pages) is not opened
 // from here at all.
-function openWorkflowTabs(folder) {
+async function openWorkflowTabs(folder) {
     const all = workflowTabs(folder);
     if (!all.length) { showToast('This workflow has no tabs.'); return; }
+    if (helper.supports('windows.openWorkflow')) {
+        try {
+            const account = helperAccount();
+            if (!account) throw new Error('Sign in to open a tracked workflow.');
+            const result = await helper.request('windows.openWorkflow', {
+                requestId: helperRequestId(), workflowId: folder._pwaId, account,
+                items: all.map(t => ({ bookmarkId: t._pwaId, url: t.url })), target: 'new-window'
+            });
+            const failed = Array.isArray(result.failed) ? result.failed.length : Number(result.failed) || 0;
+            if (failed) showToast(`${failed} tabs could not be opened.`);
+        } catch (e) { showToast(e.message); }
+        return;
+    }
     const tabs = all.filter(t => NM.safeHref(t.url));
     const skipped = all.length - tabs.length;
     let opened = 0;
@@ -1656,7 +1954,11 @@ function renderWorkflowsSection(root) {
             e.stopPropagation();
             if (signedOutRefuses()) return;
             if (!confirm(`Delete workflow "${wf.title}" (${tabs.length} tabs)?`)) return;
+            const trackedAccount = helperAccount();
             if (!(await copyEdit(() => TreeStore.removeNode(wf._pwaId)))) return;
+            if (trackedAccount && helper.supports('track.untrack') && await TreeStore.flush()) {
+                await helper.request('track.untrack', { workflowId: wf._pwaId, account: trackedAccount }).catch(() => {});
+            }
             renderView();
             try {
                 setStatus('Saving…');
@@ -6623,7 +6925,7 @@ function makeShareSheet() {
 // api() changed — only how the token is obtained.
 function openSettings() {
     const urlEl = $('cfg-url');
-    if (urlEl) urlEl.value = state.config.url || defaultServerUrl();
+    if (urlEl) { urlEl.value = defaultServerUrl(); urlEl.readOnly = true; }
     refreshAuthUi();
     forgetMadeMcpToken();
     mcpError('');
@@ -6679,9 +6981,7 @@ function defaultServerUrl() {
 }
 
 function currentServerUrl() {
-    const urlEl = $('cfg-url');
-    const typed = urlEl ? urlEl.value.trim() : '';
-    return (typed || state.config.url || defaultServerUrl()).replace(/\/$/, '');
+    return defaultServerUrl();
 }
 
 // --- Importers ---
@@ -6901,6 +7201,7 @@ function refreshAuthUi() {
     if (setupHint) setupHint.classList.add('hidden');
     updateOriginNotice();
     if (!signedIn) probeAuthStatus();
+    reportHelperSession();
 }
 
 // The server in Settings, when it is not the one this app was opened from:
@@ -7072,6 +7373,7 @@ async function signOut() {
     // unreachable can't leave you stuck signed in on the device. An import
     // link tapped meanwhile waits for whoever signs in next.
     accountChanging = true;
+    if (helper.supports('session.report')) await helper.request('session.report', { signedIn: false, signedOut: true }).catch(() => {});
     try {
         await fetch(base + '/api/logout', {
             method: 'POST',
@@ -7121,6 +7423,8 @@ async function signOut() {
 // parked before this runs. An import link under review stays kept on the
 // phone (pendingImports), for the account it was opened for.
 function resetAccountUi() {
+    hide($('helper-save-sheet'));
+    helperSave = null;
     closeNotesSheets();
     hide($('inbox-sheet'));
     state.proposals = [];
@@ -7838,6 +8142,7 @@ window.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('online', () => {
         if (!configured() || halted()) return;
         flushShares().then(() => refreshInbox()).catch(() => {});
+        retryHelperWorkflows();
     });
     // The worker uploaded or filed something: links it filed go into the copy.
     if (navigator.serviceWorker && typeof navigator.serviceWorker.addEventListener === 'function') {
@@ -7866,6 +8171,7 @@ window.addEventListener('DOMContentLoaded', () => {
     safeAddListener('storage-persist', 'click', keepDataHere);
     safeAddListener('primary-take', 'click', useHere);
 
+    wireHelperUi();
     startApp();
 
     // Import and suggestion links tapped while the app is already open. One
@@ -7875,6 +8181,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // that. A suggestion link is kept on the device first either way; it
     // does not depend on the copy.
     window.addEventListener('hashchange', () => {
+        helperRoute();
         if (!halted()) {
             processImportHashIfAny();
             if (stashChangesHash()) offerPendingChanges();

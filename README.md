@@ -61,10 +61,9 @@ See [server/README.md](server/README.md#importers) for setup.
 
 ## 📦 Installation
 
-Two clients, one tree. The **extension** is the full desktop client — it's the
-only one that can capture open tabs into workflows and auto-sync them on tab
-close. The **web app** (served by the sync server) is the client for phones
-and for any machine without the extension.
+Two clients, one tree. The **extension** remains the primary desktop client. The **web app** (served by the sync server) works on
+phones and PCs; connecting the helper also lets it save and reopen workflow
+windows, track individual tab closes, and pin the current tab.
 
 ### Extension (desktop)
 
@@ -103,6 +102,42 @@ Writes `dist/chrome.zip` (Chrome Web Store, Opera, Edge) and `dist/firefox.zip`
 No dependencies beyond Node. The Firefox manifest in `firefox/` uses `../`
 paths so it can live beside the Chrome one; the script rewrites them, so load
 Firefox from the zip, not from `firefox/`.
+
+### Web app tab features (sideload 1.1.0 / PWA 34)
+
+Right-click the extension toolbar icon and choose **Settings**. Enter your
+server origin (for example `https://example.com`), read the tab-access disclosure,
+and click **Connect / reconnect**. Access is requested only for that server;
+setup verifies its signed identity and pins its public key. Later connections
+refuse a changed key or invalid signature. After restoring a server without
+`identity.jwk`, check the server yourself before explicitly replacing its pin.
+Plain HTTP on a private network requires the unencrypted-network acknowledgement
+and cannot use tab features offline. Sign in in the web app; the helper never
+receives your password or session token. Signing out disconnects its bridge;
+reconnect through helper Settings before using tab features again.
+
+The toolbar click opens the desktop extension app. Its right-click menu adds
+**Open TabPaladin**, **Save tabs as workflow**, **Reopen tabs TabPaladin closed**,
+and **Settings**. Saving from the menu opens a review in the web app; confirm
+there. Saved tabs close only after the local workflow is durably stored.
+Server-origin tabs are kept open by both clients' Save & Close actions.
+
+The extension and web app each keep their own working copy, like two devices.
+Push and pull to exchange changes. Closing one tracked tab removes it only from
+the copy that opened that workflow. Closing an entire workflow window keeps the
+saved tabs by default; helper Settings can change that policy. Web removals wait
+in the helper while the web app is closed (up to 30 days / 10,000 entries), and
+are applied only to their original server, account, workflow and URL. The helper
+also keeps tabs it closed for 24 hours (up to 500), with a reopen action.
+
+**Import this browser's bookmarks** stages one read for ten minutes, handed only
+to the web-app tab the helper opens. Confirm there to add a dated folder. During
+P2 the existing bookmarks permission remains required so the desktop UI keeps
+working; making it temporary belongs to the later helper-only release. The only
+new install permissions are warning-free toolbar menus (`contextMenus` on Chrome,
+`menus` on Firefox). All-sites access remains optional for existing video seek.
+The bridge runs only on the configured server origin, checks every message,
+and uses packaged code. See [PRIVACY.md](PRIVACY.md) for the disclosure.
 
 ### Web app (phone + anywhere else)
 

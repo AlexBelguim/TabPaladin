@@ -760,16 +760,14 @@ warning. Local desktop testing over HTTP works fine.
 Every response carries `X-Content-Type-Options: nosniff` and
 `Referrer-Policy: no-referrer`.
 
-The web app (every file under the PWA directory) carries its
-Content-Security-Policy. This release enforces `script-src 'self';
-object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors
-'none'` and only reports the rest of the policy (`default-src 'self'`,
-`connect-src 'self'`, `img-src 'self' data: https://www.google.com
-https://*.gstatic.com`, …) in `Content-Security-Policy-Report-Only`: a
-phone still set to a server address other than the one it opened the app
-from would otherwise stop syncing. Settings now says when that is the case
-and offers the app's own server. The app's HTML also gets
-`Cross-Origin-Opener-Policy: same-origin` and `X-Frame-Options: DENY`.
+The web app (every file under the PWA directory) enforces the full policy:
+`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data: https://www.google.com https://*.gstatic.com;
+connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none';
+base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+PWA 34 locks its server address to its own `location.origin`; previously saved
+copies for another address stay in browser storage for recovery. The app's HTML
+also gets `Cross-Origin-Opener-Policy: same-origin` and `X-Frame-Options: DENY`.
 
 Every other HTML response — the Reddit connect pages, Express's 404, error
 and redirect pages — carries a script-free policy (`default-src 'none';

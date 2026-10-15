@@ -1317,6 +1317,67 @@ export const TreeStore = {
         return true;
     },
 
+    // The helper owns tab ids, never the tree. Apply only removals stamped for
+    // this exact origin, identity and account, then acknowledge after storage.
+    async applyHelperRemovals(entries, { origin, serverId } = {}) {
+        await ensureLoaded();
+        return withCopyLock(async () => {
+            await reconcile();
+            if (pendingOps.length) throw new Error('The copy could not be saved. Removals remain queued.');
+            const qids = [];
+            const exact = (owner, account) => owner && account && serverId
+                && owner.serverId === serverId && account.serverId === serverId
+                && trim(owner.url) === trim(origin) && trim(account.url) === trim(origin)
+                && Number.isInteger(Number(account.userId)) && Number(account.userId) > 0
+                && Number(owner.userId) === Number(account.userId);
+            const matches = (roots, e) => {
+                let found = null;
+                const walk = (nodes, workflow = false) => {
+                    for (const n of nodes || []) {
+                        const inside = workflow || (n.kind === 'folder' && n.id === e.workflowId);
+                        if (inside && n.kind === 'bookmark' && n.id === e.bookmarkId && n.url === e.url
+                            && !n.virtual && !n.readOnly) found = n.id;
+                        if (!n.virtual && !n.readOnly) walk(n.children, inside);
+                    }
+                };
+                walk(roots);
+                return found;
+            };
+            const accepted = (Array.isArray(entries) ? entries : []).filter(e => e
+                && typeof e.qid === 'string' && typeof e.workflowId === 'string'
+                && typeof e.bookmarkId === 'string' && typeof e.url === 'string'
+                && e.origin === origin && e.account && e.account.serverId === serverId);
+            const own = accepted.filter(e => exact(state.owner, e.account));
+            const step = () => {
+                const ids = own.map(e => matches(state.roots, e)).filter(Boolean);
+                return ids.length ? removeStep(ids)() : false;
+            };
+            if (step()) {
+                recordEdit(step);
+                await writeCopy();
+                if (pendingOps.length) throw new Error('Removals could not be saved. They remain queued.');
+                emit('removed');
+            }
+            qids.push(...own.map(e => e.qid));
+            // A signed-out account's copy can be set aside in this browser.
+            // Keep the queue with that copy; the existing restore path applies it.
+            const keys = await stashIndex();
+            for (const key of keys) {
+                const data = await api.storage.local.get(key);
+                const stash = data[key];
+                if (!stash) continue;
+                const relevant = accepted.filter(e => exact(stash.owner, e.account));
+                if (!relevant.length) continue;
+                const ids = relevant.map(e => matches(stash.roots, e)).filter(Boolean);
+                if (ids.length) await api.storage.local.set({ [key]: {
+                    ...stash, pendingRemovals: [...new Set([...(stash.pendingRemovals || []), ...ids])]
+                } });
+                qids.push(...relevant.map(e => e.qid));
+            }
+            return [...new Set(qids)];
+        });
+    },
+
     // --- Accounts ---------------------------------------------------------
 
     // Would signing in as {url, userId, serverId, tenancyOwner} set this copy
@@ -1806,6 +1867,38 @@ export const TreeStore = {
             });
         },
 
+        // Accept the append of a workflow saved in this copy. Only that one
+        // edit may become clean: any intervening edit leaves the copy dirty.
+        async acceptWorkflowAppend(filing, { owner, expect, before } = {}) {
+            await ensureLoaded();
+            return withCopyLock(async () => {
+                await reconcile();
+                const now = copyToken();
+                if (!filing || !owner || !expect || !before || !sameCopy(now, expect)
+                    || !state.owner || !sameAccount(state.owner, accountOf(owner))
+                    || Number(filing.userId) !== Number(state.owner.userId)
+                    || !filing.serverId || filing.serverId !== state.owner.serverId) return null;
+                const from = Number(filing.baseVersion), to = Number(filing.version);
+                const contiguous = Number.isFinite(from) && Number.isFinite(to)
+                    && from === state.baseVersion && to >= from;
+                const clean = !before.dirty && sameCopy(before, now)
+                    && now.rev === expect.rev && now.baseId === before.baseId
+                    && from === before.baseVersion && contiguous;
+                const previous = { baseVersion: state.baseVersion, baseId: state.baseId,
+                    dirty: state.dirty, editCount: state.editCount, lastSyncAt: state.lastSyncAt,
+                    lastSyncKind: state.lastSyncKind, rev: state.rev };
+                if (contiguous) { state.baseVersion = to; state.baseId = newId(); }
+                if (clean) { state.dirty = false; state.editCount = 0; state.lastSyncAt = new Date().toISOString(); state.lastSyncKind = 'push'; }
+                await writeCopy();
+                if (state.rev === previous.rev) {
+                    Object.assign(state, previous);
+                    throw new Error('The append succeeded, but its local receipt could not be saved.');
+                }
+                emit('pull');
+                return { clean, version: state.baseVersion, copy: copyToken() };
+            });
+        },
+
         // push, but a 409 whose gap is only links filed from a share sheet
         // folds them in and pushes again (up to three times) before the
         // caller sees it. Returns push's result plus {folded, relocated}: how
@@ -1922,15 +2015,16 @@ export const TreeStore = {
     // it is obvious later where a collection came from, and so importing from
     // a second browser does not merge into the first. The browser's own
     // bookmarks are read once and never written.
-    async importFromBrowser() {
+    async importFromBrowser({ title = null } = {}) {
         await ensureLoaded();
         const tree = await api.bookmarks.getTree();
         const root = tree[0];
         const host = await TreeStore.ensureRoleRoot('bookmarks');
         const folder = makeNode({
             kind: 'folder',
-            title: `${browserName()} bookmarks`
+            title: title || `${browserName()} bookmarks`
         });
+        const importTitle = folder.title;
         let count = 0;
         for (const browserRoot of root.children || []) {
             const converted = convertBrowserNode(browserRoot);
@@ -1945,7 +2039,7 @@ export const TreeStore = {
         if (taken.has(folder.title)) {
             folder.title = `${folder.title} (${new Date().toISOString().slice(0, 10)})`;
             let n = 2;
-            while (taken.has(folder.title)) folder.title = `${browserName()} bookmarks (${n++})`;
+            while (taken.has(folder.title)) folder.title = `${importTitle} (${n++})`;
         }
         insertNode(folder, host.id);
         const walkCount = (n) => 1 + (n.children || []).reduce((s, c) => s + walkCount(c), 0);

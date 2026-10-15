@@ -42,7 +42,7 @@ const files = ['src', 'pwa', 'server', 'tools'].flatMap(d => listJs(d));
 for (const rel of files) {
     const source = fs.readFileSync(path.join(ROOT, rel), 'utf8');
     let error = null;
-    if (CLASSIC.has(rel)) {
+    if (CLASSIC.has(rel) || (rel.startsWith('src/helper/') && !rel.endsWith('/options.js'))) {
         try { new vm.Script(source, { filename: rel }); } catch (e) { error = e.message; }
     } else {
         const r = spawnSync(process.execPath, ['--input-type=module', '--check'], { input: source, encoding: 'utf8' });

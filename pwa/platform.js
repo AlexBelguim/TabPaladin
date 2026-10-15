@@ -237,6 +237,7 @@ function isQuota(e) {
 
 export function createPlatform(env = {}) {
     const id = env.id || newId();
+    let stagedBookmarks = null;
     const listeners = new Set();
     let closed = false;
     let fence = () => null;
@@ -495,8 +496,11 @@ export function createPlatform(env = {}) {
         // Until a helper stages the browser's bookmarks, there are none.
         bookmarks: {
             async getTree() {
-                return [{ id: '0', title: '', children: [] }];
+                return stagedBookmarks ? json(stagedBookmarks) : [{ id: '0', title: '', children: [] }];
             }
+        },
+        setStagedBookmarks(tree) {
+            stagedBookmarks = Array.isArray(tree) ? json(tree) : null;
         },
         // Where the copy is kept: 'indexeddb', 'cache' or 'memory' (null
         // until the first use has chosen).
@@ -585,7 +589,9 @@ function install() {
             try {
                 const ls = g.localStorage;
                 if (!ls) return null;
-                return { url: ls.getItem('tp_pwa_url') || '', token: ls.getItem('tp_pwa_token') || '' };
+                const origin = g.location?.origin || '';
+                const saved = ls.getItem('tp_pwa_url') || origin;
+                return { url: origin, token: saved.replace(/\/+$/, '') === origin ? ls.getItem('tp_pwa_token') || '' : '' };
             } catch (e) {
                 return null;
             }
