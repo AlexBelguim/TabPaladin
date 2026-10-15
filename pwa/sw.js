@@ -32,6 +32,8 @@ const SHELL = [
     '/desktop.css?v=35',
     '/home.js',
     '/board.js',
+    '/workflows.js',
+    '/workflows.css?v=35',
     '/board.css?v=35',
     '/lib/tabGrouper.js',
     '/lib/bookmarkOrganizer.js',

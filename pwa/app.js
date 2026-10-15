@@ -38,6 +38,7 @@ import { PinsManager } from './lib/pinsManager.js';
 import { createDesktopShell } from './desktopShell.js';
 import { createHome } from './home.js';
 import { createBoard } from './board.js';
+import { createWorkflows } from './workflows.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -144,6 +145,7 @@ const state = {
 };
 
 let desktopUi = null;
+let organizePort = null;
 const $ = (id) => document.getElementById(id);
 
 // --- The working copy, as TreeStore holds it ------------------------------------------
@@ -1874,6 +1876,7 @@ function desktopContext() {
             renderView(); await pushAfterEdit(); return result;
         },
         refresh: renderView, toast: showToast, navigate: navigateDesktop,
+        split:id=>{organizePort?.split(id);navigateDesktop('organize',id);},
         openWorkflow: node=>node&&openWorkflowTabs(fromWire(node)),
         capture:()=>{offerHelperSave();captureHelperTabs();}, pinCurrent:pinHelperTab,
         async publishWorkflow(id){
@@ -1904,6 +1907,7 @@ function navigateDesktop(route,id=null) {
 function wireDesktop() {
     desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
     desktopUi.register('board',createBoard(desktopContext()));
+    desktopUi.register('workflows',createWorkflows(desktopContext()));
     window.matchMedia('(min-width: 900px)').addEventListener?.('change',()=>renderView());
     const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
     if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
