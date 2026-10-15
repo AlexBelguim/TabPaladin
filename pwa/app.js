@@ -43,6 +43,7 @@ import { createSettings } from './settings.js';
 import { createOrganize } from './organize.js';
 import { createNoteExtras } from './notesExtras.js';
 import { createVaultMirror } from './vault.js';
+import { createMoveReceiver } from './move.js';
 import { housekeeping } from './housekeeping.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
@@ -433,6 +434,7 @@ async function bootstrap({ previousUsername = null, switched: switchedAtSignIn =
             ? `Restored unpushed changes from ${restored.at} — sign in as ${(owner && owner.username) || 'their account'} to push them.`
             : 'Open Settings (⚙) to configure your sync server.');
         if (arrived) showToast(SIGN_IN_TO_IMPORT);
+        else if (moveIn?.unsettled().length) showToast('Sign in to finish bringing your data in from the extension.');
         shareSheet.refreshInbox();
         return;
     }
@@ -499,6 +501,11 @@ async function bootstrap({ previousUsername = null, switched: switchedAtSignIn =
     refreshHelperState();
     retryHelperWorkflows();
     vaultMirror?.check();
+    // What the extension handed over and is not settled yet (pwa/move.js):
+    // settled now, for this account, or waiting for a sign-in.
+    moveReady = true;
+    moveIn?.settlePending({ ids: helper.hello?.move?.delivered ? [helper.hello.move.delivered.bundleId] : [] })
+        .catch(e => console.warn('Bringing in from the extension:', e.message));
     housekeeping(desktopContext()).catch(e=>console.warn('Copy housekeeping:',e.message));
     desktopRouteFromHash();
 }
@@ -1624,7 +1631,7 @@ function renderHelperStatus() {
     const legacy = $('helper-legacy');
     if (legacy) {
         legacy.textContent = helper.hello?.legacy?.dirty
-            ? 'The extension has unpushed edits. Push them from its existing interface before editing this separate web copy.' : '';
+            ? 'The extension\'s old interface still holds unpushed edits. Click the TabPaladin toolbar icon and choose Move to bring them in here.' : '';
         legacy.classList.toggle('hidden', !legacy.textContent);
     }
     for (const [id, op] of [['helper-create', 'tabs.snapshot'], ['helper-pin', 'tabs.active'], ['helper-recent', 'options.open'], ['helper-import', 'bookmarks.take']]) {
@@ -1841,7 +1848,66 @@ async function importHelperBookmarks() {
     } catch (e) { showToast(e.message); }
 }
 
+// --- The move from the extension (P4) -------------------------------------------
+//
+// The helper hands over what the extension's old interface kept (#/move,
+// opened from its move page); pwa/move.js receives it into IndexedDB and
+// settles it into this copy, signed in only. See there.
+let moveIn = null;
+// True once a start has made the copy this account's: only then is anything
+// settled into it.
+let moveReady = false;
+
+// The account this page is signed in as, confirmed by the server just now.
+async function confirmSignedInAccount() {
+    const before = signedInAccount();
+    if (!before) return null;
+    const data = await api('/api/auth/me');
+    const now = signedInAccount();
+    return sameDesktopAccount(before, now) && Number(data.user?.id) === before.userId && data.serverId === before.serverId
+        ? { ...now, tenancyOwner: Boolean(data.user?.tenancyOwner) } : null;
+}
+
+// An incoming copy that is this account's, made the working copy: an ordinary
+// restore, which sets the copy here aside (never replaces it), with the note
+// open in it parked for it.
+async function restoreMovedCopy(key, account) {
+    const me = signedInAccount();
+    if (!me || !sameDesktopAccount(me, account)) throw new Error('The account changed. The copy stays set aside.');
+    parkOpenDraft(copyStatus());
+    await TreeStore.restoreStash(key, { ...me, tenancyOwner: Boolean(account.tenancyOwner) });
+    noteCopySwitched();
+    resetAccountUi();
+    reopenParkedDraft();
+    renderView();
+}
+
+function wireMove() {
+    let indexedDB = null;
+    try { indexedDB = globalThis.indexedDB || null; } catch (e) { indexedDB = null; }
+    moveIn = createMoveReceiver({
+        helper, store: TreeStore, storage: StorageManager, platform, ls: localStorage, indexedDB, origin: location.origin,
+        account: signedInAccount, helperAccount, confirmAccount: confirmSignedInAccount,
+        assertAccount: (a) => assertHelperAccount({ url: defaultServerUrl(), userId: a.userId, serverId: a.serverId }),
+        restore: restoreMovedCopy, parkDrafts, reopenDrafts: reopenParkedDraft, toast: showToast, refresh: renderView, signIn: openSettings
+    });
+    // Opened by itself once for the tab the move page approved (a hello
+    // comes again with every focus); a new approval opens it again.
+    let opened = false;
+    helper.on((event) => {
+        const move = helper.hello?.move;
+        if (event === 'move.approved' || (event === 'hello' && move?.approvedHere && !opened)) {
+            opened = true;
+            moveIn.open();
+        }
+        if (event === 'hello' && moveReady && move?.delivered) {
+            moveIn.settlePending({ ids: [move.delivered.bundleId] }).catch(e => console.warn('Bringing in from the extension:', e.message));
+        }
+    });
+}
+
 function helperRoute() {
+    if (location.hash.startsWith('#/move')) moveIn?.open();
     if (location.hash.startsWith('#/workflows/save')) offerHelperSave();
     if (location.hash.startsWith('#/import-browser')) {
         openSettings();
@@ -1873,6 +1939,7 @@ function wireHelperUi() {
     window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
     renderHelperStatus();
+    wireMove();
     helperRoute();
 }
 
@@ -1904,7 +1971,7 @@ function desktopContext() {
         recentNotes:()=>NM.sortNotes(notesLibrary().notes,'edited'), openNote:id=>openNoteById(id,{from:'Home'}),
         search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
         pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},
-        restoreSetAside, discardSetAside, openLegacySettings:openSettings, renderVault:root=>vaultMirror?.render(root),
+        restoreSetAside, discardSetAside, openLegacySettings:openSettings, renderVault:root=>vaultMirror?.render(root), renderMove:root=>moveIn?.render(root),
         exportDrafts:()=>downloadFile(draftsMarkdown(parkedList()),'text/markdown','tabpaladin-note-drafts.md')
     };
 }

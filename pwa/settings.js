@@ -36,11 +36,11 @@ export function createSettings(ctx){
         root.append(button('Save all device settings',async()=>{await ctx.assertAccount(account);await ctx.store.saveCopySettings(draft,{account});ctx.toast('Settings saved.');ctx.refresh();},'primary'),button('Cancel settings changes',()=>ctx.refresh()));
         root.append(el('h2',{},'Set-aside copies'));
         const all=await ctx.store.listStashes(account);for(const stash of all){
-            const label=(stash.username||'Kept copy')+' @ '+(stash.url||'local')+' · '+stash.items+' items'+(stash.dirty?' · '+stash.editCount+' unpushed':'');
+            const raw=(await ctx.platform.getRaw(stash.key))[stash.key];
+            const label=(raw?.meta?.movedFromExtension?'From the browser extension: ':'')+(stash.username||'Kept copy')+' @ '+(stash.url||'local')+' · '+stash.items+' items'+(stash.dirty?' · '+stash.editCount+' unpushed edit'+(stash.editCount===1?'':'s'):'');
             const row=el('article',{className:'settings-stash'},el('strong',{},label));
             row.append(button('Export recovery JSON',async()=>{const data=(await ctx.platform.getRaw(stash.key))[stash.key];download('kept-copy.json',JSON.stringify(data,null,2));}));
             row.append(button('Export bookmarks.html',async()=>download('kept-copy.html',await ctx.store.exportStashHtml(stash.key),'text/html')));
-            const raw=(await ctx.platform.getRaw(stash.key))[stash.key];
             if(raw?.recoveryDrafts?.length)row.append(button('Export recovered drafts',()=>download('recovered-drafts.md',raw.recoveryDrafts.map(d=>'# '+(d.title||'Draft')+'\n\n'+(d.content||d.nv?.draft||'')).join('\n\n---\n\n'),'text/markdown')));
             if(stash.url===location.origin&&['same','moved'].includes(stash.match)){
                 row.append(button('Restore',()=>ctx.restoreSetAside(stash)),button('Discard…',async()=>{if(raw?.recoveryDrafts?.length&&!confirm('Export the recovered drafts first? Cancel keeps this copy.'))return;if(raw?.recoveryDrafts?.length)download('recovered-drafts.md',raw.recoveryDrafts.map(d=>d.content||'').join('\n\n---\n\n'),'text/markdown');await ctx.discardSetAside(stash,all);ctx.refresh();}));
@@ -63,6 +63,7 @@ export function createSettings(ctx){
             }ctx.toast('Backup copies kept separately. Review their owners before restoring.');ctx.refresh();
         }catch(e){ctx.toast(e.message);}finally{backupFile.value='';}});
         ctx.renderVault?.(root);
+        await ctx.renderMove?.(root);
         root.append(el('h2',{},'Recovery'),el('p',{},'Bring in an extension backup as separate copies. Credentials are ignored. Your current copy is kept.'),button('Bring in an extension backup',()=>backupFile.click()),backupFile);
     }};
 }
