@@ -173,15 +173,17 @@
 
     // --- Whose copy -------------------------------------------------------------
     // 'this': stamped for the pinned server (its address, and its signed id
-    // where the stamp has one); 'this-moved': the pinned server's signed id at
-    // another address, confirmed on the move page; 'unstamped': made while
-    // signed out ('local') or from before accounts; 'other': anything else.
-    function classify(owner, config) {
+    // where the stamp has one); 'this-moved': the pinned server at another
+    // address — its signed id in the stamp, or, for a stamp without one, an
+    // address that proved the pinned identity when the move was approved —
+    // confirmed on the move page; 'unstamped': made while signed out
+    // ('local') or from before accounts; 'other': anything else.
+    function classify(owner, config, move = null) {
         if (!config || !config.serverOrigin || !config.pin) return 'unknown';
         if (plain(owner) && owner.url) {
             const sameOrigin = H.originOf(owner.url) === config.serverOrigin;
             if (owner.serverId) return owner.serverId !== config.pin.serverId ? 'other' : sameOrigin ? 'this' : 'this-moved';
-            return sameOrigin ? 'this' : 'other';
+            return sameOrigin ? 'this' : sameServerUrl(owner.url, config, move) ? 'this-moved' : 'other';
         }
         return 'unstamped';
     }
@@ -259,10 +261,10 @@
             const unstampedAt = url => ({ sameServer: sameServerUrl(url, config, move), legacyUrl: H.originOf(url || '') || null });
             const tree = plain(data.tpTree) && Array.isArray(data.tpTree.roots) ? data.tpTree : null;
             let workingSent = false;
-            if (tree && sends(classify(tree.owner, config)) && (tree.roots.length || tree.dirty || removals.length || legacy)) {
+            if (tree && sends(classify(tree.owner, config, move)) && (tree.roots.length || tree.dirty || removals.length || legacy)) {
                 const ids = nodeIds(tree.roots);
                 add('working', 'tree', {
-                    class: classify(tree.owner, config),
+                    class: classify(tree.owner, config, move),
                     ...(tree.owner ? { sameServer: null, legacyUrl: null } : unstampedAt(legacyUrl)),
                     record: scrub(tree),
                     pendingRemovals: removals,
@@ -282,7 +284,7 @@
                 });
             }
             for (const { key, record } of stashes) {
-                const cls = classify(record.owner, config);
+                const cls = classify(record.owner, config, move);
                 if (!sends(cls) || !(record.roots.length || record.dirty)) continue;
                 add('stash:' + key, 'tree', {
                     class: cls, key,
@@ -291,7 +293,7 @@
                 });
             }
             const drafts = draftsOf(data);
-            const mine = list => list.filter(d => sends(classify(d.owner, config))).map(d => scrub(d));
+            const mine = list => list.filter(d => sends(classify(d.owner, config, move))).map(d => scrub(d));
             const moving = { parked: mine(drafts.parked), mirrored: mine(drafts.mirrored), live: mine(drafts.live) };
             if (moving.parked.length + moving.mirrored.length + moving.live.length) add('drafts', 'drafts', moving);
             const ls = plain(data[LEGACY_LS]) && plain(data[LEGACY_LS].keys) ? data[LEGACY_LS].keys : {};
@@ -322,17 +324,57 @@
         return out;
     }
 
+    // --- Other addresses of this server ----------------------------------------
+    // The old UI may have reached this server at another address (a LAN
+    // address before a tunnel): its copies say so in their stamps. Such an
+    // address counts as this server only while it proves the pinned identity
+    // (signature and key); one that cannot be reached is asked again after a
+    // while. Copies at an address that does not stay in this browser.
+    function addressesOf(data, stashes) {
+        const urls = [legacyUrlOf(data)];
+        const tree = plain(data.tpTree) ? data.tpTree : null;
+        for (const rec of [tree, ...stashes.map(s => s.record)]) {
+            if (!rec) continue;
+            if (plain(rec.owner)) { if (!rec.owner.serverId) urls.push(String(rec.owner.url || '')); } else urls.push(String(rec.url || ''));
+        }
+        return urls;
+    }
+    async function checkAddresses(config, urls) {
+        const scope = H.pinScope(config);
+        const move = await readMove();
+        const tried = plain(move && move.addressChecks) ? move.addressChecks : {};
+        const fresh = o => tried[o] && tried[o].pinScope === scope && (tried[o].same || now() - (Number(tried[o].at) || 0) < 10 * 60 * 1000);
+        const origins = [...new Set(urls.map(u => H.originOf(u || '')).filter(o => /^https?:/.test(o) && o !== config.serverOrigin))]
+            .filter(o => !fresh(o)).slice(0, 5);
+        if (!origins.length) return;
+        const results = {};
+        for (const o of origins) {
+            try { results[o] = Boolean(H.sameIdentity(config.pin, await H.fetchIdentity(o))); } catch (_) { results[o] = false; }
+        }
+        await updateMove((cur) => {
+            if (!cur) return null;
+            const map = { ...(plain(cur.sameServer) ? cur.sameServer : {}) };
+            const checks = { ...(plain(cur.addressChecks) ? cur.addressChecks : {}) };
+            for (const [o, same] of Object.entries(results)) {
+                if (same) map[o] = scope; else delete map[o];
+                checks[o] = { pinScope: scope, same, at: now() };
+            }
+            return { ...cur, sameServer: map, addressChecks: checks };
+        });
+    }
+
     // --- The move page's summary ----------------------------------------------
     async function status() {
         const config = await H.getConfig();
         const pinned = Boolean(config.serverOrigin && config.pin);
-        const move = await readMove();
         const { data, stashes } = await inventory();
+        if (pinned) await checkAddresses(config, addressesOf(data, stashes)).catch(() => {});
+        const move = await readMove();
         const settings = settingsOf(data);
         const legacyUrl = legacyUrlOf(data);
         const view = (record, extra = {}) => {
             const owner = plain(record.owner) ? record.owner : null;
-            const cls = classify(owner, pinned ? config : null);
+            const cls = classify(owner, pinned ? config : null, move);
             const url = owner ? String(owner.url || '') : String(record.url || legacyUrl || '');
             return {
                 owner: owner ? { url: String(owner.url || ''), userId: owner.userId ?? null, username: owner.username || record.username || null, serverId: owner.serverId || null } : null,
@@ -345,7 +387,7 @@
         const tree = plain(data.tpTree) && Array.isArray(data.tpTree.roots) ? data.tpTree : null;
         const drafts = draftsOf(data);
         const all = [...drafts.parked, ...drafts.mirrored, ...drafts.live];
-        const draftsMoving = pinned ? all.filter(d => sends(classify(d.owner, config))).length : 0;
+        const draftsMoving = pinned ? all.filter(d => sends(classify(d.owner, config, move))).length : 0;
         const cards = plain(data.tpUiExpanded) && plain(data.tpUiExpanded.cards) ? Object.keys(data.tpUiExpanded.cards).length : 0;
         const session = (await api.storage.local.get('tpHelperSession')).tpHelperSession;
         const approval = (await H.temporary.get(APPROVAL))[APPROVAL];
@@ -380,19 +422,9 @@
         let move = await readMove();
         if (!move || move.state === 'none') move = await H.detectMove({ rescan: true });
         if (!move || move.state === 'none') H.fail('nothing-to-move', 'This browser holds nothing of the old TabPaladin to move.');
-        // The old UI's server address, when it is not this one: the same
-        // server only if it proves the pinned identity now.
-        const { settings } = await api.storage.local.get('settings');
-        const legacyOrigin = H.originOf(plain(settings) && plain(settings.backend) ? String(settings.backend.url || '') : '');
-        if (/^https?:/.test(legacyOrigin) && legacyOrigin !== config.serverOrigin) {
-            let same = false;
-            try { same = Boolean(H.sameIdentity(config.pin, await H.fetchIdentity(legacyOrigin))); } catch (_) { same = false; }
-            await updateMove((cur) => {
-                const map = { ...(plain(cur && cur.sameServer) ? cur.sameServer : {}) };
-                if (same) map[legacyOrigin] = H.pinScope(config); else delete map[legacyOrigin];
-                return { ...(cur || { v: 1 }), sameServer: map };
-            });
-        }
+        // Which other addresses are this server, as of now.
+        const { data, stashes } = await inventory();
+        await checkAddresses(config, addressesOf(data, stashes));
         const tab = await H.openWebApp('#/move', { requireBridge: true });
         const current = await H.getConfig();
         if (!current.enabled || !current.pin || H.pinScope(current) !== H.pinScope(config)) H.fail('not-configured', 'The helper connection changed. Try again.');
@@ -517,7 +549,7 @@
         let target = null, tree = null;
         if (bundle.parts.some(p => p.id === 'working')) {
             tree = (await api.storage.local.get('tpTree')).tpTree;
-            const cls = classify(tree && tree.owner, ctx.config);
+            const cls = classify(tree && tree.owner, ctx.config, await readMove());
             if ((cls === 'this' || cls === 'this-moved') && Number.isInteger(Number(tree.owner.userId)) && Number(tree.owner.userId) > 0) {
                 target = { url: ctx.config.serverOrigin, serverId: ctx.config.pin.serverId, userId: String(tree.owner.userId) };
             } else if (cls === 'unstamped' && account) target = account;

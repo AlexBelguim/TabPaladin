@@ -284,6 +284,15 @@ function legacyData() {
         // From before accounts, set aside at the old address.
         'tpTreeStash:https://old.example.com|legacy': { roots: [{ id: 'pre-f', kind: 'folder', title: 'Before accounts', children: [] }], baseVersion: 5, dirty: false, editCount: 0,
             owner: null, origin: 'pre-accounts', url: OLD, username: null, setAsideAt: '2026-06-01T00:00:00.000Z', focusedFolderIds: [], expanded: {}, pendingRemovals: [], restoredFrom: [], copyId: 'copy-pre', fromRev: null },
+        // Stamped at the old address before stamps carried a server id: this
+        // server only because that address proves the pinned identity.
+        'tpTreeStash:https://old.example.com|1#1700000000000': { roots: [{ id: 'nosid-f', kind: 'folder', title: 'Stamped without an id', children: [] }], baseVersion: 2, dirty: false, editCount: 0,
+            owner: { url: OLD, userId: 1, username: 'alex' }, origin: null, url: OLD, username: 'alex', setAsideAt: '2026-05-01T00:00:00.000Z',
+            focusedFolderIds: [], expanded: {}, pendingRemovals: [], restoredFrom: [], copyId: 'copy-nosid', fromRev: 'rev-nosid' },
+        // The same, at an address nothing answers at any more: it stays.
+        'tpTreeStash:https://gone.example.net|1': { roots: [{ id: 'gone-f', kind: 'folder', title: 'Unreachable address', children: [] }], baseVersion: 2, dirty: false, editCount: 0,
+            owner: { url: 'https://gone.example.net', userId: 1, username: 'alex' }, origin: null, url: 'https://gone.example.net', username: 'alex', setAsideAt: '2026-05-02T00:00:00.000Z',
+            focusedFolderIds: [], expanded: {}, pendingRemovals: [], restoredFrom: [], copyId: 'copy-gone', fromRev: 'rev-gone' },
         // Another account on this server, set aside and lost from the index.
         'tpTreeStash:https://tp.example.com|2': { roots: [{ id: 'sam-f', kind: 'folder', title: 'Sam', children: [] }], baseVersion: 7, dirty: true, editCount: 1,
             owner: { url: ORIGIN, userId: 2, username: 'sam', serverId: 'srv-main' }, origin: null, url: ORIGIN, username: 'sam', setAsideAt: '2026-09-15T00:00:00.000Z',
@@ -429,6 +438,9 @@ const byKey = Object.fromEntries(status.stashes.map(s => [s.key, s]));
 check('the copy from the server\'s old address is this server\'s (signed id)', byKey['tpTreeStash:https://old.example.com|1']?.class === 'this-moved');
 check('the copy for another server is kept in this browser', byKey['tpTreeStash:https://other.example.org|1']?.class === 'other' && !byKey['tpTreeStash:https://other.example.org|1'].moves);
 check('the unstamped copy goes, for the web app to decide', byKey['tpTreeStash:https://old.example.com|legacy']?.class === 'unstamped');
+check('a stamp without a server id, at an address that proves the pinned identity, is this server\'s', byKey['tpTreeStash:https://old.example.com|1#1700000000000']?.class === 'this-moved'
+    && byKey['tpTreeStash:https://old.example.com|1#1700000000000'].moves);
+check('one at an address that cannot prove it stays in this browser', byKey['tpTreeStash:https://gone.example.net|1']?.class === 'other' && !byKey['tpTreeStash:https://gone.example.net|1'].moves);
 check('drafts: those for this server move, the other server\'s stays', status.drafts.moving >= 2 && status.drafts.kept === 1, JSON.stringify(status.drafts));
 check('the status carries no credential', !JSON.stringify(status).includes(SESSION_TOKEN) && !JSON.stringify(status).includes(AI_KEY));
 // A page left open from before writes the old AI key back: it still never moves.
@@ -476,10 +488,11 @@ page.click();
 const bundle1 = await rx1.r.receive();
 const partIds = bundle1.parts.map(p => p.id).sort();
 check('every part for this server arrived', JSON.stringify(partIds) === JSON.stringify(['drafts', 'prefs', 'stash:tpTreeStash:https://old.example.com|1',
-    'stash:tpTreeStash:https://old.example.com|legacy', 'stash:tpTreeStash:https://tp.example.com|2', 'working'].sort()), JSON.stringify(partIds));
+    'stash:tpTreeStash:https://old.example.com|1#1700000000000', 'stash:tpTreeStash:https://old.example.com|legacy', 'stash:tpTreeStash:https://tp.example.com|2', 'working'].sort()), JSON.stringify(partIds));
 check('a part bigger than one chunk came in several', page.calls.filter(c => c === 'move.part').length > bundle1.parts.length);
 const held = allText(rx1.moves.map);
 check('the other server\'s copy and draft never left the helper', !held.includes('other.example.org') && !held.includes('Other server only') && !held.includes('Other server draft'));
+check('nor did the copy at the address that could not prove the identity', !held.includes('Unreachable address'));
 check('no session token and no old AI key in any part', !held.includes(SESSION_TOKEN) && !held.includes(AI_KEY) && !/"(token|apiKey|geminiApiKey)"/.test(held));
 check('the parts are kept verbatim with their digests, and the bundle with them', bundle1.parts.every(p => rx1.moves.map.get('part:' + p.digest)?.digest === p.digest)
     && rx1.moves.map.has('bundle:' + bundle1.bundleId));
@@ -514,6 +527,8 @@ const stashes1 = await web1.TreeStore.listStashes(A);
 const label = s => `${s.username}@${s.url}`;
 check('the old-address copy lands set aside, stamped at this address', stashes1.some(s => s.url === ORIGIN && s.items === 1 && s.match === 'same' && s.stamps.some(x => x.url === OLD)), JSON.stringify(stashes1.map(label)));
 check('sam\'s copy lands set aside for sam, not for alex', stashes1.some(s => s.username === 'sam' && s.match === null));
+check('the copy stamped without a server id lands as alex\'s, at this address', stashes1.some(s => s.url === ORIGIN && s.match === 'same' && s.items === 1
+    && s.stamps.some(x => x.url === OLD) && s.setAsideAt && s.key.includes(ORIGIN)) && stashes1.filter(s => s.stamps.some(x => x.url === OLD) && s.match === 'same').length === 2);
 check('the copy from before accounts is the server owner\'s to take back', stashes1.some(s => s.origin === 'pre-accounts' && s.match === 'same'));
 check('nothing for another server came in', !allText(web1.map).includes('other.example.org'));
 const parked1 = web1.DC.readParked(rx1.ls);
@@ -591,9 +606,9 @@ console.log('\n7. Never over a copy with unpushed edits');
     check('run again, the extension\'s dirty copy is current over the clean one', st.dirty && JSON.stringify(web.TreeStore.roots()).includes('"Research"'));
     const all = await web.TreeStore.listStashes(A);
     check('the clean copy was set aside, not replaced', all.some(s => s.items === 1 && !s.dirty && s.match === 'same' && s.url === ORIGIN && !s.stamps.some(x => x.url === OLD)));
-    // Half-way: the incoming copy and the three set-aside ones filed. Then:
+    // Half-way: the incoming copy and the four set-aside ones filed. Then:
     // the incoming one current, the clean one aside in its place.
-    check('and nothing was filed twice', stashesMid === 4 && all.length === 4, `${stashesMid} → ${all.length}`);
+    check('and nothing was filed twice', stashesMid === 5 && all.length === 5, `${stashesMid} → ${all.length}`);
     check('the incoming working copy is not also left set aside', !all.some(s => s.items > 5));
 }
 
@@ -673,7 +688,7 @@ console.log('\n10. Rollback: 1.1.0 finds its data untouched');
 {
     const after = Object.fromEntries(b.local);
     const legacyKeys = ['tpTree', 'tpTreeStashIndex', 'tpTreeStash:https://old.example.com|1', 'tpTreeStash:https://other.example.org|1', 'tpTreeStash:https://old.example.com|legacy',
-        'tpTreeStash:https://tp.example.com|2', 'tpPendingRemovals', 'tpLiveDraft', 'tpParkedMirror', 'workflows', 'workflows_legacy_backup', 'tpUiExpanded'];
+        'tpTreeStash:https://tp.example.com|2', 'tpTreeStash:https://old.example.com|1#1700000000000', 'tpTreeStash:https://gone.example.net|1', 'tpPendingRemovals', 'tpLiveDraft', 'tpParkedMirror', 'workflows', 'workflows_legacy_backup', 'tpUiExpanded'];
     for (const k of legacyKeys) check(`${k} is as it was`, JSON.stringify(after[k]) === JSON.stringify(before[k]));
     // The AI switch was retired by the background since 1.0.x; the key a
     // stale page wrote back (above) is still where it was, and never moved.
