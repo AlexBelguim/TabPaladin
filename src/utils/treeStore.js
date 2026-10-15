@@ -946,8 +946,10 @@ async function stashCurrent({ fallbackUrl, username = null } = {}) {
 }
 
 // A set-aside copy of `copy` (as record() gives it). It says which copy it was
-// made from, and from which stored version of it, for saveOrphan.
-async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [], recoveryDrafts = [] } = {}) {
+// made from, and from which stored version of it, for saveOrphan. One filed
+// by an import (`imported`: a recovery, a backup file, the move) says so: it
+// comes back only when someone restores it (see takeStashFor).
+async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [], recoveryDrafts = [], imported = false } = {}) {
     const keys = await stashIndex();
     const base = stashKeyFor(copy.owner, fallbackUrl);
     let key = base;
@@ -969,6 +971,7 @@ async function writeStash(copy, { fallbackUrl, username = null, focusedFolderIds
             expanded,
             pendingRemovals,
             ...(recoveryDrafts.length ? { recoveryDrafts: clone(recoveryDrafts) } : {}),
+            ...(imported ? { imported: true } : {}),
             restoredFrom: copy.restoredFrom,
             copyId: copy.copyId || null,
             fromRev: copy.rev || null,
@@ -990,17 +993,20 @@ async function takeStash(key) {
     return stash;
 }
 
-// The first set-aside copy that is `target`'s own — matched on the stamp, not
-// the key, since a key names the address and id but not the server. With
-// `legacy`, an unstamped copy from before accounts set aside from this
-// address instead.
+// The set-aside copy that is `target`'s own, last set aside first (the
+// index is in the order copies were filed): the copy the account was last
+// working on — matched on the stamp, not the key, since a key names the
+// address and id but not the server. With `legacy`, an unstamped copy from
+// before accounts set aside from this address instead. A copy filed by an
+// import never comes back this way: it waits until someone restores it, so
+// an older copy brought in never takes the place of the account's own work.
 async function takeStashFor(target, { legacy = false } = {}) {
     const keys = await stashIndex();
     if (!keys.length) return null;
     const data = await api.storage.local.get(keys);
-    const key = keys.find(k => {
+    const key = [...keys].reverse().find(k => {
         const s = data[k];
-        if (!s) return false;
+        if (!s || s.imported === true) return false;
         if (legacy) return !s.owner && originOf(s) === 'pre-accounts' && sameUrl(s.url, target.url);
         return Boolean(s.owner) && sameAccount(s.owner, target);
     });
@@ -1422,7 +1428,7 @@ export const TreeStore = {
                 if (sourceId && item?.meta?.recoverySourceId === String(sourceId)) return { key, items: count, owner: item.owner, duplicate: true };
                 if (copy.rev && item && item.copyId === copy.copyId && item.fromRev === copy.rev) return { key, items: count, owner: item.owner, duplicate: true };
             }
-            const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))), recoveryDrafts: drafts });
+            const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))), recoveryDrafts: drafts, imported: true });
             return { key, items: count, owner };
         });
     },
@@ -1459,9 +1465,10 @@ export const TreeStore = {
     // here while nobody was signed in is claimed by this account (doSignIn
     // asks first when it holds edits); a copy from before accounts is adopted
     // when this account is the server's tenancy owner; otherwise the copy is
-    // set aside (never discarded) and this account's own set-aside copy comes
-    // back, or an empty one ready to pull. Decided on the copy as stored
-    // now, under the lock, whatever another page did since this page asked.
+    // set aside (never discarded) and the copy this account last set aside
+    // comes back (never one an import filed), or an empty one ready to pull.
+    // Decided on the copy as stored now, under the lock, whatever another
+    // page did since this page asked.
     // Returns {action: 'same'|'claimed'|'adopted'|'restored'|'fresh', setAside, copy}.
     async switchAccount({ url, userId, username = null, serverId = null, tenancyOwner = false, previousUsername = null }) {
         await ensureLoaded();

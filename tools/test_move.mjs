@@ -584,6 +584,25 @@ console.log('\n7. Never over a copy with unpushed edits');
     const outcome = Object.values(rx.moves.map.get([...rx.moves.map.keys()].find(k => k.startsWith('receipt:'))).outcome).find(o => o.why === 'both-dirty');
     // Three edits, and the legacy workflows array it brings as a fourth.
     check('and the report says both have unpushed edits', Boolean(outcome) && /From the browser extension: 4 unpushed edits/.test(web.M.outcomeText(outcome)), outcome && web.M.outcomeText(outcome));
+    // Nothing happens to it by itself after that: signing in as sam on this
+    // device and back as alex brings back alex's own work, never the
+    // extension's copy filed before it.
+    const SAM = { url: ORIGIN, userId: 2, username: 'sam', serverId: 'srv-main' };
+    const asSam = await web.TreeStore.switchAccount(SAM);
+    check('sam\'s copy brought in by the move does not come back by itself either', asSam.action === 'fresh' && web.TreeStore.roots().length === 0, JSON.stringify(asSam.action));
+    const back = await web.TreeStore.switchAccount(A);
+    const rootsBack = JSON.stringify(web.TreeStore.roots());
+    check('as sam and back as alex: alex\'s own copy comes back, not the one the move set aside', back.action === 'restored' && web.TreeStore.status().dirty
+        && Boolean(await web.TreeStore.getNode(mine.id)) && !rootsBack.includes('"Research"'), `${back.action} ${rootsBack.slice(0, 120)}`);
+    check('and the extension\'s copy still waits set aside, as it was', (await web.TreeStore.listStashes(A)).some(s => s.key === ext.key && s.dirty));
+    // Two of alex's own copies aside: the one set aside last comes back.
+    await web.TreeStore.setAsideAndReset({ url: A.url, userId: A.userId, username: A.username, serverId: A.serverId });
+    const second = await web.TreeStore.createNode({ parentId: null, kind: 'folder', title: 'Second copy' });
+    await web.TreeStore.flush();
+    await web.TreeStore.switchAccount(SAM);
+    const again = await web.TreeStore.switchAccount(A);
+    check('with two of alex\'s own copies aside, the one set aside last comes back', again.action === 'restored'
+        && Boolean(await web.TreeStore.getNode(second.id)) && !(await web.TreeStore.getNode(mine.id)));
 }
 {
     await b.movePage('approve');
