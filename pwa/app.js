@@ -39,6 +39,7 @@ import { createDesktopShell } from './desktopShell.js';
 import { createHome } from './home.js';
 import { createBoard } from './board.js';
 import { createWorkflows } from './workflows.js';
+import { createSettings } from './settings.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
@@ -1908,6 +1909,7 @@ function wireDesktop() {
     desktopUi=createDesktopShell(desktopContext());desktopUi.register('home',createHome(desktopContext()));
     desktopUi.register('board',createBoard(desktopContext()));
     desktopUi.register('workflows',createWorkflows(desktopContext()));
+    desktopUi.register('settings',createSettings(desktopContext()));
     window.matchMedia('(min-width: 900px)').addEventListener?.('change',()=>renderView());
     const match=location.hash.match(/^#\/(home|board|workflows|organize|notes|settings)(?:\/(.*))?$/);
     if(match&&isDesktop())navigateDesktop(match[1],match[2]?decodeURIComponent(match[2]):null);
@@ -6616,6 +6618,7 @@ async function restoreSetAside(s) {
             const { ownerWas, ...rest } = now;
             await platform.storage.local.set({ [s.key]: { ...rest, owner: ownerWas, origin: null } });
         }
+        if(raw.recoveryDrafts?.length&&!parkDrafts(raw.recoveryDrafts))throw new Error('The recovered note drafts could not be parked. Nothing was restored.');
         await TreeStore.restoreStash(s.key, me, { moved: !keptAside && s.match === 'moved' });
     } catch (e) {
         showToast(e.message);

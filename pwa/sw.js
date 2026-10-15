@@ -33,6 +33,8 @@ const SHELL = [
     '/home.js',
     '/board.js',
     '/workflows.js',
+    '/settings.js',
+    '/settings.css?v=35',
     '/workflows.css?v=35',
     '/board.css?v=35',
     '/lib/tabGrouper.js',

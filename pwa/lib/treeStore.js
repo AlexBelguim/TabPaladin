@@ -1378,6 +1378,51 @@ export const TreeStore = {
         });
     },
 
+    // Recovery is additive: validate and file a copy as a new stash. Never
+    // overwrite the active tree or adopt the current sign-in as its owner.
+    async importBackupCopy(incoming, { account, expect = null, sourceId = null, focusedFolderIds = [], expanded = {}, pendingRemovals = [], drafts = [] } = {}) {
+        await ensureLoaded();
+        const ids = new Set(), roles = new Set(); let count = 0;
+        const clean = (node, depth = 0) => {
+            if (!node || typeof node !== 'object' || depth > 100 || ++count > 500000) throw new Error('The recovery tree is invalid or too large.');
+            if (node.virtual || node.readOnly || String(node.id).startsWith('imp:') || String(node.id).startsWith('imports:')) return null;
+            if (!['folder','bookmark','note'].includes(node.kind) || typeof node.id !== 'string' || !node.id || node.id.length > 200 || ids.has(node.id) || typeof node.title !== 'string') throw new Error('The recovery tree has invalid or duplicate nodes.');
+            ids.add(node.id);
+            const out = { id: node.id, kind: node.kind, title: node.title };
+            if (node.role) { if (!ROLES.includes(node.role) || roles.has(node.role) || node.kind !== 'folder') throw new Error('The recovery tree has duplicate role folders.'); roles.add(node.role); out.role = node.role; }
+            if (node.kind === 'bookmark') { if (typeof node.url !== 'string' || node.url.length > 8192) throw new Error('Invalid bookmark in the recovery tree.'); out.url = node.url; }
+            if (node.kind === 'note') { if (typeof node.payload?.content !== 'string') throw new Error('Invalid note in the recovery tree.'); out.payload = { content: node.payload.content, createdAt: node.payload.createdAt || null, updatedAt: node.payload.updatedAt || null }; }
+            else if (node.payload?.createdAt) out.payload = { createdAt: node.payload.createdAt };
+            if (node.kind === 'folder') { if (node.children != null && !Array.isArray(node.children)) throw new Error('Invalid folder children.'); out.children = (node.children || []).map(n => clean(n, depth + 1)).filter(Boolean); }
+            return out;
+        };
+        if (!incoming || !Array.isArray(incoming.roots)) throw new Error('The backup has no working-copy tree.');
+        const roots = incoming.roots.map(n => clean(n)).filter(Boolean);
+        let owner = null;
+        if (incoming.owner) {
+            const a = incoming.owner;
+            if (!a.url || !Number.isInteger(Number(a.userId)) || Number(a.userId) < 1) throw new Error('The recovery account stamp is invalid.');
+            const url = new URL(a.url); if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid recovery origin.');
+            owner = { url: url.origin, userId: Number(a.userId), username: typeof a.username === 'string' ? a.username : null, serverId: typeof a.serverId === 'string' ? a.serverId : null };
+        }
+        const copy = { roots, owner, origin: owner ? null : incoming.origin || 'pre-accounts', dirty: Boolean(incoming.dirty), editCount: Math.max(0, Number(incoming.editCount) || 0), baseVersion: Math.max(0,Number(incoming.baseVersion)||0), copyId: typeof incoming.copyId === 'string' ? incoming.copyId : newId(), rev: null, restoredFrom: [], meta: {} };
+        if (sourceId) copy.meta.recoverySourceId = String(sourceId);
+        return withCopyLock(async () => {
+            await reconcile();
+            if (!account || !sameAccount(state.owner, accountOf(account)) || expect && !sameCopy(copyToken(), expect)) throw stopped('account-changed');
+            if (sourceId) for (const key of await stashIndex()) {
+                const item = (await api.storage.local.get(key))[key];
+                if (item?.meta?.recoverySourceId === sourceId) return { key, items: count, owner: item.owner, duplicate: true };
+            }
+            const key = await writeStash(copy, { fallbackUrl: owner?.url || incoming.url || account.url, focusedFolderIds: focusedFolderIds.filter(id => ids.has(id)), expanded, pendingRemovals: pendingRemovals.filter(id => ids.has(String(id))) });
+            if (drafts.length) {
+                const stash = (await api.storage.local.get(key))[key];
+                await api.storage.local.set({ [key]: { ...stash, recoveryDrafts: clone(drafts) } });
+            }
+            return { key, items: count, owner };
+        });
+    },
+
     // --- Accounts ---------------------------------------------------------
 
     // Would signing in as {url, userId, serverId, tenancyOwner} set this copy
