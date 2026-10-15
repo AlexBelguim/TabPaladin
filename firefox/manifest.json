@@ -1,7 +1,7 @@
 {
     "manifest_version": 2,
     "name": "TabPaladin",
-    "version": "1.2.0",
+    "version": "1.9.0",
     "description": "Group tabs, save workflows, and manage your browsing sessions efficiently.",
     "incognito": "not_allowed",
     "browser_specific_settings": {
@@ -29,6 +29,7 @@
             "../src/helper/tabs.js",
             "../src/helper/menus.js",
             "../src/helper/vault.js",
+            "../src/helper/move.js",
             "../src/helper/router.js"
         ],
         "persistent": false

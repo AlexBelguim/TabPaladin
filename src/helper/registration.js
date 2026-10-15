@@ -2,9 +2,14 @@
     const H = globalThis.TPHelper;
     const api = H.api;
     let chain = Promise.resolve();
+    // '!' for a bridge problem; a pending move (move.js sets H.moveBadge)
+    // says so instead. Called without an argument, it repaints.
+    let bridgeProblem = false;
     H.badge = async problem => {
+        if (problem !== undefined) bridgeProblem = Boolean(problem);
         const action = api.action || api.browserAction;
-        try { if (action && action.setBadgeText) await action.setBadgeText({ text: problem ? '!' : '' }); } catch (_) { /* cosmetic */ }
+        const text = H.moveBadge || (bridgeProblem ? '!' : '');
+        try { if (action && action.setBadgeText) await action.setBadgeText({ text }); } catch (_) { /* cosmetic */ }
     };
     H.sendEvent = async (tabId, event, body = {}, documentId) => {
         const attached = H.attached.get(tabId);

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Move TabPaladin into your web app</title><link rel="stylesheet" href="options.css"><link rel="stylesheet" href="move.css"></head>
+<body><main><header><img src="../../assets/icon48.png" alt=""><div><h1>Move TabPaladin into your web app</h1><p>TabPaladin now runs in your server's web app. This page hands over what this browser kept for it. Nothing here is deleted, and every copy arrives in the web app set aside first, never over work you have there.</p></div></header>
+<p id="status" role="status" aria-live="polite">Looking at what this browser holds…</p>
+<section><h2>1. Keep a backup file</h2><p>One file with everything this browser's TabPaladin holds. Sign-in sessions and keys are left out. Keep it until you have checked the web app.</p><button id="backup">Download a backup file</button><p id="backup-done"></p></section>
+<section><h2>2. Your server</h2><p id="connected"></p>
+<div id="setup"><label for="origin">Server address</label><input id="origin" type="url" placeholder="https://example.com" autocomplete="url"><p id="host"></p>
+<label class="check"><input id="insecure" type="checkbox"> Unencrypted: only safe on my own network</label>
+<p>The TabPaladin web app at this address will be able to see the addresses and titles of your open tabs and to open and close tabs. The server operator can see what the web app receives. Nothing is sent anywhere else.</p>
+<div class="buttons"><button id="connect">Connect</button><button id="settings" type="button">Open helper Settings</button></div></div></section>
+<section><h2>3. What moves</h2><div id="summary"></div><h3>Kept in this browser</h3><p>Copies made for another server never leave this browser. Download them here, or connect that server and move again.</p><div id="kept"></div></section>
+<section><h2>4. Move</h2><p>Opens your web app. Click <strong>Bring in</strong> there within ten minutes. Sign in there if it asks: your password and session never pass through this extension.</p><button id="move" disabled>Move</button><p id="move-note"></p></section>
+<section id="done" hidden><h2>Moved</h2><div id="done-text"></div><p id="token"></p><div class="buttons"><button id="open">Open the web app</button><button id="again">Send again</button><button id="revoke">Sign the old session out now</button></div><p>Reinstalling TabPaladin 1.1.0 brings the old interface back over this browser's untouched data.</p></section>
+</main><script src="config.js"></script><script type="module" src="movePage.js"></script></body></html>

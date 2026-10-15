@@ -148,14 +148,17 @@ console.log('\n4. The keyword organizer, and what was kept');
         JSON.stringify(inbox.children.map(c => c.title)));
     await TreeStore.flush();
 
+    // From 1.9.0 the old UI's page only sends to the move page: its code
+    // stays packaged (checked here), and the web app carries these on.
     const sidepanel = read('src/sidepanel/sidepanel.js');
-    const html = read('src/app/app.html');
-    check('Analyze & Sort and Split run the keyword organizer',
+    const organize = read('pwa/organize.js');
+    check('Analyze & Sort and Split run the keyword organizer, in the old UI\'s code and in the web app',
         /getElementById\('analyzeBtn'\)[\s\S]{0,900}BookmarkOrganizer\.proposeSmartOrganization\(folderIds\)/.test(sidepanel)
         && /async function runSplitOnFolder[\s\S]{0,300}proposeSmartOrganization\(sourceIds\)/.test(sidepanel)
-        && /id="analyzeBtn"/.test(html));
-    check('the Organize "Sources" grid is still there', /getElementById\('organizeBookmarksBtn'\)[\s\S]{0,400}renderSourceGrid\(VIRTUAL_ROOT_ID\)/.test(sidepanel)
-        && /id="organizer-source-container"/.test(html));
+        && /BookmarkOrganizer\.proposeSmartOrganization\(/.test(organize));
+    check('the Organize "Sources" grid is still there, in the old UI\'s code and in the web app',
+        /getElementById\('organizeBookmarksBtn'\)[\s\S]{0,400}renderSourceGrid\(VIRTUAL_ROOT_ID\)/.test(sidepanel)
+        && /button\('Sources'/.test(organize));
     check('folder JSON export and import are still there', /async function exportBookmarkFolder\(/.test(sidepanel)
         && /async function importBookmarkFolder\(/.test(sidepanel) && /id="folderImportBtn"/.test(sidepanel));
     check('keyword JSON export and import are still there', /id="kwExportBtn"/.test(sidepanel) && /id="kwImportBtn"/.test(sidepanel)

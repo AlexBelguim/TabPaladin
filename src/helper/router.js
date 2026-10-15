@@ -2,8 +2,10 @@
     const H = globalThis.TPHelper;
     const api = H.api;
     const readsVisible = op => op.startsWith('tabs.') || op.startsWith('windows.') || ['actions.take', 'bookmarks.take', 'vault.get'].includes(op);
-    const gestureOps = new Set(['tabs.snapshot', 'tabs.active', 'tabs.closeSnapshot', 'windows.openWorkflow', 'windows.openUrls', 'windows.list', 'bookmarks.take', 'options.open']);
-    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack', 'vault.put', 'vault.clear']);
+    // move.manifest starts a hand-over (and binds its document) only from a
+    // click; its parts and ack are bound to that document and bundle (move.js).
+    const gestureOps = new Set(['tabs.snapshot', 'tabs.active', 'tabs.closeSnapshot', 'windows.openWorkflow', 'windows.openUrls', 'windows.list', 'bookmarks.take', 'options.open', 'move.manifest']);
+    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack', 'vault.put', 'vault.clear', 'move.ack']);
     const requestRates = new Map();
     const inFlight = new Map();
     let mutationChain = Promise.resolve();
@@ -83,7 +85,9 @@
         }).catch(() => {});
     }
     async function legacySummary(config) {
-        const { tpTree: tree } = await api.storage.local.get('tpTree');
+        // Moved: what the old UI kept is the web app's to settle now.
+        const { tpTree: tree, tpMove: move } = await api.storage.local.get(['tpTree', 'tpMove']);
+        if (move && move.state === 'done') return null;
         if (!tree || !Array.isArray(tree.roots)) return null;
         let username = '';
         if (tree.owner) {
@@ -116,7 +120,8 @@
                 self: { tabId: ctx.sender.tab.id, windowId: ctx.sender.tab.windowId, windowType: win.type },
                 serverOrigin: ctx.config.serverOrigin, serverId: ctx.config.pin.serverId,
                 perms: { bookmarks: await api.permissions.contains({ permissions: ['bookmarks'] }), allSites: await api.permissions.contains({ origins: ['<all_urls>'] }) },
-                pending, legacy: await legacySummary(ctx.config)
+                pending, legacy: await legacySummary(ctx.config),
+                move: H.moveHello ? await H.moveHello(ctx) : null
             };
         }
         if (req.op === 'session.report') {
@@ -125,6 +130,9 @@
             // Display only: never use these fields to authorize a workflow or removal.
             const session = { signedIn: req.body.signedIn, username: typeof req.body.username === 'string' ? req.body.username.slice(0, 200) : '', userId: ['string', 'number'].includes(typeof req.body.userId) ? String(req.body.userId).slice(0, 256) : '', at: Date.now() };
             await api.storage.local.set({ tpHelperSession: { ...session, origin: ctx.config.serverOrigin, serverId: ctx.config.pin.serverId } });
+            // A hint only: the move signs the old UI's own session out once
+            // the web app has one, and goes by the server's answer (move.js).
+            if (H.onSessionReport) H.onSessionReport(session);
             return { reported: true };
         }
         if (req.op === 'options.open') {

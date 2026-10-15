@@ -39,7 +39,11 @@ check('Chrome: only the warning-free menu permission is added to 1.0.0', sorted(
 check('Firefox: only the warning-free menu permission is added to 1.0.0', sorted(firefox.permissions) === sorted([...PERMISSIONS, 'menus']), sorted(firefox.permissions));
 check('Chrome: all-sites access stays optional', sorted(chrome.optional_host_permissions) === '["<all_urls>"]' && !chrome.host_permissions);
 check('Firefox: all-sites access stays optional', sorted(firefox.optional_permissions) === '["<all_urls>"]');
-check('P3 sideload release is 1.2.0', chrome.version === '1.2.0');
+check('P4 sideload release (the move) is 1.9.0', chrome.version === '1.9.0');
+const ffScripts = firefox.background?.scripts || [];
+check('Firefox loads the move after the helper modules and before the router', ffScripts.indexOf('../src/helper/move.js') > ffScripts.indexOf('../src/helper/vault.js') && ffScripts.indexOf('../src/helper/move.js') < ffScripts.indexOf('../src/helper/router.js'));
+const bg = fs.readFileSync(path.join(ROOT, 'src/background/background.js'), 'utf8');
+check('Chrome imports the move in the same place', bg.includes("'../helper/vault.js', '../helper/move.js', '../helper/router.js'"));
 check('the setup page is available in both browsers', chrome.options_ui?.page === 'src/helper/options.html' && firefox.options_ui?.page === '../src/helper/options.html' && chrome.options_ui.open_in_tab && firefox.options_ui.open_in_tab);
 check('no external extension messaging or web accessible resources', JSON.stringify(chrome.externally_connectable) === '{"ids":[]}' && !chrome.web_accessible_resources && !firefox.web_accessible_resources);
 check('no static content scripts', !chrome.content_scripts && !firefox.content_scripts);

@@ -1,0 +1,8 @@
+h3{font-size:16px;margin:22px 0 8px}
+.copy{border-top:1px solid #2c394a;padding:10px 0;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
+.copy strong{flex:1 1 260px;overflow-wrap:anywhere}
+.copy small{color:#aebac8;flex:1 1 100%}
+.tag{font-size:13px;border-radius:999px;padding:2px 10px;background:#24364a;color:#cfe3f7}
+.tag.kept{background:#4a3424;color:#f7dccf}
+#move{background:#1c6b60}
+.parts{font:13px/1.5 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#aebac8}

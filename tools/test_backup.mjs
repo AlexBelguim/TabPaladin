@@ -152,10 +152,15 @@ console.log('\n5. Where it is offered');
     check('Settings has "Download a backup", writing the copy and the open note first',
         /id="backup-download-btn"[^>]*>📦 Download a backup</.test(sidepanel) && /getElementById\('backup-download-btn'\)[\s\S]{0,200}downloadPageBackup\(\)/.test(sidepanel)
         && /function downloadPageBackup\(\) \{[\s\S]*?TreeStore\.flush\(\)[\s\S]*?saveLiveDraft\(\)/.test(sidepanel));
-    check('the app page says TabPaladin is moving, and to push before updating',
-        /moving into your server's web app/.test(html) && /Push your edits before updating/.test(html));
-    check('with a backup button and a way to hide it on this device',
-        /id="tp-moving-backup"/.test(html) && /id="tp-moving-dismiss"/.test(html)
+    // 1.9.0: the old app page only sends to the move page, which offers the
+    // backup first. The old page's moving banner stays in its packaged code.
+    const movePage = fs.readFileSync(path.join(ROOT, 'src/helper/move.html'), 'utf8');
+    const movePageJs = fs.readFileSync(path.join(ROOT, 'src/helper/movePage.js'), 'utf8');
+    check('the app page says TabPaladin is moving, and sends to the move page',
+        /moving into your server's web app/.test(html) && /http-equiv="refresh" content="0; url=\.\.\/helper\/move\.html"/.test(html) && !/<script/.test(html));
+    check('the move page offers a backup file first, the old banner\'s code is still packaged',
+        movePage.indexOf('id="backup"') > -1 && movePage.indexOf('id="backup"') < movePage.indexOf('id="move"')
+        && /import \{ downloadBackup \} from '\.\.\/utils\/backup\.js'/.test(movePageJs) && /downloadBackup\(\{ api \}\)/.test(movePageJs)
         && /tp_moving_banner_dismissed_v1/.test(app) && /downloadBackup\(/.test(app));
 }
 

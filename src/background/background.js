@@ -1,11 +1,11 @@
-// Background script: opens the app page, workflow auto-sync, and the
-// optional video scroll-seek content script.
+// Background script: the toolbar (the move page, then the web app), workflow
+// auto-sync, and the optional video scroll-seek content script.
 // Compatible with both Chrome (service worker) and Firefox (event page).
 
 const api = typeof browser !== 'undefined' ? browser : chrome;
 
 const TRACK_STORE_KEY = 'tpOpenWorkflowTabs'; // { [tabId]: { workflowId, bookmarkId } }
-const APP_PAGE = 'src/app/app.html';
+const MOVE_PAGE = 'src/helper/move.html';
 
 
 // --- Who may talk to this script ---
@@ -25,7 +25,7 @@ function fromExtensionPage(sender) {
 }
 
 
-// --- Opening the app ---
+// --- Opening TabPaladin ---
 //
 // The toolbar icon opens a full browser tab. This used to call
 // sidePanel.setPanelBehavior({ openPanelOnActionClick: true }), and that is
@@ -33,10 +33,22 @@ function fromExtensionPage(sender) {
 // because the click is consumed by the panel. Adding the listener below without
 // removing those calls looks like the listener is simply broken.
 //
-// Reuse an existing tab rather than piling up copies — this is a workspace, not
-// a document.
+// From 1.9.0 the old UI is no longer opened: until what it kept has moved
+// into the server's web app, the toolbar opens the move page; after that, the
+// web app (helper.toolbarClick, in src/helper/move.js). Without the helper,
+// the move page.
+//
+// Reuse an existing tab rather than piling up copies.
 async function openApp() {
-    const url = api.runtime.getURL(APP_PAGE);
+    if (helper.toolbarClick) {
+        try {
+            await helper.toolbarClick();
+            return;
+        } catch (e) {
+            console.warn('TabPaladin: could not open the web app', e);
+        }
+    }
+    const url = api.runtime.getURL(MOVE_PAGE);
     try {
         const existing = await api.tabs.query({ url });
         if (existing && existing.length) {
@@ -219,7 +231,9 @@ async function untrackClosedTab(tabId, removeInfo) {
             // If the helper failed to load, keep the bookmark. Never send a
             // web account's id into the legacy working copy's queue.
             if (helper.queueWebRemoval) await helper.queueWebRemoval(entry, removeInfo);
-        } else {
+        } else if (!(helper.moveDone && await helper.moveDone())) {
+            // Once the old UI's data has moved, nothing reads its queue any
+            // more: an entry the move could not retarget keeps its bookmark.
             await queueTreeRemoval(entry.bookmarkId);
         }
     }
@@ -426,5 +440,5 @@ if (api.runtime.onUpdateAvailable) {
 // Chrome's worker imports them after the legacy writer has been installed.
 if (typeof importScripts === 'function') {
     importScripts('../helper/config.js', '../helper/identity.js', '../helper/registration.js',
-        '../helper/tracking.js', '../helper/tabs.js', '../helper/menus.js', '../helper/vault.js', '../helper/router.js');
+        '../helper/tracking.js', '../helper/tabs.js', '../helper/menus.js', '../helper/vault.js', '../helper/move.js', '../helper/router.js');
 }

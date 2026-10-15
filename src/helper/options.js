@@ -36,6 +36,7 @@ $('signin').addEventListener('click', act(() => call('open', { hash: '#/signin' 
 $('policy').addEventListener('change', act(() => call('policy', { windowClosePolicy: $('policy').value })));
 $('stopTracking').addEventListener('click', act(() => call('stopTracking')));
 $('reopen').addEventListener('click', act(() => call('reopen')));
+$('movePage').addEventListener('click', () => api.tabs.create({ url: api.runtime.getURL('src/helper/move.html') }));
 $('import').addEventListener('click', act(async () => {
     const tree = await api.bookmarks.getTree();
     await call('stageBookmarks', { tree, browser: typeof browser !== 'undefined' ? 'Firefox' : 'Browser' });
@@ -54,7 +55,7 @@ $('video').addEventListener('change', () => {
     }).catch(e => { $('video').checked = !on; status(e.message); });
 });
 async function refresh() {
-    const d = await api.storage.local.get(['tpHelper', 'settings', 'tpOpenWorkflowTabs', 'tpHelperRemovals', 'tpHelperRecentlyClosed', 'tpHelperCalls', 'tpVideoSeek', 'tpHelperSession']);
+    const d = await api.storage.local.get(['tpHelper', 'settings', 'tpOpenWorkflowTabs', 'tpHelperRemovals', 'tpHelperRecentlyClosed', 'tpHelperCalls', 'tpVideoSeek', 'tpHelperSession', 'tpMove']);
     const c = d.tpHelper || {};
     configuredPattern = c.pattern || null;
     if (!$('origin').value) $('origin').value = c.serverOrigin || d.settings?.backend?.url || '';
@@ -65,11 +66,14 @@ async function refresh() {
     $('tracking').textContent = Object.keys(d.tpOpenWorkflowTabs || {}).length + ' tracked tabs · ' + (d.tpHelperRemovals || []).length + ' queued removals';
     $('recent').textContent = (d.tpHelperRecentlyClosed || []).filter(t => t.origin === c.serverOrigin).slice(-20).map(t => t.title || t.url).join('\n') || 'No recently closed tabs.';
     $('calls').textContent = (d.tpHelperCalls || []).slice(-50).map(c => new Date(c.at).toLocaleString() + ' · ' + c.op + ' · ' + (c.origin || '')).join('\n') || 'No bridge calls yet.';
+    const move = d.tpMove || {};
+    const delivered = Object.entries(move.deliveredTo || {}).map(([origin, x]) => 'Moved to ' + origin + ' on ' + new Date(x.at).toLocaleString() + ' (' + (x.parts || []).length + ' parts).');
+    $('move-status').textContent = delivered.length ? delivered.join(' ') + ' Send again from the move page.' : move.state === 'pending' ? "The old interface's data has not moved yet. The toolbar opens the move page until it has." : 'Nothing of the old interface needs moving.';
     $('video').checked = !!d.tpVideoSeek; $('version').textContent = api.runtime.getManifest().version;
     showHost();
 }
 $('privacy').removeAttribute('href');
 api.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && Object.keys(changes).some(k => k.startsWith('tpHelper') || k === 'tpOpenWorkflowTabs')) refresh().catch(e => status(e.message));
+    if (area === 'local' && Object.keys(changes).some(k => k.startsWith('tpHelper') || k === 'tpOpenWorkflowTabs' || k === 'tpMove')) refresh().catch(e => status(e.message));
 });
 refresh().then(() => status('Choose your server to connect the web app.')).catch(e => status(e.message));

@@ -4,7 +4,7 @@
     const api = H.api;
     const ACTIONS = 'tpHelperPendingActions';
     const BOOKMARKS = 'tpBrowserBookmarks';
-    const routes = new Set(['', '#/signin', '#/workflows/save', '#/import-browser']);
+    const routes = new Set(['', '#/signin', '#/workflows/save', '#/import-browser', '#/move']);
 
     H.openWebApp = async (hash = '', { requireBridge = false } = {}) => {
         if (!routes.has(hash)) H.fail('bad-args', 'Unknown TabPaladin page.');
