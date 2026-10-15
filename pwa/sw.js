@@ -34,6 +34,8 @@ const SHELL = [
     '/board.js',
     '/workflows.js',
     '/settings.js',
+    '/organize.js',
+    '/organize.css?v=35',
     '/settings.css?v=35',
     '/workflows.css?v=35',
     '/board.css?v=35',

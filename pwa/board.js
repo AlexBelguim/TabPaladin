@@ -83,7 +83,7 @@ export function createFolderCards(ctx){
 export function createBoard(ctx){
     let snapshot=null,windowId=null,settings={},rootRef=null,smart=true,groupsOverride=null;
     const accountAtSnapshot=()=>snapshot?.account;
-    const localCtx={...ctx,fileTabs,split:id=>ctx.navigate('organize',id)};
+    const localCtx={...ctx,fileTabs,split:id=>ctx.split(id)};
     const cards=createFolderCards(localCtx);
     async function fileTabs(payload,targetId){
         if(!snapshot||snapshot.snapshotId!==payload.snapshotId||!sameAccount(accountAtSnapshot(),ctx.account()))throw new Error('Refresh the tab snapshot before filing.');
