@@ -1888,7 +1888,7 @@ function desktopContext() {
             if(!await TreeStore.flush()) throw new Error('The edit is not written yet. Keep this page open.');
             renderView(); await pushAfterEdit(); return result;
         },
-        refresh: renderView, toast: showToast, navigate: navigateDesktop,
+        refresh: renderView, toast: showToast, navigate: navigateDesktop, openExternal,
         split:id=>{organizePort?.split(id);navigateDesktop('organize',id);},
         openWorkflow: node=>{if(!node)return;const view=fromWire(node);const all=[];const collect=nodes=>{for(const n of nodes||[]){if(n.kind==='bookmark')all.push(fromWire(n));collect(n.children);}};collect(node.children);view.children=all;return openWorkflowTabs(view);},
         capture:()=>{offerHelperSave();captureHelperTabs();}, pinCurrent:pinHelperTab,

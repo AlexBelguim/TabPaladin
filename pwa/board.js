@@ -10,7 +10,7 @@ export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
     if(eligible.length>limit&&limit===500)ctx.toast('Opening the first 500 of '+eligible.length+' bookmarks. Open smaller folders for the rest.');
     if(!urls.length)return;
     if(ctx.helper.supports('windows.openUrls')){const result=await ctx.helper.request('windows.openUrls',{urls,mode});if(result.failed?.length)ctx.toast(result.failed.length+' bookmarks could not be opened. Your bookmarks are kept.');}
-    else for(const url of urls){const u=new URL(url);if(['http:','https:'].includes(u.protocol))window.open(url,'_blank','noopener');}
+    else for(const url of urls)ctx.openExternal(url);
 }
 function drag(elm,payload,ctx){elm.draggable=true;elm.addEventListener('dragstart',e=>{dragging={...payload,account:ctx.account()};e.dataTransfer.setData('text/plain','TabPaladin items');e.dataTransfer.effectAllowed='move';});elm.addEventListener('dragend',()=>{dragging=null;});}
 async function removeItems(ctx,nodes){
