@@ -10,8 +10,9 @@ services:
       - "${HOST_PORT:-18921}:18921"
     volumes:
       - ./data:/data
-      # Mount the PWA folder live so changes don't require rebuilds during dev.
-      - ../pwa:/app/pwa:ro
+      # The web app is built into the image (rebuild to update it). To serve a
+      # host folder live while developing, mount it over /app/pwa:
+      # - ../pwa:/app/pwa:ro
     environment:
       - PORT=18921
       - DATA_DIR=/data
@@ -38,6 +39,8 @@ services:
       # Whose data this is, for the one-time upgrade to separate accounts —
       # only needed when the database already holds more than one account.
       - TENANCY_OWNER=${TENANCY_OWNER:-}
+      # Set to root only if the host will not let uid 1000 write to ./data.
+      - RUN_AS=${RUN_AS:-}
       # "off" stops the import scheduler (for a rehearsal on a copy of a real
       # database, which would otherwise sweep the real Reddit account).
       - IMPORTS_SCHEDULER=${IMPORTS_SCHEDULER:-}

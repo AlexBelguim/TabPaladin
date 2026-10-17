@@ -1,7 +1,8 @@
 FROM node:22-alpine
 
-# better-sqlite3 needs a compiler at install time on Alpine
-RUN apk add --no-cache python3 make g++ libstdc++
+# better-sqlite3 needs a compiler at install time on Alpine; su-exec lets the
+# entrypoint hand /data over as root and then drop to the node user.
+RUN apk add --no-cache python3 make g++ libstdc++ su-exec
 
 WORKDIR /app
 
@@ -19,12 +20,17 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY server/*.js ./
 COPY server/imports ./imports
 
-# /data is a bind mount in compose; it is created here so a container without
-# one still has somewhere writable for the unprivileged user.
-RUN mkdir -p /data && chown node:node /data
+# The web app ships inside the image, so it is served exactly as built rather
+# than from a host folder the container's user may not be allowed to read.
+COPY pwa ./pwa
 
-# PWA is copied from the build context (the repo root, see docker-compose context).
-# We mount it at /app/pwa via volume or COPY in compose context.
+COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# COPY keeps the build host's file modes. On a NAS dataset those often deny
+# "other" read access, and the server runs as node, not root: make every file
+# readable (and directories enterable) whatever the host's modes were.
+RUN chmod -R a+rX /app && chmod 755 /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /data && chown node:node /data
 
 # production: Express error pages then carry no stack traces.
 ENV NODE_ENV=production
@@ -33,9 +39,10 @@ ENV DATA_DIR=/data
 ENV PWA_DIR=/app/pwa
 EXPOSE 18921
 
-# Run unprivileged. An existing ./data directory written by the old root
-# container must be handed over once: chown -R 1000:1000 ./data
-USER node
+# Runs unprivileged: the entrypoint starts as root only to make /data the node
+# user's (an existing ./data written by an older, root image included), then
+# drops to node. See server/docker-entrypoint.sh.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||18921)+'/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"

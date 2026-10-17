@@ -26,8 +26,7 @@ Nothing of one account is ever shown to, or overwritten by, another — see
 cd server
 cp .env.example .env
 # Edit .env: at least ADMIN_PASSWORD. Generate one with: openssl rand -base64 18
-mkdir -p data && sudo chown 1000:1000 data   # the container runs as uid 1000 (node)
-docker compose up -d --build
+docker compose up -d --build   # the server runs as uid 1000 (node); it takes ./data over itself
 ```
 
 The server listens on `http://<host>:18921`. On its first start it creates
@@ -88,8 +87,8 @@ log says so, and prints the key's id (`identity key <id>`) on every start. A
 key file the server cannot read at all is left as it is and no new key is
 made: `/api/identity` answers 503 and the log says what to fix. After a
 restore, check that the file belongs to the server's user (in the container,
-`node`; `sudo chown 1000:1000 identity.jwk` on the host) before the first
-start, or the server serves without its identity until it does.
+`node`, uid 1000; the entrypoint takes over files it can on start) before the
+first start, or the server serves without its identity until it does.
 
 ### Upgrading an existing server
 
@@ -97,9 +96,10 @@ Existing data, the existing account, its password and every signed-in device
 keep working; the account becomes the admin. Before the first start of the new
 image:
 
-1. The container no longer runs as root. Hand it the data directory once:
-   `sudo chown -R 1000:1000 ./data`. The server says so at boot if it can't
-   write there.
+1. The server no longer runs as root. Its entrypoint hands `./data` to the
+   server's user (uid 1000) on start, so nothing needs doing by hand. If the
+   host refuses that (some NAS datasets do), it says so in the log and runs as
+   root instead; set `RUN_AS=root` in `.env` to skip the hand-over.
 2. If `TABPALADIN_TOKEN` is the example value this README used to publish, or
    shorter than 32 characters, the server refuses to start. Replace it with
    `openssl rand -hex 32` (and update anything still using it), or remove it
