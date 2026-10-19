@@ -1,1 +1,50 @@
-.workflow-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px;margin-top:18px}.workflow-panel>.board-card{max-width:none;margin-top:8px}.workflow-panel>.desktop-inline{gap:4px}.workflow-panel>.desktop-inline button{font-size:12px}
+/* ==========================================================================
+   Workflows (workflows.js), 900px and wider: one card per saved window in a
+   grid across the page. Each card is the Board's folder card (board.css)
+   with the workflow's own bar under its header.
+   ========================================================================== */
+
+@media (min-width: 900px) {
+  .workflow-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    align-items: start;
+    gap: 16px;
+  }
+
+  .workflow-panel > .board-card {
+    display: flex;
+    flex-direction: column;
+    border-left: 3px solid #6366f1;
+    transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+  }
+  .workflow-panel > .board-card:hover { box-shadow: var(--shadow-lift); }
+  .workflow-panel > .board-card > .board-heading { padding: 11px 12px; }
+  .workflow-panel > .board-card > .board-heading button.board-toggle { font-size: 0.95rem; }
+  /* Split is in the workflow's own bar. */
+  .workflow-panel > .board-card > .board-heading .tool-split { display: none; }
+  .workflow-panel > .board-card > .board-body {
+    max-height: 46vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  /* Under the header: when it was saved, and what to do with it. */
+  .workflow-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    padding: 8px 12px 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .workflow-meta {
+    margin-right: auto;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+  .workflow-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .desktop-page .workflow-actions button { padding: 4px 10px; font-size: 0.78rem; }
+  .desktop-page .workflow-actions button.primary { box-shadow: none; }
+}

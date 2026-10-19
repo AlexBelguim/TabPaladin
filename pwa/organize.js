@@ -39,34 +39,61 @@ export function createOrganize(ctx){
     }
     const api={split(id){splitNext=id;proposal=null;},async render(root,id=null){
         rootRef=root;if(previewAccount&&!sameAccount(previewAccount,ctx.account()))reset();if(rootId!==id){rootId=id;selected=new Set();if(!splitNext)proposal=null;}
-        root.append(el('h1',{},'Organize'));
+        const tools=el('div',{className:'page-actions'});
+        root.append(el('div',{className:'page-head'},
+            el('div',{className:'page-title'},el('h1',{},'Organize'),el('p',{className:'page-sub'},'Pick folders, then sort their loose bookmarks into subfolders by your keywords (Settings › Custom keywords).')),
+            tools));
         const settings=await ctx.storage.getSettings(),all=folderPaths(ctx.store.roots());
         const current=id?await ctx.store.getNode(id):null;
-        if(current&&(current.virtual||current.readOnly)){root.append(el('p',{},'The archive is managed on the Board; choose a writable source.'));return;}
-        const tools=el('div',{className:'desktop-inline'},button('Sources',()=>{proposal=null;ctx.navigate('organize');}),button('+ New folder',async()=>{const title=prompt('Folder name');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:current?.id||null,kind:'folder',title:title.trim()}));}));
+        if(current&&(current.virtual||current.readOnly)){root.append(el('p',{className:'desk-empty'},'The archive is managed on the Board; choose a writable source.'));return;}
+        tools.append(button('Sources',()=>{proposal=null;ctx.navigate('organize');}),button('＋📁 New folder',async()=>{const title=prompt('Folder name');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:current?.id||null,kind:'folder',title:title.trim()}));}));
         const file=el('input',{type:'file',accept:'.json',hidden:true});file.addEventListener('change',async()=>{try{await importFolder(file.files[0]);}catch(e){ctx.toast(e.message);}finally{file.value='';}});
-        tools.append(button('Import folder JSON',()=>file.click()),file);if(current)tools.append(button('Export folder JSON',()=>download('folder.json',JSON.stringify({version:1,exportedAt:new Date().toISOString(),...exportNode(current)},null,2))));root.append(tools);
+        tools.append(button('📥 Import folder JSON',()=>file.click()),file);if(current)tools.append(button('📤 Export folder JSON',()=>download('folder.json',JSON.stringify({version:1,exportedAt:new Date().toISOString(),...exportNode(current)},null,2))));
         if(splitNext){const target=splitNext;splitNext=null;await analyze(['loose-'+target]);return;}
         if(proposal){
-            root.append(el('h2',{},'Review proposed moves'));
-            if(!proposal.length)root.append(el('p',{},'No keyword-based moves were proposed.'));
+            const moving=proposal.reduce((n,g)=>n+g.items.length,0);
+            root.append(el('h2',{},'Review proposed moves · '+proposal.length+' group'+(proposal.length===1?'':'s')+', '+moving+' bookmark'+(moving===1?'':'s')));
+            if(!proposal.length)root.append(el('p',{className:'desk-empty'},'No keyword-based moves were proposed.'));
             const paths=el('datalist',{id:'organize-paths'});for(const f of all)paths.append(el('option',{value:f.path}));root.append(paths);
-            for(const group of proposal){const section=el('section',{className:'organize-proposal'}),check=el('input',{type:'checkbox',checked:group.checked});check.addEventListener('change',()=>group.checked=check.checked);
+            const groups=el('div',{className:'proposal-grid'});
+            for(const group of proposal){const section=el('section',{className:'organize-proposal'}),check=el('input',{type:'checkbox',checked:group.checked});check.addEventListener('change',()=>{group.checked=check.checked;section.classList.toggle('unchecked',!check.checked);});
+                section.classList.toggle('unchecked',!group.checked);
                 const base=all.find(f=>f.node.id===group.targetId)?.path||'Bookmarks';group.destination??=base+(group.newSubfolder?' > '+group.newSubfolder:'');
                 const input=el('input',{value:group.destination,list:'organize-paths','aria-label':'Destination folder path'});input.addEventListener('input',()=>group.destination=input.value);
-                section.append(el('label',{},check,' '+group.groupName),input);
-                group.items.forEach(item=>{const row=el('div',{className:'proposal-item',text:item.title+' — '+item.url,draggable:true});row.addEventListener('dragstart',e=>e.dataTransfer.setData('application/x-tp-proposal',item.id));section.append(row);});
-                section.addEventListener('dragover',e=>e.preventDefault());section.addEventListener('drop',e=>{e.preventDefault();const itemId=e.dataTransfer.getData('application/x-tp-proposal');let item;for(const from of proposal){const hit=from.items.find(i=>i.id===itemId);if(hit){item=hit;from.items=from.items.filter(i=>i.id!==itemId);break;}}if(item){group.items.push(item);ctx.refresh();}});
-                section.append(button('Apply this group',()=>apply([group])));root.append(section);
+                section.append(el('label',{className:'proposal-head'},check,el('span',{className:'proposal-name',text:group.groupName}),el('span',{className:'proposal-count',text:String(group.items.length)})),
+                    el('label',{className:'proposal-dest'},el('span',{},'Move to'),input));
+                const list=el('div',{className:'proposal-items'});
+                group.items.forEach(item=>{const row=el('div',{className:'proposal-item',draggable:true,title:item.url},el('span',{className:'pi-title',text:item.title}),el('span',{className:'pi-url',text:item.url}));row.addEventListener('dragstart',e=>e.dataTransfer.setData('application/x-tp-proposal',item.id));list.append(row);});
+                section.append(list);
+                section.addEventListener('dragover',e=>{e.preventDefault();section.classList.add('drop-target');});section.addEventListener('dragleave',()=>section.classList.remove('drop-target'));
+                section.addEventListener('drop',e=>{e.preventDefault();section.classList.remove('drop-target');const itemId=e.dataTransfer.getData('application/x-tp-proposal');let item;for(const from of proposal){const hit=from.items.find(i=>i.id===itemId);if(hit){item=hit;from.items=from.items.filter(i=>i.id!==itemId);break;}}if(item){group.items.push(item);ctx.refresh();}});
+                section.append(el('div',{className:'proposal-foot'},button('Apply this group',()=>apply([group]))));groups.append(section);
             }
-            root.append(button('Apply selected changes',()=>apply(proposal.filter(g=>g.checked)),'primary'),button('Back to sources',()=>{proposal=null;ctx.refresh();}));return;
+            root.append(groups);
+            root.append(el('div',{className:'page-footer'},el('span',{className:'page-footer-note'},'Drag a bookmark onto another group to move it there. Nothing moves until you apply.'),
+                button('Back to sources',()=>{proposal=null;ctx.refresh();}),button('Apply selected changes',()=>apply(proposal.filter(g=>g.checked)),'primary')));return;
         }
-        const breadcrumb=el('div',{className:'desktop-inline'},button('All sources',()=>ctx.navigate('organize')));if(current){const entry=all.find(f=>f.node.id===current.id);for(const folder of entry?.trail||[current])breadcrumb.append(button(folder.title||'Untitled',()=>ctx.navigate('organize',folder.id)));}root.append(breadcrumb);
+        const breadcrumb=el('nav',{className:'organize-crumbs','aria-label':'Folder path'},button('All sources',()=>ctx.navigate('organize'),'crumb'));if(current){const entry=all.find(f=>f.node.id===current.id);for(const folder of entry?.trail||[current])breadcrumb.append(el('span',{className:'crumb-sep','aria-hidden':'true',text:'›'}),button(folder.title||'Untitled',()=>ctx.navigate('organize',folder.id),'crumb'+(folder.id===current.id?' current':'')));}root.append(breadcrumb);
         const sources=current?(current.children||[]).filter(n=>n.kind==='folder'&&!n.readOnly&&!n.virtual):visibleRoots(ctx.store.roots(),settings).filter(n=>!n.virtual&&!n.readOnly);
         const grid=el('div',{className:'organize-sources'});
-        for(const source of sources){const check=el('input',{type:'checkbox',checked:selected.has(source.id)});check.addEventListener('change',()=>check.checked?selected.add(source.id):selected.delete(source.id));const tile=el('article',{},el('label',{},check,' '+source.title),el('p',{},(source.children||[]).filter(n=>n.kind==='bookmark').length+' loose bookmarks'),button('Browse ›',()=>ctx.navigate('organize',source.id)),button('Split loose bookmarks',()=>analyze(['loose-'+source.id])));grid.append(tile);}
+        for(const source of sources){
+            const kids=source.children||[],loose=kids.filter(n=>n.kind==='bookmark').length,subs=kids.filter(n=>n.kind==='folder').length;
+            // The old page's source card: select on the left, drill in on the right.
+            const tile=el('article',{className:'organize-source'+(selected.has(source.id)?' selected':'')});
+            const check=el('input',{type:'checkbox',checked:selected.has(source.id)});check.addEventListener('change',()=>{check.checked?selected.add(source.id):selected.delete(source.id);tile.classList.toggle('selected',check.checked);});
+            tile.append(el('label',{className:'source-select'},check,el('span',{className:'source-text'},
+                    el('span',{className:'source-title',text:(source.role==='workflows'?'💾 ':'📁 ')+(source.title||'Untitled')}),
+                    el('span',{className:'source-count',text:loose+' loose bookmark'+(loose===1?'':'s')+(subs?' · '+subs+' folder'+(subs===1?'':'s'):'')}))),
+                el('div',{className:'source-actions'},button('✨ Split loose',()=>analyze(['loose-'+source.id])),button('Browse ›',()=>ctx.navigate('organize',source.id))));
+            grid.append(tile);
+        }
         root.append(grid);
-        if(current){const loose=(current.children||[]).filter(n=>n.kind==='bookmark');const check=el('input',{type:'checkbox',checked:selected.has('loose-'+current.id)});check.addEventListener('change',()=>check.checked?selected.add('loose-'+current.id):selected.delete('loose-'+current.id));root.append(el('label',{},check,' Loose bookmarks here · '+loose.length));for(const n of loose.slice(0,200))root.append(el('p',{},n.title+' — '+n.url));}
-        root.append(button('Analyze & Sort selected',()=>analyze([...selected]),'primary'),button('Back to Board',()=>ctx.navigate('board')));
+        if(!sources.length)root.append(el('p',{className:'desk-empty'},current?'No folders inside '+(current.title||'this folder')+'.':'No sources yet. Pull your tree or import a folder.'));
+        if(current){const loose=(current.children||[]).filter(n=>n.kind==='bookmark');const check=el('input',{type:'checkbox',checked:selected.has('loose-'+current.id)});check.addEventListener('change',()=>check.checked?selected.add('loose-'+current.id):selected.delete('loose-'+current.id));
+            const box=el('section',{className:'organize-loose desk-card'},el('label',{className:'proposal-head'},check,el('span',{className:'proposal-name',text:'Loose bookmarks here'}),el('span',{className:'proposal-count',text:String(loose.length)})));
+            const rows=el('div',{className:'proposal-items'});for(const n of loose.slice(0,200))rows.append(el('div',{className:'proposal-item static',title:n.url},el('span',{className:'pi-title',text:n.title}),el('span',{className:'pi-url',text:n.url})));
+            if(loose.length)box.append(rows);root.append(box);}
+        root.append(el('div',{className:'page-footer'},el('span',{className:'page-footer-note'},'Select sources, then sort their loose bookmarks by keyword.'),
+            button('Back to Board',()=>ctx.navigate('board')),button('Analyze & Sort selected',()=>analyze([...selected]),'primary')));
     }};return api;
 }

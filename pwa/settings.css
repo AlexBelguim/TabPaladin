@@ -1,1 +1,194 @@
-.settings-source{display:inline-flex;gap:8px;padding:10px;margin:5px;border:1px solid var(--border);border-radius:8px}.keyword-row{display:grid;grid-template-columns:minmax(110px,1fr) 2fr minmax(180px,2fr) auto auto auto;align-items:center;gap:8px;margin:9px 0}.keyword-row small{color:var(--muted);font-size:11px}.settings-stash{padding:16px;border:1px solid var(--border);margin:12px 0;border-radius:8px}.settings-stash strong,.settings-stash small{display:block;margin-bottom:8px}@media(max-width:1100px){.keyword-row{grid-template-columns:1fr 1fr}.keyword-row small{grid-column:1/-1}}.move-sheet{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px;overflow:auto}.move-panel{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius,12px);max-width:720px;width:100%;padding:18px 20px;box-shadow:0 12px 40px rgba(0,0,0,.5)}.move-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px}.move-message{border-left:3px solid var(--primary);padding:6px 10px}.move-progress{color:var(--muted)}.move-bundle{padding:12px;border:1px solid var(--border);border-radius:8px;margin:12px 0}.move-bundle>strong{display:block;margin-bottom:8px}.move-part{display:flex;flex-wrap:wrap;align-items:center;gap:8px;justify-content:space-between;padding:6px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}.move-part span{flex:1 1 280px}
+/* ==========================================================================
+   Settings (settings.js), 900px and wider: two columns of cards — what this
+   device shows and sorts by on the left, the kept copies, the helper vault,
+   the move from the extension and recovery on the right. Also the move
+   dialog (move.js), which opens over any page.
+   ========================================================================== */
+
+@media (min-width: 900px) {
+  .settings-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.65fr) minmax(340px, 1fr);
+    align-items: start;
+    gap: 18px;
+  }
+  .settings-main,
+  .settings-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+  /* Every section is a card, the vault's and the move's included. */
+  .settings-card,
+  .settings-side > section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+  }
+  .settings-card > h2:first-child,
+  .settings-side > section > h2:first-child { margin-top: 0; margin-bottom: 6px; }
+  .settings-hint,
+  .settings-side > section > p { margin: 0 0 12px; color: var(--muted); font-size: 0.8rem; }
+  .settings-empty { margin: 0 0 12px; color: var(--muted); font-style: italic; font-size: 0.85rem; }
+  .settings-side > section > button { margin: 4px 6px 0 0; }
+  .settings-row-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+  /* ---------- sources: ticked folders as chips ---------- */
+  .settings-sources {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-height: 280px;
+    overflow-y: auto;
+    padding: 2px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .settings-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 100%;
+    padding: 6px 11px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .settings-source > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .settings-source:hover { border-color: var(--primary); }
+  .settings-source:has(input:checked) {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: var(--primary);
+  }
+
+  /* ---------- keywords: the old .kw-category rows ---------- */
+  .keyword-rows {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .keyword-row {
+    display: grid;
+    grid-template-columns: 16px minmax(110px, 0.8fr) minmax(140px, 1.6fr) minmax(200px, 2fr) 26px 26px 30px;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    background: rgba(0, 0, 0, 0.12);
+  }
+  .keyword-row + .keyword-row { border-top: 1px solid var(--row-line); }
+  .keyword-row:hover { background: rgba(255, 255, 255, 0.03); }
+  .keyword-row .drag-handle { cursor: grab; }
+  .keyword-row strong {
+    font-size: 0.88rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .keyword-row small {
+    color: var(--muted);
+    font-size: 0.72rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .keyword-row input { width: 100%; padding: 5px 9px; font-size: 0.82rem; }
+  .desktop-page .keyword-row button.icon-btn { padding: 2px 0; font-size: 0.85rem; }
+  .desktop-page .keyword-row button.icon-btn:disabled { opacity: 0.25; }
+
+  /* Save and Cancel for the two cards above. */
+  .settings-save {
+    position: sticky;
+    bottom: 12px;
+    z-index: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: rgba(30, 41, 59, 0.95);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lift);
+    backdrop-filter: blur(8px);
+  }
+
+  /* ---------- set-aside copies ---------- */
+  .settings-stash {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 12px;
+    margin: 0 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.15);
+  }
+  .settings-stash strong,
+  .settings-stash small {
+    flex-basis: 100%;
+    overflow-wrap: anywhere;
+  }
+  .settings-stash strong { font-size: 0.85rem; }
+  .settings-stash small { color: var(--muted); font-size: 0.76rem; }
+  .desktop-page .settings-stash button { padding: 4px 9px; font-size: 0.76rem; }
+
+  /* The move from the extension, drawn in its card (move.js). */
+  .move-settings .move-body p { margin: 0 0 10px; color: var(--muted); font-size: 0.8rem; }
+  .move-settings .move-body .move-message { color: var(--text); }
+}
+
+@media (min-width: 900px) and (max-width: 1279px) {
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
+  .keyword-row { grid-template-columns: 16px minmax(100px, 1fr) minmax(160px, 2fr) 26px 26px 30px; }
+  .keyword-row small { display: none; }
+}
+
+/* ---------- the move dialog (move.js): over any page, any width ---------- */
+.move-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.55);
+}
+.move-panel {
+  width: 100%;
+  max-width: 720px;
+  padding: 18px 20px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.move-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.move-message { border-left: 3px solid var(--primary); padding: 6px 10px; }
+.move-progress { color: var(--muted); }
+.move-bundle {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.move-bundle > strong { display: block; margin-bottom: 8px; }
+.move-part {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.move-part span { flex: 1 1 280px; }

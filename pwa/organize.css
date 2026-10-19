@@ -1,1 +1,176 @@
-.organize-sources{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;margin:20px 0}.organize-sources article,.organize-proposal{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:16px}.organize-proposal{margin:12px 0}.organize-proposal>input{display:block;width:100%;margin:12px 0}.proposal-item{padding:7px;border-bottom:1px solid var(--border);overflow-wrap:anywhere;cursor:grab}
+/* ==========================================================================
+   Organize (organize.js), 900px and wider: the sources as the old page's
+   selectable cards in a grid, the folder path as chips, and the proposed
+   moves as cards, with the main action in a footer bar.
+   ========================================================================== */
+
+@media (min-width: 900px) {
+  /* At least the window's height, so the footer bar sits at its bottom. */
+  .desktop-page.page-organize {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  .page-organize > .page-footer { margin-top: auto; }
+  .page-organize > .organize-sources { margin-bottom: 24px; }
+
+  /* ---------- the folder path ---------- */
+  .organize-crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 16px;
+  }
+  .desktop-page button.crumb {
+    padding: 3px 11px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .desktop-page button.crumb:hover { color: var(--text); border-color: var(--primary); }
+  .desktop-page button.crumb.current { color: var(--text); background: rgba(59, 130, 246, 0.12); border-color: rgba(59, 130, 246, 0.45); }
+  .crumb-sep { color: var(--muted); padding: 0 2px; }
+
+  /* ---------- sources: the old .source-split-card ---------- */
+  .organize-sources {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+  }
+  .organize-source {
+    display: flex;
+    align-items: stretch;
+    min-height: 78px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+  }
+  .organize-source:hover {
+    border-color: var(--primary);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-lift);
+  }
+  .organize-source.selected {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: var(--primary);
+    box-shadow: 0 0 0 1px var(--primary);
+  }
+  .source-select {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 10px 12px;
+    border-right: 1px solid rgba(255, 255, 255, 0.05);
+    cursor: pointer;
+  }
+  .source-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .source-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .source-count { color: var(--muted); font-size: 0.76rem; }
+  .source-actions {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: rgba(0, 0, 0, 0.1);
+  }
+  .desktop-page .source-actions button {
+    flex: 1;
+    padding: 0 12px;
+    border: none;
+    border-radius: 0;
+    background: none;
+    color: var(--muted);
+    font-size: 0.76rem;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .desktop-page .source-actions button + button { border-top: 1px solid rgba(255, 255, 255, 0.05); }
+  .desktop-page .source-actions button:hover { background: var(--primary); color: #fff; }
+
+  /* ---------- the proposed moves, and the loose bookmarks here ---------- */
+  .proposal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    align-items: start;
+    gap: 14px;
+  }
+  .organize-proposal {
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: opacity 0.15s, border-color 0.15s;
+  }
+  .organize-proposal.unchecked { opacity: 0.55; }
+  .organize-proposal.drop-target { border-color: var(--success); background: rgba(16, 185, 129, 0.08); outline: none; }
+  .proposal-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: rgba(139, 92, 246, 0.1);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .organize-loose .proposal-head { margin: -16px -18px 10px; background: rgba(255, 255, 255, 0.03); }
+  .proposal-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proposal-count {
+    flex: none;
+    min-width: 22px;
+    padding: 0 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--muted);
+    font-size: 0.74rem;
+    font-weight: 600;
+    line-height: 20px;
+    text-align: center;
+  }
+  .proposal-dest {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px 6px;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+  .proposal-dest input { flex: 1; min-width: 0; }
+  .proposal-items {
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 4px 8px 8px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .organize-loose .proposal-items { max-height: 50vh; padding: 0; }
+  .proposal-item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 0.84rem;
+    cursor: grab;
+  }
+  .proposal-item.static { cursor: default; }
+  .proposal-item:hover { background: rgba(255, 255, 255, 0.04); }
+  .pi-title,
+  .pi-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pi-url { color: var(--muted); font-size: 0.74rem; }
+  .proposal-foot {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .organize-loose { margin-bottom: 8px; }
+}
