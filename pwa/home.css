@@ -1,0 +1,280 @@
+/* ==========================================================================
+   Desktop Home (home.js), 900px and wider: the old extension page's home —
+   a big search box, favicon pins, the coloured action tiles, and recent
+   workflows and notes side by side. The phone's Home is app.css's; the pin
+   tile itself is shared with it (app.js pinTile), sized up here.
+   ========================================================================== */
+
+@media (min-width: 900px) {
+  .desktop-page.page-home {
+    max-width: calc(1100px + 72px);
+    padding-top: 22px;
+  }
+
+  /* ---------- search ---------- */
+  .home-search-block { padding: 18px 0 30px; }
+  .page-home .home-search {
+    max-width: 680px;
+    gap: 12px;
+    padding: 13px 17px;
+    border-radius: 12px;
+    background: var(--surface);
+    cursor: text;
+    transition: box-shadow 0.15s, border-color 0.15s;
+  }
+  .page-home .home-search:focus-within {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+  }
+  .page-home .home-search-mark { width: 19px; height: 19px; font-size: 0.62rem; }
+  .page-home .home-search input,
+  .page-home .home-search input:focus {
+    flex: 1;
+    padding: 0;
+    border: none;
+    background: none;
+    box-shadow: none;
+    font-size: 0.98rem;
+  }
+  .home-search-kbd {
+    flex: none;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--muted);
+    font-size: 0.68rem;
+  }
+
+  /* ---------- section heads ---------- */
+  .home-section { margin-bottom: 30px; }
+  .home-section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .page-home .home-section-head h2 { margin: 0; }
+  .home-count { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+  .desktop-page button.home-head-link {
+    margin-left: auto;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--primary);
+    font-size: 0.78rem;
+  }
+  .desktop-page button.home-head-link:hover { text-decoration: underline; }
+
+  /* ---------- pinned links ---------- */
+  .desk-pins {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, 88px);
+    gap: 20px 14px;
+  }
+  .desk-pin {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 0;
+  }
+  .desk-pin .pin-tile {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+  }
+  .desk-pin .pin-tile .pin-fav {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+    font-size: 1.15rem;
+    box-shadow: 0 4px 10px -4px rgba(0, 0, 0, 0.5);
+  }
+  .desk-pin .pin-tile:hover .pin-fav { transform: scale(1.07); }
+  .desk-pin .pin-tile:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+  .desk-pin-name {
+    max-width: 88px;
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 0.74rem;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .desk-pin:hover .desk-pin-name { color: var(--text); }
+
+  /* The ⋯ on a pin's corner: there on hover, or while its menu is open. */
+  .pin-menu {
+    position: absolute;
+    top: -8px;
+    right: 2px;
+    z-index: 3;
+  }
+  .pin-menu-btn {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1;
+    list-style: none;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .pin-menu-btn::-webkit-details-marker { display: none; }
+  .desk-pin:hover .pin-menu-btn,
+  .desk-pin:focus-within .pin-menu-btn,
+  .pin-menu[open] .pin-menu-btn { opacity: 1; }
+  .pin-menu-btn:hover { color: var(--text); border-color: var(--primary); }
+  .pin-menu-pop {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 140px;
+    padding: 5px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  }
+  .desktop-page button.pin-menu-item {
+    padding: 7px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text);
+    text-align: left;
+  }
+  .desktop-page button.pin-menu-item:hover { background: var(--surface-hover); }
+  .desktop-page button.pin-menu-item.danger { color: #f87171; }
+
+  /* The add tile keeps a dashed border, a little smaller than the pins so
+     the hollow square reads as the same size as the solid ones. */
+  .desktop-page button.pin-add {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0;
+    border: none;
+    background: none;
+  }
+  .pin-add-box {
+    display: grid;
+    place-items: center;
+    width: 58px;
+    height: 58px;
+    margin: 3px;
+    border: 1.5px dashed rgba(148, 163, 184, 0.5);
+    border-radius: 14px;
+    color: var(--muted);
+    font-size: 1.4rem;
+    font-weight: 300;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .desktop-page button.pin-add:hover .pin-add-box { border-color: var(--primary); color: var(--text); }
+
+  /* ---------- action tiles: the old page's coloured buttons ---------- */
+  .home-tiles {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 30px;
+  }
+  .desktop-page button.home-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 4px;
+    min-height: 78px;
+    padding: 14px 16px;
+    border: none;
+    border-radius: var(--radius-md);
+    color: #fff;
+    text-align: left;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+    transition: transform 0.15s, box-shadow 0.15s, filter 0.15s;
+  }
+  .desktop-page button.home-tile:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 14px -4px rgba(0, 0, 0, 0.4);
+    filter: brightness(1.06);
+  }
+  .home-tile-label { font-size: 0.92rem; font-weight: 600; }
+  .home-tile-hint { font-size: 0.74rem; opacity: 0.85; }
+  .home-tile.tone-blue { background: #3b82f6; }
+  .home-tile.tone-green { background: #10b981; }
+  .home-tile.tone-indigo { background: #6366f1; }
+  .home-tile.tone-amber { background: #f59e0b; }
+  .home-tile.tone-sky { background: #0ea5e9; }
+
+  /* Suggested changes from AI chats wait between the tiles and the recents. */
+  .page-home .proposals.changes { margin: 0 0 30px; }
+
+  /* ---------- recent workflows | recent notes ---------- */
+  .home-recents {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+    align-items: start;
+  }
+  .page-home .home-panel {
+    padding: 14px 15px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .page-home .home-panel .home-section-head { margin-bottom: 10px; }
+  .home-cards { display: flex; flex-direction: column; gap: 8px; }
+  .desktop-page button.home-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.15);
+    color: var(--text);
+    text-align: left;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .desktop-page button.home-card:hover { border-color: var(--primary); background: rgba(59, 130, 246, 0.07); }
+  .home-card-icon { flex: none; font-size: 1.05rem; }
+  .home-card-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .home-card-title {
+    font-weight: 600;
+    font-size: 0.88rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .home-card-title.untitled { color: var(--muted); font-style: italic; font-weight: 500; }
+  .home-card-meta {
+    color: var(--muted);
+    font-size: 0.75rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .home-card-time { flex: none; color: var(--muted); font-size: 0.72rem; }
+  .home-card-go { flex: none; color: var(--muted); font-size: 0.7rem; }
+  .desktop-page button.home-card:hover .home-card-go { color: var(--primary); }
+  .home-empty { margin: 4px 0; color: var(--muted); font-size: 0.84rem; }
+}
+
+@media (min-width: 900px) and (max-width: 1199px) {
+  .home-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (min-width: 900px) and (max-width: 1049px) {
+  .home-recents { grid-template-columns: minmax(0, 1fr); }
+}

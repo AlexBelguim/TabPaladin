@@ -30,6 +30,7 @@ const SHELL = [
     '/desktopCore.js',
     '/desktopShell.js',
     '/desktop.css?v=37',
+    '/home.css?v=37',
     '/home.js',
     '/board.js',
     '/workflows.js',
