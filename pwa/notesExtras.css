@@ -1,1 +1,92 @@
-.note-mode-bar{display:flex;gap:7px;align-items:center;padding:9px 0}.note-removed-banner{padding:14px;border-left:3px solid #f7b24b;background:var(--card)}#note-title-input{width:100%;font-size:26px;font-weight:600;background:transparent;color:var(--text);border:0;border-bottom:1px solid var(--border);padding:12px 0}.note-live-preview{display:none;padding:18px;overflow:auto}.note-page[data-note-mode=read] .note-editor-fields{display:none}.note-page[data-note-mode=read] .note-live-preview{display:block}@media(min-width:1500px){.note-page[data-note-mode=split]{display:grid;grid-template-columns:1fr 1fr;gap:18px}.note-page[data-note-mode=split]>.note-topbar,.note-page[data-note-mode=split]>.note-mode-bar,.note-page[data-note-mode=split]>.nv-crumb,.note-page[data-note-mode=split]>.note-removed-banner{grid-column:1/-1}.note-page[data-note-mode=split] .note-live-preview{display:block;border-left:1px solid var(--border)}.note-page[data-note-mode=split] textarea{min-height:50vh!important;max-height:70vh;overflow:auto}}
+/* ==========================================================================
+   Notes on a computer (notesExtras.js): the Read | Edit | Split control, the
+   title field and the live preview. The three panes themselves are laid out
+   in app.css (the notes screen is the phone's too).
+   ========================================================================== */
+
+/* Read | Edit | Split: the old notes page's segmented control. */
+.note-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0 12px;
+}
+.note-seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.note-seg button,
+.note-seg button.primary,
+.note-seg button.ghost {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.note-seg button + button { border-left: 1px solid var(--border); }
+.note-seg button:hover:not(:disabled) { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+.note-seg button[aria-pressed="true"] { background: rgba(59, 130, 246, 0.18); color: var(--text); }
+.note-seg button:disabled { opacity: 0.4; }
+.note-mode-bar .note-push {
+  margin-left: auto;
+  padding: 5px 12px;
+  border: 1px solid rgba(59, 130, 246, 0.32);
+  border-radius: 7px;
+  background: rgba(59, 130, 246, 0.06);
+  color: #93c5fd;
+  font-size: 0.8rem;
+}
+.note-mode-bar .note-push:hover { background: rgba(59, 130, 246, 0.16); }
+
+.note-removed-banner {
+  padding: 12px 14px;
+  border-left: 3px solid #f7b24b;
+  border-radius: 0 8px 8px 0;
+  background: rgba(245, 158, 11, 0.07);
+  color: #fbbf24;
+}
+
+/* The title, as the page's heading. */
+#note-title-input {
+  width: 100%;
+  padding: 10px 0;
+  background: transparent;
+  color: var(--text);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+#note-title-input:focus { outline: none; border-bottom-color: var(--primary); }
+
+.note-live-preview { display: none; padding: 18px 0; overflow: auto; }
+.note-page[data-note-mode=read] .note-editor-fields { display: none; }
+.note-page[data-note-mode=read] .note-live-preview { display: block; }
+
+@media (min-width: 1500px) {
+  .note-page[data-note-mode=split] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 24px;
+  }
+  .note-page[data-note-mode=split] > * { max-width: none; }
+  .note-page[data-note-mode=split] > .note-topbar,
+  .note-page[data-note-mode=split] > .note-mode-bar,
+  .note-page[data-note-mode=split] > .nv-crumb,
+  .note-page[data-note-mode=split] > .note-removed-banner { grid-column: 1 / -1; }
+  .note-page[data-note-mode=split] .note-live-preview {
+    display: block;
+    padding: 18px 0 18px 24px;
+    border-left: 1px solid var(--border);
+  }
+  .note-page[data-note-mode=split] textarea {
+    min-height: 50vh !important;
+    max-height: 70vh;
+    overflow: auto;
+  }
+}

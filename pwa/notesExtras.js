@@ -11,8 +11,11 @@ export function createNoteExtras(ctx){
             let mode=ctx.getMode()||'read';if(!nv.editing)mode='read';else if(mode==='read'&&(!nvRef||nvRef!==nv)){mode='edit';ctx.setMode(mode);}
             if(note&&!nv.editing)lastRead={id:note.id,title:note.title,content:note.content,account:ctx.account()};
             const set=next=>{ctx.setMode(next);if(next!=='read'&&!nv.editing)ctx.startEdit();else ctx.refresh();};
-            for(const label of ['Read','Edit','Split']){const key=label.toLowerCase();const b=button(label,()=>set(key),mode===key?'primary':'ghost');if(key==='split'&&!matchMedia('(min-width:1500px)').matches)b.disabled=true;bar.append(b);}
-            bar.append(button('Push',()=>ctx.push()));page.querySelector('.note-topbar')?.after(bar);page.dataset.noteMode=mode;
+            // Read | Edit | Split as one segmented control, the old notes page's.
+            const seg=el('div',{className:'note-seg',role:'group','aria-label':'View'});
+            for(const label of ['Read','Edit','Split']){const key=label.toLowerCase();const b=button(label,()=>set(key),mode===key?'primary':'ghost');b.setAttribute('aria-pressed',String(mode===key));if(key==='split'&&!matchMedia('(min-width:1500px)').matches){b.disabled=true;b.title='Split needs a window 1500px wide';}seg.append(b);}
+            const push=button('⬆ Push',()=>ctx.push(),'ghost note-push');push.title='Push to the server';
+            bar.append(seg,push);page.querySelector('.note-topbar')?.after(bar);page.dataset.noteMode=mode;
             if(nv.removedElsewhere)bar.after(el('p',{className:'note-removed-banner'},'This note was removed elsewhere. Save keeps your text as a new note.'));
             if(nv.editing){
                 const textarea=page.querySelector('#note-body-input');const title=el('input',{id:'note-title-input',value:nv.titleField ?? note?.title ?? (leadingTitle(nv.draft) || ''),placeholder:'Note title','aria-label':'Note title'});
