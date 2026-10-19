@@ -1,1 +1,516 @@
-.desktop-nav{display:none}.desktop-page{padding:12px;max-width:1600px;margin:auto}.desktop-inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.desktop-search input{width:100%;padding:16px;border-radius:10px;margin:12px 0}.desktop-pins,.desktop-actions{display:flex;flex-wrap:wrap;gap:14px;margin:18px 0}.desktop-pin{border:1px solid var(--border);border-radius:12px;padding:16px;min-width:170px}.desktop-pin>a{font-size:17px}.desktop-recent{display:block;width:100%;text-align:left;padding:14px;margin:6px 0}.desktop-page input,.desktop-page select,.desktop-page textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);padding:9px;border-radius:6px}.desktop-page button{cursor:pointer}.desktop-page h1{font-size:27px}.desktop-page h2{font-size:20px;margin-top:24px}.desktop-page .field{display:block;margin:12px 0}.desktop-page .field>input{width:100%}@media(min-width:900px){body{padding-left:164px}.desktop-nav{display:flex;position:fixed;left:0;top:64px;bottom:0;width:152px;flex-direction:column;padding:18px 8px;gap:6px;border-right:1px solid var(--border);z-index:15;background:var(--bg)}.desktop-nav-item{text-align:left;padding:12px;border-radius:8px;background:transparent;color:var(--text);border:0}.desktop-nav-item.active{background:var(--card);color:var(--accent)}#content>.desktop-page{min-height:70vh}body.view-notes .desktop-nav-item{color:var(--text)}.desktop-page{max-width:none}}
+/* ==========================================================================
+   Desktop shell (900px and wider): the left sidebar, the page frame, and the
+   controls every desktop view shares. The views' own styles live next to
+   them: home.css, board.css, workflows.css, organize.css, settings.css,
+   notesExtras.css. Below 900px nothing here applies except the hiding of the
+   desktop-only pieces, so the phone keeps its top bar and tab bar.
+
+   Design tokens are the old extension page's (src/sidepanel/sidepanel.css,
+   src/app/app.css): the same dark slate palette app.css already uses, plus
+   the radii, the warning/accent colours and the hover surface it had.
+   ========================================================================== */
+
+:root {
+  --sidebar-w: 220px;
+  --surface-hover: #334155;
+  --warning: #f59e0b;
+  --accent: #8b5cf6;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --shadow-lift: 0 6px 16px -4px rgba(0, 0, 0, 0.45);
+  --sidebar-bg: #0b1120;
+  --row-line: rgba(51, 65, 85, 0.55);
+}
+
+/* The sidebar's own pieces never show on a phone. */
+.desktop-nav,
+.desktop-account,
+.sync-chip-time { display: none; }
+
+@media (min-width: 900px) {
+  body { padding-left: var(--sidebar-w); }
+
+  /* ---------- the sidebar: the header, laid out as a column ---------- */
+  #topbar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--sidebar-w);
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    padding: 0 0 12px;
+    background: var(--sidebar-bg);
+    border-bottom: none;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: var(--surface-2) transparent;
+    z-index: 20;
+  }
+
+  /* No top bar on a computer: its phone-only buttons go, and what they did
+     is in the sidebar (Notes in the nav, Push in the sync block). */
+  #notesBtn,
+  #pushBtn,
+  #menuBtn,
+  #breadcrumb { display: none !important; }
+
+  /* Brand: the way home. */
+  #brand-home {
+    flex: none;
+    margin: 0;
+    padding: 18px 18px 14px;
+    gap: 10px;
+    border-radius: 0;
+  }
+  #brand-home:hover { background: rgba(255, 255, 255, 0.03); }
+  #brand-home:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+  #brand-home img { width: 26px; height: 26px; }
+  #topbar #brand-home h1 { flex: none; font-size: 1.15rem; letter-spacing: -0.02em; }
+
+  /* Navigation */
+  .desktop-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 4px 10px 12px;
+  }
+  .desktop-nav-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    width: 100%;
+    min-height: 38px;
+    padding: 0 10px;
+    border-radius: 8px;
+    background: none;
+    color: var(--muted);
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-align: left;
+  }
+  .desktop-nav-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--text); }
+  .desktop-nav-item.active {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--text);
+    box-shadow: inset 3px 0 0 var(--primary);
+  }
+  .desktop-nav-item:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+  .dn-icon { flex: none; width: 20px; text-align: center; font-size: 1rem; line-height: 1; }
+  .dn-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dn-badge {
+    flex: none;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 10px;
+    background: var(--primary);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 700;
+    line-height: 20px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .dn-badge[hidden] { display: none; }
+  .dn-badge-sync { background: var(--warning); color: #111827; }
+
+  /* Sync block: status, Push and Pull, when it last met the server. Pushed
+     to the bottom of the sidebar, with everything after it. */
+  #topbar .sync-chip {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin: auto 12px 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.82rem;
+    white-space: normal;
+  }
+  #sync-chip-label {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+  }
+  #sync-chip-label::before {
+    content: "";
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+  }
+  #topbar .sync-chip.dirty { border-color: rgba(245, 158, 11, 0.45); }
+  #topbar .sync-chip.dirty #sync-chip-label { color: var(--warning); }
+  #topbar .sync-chip.dirty #sync-chip-label::before { background: var(--warning); box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18); }
+  #topbar .sync-chip button {
+    padding: 6px 0;
+    border-radius: var(--radius-sm);
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  /* The old page's Push and Pull: tinted blue and amber. */
+  #sync-chip-push {
+    color: #93c5fd;
+    background: rgba(59, 130, 246, 0.1);
+    border: 1px solid rgba(59, 130, 246, 0.35);
+  }
+  #sync-chip-push:hover { background: rgba(59, 130, 246, 0.2); }
+  #topbar .sync-chip.dirty #sync-chip-push { background: var(--primary); border-color: var(--primary); color: #fff; }
+  #sync-chip-pull {
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.06);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+  }
+  #sync-chip-pull:hover { background: rgba(245, 158, 11, 0.14); }
+  .sync-chip-time {
+    display: block;
+    grid-column: 1 / -1;
+    color: var(--muted);
+    font-size: 0.72rem;
+  }
+
+  /* Helper status */
+  #topbar #helper-status {
+    max-width: none;
+    margin: 0 12px 6px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: left;
+    white-space: normal;
+  }
+  #topbar #helper-status::before { content: "🧩"; margin-right: 8px; }
+  #topbar #helper-status:hover { background: rgba(255, 255, 255, 0.05); color: var(--text); }
+
+  /* The ⋯ menu's actions, listed: New folder, Create Workflow, Pin current
+     tab. Inbox, Pull and Settings are already in the sidebar. */
+  #menu-wrap { margin: 0 12px; }
+  #topbar #menu,
+  #topbar #menu.hidden {
+    position: static;
+    display: flex !important;
+    min-width: 0;
+    padding: 6px 0;
+    gap: 0;
+    background: none;
+    border: none;
+    border-top: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: none;
+  }
+  #topbar #menu::before {
+    content: "Actions";
+    padding: 4px 10px 4px;
+    color: var(--muted);
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+  }
+  #clipBtn,
+  #pullBtn,
+  #settingsBtn { display: none !important; }
+  #menu .menu-item {
+    padding: 6px 10px;
+    color: var(--muted);
+    font-size: 0.8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #menu .menu-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--text); }
+  #menu .menu-item:disabled { opacity: 0.45; }
+
+  /* Who is signed in, and the way out. */
+  .desktop-account {
+    display: block;
+    margin: 6px 12px 0;
+    padding: 10px 0 0;
+    border-top: 1px solid var(--border);
+  }
+  .da-who { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .da-avatar {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    color: #fff;
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+  .da-text { display: flex; flex-direction: column; min-width: 0; }
+  .da-name { font-weight: 600; font-size: 0.86rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .da-sub { color: var(--muted); font-size: 0.72rem; }
+  .da-actions { display: flex; gap: 6px; margin-top: 10px; }
+  .da-actions button {
+    flex: 1;
+    padding: 6px 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--muted);
+    font-size: 0.76rem;
+    white-space: nowrap;
+  }
+  .da-actions button:hover { color: var(--text); border-color: var(--primary); background: rgba(59, 130, 246, 0.08); }
+  .da-actions .da-signout:hover { color: #fca5a5; border-color: rgba(239, 68, 68, 0.5); background: rgba(239, 68, 68, 0.08); }
+  .da-actions .da-signin { background: var(--primary); border-color: var(--primary); color: #fff; }
+
+  /* The floating Inbox button: the nav's Inbox carries its count here. */
+  #inbox-fab { display: none !important; }
+
+  /* "Saving…" and friends: a pill over the content's top-right corner. */
+  #status {
+    position: fixed;
+    top: 14px;
+    right: 18px;
+    z-index: 25;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    box-shadow: var(--shadow-lift);
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-style: normal;
+  }
+
+  /* ---------- the Inbox: a page over the content, beside the sidebar ---------- */
+  #inbox-sheet {
+    top: 0;
+    bottom: 0;
+    left: var(--sidebar-w);
+    right: 0;
+    width: auto;
+    max-height: none;
+    transform: none;
+    border: none;
+    border-radius: 0;
+    background: var(--bg);
+    box-shadow: none;
+    z-index: 9;
+  }
+  #inbox-sheet .sheet-header {
+    padding: 26px 36px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  #inbox-title { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em; }
+  #inbox-close {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+  }
+  #inbox-close:hover { color: var(--text); border-color: var(--primary); }
+  #inbox-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    align-content: start;
+    gap: 10px;
+    padding: 20px 36px 48px;
+  }
+  #inbox-list > :not(.inbox-row) { grid-column: 1 / -1; }
+  #inbox-list .inbox-paste input { max-width: 560px; }
+  #inbox-list .share-section {
+    margin: 14px 0 0;
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+  }
+  #inbox-list .inbox-row {
+    margin: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  #inbox-list .inbox-row:hover { border-color: var(--primary); }
+  #inbox-list .inbox-open { padding: 12px 14px; }
+  #inbox-list .inbox-filed[open] {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 10px;
+  }
+  #inbox-list .inbox-filed > summary { grid-column: 1 / -1; }
+
+  /* ---------- the page frame ---------- */
+  .desktop-page {
+    padding: 28px 36px 56px;
+    color: var(--text);
+  }
+  .desktop-loading {
+    margin: 0;
+    padding: 32px 36px;
+    color: var(--muted);
+  }
+
+  /* A page's title row: the heading, a muted line, and its actions. */
+  .page-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 16px;
+    margin-bottom: 22px;
+  }
+  .page-head .page-title { flex: 1 1 auto; min-width: 0; }
+  .desktop-page h1 {
+    margin: 0;
+    font-size: 1.6rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .page-sub { margin: 4px 0 0; color: var(--muted); font-size: 0.85rem; }
+  .page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+  /* Section labels: the old page's uppercase muted heads. */
+  .desktop-page h2 {
+    margin: 28px 0 12px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  /* A card: the old .source-folder-card surface. */
+  .desk-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+  }
+  .desk-card > h2:first-child { margin-top: 0; }
+
+  .desk-empty {
+    margin: 0;
+    padding: 18px;
+    border: 2px dashed var(--border);
+    border-radius: var(--radius-md);
+    color: var(--muted);
+    font-style: italic;
+    text-align: center;
+  }
+
+  /* ---------- controls ---------- */
+  /* The views' buttons are ghost (the default of desktopCore's button()) or
+     primary: the old page's .sm-btn with an outline, and its .primary-btn. */
+  .desktop-page button { font-size: 0.84rem; }
+  .desktop-page button.ghost {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text);
+  }
+  .desktop-page button.ghost:hover:not(:disabled) {
+    border-color: var(--primary);
+    background: rgba(59, 130, 246, 0.08);
+  }
+  .desktop-page button.primary {
+    padding: 8px 16px;
+    border: 1px solid var(--primary);
+    border-radius: var(--radius-sm);
+    background: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+  }
+  .desktop-page button.primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+    border-color: var(--primary-hover);
+    transform: translateY(-1px);
+  }
+  .desktop-page button.danger,
+  .desktop-page button.ghost.danger { color: #f87171; }
+  .desktop-page button.ghost.danger:hover:not(:disabled) { border-color: rgba(239, 68, 68, 0.6); background: rgba(239, 68, 68, 0.1); }
+  .desktop-page button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  /* Compact icon buttons for card headers and rows. */
+  .desktop-page button.icon-btn {
+    padding: 2px 7px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .desktop-page button.icon-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); color: var(--text); }
+  .desktop-page button.icon-btn.danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.14); color: #f87171; }
+
+  .desktop-page input,
+  .desktop-page select,
+  .desktop-page textarea {
+    padding: 8px 11px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.88rem;
+  }
+  .desktop-page input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    accent-color: var(--primary);
+    vertical-align: middle;
+  }
+  .desktop-page input:focus,
+  .desktop-page select:focus,
+  .desktop-page textarea:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  }
+  .desktop-page .field { display: block; margin: 12px 0; }
+  .desktop-page .field > input { width: 100%; }
+
+  /* A page's footer bar: its main action, kept in view at the bottom. */
+  .page-footer {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin: 24px -36px -56px;
+    padding: 14px 36px;
+    background: rgba(15, 23, 42, 0.92);
+    border-top: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+  }
+  .page-footer-note { margin-right: auto; color: var(--muted); font-size: 0.8rem; }
+
+  /* Scrollbars, as the old page drew them. */
+  .desktop-page ::-webkit-scrollbar { width: 8px; height: 8px; }
+  .desktop-page ::-webkit-scrollbar-track { background: transparent; }
+  .desktop-page ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .desktop-page ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+}
+
+/* A narrower window: a slimmer sidebar. */
+@media (min-width: 900px) and (max-width: 1099px) {
+  :root { --sidebar-w: 196px; }
+  .desktop-page { padding-left: 24px; padding-right: 24px; }
+  .page-footer { margin-left: -24px; margin-right: -24px; padding-left: 24px; padding-right: 24px; }
+}

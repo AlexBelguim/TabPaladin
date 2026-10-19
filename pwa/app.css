@@ -1019,25 +1019,17 @@ body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 
 /* ---------- desktop layout ---------- */
 /* The web app is the desktop client too, not just the phone's. Same DOM, one
-   media query: the bottom tab bar disappears (its four destinations already
-   live in the topbar and menu), content settles into a centered column, and
-   the bottom sheets become centered dialogs instead of drawers. */
+   media query: the bottom tab bar disappears, the header becomes the left
+   sidebar and the content takes the rest of the window (desktop.css), and the
+   bottom sheets become centered dialogs instead of drawers. */
 @media (min-width: 900px) {
   #bottom-nav { display: none; }
-  body { padding-bottom: 48px; }
+  body { padding-bottom: 0; }
+  #content { padding: 0; gap: 0; }
 
-  /* Full-width bars, centered contents — no wrapper element needed. */
-  #topbar,
-  #breadcrumb,
-  #content {
-    padding-left: max(16px, calc((100vw - 880px) / 2));
-    padding-right: max(16px, calc((100vw - 880px) / 2));
-  }
-  #content { padding-bottom: 48px; }
-
-  /* Sheets become centered modal dialogs. */
+  /* Sheets become modal dialogs, centred over the content beside the sidebar. */
   .sheet {
-    left: 50%;
+    left: calc(50% + var(--sidebar-w, 0px) / 2);
     right: auto;
     bottom: 48px;
     width: min(560px, 92vw);
@@ -1677,15 +1669,11 @@ input.nv-search {
   body.view-notes:not(.pane-note) .nv-note { display: none; }
 }
 
-/* Desktop: the panes side by side, each scrolling on its own, in a column
-   wider than the 880px one the rest of the app uses. */
+/* Desktop: the panes side by side next to the sidebar, the full height and
+   width of the window, each scrolling on its own. */
 @media (min-width: 900px) {
   body.view-notes { padding-bottom: 0; }
-  body.view-notes #content {
-    padding-left: max(16px, calc((100vw - 1680px) / 2));
-    padding-right: max(16px, calc((100vw - 1680px) / 2));
-    padding-bottom: 0;
-  }
+  body.view-notes #content { padding: 0; }
 
   #notesBtn.on {
     background: rgba(59, 130, 246, 0.15);
@@ -1694,10 +1682,9 @@ input.nv-search {
 
   .nv {
     display: grid;
-    grid-template-columns: 340px minmax(0, 1fr);
-    height: calc(100dvh - var(--topbar-h, 60px) - 24px);
-    border: 1px solid var(--border);
-    border-radius: 12px;
+    grid-template-columns: 320px minmax(0, 1fr);
+    height: 100vh;
+    height: 100dvh;
     overflow: hidden;
   }
 
@@ -1711,7 +1698,7 @@ input.nv-search {
   .nv-side,
   .nv-list { border-right: 1px solid var(--border); }
 
-  /* 900–1099px: the left column is the library or the list. */
+  /* 900–1279px: the left column is the library or the list. */
   body.pane-library .nv-list,
   body.view-notes:not(.pane-library) .nv-side { display: none; }
 
@@ -1723,13 +1710,15 @@ input.nv-search {
     padding: 8px 28px 60px;
   }
 
+  /* A reading measure inside the note column, which itself takes the rest. */
   .nv-note .note-page > * {
-    max-width: 720px;
+    max-width: 880px;
     margin-left: auto;
     margin-right: auto;
   }
 
-  .nv-note .note-page > .nv-crumb { display: block; width: max-content; margin-left: max(0px, calc((100% - 720px) / 2)); }
+  .nv-note .note-page > .nv-crumb { display: block; width: max-content; margin-left: max(0px, calc((100% - 880px) / 2)); }
+  .nv-note .note-page > h1.note-title { margin-left: auto; margin-right: auto; }
 
   /* The note column is always on screen, so its back arrow is not needed. */
   .note-topbar .nv-back { visibility: hidden; }
@@ -1758,7 +1747,8 @@ input.nv-search {
   .nv-tree-row:focus-within .nv-more { opacity: 1; }
 }
 
-@media (min-width: 1100px) {
+/* With the 220px sidebar beside it, three panes fit from 1280px. */
+@media (min-width: 1280px) {
   .nv { grid-template-columns: 260px 360px minmax(0, 1fr); }
   body.pane-library .nv-list,
   body.view-notes:not(.pane-library) .nv-side { display: block; }

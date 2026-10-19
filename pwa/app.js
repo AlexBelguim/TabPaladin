@@ -1442,6 +1442,47 @@ function attachFavicon(favEl, pageUrl) {
     favEl.appendChild(img);
 }
 
+// One pinned link as a tile: its favicon over coloured initials. The phone's
+// Home draws these, and so does the desktop's (home.js, through its context).
+function pinTile(p) {
+    // A pin saved as a bare host has no scheme, and a scheme-less href
+    // resolves against this app's origin instead of the web. Only an
+    // http(s) pin is a link; any other scheme is an inert tile.
+    const raw = String(p.url).trim();
+    const href = NM.safeHref(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
+    const tile = document.createElement(href ? 'a' : 'span');
+    tile.className = 'pin-tile' + (href ? '' : ' pin-inert');
+    if (href) {
+        tile.href = href;
+        tile.target = '_blank';
+        tile.rel = 'noopener';
+    }
+    // Icon only. The name lives in title/aria-label so the tile is
+    // still identifiable on hover and to a screen reader — a row of
+    // unlabelled squares would otherwise be unusable without sight.
+    const label = p.title || hostOf(p.url) || p.url;
+    tile.title = label;
+    tile.setAttribute('aria-label', label);
+
+    const fav = document.createElement('span');
+    fav.className = 'pin-fav';
+
+    // Own element, not text on the container, so hiding it can never
+    // take the icon with it. The tile colour rides on the initials
+    // rather than the container for the same reason: it has to
+    // disappear together with them.
+    const initials = document.createElement('span');
+    initials.className = 'pin-initials';
+    initials.style.background = colorFor(p.url);
+    initials.textContent = initialsFor(p.title, p.url);
+    fav.appendChild(initials);
+
+    // Initials show through if the icon never arrives.
+    if (href) attachFavicon(fav, href);
+    tile.appendChild(fav);
+    return tile;
+}
+
 function renderHome(root) {
     const wrap = document.createElement('div');
     wrap.className = 'home-block';
@@ -1476,44 +1517,7 @@ function renderHome(root) {
 
         const grid = document.createElement('div');
         grid.className = 'pins-grid';
-        for (const p of pins) {
-            // A pin saved as a bare host has no scheme, and a scheme-less href
-            // resolves against this app's origin instead of the web. Only an
-            // http(s) pin is a link; any other scheme is an inert tile.
-            const raw = String(p.url).trim();
-            const href = NM.safeHref(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
-            const tile = document.createElement(href ? 'a' : 'span');
-            tile.className = 'pin-tile' + (href ? '' : ' pin-inert');
-            if (href) {
-                tile.href = href;
-                tile.target = '_blank';
-                tile.rel = 'noopener';
-            }
-            // Icon only. The name lives in title/aria-label so the tile is
-            // still identifiable on hover and to a screen reader — a row of
-            // unlabelled squares would otherwise be unusable without sight.
-            const label = p.title || hostOf(p.url) || p.url;
-            tile.title = label;
-            tile.setAttribute('aria-label', label);
-
-            const fav = document.createElement('span');
-            fav.className = 'pin-fav';
-
-            // Own element, not text on the container, so hiding it can never
-            // take the icon with it. The tile colour rides on the initials
-            // rather than the container for the same reason: it has to
-            // disappear together with them.
-            const initials = document.createElement('span');
-            initials.className = 'pin-initials';
-            initials.style.background = colorFor(p.url);
-            initials.textContent = initialsFor(p.title, p.url);
-            fav.appendChild(initials);
-
-            // Initials show through if the icon never arrives.
-            if (href) attachFavicon(fav, href);
-            tile.appendChild(fav);
-            grid.appendChild(tile);
-        }
+        for (const p of pins) grid.appendChild(pinTile(p));
         wrap.appendChild(grid);
     }
 
@@ -1973,7 +1977,14 @@ function desktopContext() {
         search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
         pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},
         restoreSetAside, discardSetAside, openLegacySettings:openSettings, renderVault:root=>vaultMirror?.render(root), renderMove:root=>moveIn?.render(root),
-        exportDrafts:()=>downloadFile(draftsMarkdown(parkedList()),'text/markdown','tabpaladin-note-drafts.md')
+        exportDrafts:()=>downloadFile(draftsMarkdown(parkedList()),'text/markdown','tabpaladin-note-drafts.md'),
+        // What the desktop sidebar shows (desktopShell.js): the counts the
+        // phone's tab bar shows, who is signed in, and the Inbox.
+        pinTile, signOut,
+        badges:()=>{const st=copyStatus();return{home:st.dirty?Math.max(1,st.editCount||0):0,notes:state.proposals.length,inbox:configured()?inboxCount:0};},
+        who:()=>({signedIn:Boolean(state.config.token),username:localStorage.getItem(LS.username)||'',role:localStorage.getItem(LS.role)||''}),
+        inboxOpen:()=>{const sheet=$('inbox-sheet');return Boolean(sheet)&&!sheet.classList.contains('hidden');},
+        closeInbox:()=>hide($('inbox-sheet'))
     };
 }
 function navigateDesktop(route,id=null) {
@@ -2007,6 +2018,8 @@ function wireDesktop() {
     });
     window.addEventListener('hashchange',desktopRouteFromHash);
     desktopRouteFromHash();
+    // The sidebar's "Synced 5m ago" keeps up while nothing else redraws.
+    setInterval(()=>{if(isDesktop())updateSyncUi();},60000).unref?.();
 }
 
 // --- Workflows: saved tab sessions, now first-class in the web app ---
@@ -4375,6 +4388,7 @@ function syncBottomNav() {
     }
     const notesBtn = $('notesBtn');
     if (notesBtn) notesBtn.classList.toggle('on', state.view === 'notes');
+    desktopUi?.refreshChrome();
 }
 
 // --- Inbox ---
@@ -6843,12 +6857,21 @@ function updateSyncUi() {
     }
     const chip = $('sync-chip');
     if (chip) chip.classList.toggle('dirty', n > 0);
+    // When this copy last met the server (the desktop sidebar's sync block).
+    const time = $('sync-chip-time');
+    if (time) {
+        const when = st && st.lastSyncAt ? NM.relativeTime(st.lastSyncAt) : '';
+        time.textContent = !when ? 'Not synced yet' : when === 'now' ? 'Synced just now'
+            : /^\d+[mh]$/.test(when) ? `Synced ${when} ago` : `Synced ${when}`;
+        time.title = st && st.lastSyncAt ? new Date(st.lastSyncAt).toLocaleString() : '';
+    }
     const nav = $('bottom-nav');
     const badge = nav && nav.querySelector ? nav.querySelector('.sync-badge') : null;
     if (badge) {
         badge.textContent = n > 99 ? '99+' : String(n);
         badge.classList.toggle('hidden', n === 0);
     }
+    desktopUi?.refreshChrome();
 }
 
 // --- The share sheet's prefs and statistics --------------------------------------
@@ -7364,6 +7387,7 @@ function refreshAuthUi() {
     updateOriginNotice();
     if (!signedIn) probeAuthStatus();
     reportHelperSession();
+    desktopUi?.refreshChrome();
 }
 
 // The server in Settings, when it is not the one this app was opened from:

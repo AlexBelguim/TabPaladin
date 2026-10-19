@@ -9,13 +9,13 @@
   <link rel="icon" href="icons/icon192.png">
   <!-- Version query busts browser/proxy caches on each release.
        Bump the number together with SHELL_CACHE in sw.js. -->
-  <link rel="stylesheet" href="app.css?v=36">
-  <link rel="stylesheet" href="desktop.css?v=36">
-  <link rel="stylesheet" href="board.css?v=36">
-  <link rel="stylesheet" href="workflows.css?v=36">
-  <link rel="stylesheet" href="settings.css?v=36">
-  <link rel="stylesheet" href="organize.css?v=36">
-  <link rel="stylesheet" href="notesExtras.css?v=36">
+  <link rel="stylesheet" href="app.css?v=37">
+  <link rel="stylesheet" href="desktop.css?v=37">
+  <link rel="stylesheet" href="board.css?v=37">
+  <link rel="stylesheet" href="workflows.css?v=37">
+  <link rel="stylesheet" href="settings.css?v=37">
+  <link rel="stylesheet" href="organize.css?v=37">
+  <link rel="stylesheet" href="notesExtras.css?v=37">
 </head>
 <body>
   <header id="topbar">
@@ -24,11 +24,12 @@
       <h1>TabPaladin</h1>
     </button>
     <!-- The sync chip: what this device holds that the server does not yet
-         (in the top bar from 900px; on a phone, a count on Home below). -->
+         (in the sidebar from 900px; on a phone, a count on Home below). -->
     <div id="sync-chip" class="sync-chip" role="status">
       <span id="sync-chip-label"></span>
       <button id="sync-chip-push" type="button" class="ghost" title="Push this device's changes to the server">Push</button>
       <button id="sync-chip-pull" type="button" class="ghost" title="Pull the server's tree">Pull</button>
+      <small id="sync-chip-time" class="sync-chip-time"></small>
     </div>
     <button id="helper-status" class="ghost helper-desktop" type="button">Get the TabPaladin helper</button>
     <button id="notesBtn" class="ghost" title="Open notes">📝</button>
@@ -326,7 +327,7 @@
   </div>
 
   <!-- The share core is a classic script: the worker loads the same file. -->
-  <script src="shareCore.js?v=36"></script>
-  <script src="app.js?v=36" type="module"></script>
+  <script src="shareCore.js?v=37"></script>
+  <script src="app.js?v=37" type="module"></script>
 </body>
 </html>
