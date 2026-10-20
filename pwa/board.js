@@ -1,7 +1,7 @@
 import { el, button, walk, visibleRoots, nodeCount, sameAccount } from './desktopCore.js';
 import { ExpandState, OPEN_TABS_KEY, tabGroupKey } from './lib/expandState.js';
 import { TabGrouper } from './lib/tabGrouper.js';
-import { helperUrl } from './helper.js';
+import { helperUrl, keptSummary } from './helper.js';
 let dragging = null;
 const domain = url => { try { return new URL(url).hostname.replace(/^www\./,'') || 'Local files'; } catch { return 'Other'; } };
 export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
@@ -140,7 +140,10 @@ export function createBoard(ctx){
         await ctx.assertAccount(payload.account);
         const result=await ctx.helper.request('tabs.closeSnapshot',{snapshotId:filingSnapshot.snapshotId,tabIds:selected.map(t=>t.tabId),expectedCount:selected.length});
         if(workflowId)await ctx.publishWorkflow?.(workflowId);
-        snapshot=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed. Refresh to file more.');ctx.refresh();
+        snapshot=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed.'+keptSummary(result));ctx.refresh();
+        // A snapshot closes only once: take a fresh one so the next drag works
+        // without pressing Refresh.
+        if(ctx.helper.supports('tabs.snapshot'))refreshTabs().catch(()=>{});
     }
     async function refreshTabs(){
         const account=ctx.account();await ctx.assertAccount(account);

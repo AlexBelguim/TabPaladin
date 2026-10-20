@@ -6,6 +6,13 @@
     const RECENT = 'tpHelperRecentlyClosed';
     const MAX_URL = 8192;
     const LAST_TABS = 'tpHelperLastActiveTabs';
+    // Long enough to pick tabs, name a workflow or drag a few groups on the
+    // Board; every tab is still rechecked against the browser at close time.
+    const SNAPSHOT_TTL = 60 * 60 * 1000;
+    // Firefox can create a tab already unloaded (and titled), so it costs
+    // nothing until it is clicked; Chrome needs the tab discarded once its
+    // address has committed.
+    const CREATE_DISCARDED = typeof browser !== 'undefined' && Boolean(api.runtime && api.runtime.getBrowserInfo);
     let lastNormalWindow = null;
     H.urlAllowed = value => {
         if (typeof value !== 'string' || !value || value.length > MAX_URL || /[\u0000-\u0020\\]/.test(value)) return false;
@@ -20,6 +27,16 @@
     const getWindow = async id => { try { return await api.windows.get(id); } catch (_) { return null; } };
     const allowedTab = (tab, ctx) => tab && !tab.incognito && tab.id !== ctx.sender.tab.id
         && !H.isServer(tab.url, ctx.config) && H.urlAllowed(tab.url);
+    // The same document: a page that only moved to another #fragment since
+    // the snapshot (in-page navigation) is still the page that was saved.
+    const samePage = (a, b) => {
+        if (a === b) return true;
+        try {
+            const x = new URL(a), y = new URL(b);
+            x.hash = ''; y.hash = '';
+            return x.href === y.href;
+        } catch (_) { return false; }
+    };
     const view = tab => ({ tabId: tab.id, url: tab.url, title: String(tab.title || ''),
         pinned: Boolean(tab.pinned), active: Boolean(tab.active), index: tab.index, saveable: true });
 
@@ -76,7 +93,7 @@
         if (body.purpose !== 'save-window' && body.purpose !== 'file') H.fail('bad-args', 'Invalid snapshot purpose.');
         const listed = await H.handlers['tabs.listWindow'](body, ctx);
         const snapshot = { ...listed, snapshotId: H.randomId(), purpose: body.purpose,
-            scope: H.scope(ctx), until: Date.now() + 5 * 60 * 1000 };
+            scope: H.scope(ctx), until: Date.now() + SNAPSHOT_TTL };
         await H.serialized(async () => {
             await H.assertContext(ctx);
             const snapshots = (await H.temporary.get(SNAPSHOTS))[SNAPSHOTS] || {};
@@ -110,7 +127,7 @@
             if (id === ctx.sender.tab.id) reason = 'caller';
             else if (H.isServer(tab.url, ctx.config)) reason = 'server';
             else if (tab.incognito || !H.urlAllowed(tab.url) || !normal(await getWindow(tab.windowId))) reason = 'privileged';
-            else if (tab.url !== saved.url || tab.windowId !== snapshot.windowId) reason = 'navigated';
+            else if (!samePage(tab.url, saved.url) || tab.windowId !== snapshot.windowId) reason = 'navigated';
             else if (snapshot.purpose === 'file' && tab.pinned) reason = 'pinned';
             else if (snapshot.purpose === 'file' && tab.active) reason = 'active';
             if (reason) { kept.push({ tabId: id, reason }); continue; }
@@ -127,7 +144,7 @@
             // storage operation must leave the new page open.
             let current;
             try { current = await api.tabs.get(id); } catch (_) { kept.push({ tabId: id, reason: 'gone' }); continue; }
-            if (current.url !== tab.url || current.incognito || current.windowId !== tab.windowId) {
+            if (!samePage(current.url, tab.url) || current.incognito || current.windowId !== tab.windowId) {
                 kept.push({ tabId: id, reason: 'navigated' }); continue;
             }
             if (snapshot.purpose === 'file' && (current.pinned || current.active)) {
@@ -148,6 +165,50 @@
         return urls;
     }
 
+    // Opening a workflow or "Open All" creates every tab, but only the window's
+    // first tab loads; the rest stay asleep until they are clicked, so dozens
+    // of tabs do not all load at once.
+    async function createSleeping(windowId, item) {
+        if (CREATE_DISCARDED) {
+            try {
+                return await api.tabs.create({ windowId, url: item.url, active: false, discarded: true,
+                    ...(item.title ? { title: String(item.title).slice(0, 300) } : {}) });
+            } catch (_) { /* an older Firefox: create it awake below */ }
+        }
+        const tab = await api.tabs.create({ windowId, url: item.url, active: false });
+        discardOnceCommitted(tab.id);
+        return tab;
+    }
+
+    // Chrome cannot create a tab discarded; discarding before its address has
+    // committed can leave it blank, so wait for the first update that carries
+    // the real URL. A tab the user switches to in the meantime just loads.
+    function discardOnceCommitted(tabId) {
+        if (!api.tabs.discard || !api.tabs.onUpdated) return;
+        let done = false;
+        const stop = () => { done = true; api.tabs.onUpdated.removeListener(onUpdated); clearTimeout(timer); };
+        const attempt = async tab => {
+            if (done || !tab) return;
+            if (tab.active) { stop(); return; }
+            if (!tab.url || tab.url === 'about:blank' || !H.urlAllowed(tab.url)) return;
+            stop();
+            let slept = null;
+            try { slept = await api.tabs.discard(tabId); } catch (_) { return; /* it loads normally */ }
+            // Some Chrome versions give a discarded tab a new id; keep its
+            // workflow tracking pointing at the tab that is really there.
+            if (slept && Number.isInteger(slept.id) && slept.id !== tabId) {
+                await H.serialized(async () => {
+                    const map = await H.getTrackMap();
+                    if (map[tabId]) { map[slept.id] = map[tabId]; delete map[tabId]; await H.setTrackMap(map); }
+                }).catch(() => {});
+            }
+        };
+        const onUpdated = (id, info, tab) => { if (id === tabId && (info.url || info.status)) attempt(tab); };
+        api.tabs.onUpdated.addListener(onUpdated);
+        const timer = setTimeout(stop, 30000);
+        api.tabs.get(tabId).then(attempt).catch(stop);
+    }
+
     async function openItems(items, mode, ctx, tracking) {
         checkedUrls(items.map(item => item.url));
         let win = mode === 'new-window' ? null : await normalWindow(ctx);
@@ -160,7 +221,7 @@
                     win = await api.windows.create({ url: item.url, type: 'normal', incognito: false });
                     if (!normal(win)) H.fail('bad-args', 'A private or app window cannot be used.');
                     tab = (win.tabs || [])[0] || (await api.tabs.query({ windowId: win.id }))[0];
-                } else tab = await api.tabs.create({ windowId: win.id, url: item.url, active: false });
+                } else tab = await createSleeping(win.id, item);
                 if (!tab || tab.incognito || !Number.isInteger(tab.id)) throw new Error('The browser did not return a tab.');
                 if (tracking) {
                     const map = await H.getTrackMap();

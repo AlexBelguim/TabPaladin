@@ -151,6 +151,27 @@ function find(nodes, id) {
     return null;
 }
 
+// Why the helper left tabs open, in words: a close that quietly kept tabs
+// looked like a close that did not happen.
+const KEPT_REASONS = {
+    navigated: 'went to another page since you picked them',
+    active: 'the tab you are looking at',
+    pinned: 'pinned',
+    caller: 'the TabPaladin tab',
+    server: 'on your TabPaladin server',
+    privileged: 'private or browser pages',
+    gone: 'already closed'
+};
+export function keptSummary(result) {
+    const kept = Array.isArray(result?.kept) ? result.kept : [];
+    const real = kept.filter(k => k.reason !== 'gone');
+    if (!real.length) return '';
+    const counts = new Map();
+    for (const k of real) counts.set(k.reason, (counts.get(k.reason) || 0) + 1);
+    const parts = [...counts].map(([reason, n]) => `${n} ${KEPT_REASONS[reason] || reason}`);
+    return ` ${real.length} kept open (${parts.join(', ')}).`;
+}
+
 // Read the committed record, not TreeStore's in-memory view. Closing browser
 // tabs must never depend on a failed write or on the memory-only fallback.
 export async function durableWorkflow(platform, store, workflow, selected) {

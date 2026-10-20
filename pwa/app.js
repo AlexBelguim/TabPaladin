@@ -32,7 +32,7 @@ import { importedFolderFrom, countNodes } from './bookmarksHtml.js';
 import * as NM from './lib/notesModel.js';
 import { createShareSheet } from './shareSheet.js';
 import * as DC from './durableCopy.js';
-import { pageHelper as helper, saveHelperWorkflow, sameHelperAccount, helperUrl, helperRequestId, stagedBookmarkFolder } from './helper.js';
+import { pageHelper as helper, saveHelperWorkflow, sameHelperAccount, helperUrl, helperRequestId, stagedBookmarkFolder, keptSummary } from './helper.js';
 import { StorageManager } from './lib/storageManager.js';
 import { PinsManager } from './lib/pinsManager.js';
 import { createDesktopShell } from './desktopShell.js';
@@ -1765,7 +1765,7 @@ async function completeHelperSave() {
         helperSave = null;
         renderView();
         const closed = Array.isArray(result.closed?.closed) ? result.closed.closed.length : 0;
-        showToast(`Workflow saved; ${closed} tabs closed. ${result.pushed ? 'Pushed to the server.' : 'Push pending: ' + (result.pushError?.message || 'use Push to retry.')}`
+        showToast(`Workflow saved; ${closed} tabs closed.${keptSummary(result.closed)} ${result.pushed ? 'Pushed to the server.' : 'Push pending: ' + (result.pushError?.message || 'use Push to retry.')}`
             + (result.closeError ? ` Tabs kept: ${result.closeError.message}` : ''));
     } catch (e) {
         // A partial or failed durable save is retained, but the snapshot is
@@ -2066,7 +2066,7 @@ async function openWorkflowTabs(folder) {
             if (!account) throw new Error('Sign in to open a tracked workflow.');
             const result = await helper.request('windows.openWorkflow', {
                 requestId: helperRequestId(), workflowId: folder._pwaId, account,
-                items: all.map(t => ({ bookmarkId: t._pwaId, url: t.url })), target: 'new-window'
+                items: all.map(t => ({ bookmarkId: t._pwaId, url: t.url, title: t.title || '' })), target: 'new-window'
             });
             const failed = Array.isArray(result.failed) ? result.failed.length : Number(result.failed) || 0;
             if (failed) showToast(`${failed} tabs could not be opened.`);
