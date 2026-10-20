@@ -6,15 +6,17 @@
    ========================================================================== */
 
 @media (min-width: 900px) {
+  /* Full width beside the sidebar, like every other desktop page: a capped
+     Home left a wide empty band on the right of a large screen. */
   .desktop-page.page-home {
-    max-width: calc(1100px + 72px);
+    max-width: none;
     padding-top: 22px;
   }
 
   /* ---------- search ---------- */
   .home-search-block { padding: 18px 0 30px; }
   .page-home .home-search {
-    max-width: 680px;
+    max-width: none;
     gap: 12px;
     padding: 13px 17px;
     border-radius: 12px;
