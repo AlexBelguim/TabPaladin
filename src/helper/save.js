@@ -123,20 +123,33 @@
         return run;
     };
 
+    // A video opens where it belongs: a Short in the Shorts player, the rest
+    // on the video page.
+    const watchUrl = (pl, i) => pl.shorts && pl.shorts[i] === false
+        ? 'https://www.youtube.com/watch?v=' + pl.ids[i] : 'https://www.youtube.com/shorts/' + pl.ids[i];
+
     H.handlers['youtube.playlist'] = async (body, ctx) => {
         await H.assertContext(ctx);
-        const ids = [...new Set(Array.isArray(body.ids) ? body.ids.filter(id => typeof id === 'string' && ID.test(id)) : [])].slice(0, 1000);
-        if (!ids.length) H.fail('bad-args', 'No YouTube Shorts in this folder.');
+        // videos: [{id, short}]; ids: Shorts only (helper 1.10's web app).
+        const given = Array.isArray(body.videos) ? body.videos : Array.isArray(body.ids) ? body.ids.map(id => ({ id, short: true })) : [];
+        const ids = [], shorts = [];
+        for (const v of given) {
+            if (!v || typeof v.id !== 'string' || !ID.test(v.id) || ids.includes(v.id)) continue;
+            ids.push(v.id);
+            shorts.push(v.short !== false);
+            if (ids.length >= 5000) break;
+        }
+        if (!ids.length) H.fail('bad-args', 'No YouTube videos in this folder.');
         const registered = api.scripting && api.scripting.getRegisteredContentScripts
             && (await api.scripting.getRegisteredContentScripts({ ids: [YOUTUBE_ID] })).length;
         if (!registered) H.fail('youtube-off', 'Turn on the YouTube button in helper Settings first.');
         const win = await api.windows.get(ctx.sender.tab.windowId);
-        const tab = await api.tabs.create({ url: 'https://www.youtube.com/shorts/' + ids[0], active: true,
+        const tab = await api.tabs.create({ url: watchUrl({ ids, shorts }, 0), active: true,
             ...(win && win.type === 'normal' && !win.incognito ? { windowId: win.id } : {}) });
         const title = String(body.title || '').slice(0, 200);
         await withPlaylists((all) => {
             for (const k of Object.keys(all)) if (Date.now() - all[k].at > 7 * 24 * 3600 * 1000) delete all[k];
-            all[tab.id] = { title, ids, index: 0, at: Date.now() };
+            all[tab.id] = { title, ids, shorts, index: 0, at: Date.now() };
         });
         return { tabId: tab.id, count: ids.length };
     };
@@ -169,7 +182,7 @@
                 if (next < 0 || next >= pl.ids.length) return { end: true };
                 pl.index = next;
                 pl.at = Date.now();
-                return { url: 'https://www.youtube.com/shorts/' + pl.ids[next] };
+                return { url: watchUrl(pl, next) };
             }
             return {};
         }).then(r => reply({ ok: true, ...r }), e => reply({ ok: false, message: e.message }));

@@ -114,6 +114,14 @@
         return null;
     };
 
+    // Rows the button was put in and YouTube hid or clipped it.
+    const clippedRows = new WeakSet();
+    // Drawn with a size and inside the row's box (not cut off by it).
+    const drawn = (el, row) => {
+        const r = el.getBoundingClientRect(), box = (row.closest('#actions') || row.parentElement || row).getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.left >= box.left - 1 && r.right <= box.right + 1;
+    };
+
     // The like button's slot in the Shorts column: climb from the like button
     // to the first ancestor that stacks it with the other buttons.
     function shortsSlot() {
@@ -139,10 +147,17 @@
         if (sincePath !== location.pathname) { sincePath = location.pathname; since = Date.now(); }
         let placed = false;
         if (watch) {
+            // Right after the like/dislike button: what comes later in that
+            // row YouTube may fold into its "…" menu, or clip.
             const row = first(WATCH_ROW);
-            if (row && row.parentElement) {
+            if (row && !clippedRows.has(row)) {
                 placed = true;
-                if (!row.parentElement.querySelector(':scope > .' + CLASS)) row.parentElement.insertBefore(makeButton(false), row.nextSibling);
+                if (!row.querySelector(':scope > .' + CLASS)) {
+                    const btn = makeButton(false);
+                    row.insertBefore(btn, row.firstElementChild ? row.firstElementChild.nextSibling : null);
+                    // Still not drawn a moment later: float instead.
+                    setTimeout(() => { if (btn.isConnected && !drawn(btn, row)) { clippedRows.add(row); btn.remove(); schedule(); } }, 800);
+                }
             }
         } else {
             const slot = shortsSlot();
@@ -300,8 +315,12 @@
     const typing = (t) => t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
     const onShorts = () => location.pathname.startsWith('/shorts/');
     window.addEventListener('keydown', (e) => {
-        if (!playlist || !onShorts() || typing(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
-        const dir = e.key === 'ArrowDown' || e.key === 'PageDown' ? 1 : e.key === 'ArrowUp' || e.key === 'PageUp' ? -1 : 0;
+        if (!playlist || typing(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
+        // Shorts: the arrows and Page keys. Video page: Shift+N / Shift+P,
+        // YouTube's own next and previous in a playlist.
+        const dir = onShorts()
+            ? (e.key === 'ArrowDown' || e.key === 'PageDown' ? 1 : e.key === 'ArrowUp' || e.key === 'PageUp' ? -1 : 0)
+            : (e.shiftKey && (e.key === 'N' || e.key === 'n') ? 1 : e.shiftKey && (e.key === 'P' || e.key === 'p') ? -1 : 0);
         if (!dir) return;
         e.preventDefault();
         e.stopImmediatePropagation();

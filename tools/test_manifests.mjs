@@ -40,7 +40,7 @@ check('Chrome: only the warning-free menu permission is added to 1.0.0', sorted(
 check('Firefox: only the warning-free menu permission is added to 1.0.0', sorted(firefox.permissions) === sorted([...PERMISSIONS, 'menus']), sorted(firefox.permissions));
 check('Chrome: all-sites access stays optional', sorted(chrome.optional_host_permissions) === '["<all_urls>"]' && !chrome.host_permissions);
 check('Firefox: all-sites access stays optional', sorted(firefox.optional_permissions) === '["<all_urls>"]');
-check('the X and Instagram feeds release is 1.11.0', chrome.version === '1.11.0');
+check('the X and Instagram feeds release is 1.11.1', chrome.version === '1.11.1');
 check('Firefox loads the feed helper before the router', ffScriptsOf(firefox).indexOf('../src/helper/feed.js') > -1 && ffScriptsOf(firefox).indexOf('../src/helper/feed.js') < ffScriptsOf(firefox).indexOf('../src/helper/router.js'));
 check('Firefox loads the save helper before the router', ffScriptsOf(firefox).indexOf('../src/helper/save.js') > -1 && ffScriptsOf(firefox).indexOf('../src/helper/save.js') < ffScriptsOf(firefox).indexOf('../src/helper/router.js'));
 const ffScripts = ffScriptsOf(firefox);

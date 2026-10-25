@@ -56,7 +56,7 @@
         for (const url of Array.isArray(body.urls) ? body.urls : []) {
             const key = typeof url === 'string' && url.length <= 2048 ? postKey(url) : null;
             if (key && !keys.some(k => sameKey(k, key))) keys.push(key);
-            if (keys.length >= 1000) break;
+            if (keys.length >= 5000) break;
         }
         if (!keys.length) H.fail('bad-args', 'No X or Instagram posts in this folder.');
         const registered = api.scripting && api.scripting.getRegisteredContentScripts

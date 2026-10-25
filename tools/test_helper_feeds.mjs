@@ -79,5 +79,16 @@ check('the Short learns it is 1 of 2', r.playlist && r.playlist.index === 0 && r
 r = await send({ channel: 'tp-youtube-playlist', op: 'go', to: 1, url: 'https://www.youtube.com/shorts/aaaaaa1' }, 'https://www.youtube.com/shorts/aaaaaa1', ytTab.id);
 check('a typed number goes to that Short', r.url === 'https://www.youtube.com/shorts/bbbbbb2', r);
 
+// A folder of videos and Shorts: each opens where it belongs.
+const mixed = await H.handlers['youtube.playlist']({ title: 'music', videos: [{ id: 'vvvvvv1', short: false }, { id: 'ssssss2', short: true }, { id: 'vvvvvv3', short: false }] }, ctx);
+const mixedTab = tabs.at(-1);
+check('a video opens on the video page, not as a Short', mixedTab.url === 'https://www.youtube.com/watch?v=vvvvvv1' && mixed.count === 3, mixedTab);
+r = await send({ channel: 'tp-youtube-playlist', op: 'get', url: 'https://www.youtube.com/watch?v=vvvvvv1&t=3' }, 'https://www.youtube.com/watch?v=vvvvvv1&t=3', mixedTab.id);
+check('the video page learns it is 1 of 3', r.playlist && r.playlist.index === 0 && r.playlist.count === 3, r);
+r = await send({ channel: 'tp-youtube-playlist', op: 'go', dir: 1, url: 'https://www.youtube.com/watch?v=vvvvvv1' }, 'https://www.youtube.com/watch?v=vvvvvv1', mixedTab.id);
+check('next is the Short, in the Shorts player', r.url === 'https://www.youtube.com/shorts/ssssss2', r);
+r = await send({ channel: 'tp-youtube-playlist', op: 'go', dir: 1, url: 'https://www.youtube.com/shorts/ssssss2' }, 'https://www.youtube.com/shorts/ssssss2', mixedTab.id);
+check('and then the next video on the video page', r.url === 'https://www.youtube.com/watch?v=vvvvvv3', r);
+
 console.log(failures ? `\n${failures} failed` : '\nAll helper feed checks passed');
 process.exit(failures ? 1 : 0);

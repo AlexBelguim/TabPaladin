@@ -3,7 +3,9 @@
  * In a tab the helper opened for a folder (src/helper/feed.js), a panel
  * shows where in the folder this post is, and its arrows, the J and K keys,
  * or a typed number go to the next, previous or numbered post of the folder.
- * Scrolling is left alone: it is how replies and comments are read.
+ * On a post, scrolling is left alone: it is how replies and comments are
+ * read. On an Instagram reel, which scrolls to the next reel of Instagram's
+ * own feed, the wheel and the up/down keys go through the folder instead.
  */
 
 (function () {
@@ -26,12 +28,27 @@
         }
     };
 
+    // An Instagram reel: its page scrolls on to Instagram's next reel.
+    const onReel = () => /(^|\.)instagram\.com$/.test(location.hostname) && /^\/(?:[^/]+\/)?reels?\//.test(location.pathname);
+
     async function check() {
         lastHref = location.href;
         if (!enabled) return;
+        const was = feed;
         const reply = await ask({ op: 'get' });
         feed = reply && reply.ok && reply.feed ? reply.feed : null;
         turning = false;
+        if (!feed && was && onReel()) {
+            // Instagram's own arrow or swipe went on to a reel of its feed:
+            // the folder's next one instead (its last, at the end).
+            feed = was;
+            turning = true;
+            const next = await ask({ op: 'go', to: was.index + 1 });
+            const target = next && next.url ? next : await ask({ op: 'go', to: was.index });
+            if (target && target.url) { location.assign(target.url); return; }
+            feed = null;
+            turning = false;
+        }
         draw();
     }
 
@@ -124,11 +141,33 @@
         down.style.opacity = down.disabled ? '0.4' : '1';
     }
 
-    // J next, K previous: X's own keys for that, taken over in a feed tab.
+    // An Instagram reel: the wheel goes through the folder, as on a Short.
+    // Comments and other dialogs still scroll themselves.
+    let wheelSum = 0, wheelAt = 0;
+    window.addEventListener('wheel', (e) => {
+        if (!feed || !onReel() || e.ctrlKey) return;
+        if (e.target && e.target.closest && e.target.closest('[role="dialog"], #' + PANEL)) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const now = Date.now();
+        if (now - wheelAt > 300) wheelSum = 0;
+        wheelAt = now;
+        wheelSum += e.deltaY;
+        if (Math.abs(wheelSum) >= 60) {
+            const dir = wheelSum > 0 ? 1 : -1;
+            wheelSum = 0;
+            go(dir);
+        }
+    }, { capture: true, passive: false });
+
+    // J next, K previous: X's own keys for that, taken over in a feed tab;
+    // on an Instagram reel, the up and down keys too.
     const typing = (t) => t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || (t.closest && t.closest('[contenteditable="true"], [role="textbox"]')));
     window.addEventListener('keydown', (e) => {
         if (!feed || typing(e.target) || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-        const dir = e.key === 'j' || e.key === 'J' ? 1 : e.key === 'k' || e.key === 'K' ? -1 : 0;
+        const reel = onReel();
+        const dir = e.key === 'j' || e.key === 'J' || (reel && (e.key === 'ArrowDown' || e.key === 'PageDown')) ? 1
+            : e.key === 'k' || e.key === 'K' || (reel && (e.key === 'ArrowUp' || e.key === 'PageUp')) ? -1 : 0;
         if (!dir) return;
         e.preventDefault();
         e.stopImmediatePropagation();

@@ -25,23 +25,27 @@ const youTubeVideo = url => {
         return id && /^[A-Za-z0-9_-]{6,20}$/.test(id) ? { id, short: u.pathname.startsWith('/shorts/') } : null;
     } catch { return null; }
 };
-// A YouTube folder played in order. All Shorts: the Shorts player, where the
-// helper's YouTube script makes the arrows, wheel and keys go through this
-// folder. Anything else (or without that script): YouTube's own temporary
-// playlist, which holds 50 videos.
+// Why the helper cannot do `op` for this page: not connected, or the page
+// still has the list of what the helper could do from before an update.
+function helperLacks(ctx, op, what) {
+    if (ctx.helper.supports(op)) return null;
+    if (ctx.helper.status !== 'ready') return what + ' needs the TabPaladin helper: connect it in its Settings.';
+    const v = ctx.helper.hello && ctx.helper.hello.helperVersion;
+    return 'This page still sees helper ' + (v || 'an older version') + '. Reload this page (Ctrl+R) after updating the helper.';
+}
+// A YouTube folder played in order, in any number, in the folder's own
+// player: the helper opens the first video in a tab that keeps the folder;
+// there its panel, arrows and keys (and a video's end) go through it.
 export async function playYouTube(ctx, title, nodes) {
     const vids = nodes.map(n => youTubeVideo(n.url)).filter(Boolean);
     if (!vids.length) { ctx.toast('No YouTube videos in ' + title + '.'); return; }
-    if (vids.every(v => v.short) && ctx.helper.supports('youtube.playlist')) {
-        try { await ctx.helper.request('youtube.playlist', { title, ids: vids.map(v => v.id) }); return; }
-        catch (x) {
-            if (x.code !== 'youtube-off') throw x;
-            ctx.toast('Turn on the YouTube button in helper Settings to scroll these Shorts as a playlist.');
-        }
+    const lacks = helperLacks(ctx, 'youtube.playlist', 'Playing a folder');
+    if (lacks) { ctx.toast(lacks); return; }
+    try { await ctx.helper.request('youtube.playlist', { title, videos: vids }); }
+    catch (x) {
+        if (x.code === 'youtube-off') { ctx.toast('Turn on the YouTube button in helper Settings first.'); return; }
+        throw x;
     }
-    const ids = [...new Set(vids.map(v => v.id))];
-    if (ids.length > 50) ctx.toast('A YouTube playlist holds 50 videos: playing the first 50 of ' + ids.length + '.');
-    ctx.openExternal('https://www.youtube.com/watch_videos?video_ids=' + ids.slice(0, 50).join(','));
 }
 // A saved X or Instagram post (not a profile or a page of the site).
 const isPost = url => {
@@ -56,7 +60,8 @@ const isPost = url => {
 export async function openFeed(ctx, title, nodes) {
     const urls = nodes.map(n => n.url).filter(isPost);
     if (!urls.length) { ctx.toast('No X or Instagram posts in ' + title + '.'); return; }
-    if (!ctx.helper.supports('feed.open')) { ctx.toast('Feeds need the TabPaladin helper (1.11 or later).'); return; }
+    const lacks = helperLacks(ctx, 'feed.open', 'A feed');
+    if (lacks) { ctx.toast(lacks); return; }
     try { await ctx.helper.request('feed.open', { title, urls }); }
     catch (x) {
         if (x.code === 'feeds-off') { ctx.toast('Turn on "Feeds for X and Instagram" in helper Settings first.'); return; }
