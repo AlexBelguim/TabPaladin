@@ -551,6 +551,19 @@ app.post('/api/apps/folder', requireAuth, (req, res) => {
     res.json({ ok: true, ...made, userId: req.user.id, serverId: SERVER_ID });
 });
 
+// Take a link out of folders it is in (the share sheet's "already here"):
+// [{id, url}] bookmarks, each removed only while it is still that bookmark
+// with that URL, logged as an unappend so copies fold it in without a push.
+app.post('/api/items/remove-bookmarks', requireAuth, (req, res) => {
+    const list = (req.body || {}).items;
+    if (!Array.isArray(list) || !list.length || list.length > 100
+        || list.some(it => !it || typeof it.id !== 'string' || !it.id || typeof it.url !== 'string' || !it.url)) {
+        return res.status(400).json({ error: 'Expected up to 100 {id, url} bookmarks.' });
+    }
+    const out = items.forUser(req.user.id).removeAppended(list.map(it => ({ id: it.id, kind: 'bookmark', url: it.url })));
+    res.json({ ok: true, ...out, userId: req.user.id, serverId: SERVER_ID });
+});
+
 // --- Shared links ---
 // The share sheet's inbox and filing (/api/shares*), the tree's ops log
 // (/api/tree/ops) and the old /api/shared routes over the same rows.

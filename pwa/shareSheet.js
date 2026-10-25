@@ -94,6 +94,9 @@ export function createShareSheet(ctx) {
     let s = null;          // the open sheet's state, or null
     let inbox = { pending: [], filed: [], entries: [], loadedAt: 0 };
     let pressTimer = null;
+    // A chip tapped once to take the link out of its folder: tapped again
+    // within three seconds, it goes.
+    let arming = null;
 
     const appOf = () => (s && (s.app || (s.url ? S().appOf(s.url) : null))) || 'site:unknown';
     const label = () => S().appLabel(appOf());
@@ -760,6 +763,42 @@ export function createShareSheet(ctx) {
         }, h('span', { class: 'share-chip-name', text }), h('span', { class: 'share-chip-path', text: st.kind === 'app-folder' ? 'in Bookmarks' : 'name it, pick where' }));
     }
 
+    // Take the link out of a folder it is already in. Its own earlier filing
+    // goes back through the share; a bookmark from anywhere else is removed
+    // as long as it is still that link, and every copy folds that in.
+    async function removeFrom(folderId) {
+        if (!s || !accountOk()) return;
+        const sid = s.sid, c = ctx.copy();
+        const mine = s.saved.get(folderId);
+        const name = labelOf(folderId);
+        s.pending.add(folderId);
+        render();
+        try {
+            if (mine && s.share) {
+                const res = await ctx.api(`/api/shares/${encodeURIComponent(ref())}/unfile`, { method: 'POST', body: JSON.stringify({ folderIds: [folderId], ...expect() }) });
+                ctx.applyUnfiled(res);
+                if (s && s.sid === sid) s.share = res.share || s.share;
+            }
+            const left = c.ready ? c.index.marksIn(s.urlKey, folderId).filter(m => !mine || m.id !== mine.bookmarkId) : [];
+            if (left.length) {
+                const res = await ctx.api('/api/items/remove-bookmarks', { method: 'POST', body: JSON.stringify({ items: left }) });
+                ctx.applyUnfiled(res);
+                if ((res.gone || []).length) throw new Error('push first: the server has not seen it there');
+            }
+            if (!s || s.sid !== sid) return;
+            s.saved.delete(folderId);
+            s.holding = (s.holding || []).filter(id => id !== folderId);
+            s.message = null;
+            ctx.toast(`Removed from ${name}`);
+        } catch (e) {
+            if (s && s.sid === sid) s.message = `Couldn't remove it from ${name}: ${(e.body && e.body.error) || e.message}`;
+        }
+        if (!s || s.sid !== sid) return;
+        s.pending.delete(folderId);
+        render();
+        refreshInbox();
+    }
+
     function chipEl(chip, i, c) {
         const folder = c.index.folders.get(chip.folderId);
         if (!folder) return h('span', { class: 'share-chip share-chip-gone' });
@@ -772,13 +811,26 @@ export function createShareSheet(ctx) {
             saved ? (saved.already ? 'already' : 'saved') : '', already ? 'already' : '',
             failed ? 'missing' : '', pending ? 'pending' : '', queued ? 'queued' : '',
             chip.reason === 'pinned' ? 'pinned' : ''].filter(Boolean).join(' ');
-        const meta = saved ? (saved.already ? '✓ already here' : '✓ Saved') : already ? '✓ already here'
+        // "Already here" (from before this sheet) can be taken out: tap twice.
+        const removable = !pending && (already || (saved && saved.already));
+        const armed = removable && arming === chip.folderId;
+        const meta = armed ? 'Tap again to remove' : saved ? (saved.already ? '✓ already here · tap to remove' : '✓ Saved') : already ? '✓ already here · tap to remove'
             : failed ? 'not saved' : queued ? '⏳ when online' : chipMeta(chip, folder);
         const el = h('button', {
-            class: cls, type: 'button', role: 'listitem', disabled: Boolean(saved || already || pending),
+            class: cls + (armed ? ' armed' : ''), type: 'button', role: 'listitem', disabled: Boolean((saved && !removable) || pending),
             dataset: { folderId: chip.folderId, n: String(i + 1) },
             title: S().fullPath(folder, c.index),
-            onclick: () => { if (!saved && !already && !pending) file([{ folderId: chip.folderId }], [folder.title]); },
+            onclick: () => {
+                if (pending) return;
+                if (removable) {
+                    if (arming === chip.folderId) { arming = null; removeFrom(chip.folderId); return; }
+                    arming = chip.folderId;
+                    render();
+                    setTimeout(() => { if (arming === chip.folderId) { arming = null; if (s) render(); } }, 3000);
+                    return;
+                }
+                if (!saved && !already) file([{ folderId: chip.folderId }], [folder.title]);
+            },
             oncontextmenu: (e) => { e.preventDefault(); openMenu(chip.folderId); }
         },
         h('span', { class: 'share-chip-name', text: folder.title || '(unnamed)' }),

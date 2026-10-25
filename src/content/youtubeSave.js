@@ -195,10 +195,10 @@
         drawPanel();
     }
 
-    async function go(dir) {
+    async function go(dir, to = null) {
         if (!playlist || turning) return;
         turning = true;
-        const reply = await ask({ op: 'go', dir });
+        const reply = await ask(to === null ? { op: 'go', dir } : { op: 'go', to });
         if (reply && reply.ok && reply.url) { location.assign(reply.url); return; }
         turning = false;
         if (reply && reply.end) note(dir > 0 ? 'End of ' + (playlist.title || 'the folder') : 'Start of ' + (playlist.title || 'the folder'));
@@ -209,10 +209,40 @@
         b.type = 'button';
         b.textContent = text;
         b.title = title;
+        b.dataset.dir = String(dir);
         Object.assign(b.style, { width: '56px', height: '56px', borderRadius: '50%', border: '0', cursor: 'pointer', fontSize: '22px',
             color: 'var(--yt-spec-text-primary, #f1f1f1)', background: 'var(--yt-spec-badge-chip-background, rgba(255,255,255,0.1))' });
         b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); go(dir); });
         return b;
+    }
+
+    function askNumber(panel, pos) {
+        if (!playlist) return;
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '1';
+        input.max = String(playlist.count);
+        input.value = String(playlist.index + 1);
+        input.setAttribute('aria-label', 'Number in this folder, 1 to ' + playlist.count);
+        Object.assign(input.style, { width: '64px', textAlign: 'center', font: 'inherit', color: 'inherit', borderRadius: '8px',
+            border: '1px solid rgba(255,255,255,0.3)', background: 'rgba(0,0,0,0.4)', padding: '4px' });
+        let finished = false;
+        const finish = (jump) => {
+            if (finished) return;
+            finished = true;
+            const n = Math.round(Number(input.value));
+            input.replaceWith(pos);
+            if (jump && n >= 1 && n <= playlist.count && n - 1 !== playlist.index) go(0, n - 1);
+        };
+        input.addEventListener('keydown', (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') finish(true);
+            else if (e.key === 'Escape') finish(false);
+        });
+        input.addEventListener('blur', () => finish(false));
+        pos.replaceWith(input);
+        input.focus();
+        input.select();
     }
 
     function note(text) {
@@ -247,14 +277,20 @@
             const title = document.createElement('div');
             title.dataset.title = '';
             Object.assign(title.style, { fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '120px' });
-            const pos = document.createElement('div');
+            // Click the "2 / 12" to type where in the folder to go.
+            const pos = document.createElement('button');
+            pos.type = 'button';
             pos.dataset.pos = '';
+            pos.title = 'Go to a number in this folder';
+            Object.assign(pos.style, { border: '0', background: 'transparent', color: 'inherit', font: 'inherit', cursor: 'text', padding: '4px 6px' });
+            pos.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); askNumber(panel, pos); });
             panel.append(title, roundButton('▲', 'Previous in this folder', -1), pos, roundButton('▼', 'Next in this folder', 1));
             document.body.append(panel);
         }
         panel.querySelector('[data-title]').textContent = '📥 ' + (playlist.title || 'TabPaladin');
-        panel.querySelector('[data-pos]').textContent = (playlist.index + 1) + ' / ' + playlist.count;
-        const [up, down] = panel.querySelectorAll('button');
+        const pos = panel.querySelector('[data-pos]');
+        if (pos) pos.textContent = (playlist.index + 1) + ' / ' + playlist.count;
+        const up = panel.querySelector('[data-dir="-1"]'), down = panel.querySelector('[data-dir="1"]');
         up.disabled = playlist.index === 0;
         down.disabled = playlist.index === playlist.count - 1;
         up.style.opacity = up.disabled ? '0.4' : '1';

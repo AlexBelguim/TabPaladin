@@ -1863,6 +1863,8 @@ body.share-open .sheet:not(.share-sheet) { z-index: 35; }
   opacity: 1;
 }
 .share-chip.saved .share-chip-meta, .share-chip.already .share-chip-meta { color: #86efac; font-weight: 600; }
+.share-chip.already.armed { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.6); }
+.share-chip.already.armed .share-chip-meta { color: #fca5a5; }
 .share-chip.queued { border-color: rgba(245, 158, 11, 0.55); }
 .share-chip.queued .share-chip-meta { color: #fcd34d; }
 .share-chip.missing .share-chip-name { text-decoration: line-through; color: var(--muted); }

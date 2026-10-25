@@ -164,7 +164,8 @@
                 return { playlist: { title: pl.title, index: at, count: pl.ids.length } };
             }
             if (message.op === 'go') {
-                const next = (at >= 0 ? at : pl.index) + (message.dir === -1 ? -1 : 1);
+                // dir: one step; to: a place in the folder, typed into the panel.
+                const next = Number.isInteger(message.to) ? message.to : (at >= 0 ? at : pl.index) + (message.dir === -1 ? -1 : 1);
                 if (next < 0 || next >= pl.ids.length) return { end: true };
                 pl.index = next;
                 pl.at = Date.now();

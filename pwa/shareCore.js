@@ -825,6 +825,7 @@
         const folders = new Map();
         const list = [];
         const byKey = new Map();
+        const marks = new Map();
         let bookmarksRootId = null;
         const appFolders = {};
         const walk = (node, parent, depth) => {
@@ -855,6 +856,8 @@
                     const key = dedupeKey(c.url);
                     if (!byKey.has(key)) byKey.set(key, []);
                     if (!byKey.get(key).includes(id)) byKey.get(key).push(id);
+                    if (!marks.has(key)) marks.set(key, []);
+                    marks.get(key).push({ folderId: id, id: String(c.id), url: c.url });
                 } else if (c && c.kind === 'folder') {
                     walk(c, f, depth + 1);
                 }
@@ -864,7 +867,9 @@
         return {
             folders, list, bookmarksRootId, appFolders,
             // The folders already holding this link.
-            holding: (urlKey) => (byKey.get(urlKey) || []).map(id => folders.get(id)).filter(Boolean)
+            holding: (urlKey) => (byKey.get(urlKey) || []).map(id => folders.get(id)).filter(Boolean),
+            // The bookmarks of this link in one folder: [{id, url}].
+            marksIn: (urlKey, folderId) => (marks.get(urlKey) || []).filter(m => m.folderId === folderId).map(({ id, url }) => ({ id, url }))
         };
     }
 
