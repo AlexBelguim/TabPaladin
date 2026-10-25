@@ -26,6 +26,9 @@ const folderStats = children => {
     const folders = children.filter(n => n.kind === 'folder').length, marks = children.filter(n => n.kind === 'bookmark').length;
     return [folders ? folders + ' 📁' : '', marks ? marks + ' 📄' : ''].filter(Boolean).join(' · ') || 'Empty';
 };
+// Kept out of the Board's folder cards: the Workflows column shows its own
+// folder wherever it sits, and pins and notes have pages of their own.
+const ROLE_FOLDERS = new Set(['workflows', 'pins', 'notes']);
 const tool = (label, title, handler, className = 'icon-btn') => { const b = button(label, handler, className); b.title = title; return b; };
 function favicon(url) {
     if (!/^https?:/i.test(url || '')) return el('span', { className: 'bm-icon bm-icon-none', 'aria-hidden': 'true' });
@@ -37,7 +40,9 @@ export function createFolderCards(ctx){
     let generation=0;const timers=new Set();
     const budget=()=>({remaining:2000,controllers:[]});
     // lead: an element shown between the header and the body (Workflows' bar).
-    function card(node,{depth=0,budget:pool=budget(),lead=null}={}){
+    // extra: other folders listed inside this one after its own (the Bookmarks
+    // column holds the other top-level folders).
+    function card(node,{depth=0,budget:pool=budget(),lead=null,extra=[]}={}){
         const readOnly=node.virtual||node.readOnly||String(node.id).startsWith('imp:')||String(node.id).startsWith('imports:');
         const box=el('section',{className:'board-card'+(depth?' nested':' board-column')+(readOnly?' is-imports':'')+(node.role==='workflows'?' is-workflows':''),dataset:{folderId:node.id}}),head=el('div',{className:'board-heading'}),body=el('div',{className:'board-body'});
         let open=ExpandState.isOpen(node.id,depth===0),filled=false,limit=200;
@@ -47,7 +52,7 @@ export function createFolderCards(ctx){
         toggle.append(caret,el('span',{className:'folder-icon','aria-hidden':'true',text:readOnly?'📥':node.role==='workflows'?'💾':'📁'}),
             el('span',{className:'folder-title',text:node.title||'Untitled'}));
         if(readOnly)toggle.append(el('span',{className:'imports-badge',text:'synced'}));
-        toggle.append(el('span',{className:'folder-stats',text:folderStats(node.children||[])}));
+        toggle.append(el('span',{className:'folder-stats',text:folderStats((node.children||[]).filter(n=>!ROLE_FOLDERS.has(n.role)).concat(extra))}));
         const actions=el('div',{className:'board-tools'});
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
         const many=loose().length;
@@ -57,7 +62,8 @@ export function createFolderCards(ctx){
         if(!readOnly){
             if(ctx.split)actions.append(tool('✨ Split','Sort the loose bookmarks here by keyword',()=>ctx.split(node.id),'icon-btn tool-split'));
             actions.append(tool('＋📁','New folder inside '+(node.title||'this folder'),async()=>{const title=prompt('New subfolder');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:node.id,kind:'folder',title:title.trim()}));}));
-            if(!node.role)actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}},'icon-btn danger'));
+            // A folder holding Workflows, pins or notes (shown elsewhere) is not deleted from here.
+            if(!node.role&&!walk(node.children||[]).some(n=>ROLE_FOLDERS.has(n.role)))actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}},'icon-btn danger'));
         }
         actions.append(tool('›','Browse '+(node.title||'this folder')+' in Organize',()=>ctx.navigate('organize',node.id)));
         if(!readOnly){
@@ -81,7 +87,7 @@ export function createFolderCards(ctx){
         }
         head.append(toggle,actions);box.append(head);if(lead)box.append(lead);box.append(body);
         function fill(){body.hidden=!open;caret.textContent=open?'▾':'▸';toggle.setAttribute('aria-expanded',String(open));box.classList.toggle('is-open',open);if(!open||filled)return;filled=true;
-            const children=node.children||[];const folders=children.filter(n=>n.kind==='folder');
+            const children=node.children||[];const folders=[...children.filter(n=>n.kind==='folder'&&!ROLE_FOLDERS.has(n.role)),...extra];
             for(const sub of folders)body.append(card(sub,{depth:depth+1,budget:pool}));
             const groups=new Map();for(const b of children.filter(n=>n.kind==='bookmark')){const key=domain(b.url);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(b);}
             let shown=0;
@@ -113,15 +119,35 @@ export function createFolderCards(ctx){
     return {card,budget,restore:()=>{},destroy(){generation++;for(const t of timers)clearTimeout(t);timers.clear();}};
 }
 export function createBoard(ctx){
-    let snapshot=null,windowId=null,settings={},rootRef=null,smart=true,groupsOverride=null;
-    const accountAtSnapshot=()=>snapshot?.account;
+    // listed: the window's tabs as shown, read without a click (tabs.listWindow).
+    // Filing needs a snapshot, which needs one: it is taken as a drag starts.
+    let listed=null,listing=null,listError=null,snapshotTake=null,stale=false,windowId=null,settings={},rootRef=null,smart=true,groupsOverride=null;
     const localCtx={...ctx,fileTabs,split:id=>ctx.split(id)};
     const cards=createFolderCards(localCtx);
+    const sameTabs=(a,b)=>JSON.stringify((a||[]).map(t=>[t.tabId,t.url,t.title]))===JSON.stringify((b||[]).map(t=>[t.tabId,t.url,t.title]));
+    function listTabs(){
+        if(listing)return listing;
+        listing=(async()=>{
+            const before=listed,error=listError;
+            try{const body={};if(windowId!=null)body.windowId=windowId;listed=await ctx.helper.request('tabs.listWindow',body);listError=null;}
+            catch(x){listError=x.message;}
+            finally{listing=null;}
+            if(listError!==error||!before||!sameTabs(before.tabs,listed?.tabs)){groupsOverride=null;if(rootRef?.isConnected&&!dragging)ctx.refresh();}
+        })();
+        return listing;
+    }
+    const relist=()=>{listError=null;return listTabs();};
+    function takeSnapshot(){
+        const account=ctx.account(),body={purpose:'file'};if(windowId!=null)body.windowId=windowId;
+        snapshotTake=ctx.helper.request('tabs.snapshot',body).then(got=>({...got,account}));snapshotTake.catch(()=>{});
+    }
+    const dragTabs=(elm,payload)=>{drag(elm,payload,ctx);elm.addEventListener('dragstart',takeSnapshot);};
     async function fileTabs(payload,targetId){
-        const filingSnapshot=snapshot;
-        if(!filingSnapshot||filingSnapshot.snapshotId!==payload.snapshotId||!sameAccount(accountAtSnapshot(),ctx.account()))throw new Error('Refresh the tab snapshot before filing.');
-        const selected=payload.tabs.filter(t=>filingSnapshot.tabs.some(s=>s.tabId===t.tabId&&s.url===t.url));
-        if(!selected.length||selected.length!==payload.tabs.length)throw new Error('The tab snapshot changed. No tabs were closed.');
+        if(!snapshotTake)throw new Error('Drag the tabs again.');
+        const filingSnapshot=await snapshotTake;
+        if(!sameAccount(filingSnapshot.account,ctx.account()))throw new Error('The account changed; nothing was filed.');
+        const selected=payload.tabs.map(t=>filingSnapshot.tabs.find(s=>s.tabId===t.tabId&&s.url===t.url)).filter(Boolean);
+        if(!selected.length||selected.length!==payload.tabs.length)throw new Error('The tabs changed while you dragged them. No tabs were closed.');
         let savedIds=[],workflowId=null;
         await ctx.edit(async()=>{
             let target=await ctx.store.getNode(targetId);if(!target||target.readOnly||target.virtual)throw new Error('Choose an editable folder.');
@@ -140,37 +166,33 @@ export function createBoard(ctx){
         await ctx.assertAccount(payload.account);
         const result=await ctx.helper.request('tabs.closeSnapshot',{snapshotId:filingSnapshot.snapshotId,tabIds:selected.map(t=>t.tabId),expectedCount:selected.length});
         if(workflowId)await ctx.publishWorkflow?.(workflowId);
-        snapshot=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed.'+keptSummary(result));ctx.refresh();
-        // A snapshot closes only once: take a fresh one so the next drag works
-        // without pressing Refresh.
-        if(ctx.helper.supports('tabs.snapshot'))refreshTabs().catch(()=>{});
-    }
-    async function refreshTabs(){
-        const account=ctx.account();await ctx.assertAccount(account);
-        const body={purpose:'file'};if(windowId!=null)body.windowId=windowId;
-        const got=await ctx.helper.request('tabs.snapshot',body);snapshot={...got,account};groupsOverride=null;ctx.refresh();
+        snapshotTake=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed.'+keptSummary(result));relist();
     }
     const board={async render(root){
-        rootRef=root;if(snapshot&&!sameAccount(snapshot.account,ctx.account())){snapshot=null;groupsOverride=null;}settings=await ctx.storage.getSettings();await ExpandState.load();
+        rootRef=root;settings=await ctx.storage.getSettings();await ExpandState.load();
+        const canList=ctx.helper.supports('tabs.listWindow');
+        if(canList&&!listed&&!listError)listTabs();
         const toolbar=el('div',{className:'page-actions'});
         root.append(el('div',{className:'page-head'},
             el('div',{className:'page-title'},el('h1',{},'Board'),el('p',{className:'page-sub'},'Drag open tabs onto a folder to file them. Middle-click a header to open its links.')),
             toolbar));
-        const refresh=button('⟳ Refresh open tabs',refreshTabs,'primary');refresh.disabled=!ctx.helper.supports('tabs.snapshot');toolbar.append(refresh);
-        toolbar.append(button('Choose window',async()=>{const wins=await ctx.helper.request('windows.list',{});const select=el('select',{'aria-label':'Browser window'});for(const w of wins)select.append(el('option',{value:String(w.windowId),text:(w.title||'Window')+' · '+w.tabCount}));select.addEventListener('change',()=>{windowId=Number(select.value);snapshot=null;});windowId=wins[0]?.windowId??null;toolbar.append(select);}));
+        const refresh=button('⟳ Refresh open tabs',relist,'primary');refresh.disabled=!canList;toolbar.append(refresh);
+        toolbar.append(button('Choose window',async()=>{const wins=await ctx.helper.request('windows.list',{});const select=el('select',{'aria-label':'Browser window'});for(const w of wins)select.append(el('option',{value:String(w.windowId),text:(w.title||'Window')+' · '+w.tabCount}));select.addEventListener('change',()=>{windowId=Number(select.value);relist();});toolbar.append(select);}));
         toolbar.append(button(smart?'Group by domain':'Group by keyword',()=>{smart=!smart;groupsOverride=null;ctx.refresh();}));
         const columns=el('div',{className:'board-columns'}),tabs=el('section',{className:'board-card board-column open-tabs'});
         const tabsOpen=ExpandState.isOpen(OPEN_TABS_KEY,true);
         const known=new Set(walk(ctx.store.roots()).filter(n=>n.url).map(n=>n.url));
-        const items=snapshot?snapshot.tabs.filter(t=>!known.has(t.url)):[];
+        const items=listed?listed.tabs.filter(t=>!known.has(t.url)):[];
         const toggle=button('',()=>{ExpandState.set(OPEN_TABS_KEY,!ExpandState.isOpen(OPEN_TABS_KEY,true));ctx.refresh();},'board-toggle');
         toggle.setAttribute('aria-expanded',String(tabsOpen));
         toggle.append(el('span',{className:'folder-caret','aria-hidden':'true',text:tabsOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'🌐'}),
-            el('span',{className:'folder-title',text:'Open Tabs'}),el('span',{className:'folder-stats',text:snapshot?String(items.length):''}));
+            el('span',{className:'folder-title',text:'Open Tabs'}),el('span',{className:'folder-stats',text:listed?String(items.length):''}));
         const tabsBody=el('div',{className:'board-body'});
         tabs.append(el('div',{className:'board-heading'},toggle),tabsBody);tabs.classList.toggle('is-open',tabsOpen);tabsBody.hidden=!tabsOpen;
         if(tabsOpen){
-            if(!snapshot)tabsBody.append(el('p',{className:'board-empty'},ctx.helper.supports('tabs.snapshot')?'Click Refresh open tabs. Tabs already in your tree are hidden.':'Open tabs show here with the TabPaladin helper installed. Tabs already in your tree are hidden.'));
+            if(!canList)tabsBody.append(el('p',{className:'board-empty'},'Open tabs show here with the TabPaladin helper installed. Tabs already in your tree are hidden.'));
+            else if(listError&&!listed)tabsBody.append(el('p',{className:'board-empty'},listError));
+            else if(!listed)tabsBody.append(el('p',{className:'board-empty'},'Reading open tabs…'));
             else{
                 if(!items.length)tabsBody.append(el('p',{className:'board-empty'},'No tabs to file: every open tab is already in your tree.'));
                 const groups=groupsOverride||(smart?TabGrouper.groupSmart(items,settings.customKeywords,settings.categoryOrder):Object.fromEntries([...new Set(items.map(t=>domain(t.url)))].map(d=>[d,items.filter(t=>domain(t.url)===d)])));
@@ -180,19 +202,33 @@ export function createBoard(ctx){
                     header.title='Drag to file all '+list.length+' tabs';header.setAttribute('aria-expanded',String(groupOpen));
                     header.append(el('span',{className:'folder-caret','aria-hidden':'true',text:groupOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'🏷️'}),
                         el('span',{className:'domain-name',text:name}),el('span',{className:'domain-count',text:String(list.length)}));
-                    drag(header,{kind:'tabs',tabs:list,group:name,snapshotId:snapshot.snapshotId},ctx);group.append(header);
+                    dragTabs(header,{kind:'tabs',tabs:list,group:name});group.append(header);
                     group.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
                     group.addEventListener('drop',e=>{if(dragging?.kind!=='tabs')return;e.preventDefault();e.stopPropagation();const moving=new Set(dragging.tabs.map(t=>t.tabId));groupsOverride=Object.fromEntries(Object.entries(groups).map(([k,v])=>[k,v.filter(t=>!moving.has(t.tabId))]));groupsOverride[name].push(...dragging.tabs);dragging=null;ctx.refresh();});
-                    if(groupOpen)for(const t of list){const row=el('div',{className:'board-tab',title:t.url},favicon(t.url),el('span',{className:'board-tab-title',text:t.title||t.url}));drag(row,{kind:'tabs',tabs:[t],snapshotId:snapshot.snapshotId},ctx);group.append(row);}tabsBody.append(group);
+                    if(groupOpen)for(const t of list){const row=el('div',{className:'board-tab',title:t.url},favicon(t.url),el('span',{className:'board-tab-title',text:t.title||t.url}));dragTabs(row,{kind:'tabs',tabs:[t]});group.append(row);}tabsBody.append(group);
                 }
             }
         }
         tabs.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
-        tabs.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||!snapshot)return;e.preventDefault();const items=dragging.tabs;const ids=new Set(items.map(t=>t.tabId));const original=groupsOverride||TabGrouper.groupSmart(snapshot.tabs,settings.customKeywords,settings.categoryOrder);groupsOverride=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,v.filter(t=>!ids.has(t.tabId))]));groupsOverride.Ungrouped=[...(groupsOverride.Ungrouped||[]),...items];dragging=null;ctx.refresh();});
+        tabs.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||!listed)return;e.preventDefault();const moving=dragging.tabs;const ids=new Set(moving.map(t=>t.tabId));const original=groupsOverride||TabGrouper.groupSmart(items,settings.customKeywords,settings.categoryOrder);groupsOverride=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,v.filter(t=>!ids.has(t.tabId))]));groupsOverride.Ungrouped=[...(groupsOverride.Ungrouped||[]),...moving];dragging=null;ctx.refresh();});
         columns.append(tabs);
-        const pool=cards.budget();for(const n of visibleRoots(ctx.store.roots(),settings))columns.append(cards.card(n,{budget:pool}));root.append(columns);
-    },destroy(){cards.destroy();rootRef=null;snapshot=null;}};
+        // Three columns: Open Tabs, Workflows (wherever its folder sits) and
+        // Bookmarks, which holds the other top-level folders after its own.
+        const pool=cards.budget(),roots=ctx.store.roots();
+        const flows=walk(roots).find(n=>n.kind==='folder'&&n.role==='workflows');
+        if(flows)columns.append(cards.card(flows,{budget:pool}));
+        const rest=visibleRoots(roots,settings).filter(n=>n.role!=='workflows'),home=rest.find(n=>n.role==='bookmarks');
+        if(home)columns.append(cards.card(home,{budget:pool,extra:rest.filter(n=>n!==home)}));
+        else for(const n of rest)columns.append(cards.card(n,{budget:pool}));
+        root.append(columns);
+    },destroy(){cards.destroy();rootRef=null;listed=null;listError=null;snapshotTake=null;}};
     document.addEventListener('dragover',e=>{if(!dragging)return;const edge=60;if(e.clientY<edge)window.scrollBy(0,-18);else if(e.clientY>innerHeight-edge)window.scrollBy(0,18);});
-    ctx.helper.on((event)=>{if(event==='tabs.changed'&&rootRef?.isConnected){snapshot=null;ctx.toast('Browser tabs changed. Refresh before filing.');ctx.refresh();}});
+    // The list follows the browser: tab changes the helper reports, and coming
+    // back to this page. Mid-drag it waits, so the dragged row stays put.
+    const follow=()=>{if(!rootRef?.isConnected||!ctx.helper.supports('tabs.listWindow'))return;if(dragging){stale=true;return;}relist();};
+    document.addEventListener('dragend',()=>{if(stale){stale=false;setTimeout(follow,0);}});
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')follow();});
+    window.addEventListener('focus',follow);
+    ctx.helper.on((event)=>{if(event==='tabs.changed')follow();});
     return board;
 }

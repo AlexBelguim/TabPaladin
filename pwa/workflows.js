@@ -4,7 +4,7 @@ import { ExpandState } from './lib/expandState.js';
 import { relativeTime } from './lib/notesModel.js';
 const saved = iso => { const r = relativeTime(iso); return !r ? '' : r === 'now' ? 'Saved just now' : /^\d+[mh]$/.test(r) ? 'Saved ' + r + ' ago' : 'Saved ' + r; };
 export function createWorkflows(ctx){
-    const exportsFor=()=>{const role=ctx.store.roots().find(n=>n.role==='workflows');return(role?.children||[]).filter(n=>n.kind==='folder').map(n=>({id:n.id,name:n.title,createdAt:n.payload?.createdAt||new Date().toISOString(),tabs:walk(n.children).filter(c=>c.kind==='bookmark').map(c=>({id:c.id,title:c.title,url:c.url,favIconUrl:null}))}));};
+    const exportsFor=()=>{const role=walk(ctx.store.roots()).find(n=>n.kind==='folder'&&n.role==='workflows');return(role?.children||[]).filter(n=>n.kind==='folder').map(n=>({id:n.id,name:n.title,createdAt:n.payload?.createdAt||new Date().toISOString(),tabs:walk(n.children).filter(c=>c.kind==='bookmark').map(c=>({id:c.id,title:c.title,url:c.url,favIconUrl:null}))}));};
     const cards=createFolderCards({...ctx,split:id=>ctx.split(id)});
     return {async render(root){
         await ExpandState.load();
