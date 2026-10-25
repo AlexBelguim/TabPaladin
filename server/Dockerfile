@@ -2,7 +2,8 @@ FROM node:22-alpine
 
 # better-sqlite3 needs a compiler at install time on Alpine; su-exec lets the
 # entrypoint hand /data over as root and then drop to the node user.
-RUN apk add --no-cache python3 make g++ libstdc++ su-exec
+RUN apk add --no-cache python3 make g++ libstdc++ su-exec \
+    && mkdir -p /data && chown node:node /data
 
 WORKDIR /app
 
@@ -10,7 +11,10 @@ WORKDIR /app
 COPY server/package.json server/package-lock.json ./
 # npm ci installs exactly what the lockfile pins, so an image build can't pick
 # up a newer (or compromised) transitive dependency than the one audited.
-RUN npm ci --omit=dev && npm cache clean --force
+# Made readable for the node user in this same (cached) layer: a chmod over
+# node_modules in a later layer copies every file into that layer, which took
+# over fifteen minutes on a NAS dataset.
+RUN npm ci --omit=dev && npm cache clean --force && chmod -R a+rX /app
 
 # Copy server source. A glob rather than a list of filenames: index.js used to
 # be named explicitly, so adding items.js shipped a container whose entrypoint
@@ -27,10 +31,10 @@ COPY pwa ./pwa
 COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # COPY keeps the build host's file modes. On a NAS dataset those often deny
-# "other" read access, and the server runs as node, not root: make every file
-# readable (and directories enterable) whatever the host's modes were.
-RUN chmod -R a+rX /app && chmod 755 /usr/local/bin/docker-entrypoint.sh \
-    && mkdir -p /data && chown node:node /data
+# "other" read access, and the server runs as node, not root: make what was
+# just copied readable (and directories enterable) whatever the host's modes
+# were. Only these paths: node_modules was made readable when it was installed.
+RUN chmod -R a+rX /app/*.js /app/imports /app/pwa && chmod 755 /usr/local/bin/docker-entrypoint.sh
 
 # production: Express error pages then carry no stack traces.
 ENV NODE_ENV=production
