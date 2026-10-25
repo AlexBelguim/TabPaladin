@@ -199,6 +199,10 @@ export function makeStore(db) {
                 INSERT INTO import_sources (provider, label, config, interval_minutes, created_at, user_id)
                 VALUES (?, ?, ?, ?, ?, ?)
             `).run(provider, label || provider, JSON.stringify(config), intervalMinutes, new Date().toISOString(), Number(userId));
+            // The account's first archive brings its YouTube folder (index.js).
+            if (typeof this.onSourceCreated === 'function') {
+                try { this.onSourceCreated(Number(userId)); } catch (e) { console.warn('[TabPaladin] After a new import source:', e.message); }
+            }
             return this.getSource(info.lastInsertRowid, Number(userId));
         },
 

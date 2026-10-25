@@ -826,6 +826,7 @@
         const list = [];
         const byKey = new Map();
         let bookmarksRootId = null;
+        const appFolders = {};
         const walk = (node, parent, depth) => {
             if (!node || node.kind !== 'folder' || node.virtual || node.readOnly) return;
             const id = String(node.id || '');
@@ -841,6 +842,9 @@
                 depth, role: node.role || null, directCount: 0, apps: {}, order: list.length
             };
             if (node.role === 'bookmarks' && !bookmarksRootId) bookmarksRootId = id;
+            // An app's own folder (payload.app): its subfolders are that app's chips.
+            const ownApp = node.payload && typeof node.payload.app === 'string' ? node.payload.app : null;
+            if (ownApp && !appFolders[ownApp]) appFolders[ownApp] = id;
             folders.set(id, f);
             list.push(f);
             for (const c of node.children || []) {
@@ -858,7 +862,7 @@
         };
         for (const r of roots || []) walk(r, null, 0);
         return {
-            folders, list, bookmarksRootId,
+            folders, list, bookmarksRootId, appFolders,
             // The folders already holding this link.
             holding: (urlKey) => (byKey.get(urlKey) || []).map(id => folders.get(id)).filter(Boolean)
         };
@@ -895,6 +899,8 @@
     }
 
     // The chips for links from `app`:
+    //   0. the subfolders of its own folder (YouTube › Food, Music…), or that
+    //      folder itself while it has none;
     //   1. its pinned folders, in pin order;
     //   2. the folder last used for it;
     //   3. the folders holding the most of its links (ties: the latest
@@ -907,7 +913,7 @@
     // Bookmarks for a known app (or its existing namesake as a chip), '+ New
     // folder…' for a site.
     function suggest(app, { index, prefs = null, stats = null, slots = null } = {}) {
-        const n = clampSlots(slots ?? (prefs && prefs.slots));
+        let n = clampSlots(slots ?? (prefs && prefs.slots));
         const ap = (prefs && prefs.apps && prefs.apps[app]) || {};
         const hidden = new Set(ap.hidden || []);
         const chips = [];
@@ -923,7 +929,14 @@
         const lastFor = new Map(appStats.map(s => [s.folderId, s.last]));
         const counted = index.list.filter(f => (f.apps[app] || 0) > 0);
         const pinned = (ap.pinned || []).filter(id => index.folders.has(id) && !hidden.has(id));
-        const firstTime = !pinned.length && !appStats.length && !counted.length;
+        const own = index.appFolders && index.appFolders[app];
+        const ownSubs = own ? index.list.filter(f => f.parentId === own) : [];
+        const firstTime = !own && !pinned.length && !appStats.length && !counted.length;
+        if (own) {
+            // Room for every subfolder (up to the 8-chip limit) and one more.
+            n = clampSlots(Math.max(n, ownSubs.length + 1));
+            for (const f of ownSubs.length ? ownSubs : [index.folders.get(own)]) add(f.id, 'app');
+        }
 
         let starter = null;
         let reserve = 0;

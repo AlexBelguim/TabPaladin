@@ -1404,7 +1404,7 @@ export const TreeStore = {
             if (node.role) { if (!ROLES.includes(node.role) || roles.has(node.role) || node.kind !== 'folder') throw new Error('The recovery tree has duplicate role folders.'); roles.add(node.role); out.role = node.role; }
             if (node.kind === 'bookmark') { if (typeof node.url !== 'string' || node.url.length > 8192) throw new Error('Invalid bookmark in the recovery tree.'); out.url = node.url; }
             if (node.kind === 'note') { if (typeof node.payload?.content !== 'string') throw new Error('Invalid note in the recovery tree.'); out.payload = { content: node.payload.content, createdAt: node.payload.createdAt || null, updatedAt: node.payload.updatedAt || null }; }
-            else if (node.payload?.createdAt) out.payload = { createdAt: node.payload.createdAt };
+            else if (node.payload?.createdAt || typeof node.payload?.app === 'string') out.payload = { ...(node.payload.createdAt ? { createdAt: node.payload.createdAt } : {}), ...(typeof node.payload.app === 'string' && node.kind === 'folder' ? { app: node.payload.app.slice(0, 40) } : {}) };
             if (node.kind === 'folder') { if (node.children != null && !Array.isArray(node.children)) throw new Error('Invalid folder children.'); out.children = (node.children || []).map(n => clean(n, depth + 1)).filter(Boolean); }
             return out;
         };
@@ -1682,6 +1682,9 @@ export const TreeStore = {
         assertWritable(id);
         if (!isTopLevelParent(parentId)) assertWritable(parentId);
         const e = entry(id);
+        // Bookmarks, Workflows, pins and notes are special folders: they stay
+        // at the top level, where every client looks for them first.
+        if (e.node.role && !isTopLevelParent(parentId)) throw new Error('This folder stays at the top level.');
         // Refuse moving a folder into itself or a descendant.
         if (e.node.kind === 'folder' && !isTopLevelParent(parentId)) {
             let p = entry(parentId);

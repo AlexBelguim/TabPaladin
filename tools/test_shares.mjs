@@ -308,6 +308,8 @@ async function liveTests() {
         const opsOf = () => { const d = raw(); const r = d.prepare('SELECT version, base_version, kind FROM tree_ops WHERE user_id = 1 ORDER BY version').all(); d.close(); return r; };
         db0.close();
         const v0 = (await http('/api/tree/version', { token: A })).json.version;
+        // The log may already hold the source's YouTube folder; these count what filing adds.
+        const opsSince = () => opsOf().filter(o => o.version > v0);
         const snaps0 = snaps();
         const f1 = await http(`/api/shares/${sid(1)}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'ai' }, { folderId: 'dev' }] } });
         const tree1 = (await http('/api/tree', { token: A })).json;
@@ -315,8 +317,8 @@ async function liveTests() {
             && JSON.stringify(titlesIn(tree1, 'ai')) === '["Paper 1","Paper 2","Page 1"]' && JSON.stringify(titlesIn(tree1, 'dev')) === '["Page 1"]',
             JSON.stringify(f1.json));
         check('  bumping the version exactly once', f1.json.baseVersion === v0 && f1.json.version === tree1.version && tree1.version > v0
-            && opsOf().length === 1 && opsOf()[0].base_version === v0 && opsOf()[0].version === tree1.version);
-        check('  as a logged append, with no history snapshot', opsOf()[0].kind === 'append' && snaps() === snaps0);
+            && opsSince().length === 1 && opsSince()[0].base_version === v0 && opsSince()[0].version === tree1.version);
+        check('  as a logged append, with no history snapshot', opsSince()[0].kind === 'append' && snaps() === snaps0);
         check('  and the share is filed, with both filings present', f1.json.share.status === 'filed' && f1.json.share.filedAt
             && f1.json.share.filings.length === 2 && f1.json.share.filings.every(f => f.present));
         check('  the answer says whose tree it changed, on which server', f1.json.userId === 1 && typeof f1.json.serverId === 'string' && f1.json.serverId.length > 0,
@@ -327,7 +329,7 @@ async function liveTests() {
         const f1again = await http(`/api/shares/${sid(1)}/file`, { method: 'POST', token: A, body: { targets: [{ folderId: 'ai' }, { folderId: 'dev' }] } });
         check('a retry is "already" for both, and moves nothing', f1again.status === 200 && f1again.json.created.length === 0
             && f1again.json.already.length === 2 && f1again.json.version === f1.json.version
-            && (await http('/api/tree/version', { token: A })).json.version === f1.json.version && opsOf().length === 1);
+            && (await http('/api/tree/version', { token: A })).json.version === f1.json.version && opsSince().length === 1);
 
         await intake(A, 3);
         const vBefore3 = (await http('/api/tree/version', { token: A })).json.version;

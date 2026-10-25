@@ -538,6 +538,18 @@ const { store: importsStore } = attachImports(app, {
     // The Reddit confirm page names the TabPaladin account receiving the connection.
     accountName: (id) => (userById(db, id) || {}).username || null
 });
+// With an imports archive comes the YouTube folder the web app shows inside
+// it (its subfolders are what YouTube's Save button offers): made when an
+// account's first source is, or when the web app asks (an account that had
+// one before). Idempotent, and kept once made: renaming or filling it is the
+// user's.
+importsStore.onSourceCreated = (userId) => items.forUser(userId).ensureAppFolder('youtube', 'YouTube');
+app.post('/api/apps/folder', requireAuth, (req, res) => {
+    if ((req.body || {}).app !== 'youtube') return res.status(400).json({ error: 'Unknown app.' });
+    if (!importsStore.listSources(req.user.id).length) return res.json({ ok: true, created: false });
+    const made = items.forUser(req.user.id).ensureAppFolder('youtube', 'YouTube');
+    res.json({ ok: true, ...made, userId: req.user.id, serverId: SERVER_ID });
+});
 
 // --- Shared links ---
 // The share sheet's inbox and filing (/api/shares*), the tree's ops log

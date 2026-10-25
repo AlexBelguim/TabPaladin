@@ -1973,6 +1973,9 @@ function desktopContext() {
             if(!await TreeStore.flush())throw new Error('Workflow push is pending.');
             await pushHelperWorkflow(pending);
         },
+        // The server makes an app's folder (YouTube's, beside the imports
+        // archive) and logs it as an append, folded in here like a filing.
+        async ensureAppFolder(app){const res=await api('/api/apps/folder',{method:'POST',body:JSON.stringify({app})});if(res&&res.created&&res.node)await applyFiled({...res,created:[res.node]});},
         recentNotes:()=>NM.sortNotes(notesLibrary().notes,'edited'), openNote:id=>openNoteById(id,{from:'Home'}),
         search:text=>{const target=searchTargetFor(text);if(target)openExternal(target);},
         pending:root=>{if(state.changes.length)root.appendChild(renderChangesBlock());},

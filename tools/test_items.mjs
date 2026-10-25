@@ -124,7 +124,10 @@ console.log('\n1. Migration from a browser-tree snapshot');
 
     const { version, roots } = items.readTree();
     check('version is 1 after migration', version === 1, String(version));
-    check('two top-level folders (dupe merged, Trash dropped)', roots.length === 2,
+    // The old layout kept the app's folders inside Other Bookmarks; they are
+    // lifted to the top level beside the two browser roots.
+    check('two top-level folders (dupe merged, Trash dropped) and the role folders lifted beside them',
+        roots.length === 5 && roots.filter(r => !r.role).length === 2 && ['notes', 'pins', 'workflows'].every(role => roots.some(r => r.role === role)),
         roots.map(r => r.title).join(', '));
 
     const notes = findFolder(roots, 'TabPaladin Notes');
@@ -539,6 +542,30 @@ console.log('\n8. Appends from the share sheet, and the ops log');
         store.initOpsFloors() === 1 && Number(db.prepare("SELECT value FROM user_tree_meta WHERE user_id = 1 AND key = 'opsFloor'").get().value) === items.version());
     check('  so the gap from before it is incomplete', !items.opsSince(v1).complete && items.opsSince(items.version()).complete);
     check('  and running it again changes nothing', store.initOpsFloors() === 0);
+    db.close();
+}
+
+console.log('\n--- special folders stay at the top level; the YouTube folder is made once ---');
+{
+    const { db, items } = freshDb();
+    items.writeTree([{ id: 'imp', kind: 'folder', title: 'Imported bookmarks', children: [
+        { id: 'wf', kind: 'folder', role: 'workflows', title: 'TabPaladin Workflows', children: [{ id: 'w1', kind: 'folder', title: 'Research', children: [] }] },
+        { id: 'pn', kind: 'folder', role: 'pins', title: 'TabPaladin Pinned', children: [] }] }]);
+    const roots = items.readTree().roots;
+    check('a pushed tree with nested role folders stores them at the top level',
+        roots.some(r => r.id === 'wf' && r.role === 'workflows' && r.children.length === 1) && roots.some(r => r.id === 'pn')
+        && roots.find(r => r.id === 'imp').children.length === 0);
+    db.prepare("UPDATE items SET parent_id = 'imp' WHERE id = 'wf'").run();
+    check('a stored nested role folder is lifted by the boot heal', items.healDuplicateRoles().healed && items.readTree().roots.some(r => r.id === 'wf'));
+    const made = items.ensureAppFolder('youtube', 'YouTube'), again = items.ensureAppFolder('youtube', 'YouTube');
+    const yt = items.readTree().roots.find(r => r.payload && r.payload.app === 'youtube');
+    check('ensureAppFolder makes one top-level YouTube folder and then finds it', made.created && !again.created && again.id === made.id && yt && yt.title === 'YouTube');
+    const logged = items.opsSince(made.baseVersion);
+    check('  logged as an append a copy with unpushed edits can fold in', logged.complete && logged.ops.length === 1 && logged.ops[0].kind === 'append'
+        && logged.ops[0].payload.nodes[0].id === made.id && logged.ops[0].payload.nodes[0].parentId === null && logged.ops[0].payload.nodes[0].payload.app === 'youtube',
+        JSON.stringify(logged));
+    items.writeTree(items.readTree().roots.map(r => r.id === yt.id ? { ...r, title: 'Videos', children: [{ id: 'food', kind: 'folder', title: 'Food', children: [] }] } : r));
+    check('  a renamed one with subfolders is still found, not made again', !items.ensureAppFolder('youtube', 'YouTube').created);
     db.close();
 }
 

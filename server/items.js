@@ -270,7 +270,30 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         };
         const out = (Array.isArray(roots) ? roots : []).map(clean).filter(Boolean);
         mergeDuplicateRoles(out);
+        liftNestedRoles(out);
         return out;
+    }
+
+    // Role folders are the app's own sections: every client looks for them
+    // at the top level, and a drag that nested one (Workflows inside an
+    // imported folder, say) hid it. Lift each back out, children and all.
+    function liftNestedRoles(roots) {
+        const lifted = [];
+        const walk = (siblings, depth) => {
+            for (let i = 0; i < siblings.length; i++) {
+                const n = siblings[i];
+                if (n.kind !== 'folder') continue;
+                if (depth > 0 && n.role) {
+                    lifted.push(n);
+                    siblings.splice(i--, 1);
+                    continue;
+                }
+                walk(n.children, depth + 1);
+            }
+        };
+        walk(roots, 0);
+        roots.push(...lifted);
+        return roots;
     }
 
     // A role is meant to be unique, but nothing on a client enforces it: a
@@ -301,15 +324,40 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         return roots;
     }
 
-    // Heal a stored tree that already has duplicate role folders. Runs at boot.
+    // Heal a stored tree that already has duplicate or nested role folders.
+    // Runs at boot.
     function healDuplicateRoles() {
         const dupes = db.prepare(
             "SELECT role, COUNT(*) AS n FROM items WHERE user_id = ? AND kind = 'folder' AND role IS NOT NULL GROUP BY role HAVING n > 1"
         ).all(userId);
-        if (!dupes.length) return { healed: false };
+        const nested = db.prepare(
+            "SELECT role FROM items WHERE user_id = ? AND kind = 'folder' AND role IS NOT NULL AND parent_id IS NOT NULL"
+        ).all(userId);
+        if (!dupes.length && !nested.length) return { healed: false };
         writeTree(readTree().roots, { deviceId: 'heal-duplicate-roles' });
-        return { healed: true, roles: dupes.map(d => d.role) };
+        return { healed: true, roles: [...new Set([...dupes, ...nested].map(d => d.role))] };
     }
+
+    // An app's own folder (payload.app): YouTube's sits beside the imports
+    // archive, holding the folders its Save button offers. Made here, once,
+    // so two devices never each make their own, and logged as an append so a
+    // copy with unpushed edits folds it in instead of conflicting. The user's
+    // later renames and subfolders are theirs.
+    const ensureAppFolder = db.transaction((app, title) => {
+        const baseVersion = version();
+        const existing = db.prepare("SELECT id FROM items WHERE user_id = ? AND kind = 'folder' AND json_valid(payload) AND json_extract(payload, '$.app') = ? LIMIT 1")
+            .get(userId, app);
+        if (existing) return { id: existing.id, created: false, baseVersion, version: baseVersion };
+        const id = newId();
+        const now = new Date().toISOString();
+        const max = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM items WHERE user_id = ? AND parent_id IS NULL').get(userId).p;
+        db.prepare(`
+            INSERT INTO items (id, parent_id, position, kind, role, title, payload, created_at, updated_at, user_id)
+            VALUES (?, NULL, ?, 'folder', NULL, ?, ?, ?, ?, ?)
+        `).run(id, max + 1, title, JSON.stringify({ app }), now, now, userId);
+        const node = { id, parentId: null, kind: 'folder', title, payload: { app } };
+        return { id, created: true, node, baseVersion, version: bump('append', { nodes: [node] }) };
+    });
 
     // --- Tree <-> rows ------------------------------------------------------
 
@@ -1110,6 +1158,7 @@ function makeUserStore(db, userId, { maxSnapshots }) {
         applyNoteProposal,
         migrateFromLatestSnapshotIfNeeded,
         healDuplicateRoles,
+        ensureAppFolder,
         recordHistory,
         initOpsFloor,
         opsSince,

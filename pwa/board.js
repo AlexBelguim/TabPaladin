@@ -29,6 +29,9 @@ const folderStats = children => {
 // Kept out of the Board's folder cards: the Workflows column shows its own
 // folder wherever it sits, and pins and notes have pages of their own.
 const ROLE_FOLDERS = new Set(['workflows', 'pins', 'notes']);
+// An app's own folder (payload.app, e.g. YouTube): shown inside the imports
+// archive, kept like the role folders.
+const appFolder = n => Boolean(n && n.kind === 'folder' && n.payload && n.payload.app);
 const tool = (label, title, handler, className = 'icon-btn') => { const b = button(label, handler, className); b.title = title; return b; };
 function favicon(url) {
     if (!/^https?:/i.test(url || '')) return el('span', { className: 'bm-icon bm-icon-none', 'aria-hidden': 'true' });
@@ -49,10 +52,10 @@ export function createFolderCards(ctx){
         const caret=el('span',{className:'folder-caret','aria-hidden':'true'});
         const toggle=button('',()=>{open=!open;ExpandState.set(node.id,open);fill();},'board-toggle');
         toggle.title=node.title||'Untitled';
-        toggle.append(caret,el('span',{className:'folder-icon','aria-hidden':'true',text:readOnly?'📥':node.role==='workflows'?'💾':'📁'}),
+        toggle.append(caret,el('span',{className:'folder-icon','aria-hidden':'true',text:readOnly?'📥':node.role==='workflows'?'💾':node.payload?.app==='youtube'?'▶️':'📁'}),
             el('span',{className:'folder-title',text:node.title||'Untitled'}));
         if(readOnly)toggle.append(el('span',{className:'imports-badge',text:'synced'}));
-        toggle.append(el('span',{className:'folder-stats',text:folderStats((node.children||[]).filter(n=>!ROLE_FOLDERS.has(n.role)).concat(extra))}));
+        toggle.append(el('span',{className:'folder-stats',text:folderStats((node.children||[]).filter(n=>!ROLE_FOLDERS.has(n.role)&&!appFolder(n)).concat(extra,ctx.extraFor?.(node)||[]))}));
         const actions=el('div',{className:'board-tools'});
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
         const many=loose().length;
@@ -63,11 +66,11 @@ export function createFolderCards(ctx){
             if(ctx.split)actions.append(tool('✨ Split','Sort the loose bookmarks here by keyword',()=>ctx.split(node.id),'icon-btn tool-split'));
             actions.append(tool('＋📁','New folder inside '+(node.title||'this folder'),async()=>{const title=prompt('New subfolder');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:node.id,kind:'folder',title:title.trim()}));}));
             // A folder holding Workflows, pins or notes (shown elsewhere) is not deleted from here.
-            if(!node.role&&!walk(node.children||[]).some(n=>ROLE_FOLDERS.has(n.role)))actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}},'icon-btn danger'));
+            if(!node.role&&!appFolder(node)&&!walk(node.children||[]).some(n=>ROLE_FOLDERS.has(n.role)||appFolder(n)))actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}},'icon-btn danger'));
         }
         actions.append(tool('›','Browse '+(node.title||'this folder')+' in Organize',()=>ctx.navigate('organize',node.id)));
         if(!readOnly){
-            drag(toggle,{kind:'nodes',ids:[node.id]},ctx);
+            if(!node.role&&!appFolder(node))drag(toggle,{kind:'nodes',ids:[node.id]},ctx);
             box.addEventListener('dragover',e=>{if(!dragging)return;e.preventDefault();box.classList.add('drop-target');if(!open){const t=setTimeout(()=>{ExpandState.openForSession(node.id);open=true;fill();},700);timers.add(t);}});
             box.addEventListener('dragleave',()=>{box.classList.remove('drop-target');for(const t of timers)clearTimeout(t);timers.clear();});
             box.addEventListener('drop',async e=>{
@@ -87,7 +90,7 @@ export function createFolderCards(ctx){
         }
         head.append(toggle,actions);box.append(head);if(lead)box.append(lead);box.append(body);
         function fill(){body.hidden=!open;caret.textContent=open?'▾':'▸';toggle.setAttribute('aria-expanded',String(open));box.classList.toggle('is-open',open);if(!open||filled)return;filled=true;
-            const children=node.children||[];const folders=[...children.filter(n=>n.kind==='folder'&&!ROLE_FOLDERS.has(n.role)),...extra];
+            const children=node.children||[];const folders=[...children.filter(n=>n.kind==='folder'&&!ROLE_FOLDERS.has(n.role)&&!appFolder(n)),...extra,...(ctx.extraFor?.(node)||[])];
             for(const sub of folders)body.append(card(sub,{depth:depth+1,budget:pool}));
             const groups=new Map();for(const b of children.filter(n=>n.kind==='bookmark')){const key=domain(b.url);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(b);}
             let shown=0;
@@ -122,7 +125,10 @@ export function createBoard(ctx){
     // listed: the window's tabs as shown, read without a click (tabs.listWindow).
     // Filing needs a snapshot, which needs one: it is taken as a drag starts.
     let listed=null,listing=null,listError=null,snapshotTake=null,stale=false,windowId=null,settings={},rootRef=null,smart=true,groupsOverride=null;
-    const localCtx={...ctx,fileTabs,split:id=>ctx.split(id)};
+    let appFolders=[];
+    // The imports archive also shows the app folders (YouTube): those are the
+    // user's own, editable folders, so they are kept in the tree, not the archive.
+    const localCtx={...ctx,fileTabs,split:id=>ctx.split(id),extraFor:node=>node.id==='imports:root'?appFolders:[]};
     const cards=createFolderCards(localCtx);
     const sameTabs=(a,b)=>JSON.stringify((a||[]).map(t=>[t.tabId,t.url,t.title]))===JSON.stringify((b||[]).map(t=>[t.tabId,t.url,t.title]));
     function listTabs(){
@@ -217,7 +223,9 @@ export function createBoard(ctx){
         const pool=cards.budget(),roots=ctx.store.roots();
         const flows=walk(roots).find(n=>n.kind==='folder'&&n.role==='workflows');
         if(flows)columns.append(cards.card(flows,{budget:pool}));
-        const rest=visibleRoots(roots,settings).filter(n=>n.role!=='workflows'),home=rest.find(n=>n.role==='bookmarks');
+        const hasImports=walk(roots).some(n=>n.id==='imports:root');
+        appFolders=hasImports?walk(roots).filter(appFolder):[];
+        const rest=visibleRoots(roots,settings).filter(n=>n.role!=='workflows'&&!(hasImports&&appFolder(n))),home=rest.find(n=>n.role==='bookmarks');
         if(home)columns.append(cards.card(home,{budget:pool,extra:rest.filter(n=>n!==home)}));
         else for(const n of rest)columns.append(cards.card(n,{budget:pool}));
         root.append(columns);
