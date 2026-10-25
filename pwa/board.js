@@ -47,14 +47,16 @@ export function createFolderCards(ctx){
     // column holds the other top-level folders).
     function card(node,{depth=0,budget:pool=budget(),lead=null,extra=[]}={}){
         const readOnly=node.virtual||node.readOnly||String(node.id).startsWith('imp:')||String(node.id).startsWith('imports:');
-        const box=el('section',{className:'board-card'+(depth?' nested':' board-column')+(readOnly?' is-imports':'')+(node.role==='workflows'?' is-workflows':''),dataset:{folderId:node.id}}),head=el('div',{className:'board-heading'}),body=el('div',{className:'board-body'});
+        // An app's folder (YouTube) looks like the archive it sits in, but is editable.
+        const imported=readOnly||appFolder(node);
+        const box=el('section',{className:'board-card'+(depth?' nested':' board-column')+(imported?' is-imports':'')+(node.role==='workflows'?' is-workflows':''),dataset:{folderId:node.id}}),head=el('div',{className:'board-heading'}),body=el('div',{className:'board-body'});
         let open=ExpandState.isOpen(node.id,depth===0),filled=false,limit=200;
         const caret=el('span',{className:'folder-caret','aria-hidden':'true'});
         const toggle=button('',()=>{open=!open;ExpandState.set(node.id,open);fill();},'board-toggle');
         toggle.title=node.title||'Untitled';
-        toggle.append(caret,el('span',{className:'folder-icon','aria-hidden':'true',text:readOnly?'📥':node.role==='workflows'?'💾':node.payload?.app==='youtube'?'▶️':'📁'}),
+        toggle.append(caret,el('span',{className:'folder-icon','aria-hidden':'true',text:imported?'📥':node.role==='workflows'?'💾':'📁'}),
             el('span',{className:'folder-title',text:node.title||'Untitled'}));
-        if(readOnly)toggle.append(el('span',{className:'imports-badge',text:'synced'}));
+        if(imported)toggle.append(el('span',{className:'imports-badge',text:'synced'}));
         toggle.append(el('span',{className:'folder-stats',text:folderStats((node.children||[]).filter(n=>!ROLE_FOLDERS.has(n.role)&&!appFolder(n)).concat(extra,ctx.extraFor?.(node)||[]))}));
         const actions=el('div',{className:'board-tools'});
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
@@ -65,8 +67,17 @@ export function createFolderCards(ctx){
         if(!readOnly){
             if(ctx.split)actions.append(tool('✨ Split','Sort the loose bookmarks here by keyword',()=>ctx.split(node.id),'icon-btn tool-split'));
             actions.append(tool('＋📁','New folder inside '+(node.title||'this folder'),async()=>{const title=prompt('New subfolder');if(title?.trim())await ctx.edit(()=>ctx.store.createNode({parentId:node.id,kind:'folder',title:title.trim()}));}));
-            // A folder holding Workflows, pins or notes (shown elsewhere) is not deleted from here.
-            if(!node.role&&!appFolder(node)&&!walk(node.children||[]).some(n=>ROLE_FOLDERS.has(n.role)||appFolder(n)))actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{if(confirm('Delete '+(node.title||'folder')+' and its '+(nodeCount(node)-1)+' items?')){const account=ctx.account();await ctx.edit(()=>ctx.store.removeNode(node.id));if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});}},'icon-btn danger'));
+            // Special folders inside (Workflows, pins, notes, YouTube: shown
+            // elsewhere) move to the top level first; only the rest is deleted.
+            if(!node.role&&!appFolder(node))actions.append(tool('🗑','Delete '+(node.title||'this folder'),async()=>{
+                const keep=walk(node.children||[]).filter(n=>n.kind==='folder'&&(ROLE_FOLDERS.has(n.role)||n.role==='bookmarks'||appFolder(n)));
+                const gone=nodeCount(node)-1-keep.reduce((sum,k)=>sum+nodeCount(k),0);
+                const saying='Delete '+(node.title||'folder')+(gone?' and its '+gone+' items':'')+'?'+(keep.length?'\n\n'+keep.map(k=>k.title).join(', ')+' move to the top level first and are kept.':'');
+                if(!confirm(saying))return;
+                const account=ctx.account();
+                await ctx.edit(async()=>{for(const k of keep)await ctx.store.moveNode(k.id,{parentId:null});await ctx.store.removeNode(node.id);});
+                if(ctx.helper.supports('track.untrack'))await ctx.helper.request('track.untrack',{workflowId:node.id,account});
+            },'icon-btn danger'));
         }
         actions.append(tool('›','Browse '+(node.title||'this folder')+' in Organize',()=>ctx.navigate('organize',node.id)));
         if(!readOnly){
@@ -114,7 +125,7 @@ export function createFolderCards(ctx){
             }
             const total=children.filter(n=>n.kind==='bookmark').length;
             if(shown<total)body.append(button('Show '+Math.min(500,total-shown)+' more',()=>{limit+=500;pool.remaining+=500;filled=false;body.replaceChildren();fill();},'board-more'));
-            if(!children.length)body.append(el('p',{className:'board-empty'},readOnly?'Empty folder.':'Empty folder. Drag tabs or bookmarks here.'));
+            if(!folders.length&&!children.some(n=>n.kind==='bookmark'))body.append(el('p',{className:'board-empty'},readOnly?'Empty folder.':'Empty folder. Drag tabs or bookmarks here.'));
         }
         if(open&&pool.remaining<=0){open=false;caret.textContent='▷';box.classList.add('restore-skipped');}
         fill();return box;

@@ -86,8 +86,14 @@
     }
 
     const first = (selectors) => {
+        // Only a spot on screen counts: YouTube keeps hidden copies of both
+        // rows (the previous Short, the player's other layouts) in the page.
+        const onScreen = (el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+        };
         for (const s of selectors) {
-            const el = document.querySelector(s);
+            const el = [...document.querySelectorAll(s)].find(onScreen);
             if (el) return el;
         }
         return null;

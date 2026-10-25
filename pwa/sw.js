@@ -4,9 +4,9 @@
 // together — SHELL_CACHE, the SHELL entries and the importScripts below
 // included. Miss one and the phone keeps serving the old bundle from cache
 // while the desktop looks fixed. tools/test_pwa_release.mjs checks they agree.
-importScripts('shareCore.js?v=41');
+importScripts('shareCore.js?v=42');
 
-const SHELL_CACHE = 'tp-shell-v41';
+const SHELL_CACHE = 'tp-shell-v42';
 
 // Server URL, session token and who it is, mirrored here by the app: workers
 // cannot read localStorage, where the config actually lives. Cache Storage
@@ -17,9 +17,9 @@ const CONFIG_KEY = '/__tp_config';
 const SHELL = [
     '/',
     '/index.html',
-    '/app.css?v=41',
-    '/app.js?v=41',
-    '/shareCore.js?v=41',
+    '/app.css?v=42',
+    '/app.js?v=42',
+    '/shareCore.js?v=42',
     '/shareSheet.js',
     '/bookmarksHtml.js',
     '/lib/notesModel.js',
@@ -29,8 +29,8 @@ const SHELL = [
     '/helper.js',
     '/desktopCore.js',
     '/desktopShell.js',
-    '/desktop.css?v=41',
-    '/home.css?v=41',
+    '/desktop.css?v=42',
+    '/home.css?v=42',
     '/home.js',
     '/board.js',
     '/workflows.js',
@@ -40,11 +40,11 @@ const SHELL = [
     '/vault.js',
     '/move.js',
     '/housekeeping.js',
-    '/notesExtras.css?v=41',
-    '/organize.css?v=41',
-    '/settings.css?v=41',
-    '/workflows.css?v=41',
-    '/board.css?v=41',
+    '/notesExtras.css?v=42',
+    '/organize.css?v=42',
+    '/settings.css?v=42',
+    '/workflows.css?v=42',
+    '/board.css?v=42',
     '/lib/tabGrouper.js',
     '/lib/bookmarkOrganizer.js',
     '/lib/storageManager.js',
