@@ -21,8 +21,10 @@
     // YouTube renames its markup now and then: the first match wins.
     const WATCH_ROW = ['ytd-watch-metadata #top-level-buttons-computed', '#above-the-fold #top-level-buttons-computed',
         'ytd-watch-metadata #actions ytd-menu-renderer', '#actions #top-level-buttons-computed'];
-    const SHORTS_BAR = ['ytd-reel-video-renderer[is-active] reel-action-bar-view-model',
-        'ytd-reel-video-renderer[is-active] #actions', 'ytd-shorts [is-active] #actions'];
+    // Shorts: the column is found from its like (heart) button, whatever
+    // YouTube calls the column itself this month.
+    const SHORTS_LIKE = ['ytd-shorts like-button-view-model', 'ytd-shorts #like-button', 'ytd-shorts ytd-like-button-renderer',
+        'like-button-view-model', 'ytd-reel-video-renderer #like-button'];
 
     const ICON = 'M12 2.5 4 6v6c0 4.6 3.4 8.6 8 9.5 4.6-.9 8-4.9 8-9.5V6l-8-3.5Zm-1 13.2-3.6-3.6 1.4-1.4 2.2 2.2 4.8-4.8 1.4 1.4-6.2 6.2Z';
 
@@ -53,8 +55,23 @@
         b.title = 'Save to a TabPaladin folder';
         const label = document.createElement('span');
         label.textContent = 'Save';
-        b.append(svgIcon(), label);
-        Object.assign(b.style, {
+        if (vertical) {
+            // YouTube's own Shorts buttons: a round button, its label under it.
+            const circle = document.createElement('span');
+            Object.assign(circle.style, { display: 'flex', alignItems: 'center', justifyContent: 'center', width: '48px', height: '48px',
+                borderRadius: '50%', background: 'var(--yt-spec-badge-chip-background, rgba(255,255,255,0.1))' });
+            const icon = svgIcon();
+            icon.setAttribute('width', '24');
+            icon.setAttribute('height', '24');
+            circle.append(icon);
+            b.append(circle, label);
+            Object.assign(b.style, { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', border: '0', padding: '0',
+                margin: '0 0 16px', background: 'transparent', cursor: 'pointer', color: 'var(--yt-spec-text-primary, #f1f1f1)',
+                font: '400 14px Roboto, Arial, sans-serif' });
+        } else {
+            b.append(svgIcon(), label);
+        }
+        if (!vertical) Object.assign(b.style, {
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '6px',
             border: '0', cursor: 'pointer', font: '500 14px Roboto, Arial, sans-serif',
             color: 'var(--yt-spec-text-primary, #f1f1f1)', background: 'var(--yt-spec-badge-chip-background, rgba(255,255,255,0.1))'
@@ -62,9 +79,7 @@
         if (floating) {
             Object.assign(b.style, { position: 'fixed', right: '24px', bottom: '24px', zIndex: '2147483000', height: '40px', borderRadius: '20px',
                 padding: '0 16px', background: '#3d5afe', color: '#fff', boxShadow: '0 4px 14px rgba(0,0,0,0.4)' });
-        } else if (vertical) {
-            Object.assign(b.style, { flexDirection: 'column', width: '48px', minHeight: '48px', borderRadius: '24px', padding: '8px 0', margin: '0 0 16px', fontSize: '12px', gap: '2px' });
-        } else {
+        } else if (!vertical) {
             Object.assign(b.style, { height: '36px', borderRadius: '18px', padding: '0 14px', marginLeft: '8px', flex: 'none' });
         }
         b.addEventListener('click', (e) => {
@@ -85,13 +100,13 @@
         return b;
     }
 
+    // Only a spot on screen counts: YouTube keeps hidden copies of both
+    // rows (the previous Short, the player's other layouts) in the page.
+    const onScreen = (el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+    };
     const first = (selectors) => {
-        // Only a spot on screen counts: YouTube keeps hidden copies of both
-        // rows (the previous Short, the player's other layouts) in the page.
-        const onScreen = (el) => {
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
-        };
         for (const s of selectors) {
             const el = [...document.querySelectorAll(s)].find(onScreen);
             if (el) return el;
@@ -99,8 +114,22 @@
         return null;
     };
 
-    // When YouTube's markup has moved on and no spot is found within a few
-    // seconds, the button floats in the corner instead.
+    // The like button's slot in the Shorts column: climb from the like button
+    // to the first ancestor that stacks it with the other buttons.
+    function shortsSlot() {
+        const like = first(SHORTS_LIKE);
+        let item = like;
+        for (let i = 0; item && i < 6; i++, item = item.parentElement) {
+            const column = item.parentElement;
+            if (!column || column.children.length < 3) continue;
+            const c = column.getBoundingClientRect(), r = item.getBoundingClientRect();
+            if (c.height >= r.height * 2.5) return { column, item };
+        }
+        return null;
+    }
+
+    // While no spot is found (the page still loading, or YouTube's markup
+    // moved on), the button floats in the corner.
     let since = 0, sincePath = '';
     function place() {
         if (!enabled) return;
@@ -116,15 +145,15 @@
                 if (!row.parentElement.querySelector(':scope > .' + CLASS)) row.parentElement.insertBefore(makeButton(false), row.nextSibling);
             }
         } else {
-            const bar = first(SHORTS_BAR);
-            if (bar) {
+            const slot = shortsSlot();
+            if (slot) {
                 placed = true;
-                if (!bar.querySelector(':scope > .' + CLASS)) bar.prepend(makeButton(true));
+                if (!slot.column.querySelector(':scope > .' + CLASS)) slot.column.insertBefore(makeButton(true), slot.item);
             }
         }
         if (placed) { if (floating) floating.remove(); return; }
         if (floating) return;
-        if (Date.now() - since < 4000) { setTimeout(schedule, 1000); return; }
+        if (Date.now() - since < 1500) { setTimeout(schedule, 500); return; }
         const b = makeButton(false, true);
         b.dataset.floating = '1';
         document.body.append(b);
