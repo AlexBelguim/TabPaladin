@@ -415,7 +415,13 @@ try {
         JSON.stringify(order));
     check('the share went up from the page as well (the worker is not running here)', (await api(`/api/shares/${s1.sid}`, { token: A })).status === 200);
 
-    console.log('\n2. One tap files it');
+    console.log('\n2. One tap files it, and the sheet closes');
+    // Keys go to a sheet opened over this one, not to the share sheet.
+    byId('settings-sheet').classList.remove('hidden');
+    for (const fn of documentListeners.keydown || []) fn({ key: 'Escape', target: byId('cfg-username'), preventDefault() {}, stopImmediatePropagation() {} });
+    await settle();
+    check('keys go to a sheet opened over it: Esc there leaves the share sheet open', sheetOpen());
+    byId('settings-sheet').classList.add('hidden');
     mark = created.length;
     await chip('f-ai').fire('click');
     await settle();
@@ -423,38 +429,22 @@ try {
     check('one tap: on the server, at the end of AI, titled with the words around the link',
         byTitle(t.roots, 'AI').children.at(-1).url === 'https://x.com/nasa/status/42' && byTitle(t.roots, 'AI').children.at(-1).title === 'Look at this',
         JSON.stringify(byTitle(t.roots, 'AI').children.at(-1)));
-    check('  the chip says saved, with Undo', /\bsaved\b/.test(chip('f-ai', mark).className) && drawnText('✓ Saved to AI', mark) && Boolean(button('Undo', mark)));
+    check('  the sheet closes by itself, and the toast says where it went, with Undo', !sheetOpen() && /Saved to AI/.test(lastToast()) && Boolean(button('Undo', mark)),
+        JSON.stringify({ open: sheetOpen(), toast: lastToast() }));
     check('  the share is filed', (await api(`/api/shares/${s1.sid}`, { token: A })).json.share.status === 'filed');
-    // A desktop keyboard: Enter on the focused Undo is that button's, not Done.
-    const enterOnUndo = { key: 'Enter', target: button('Undo', mark), preventDefault() {}, stopImmediatePropagation() {} };
-    for (const fn of documentListeners.keydown || []) fn(enterOnUndo);
-    await settle();
-    check('Enter on a focused button does what that button does: the sheet does not close as Done', sheetOpen());
-    byId('settings-sheet').classList.remove('hidden');
-    for (const fn of documentListeners.keydown || []) fn({ key: 'Escape', target: byId('cfg-username'), preventDefault() {}, stopImmediatePropagation() {} });
-    await settle();
-    check('  and keys go to a sheet opened over it: Esc there leaves the share sheet open', sheetOpen());
-    byId('settings-sheet').classList.add('hidden');
-    mark = created.length;
-    await chip('f-fun').fire('click');
-    await settle();
-    t = await tree(A);
-    check('a second chip files it into a second folder', byTitle(t.roots, 'Fun').children.at(-1).url === 'https://x.com/nasa/status/42'
-        && (await api(`/api/shares/${s1.sid}`, { token: A })).json.share.filings.length === 2);
-    mark = created.length;
-    await button('Undo').fire('click');
+    await button('Undo', mark).fire('click');
     await settle();
     t = await tree(A);
     const after2 = (await api(`/api/shares/${s1.sid}`, { token: A })).json.share;
     // An X link goes back to its archive, where it waited on arrival.
-    check('Undo takes both back', !JSON.stringify(t.roots).includes('nasa/status/42') && after2.status === 'archived' && after2.filings.length === 0,
+    check('the toast\'s Undo takes it back', !JSON.stringify(t.roots).includes('nasa/status/42') && after2.status === 'archived' && after2.filings.length === 0,
         JSON.stringify(after2) + ' ' + requests.filter(r => /unfile/.test(r)).join(','));
+    mark = created.length;
+    await coldStart(`${BASE}/?share=${s1.sid}`);
+    check('opened again, the sheet is back on it', sheetOpen());
     await chip('f-ai').fire('click');
     await settle();
-    mark = created.length;
-    await button('Done').fire('click');
-    await settle();
-    check('filed again, Done closes the sheet and says where it went', !sheetOpen() && /Saved to AI/.test(lastToast())
+    check('filed again, the sheet closes and says where it went', !sheetOpen() && /Saved to AI/.test(lastToast())
         && JSON.stringify((await tree(A)).roots).includes('nasa/status/42'),
         JSON.stringify({ open: sheetOpen(), toast: lastToast(), filed: JSON.stringify((await tree(A)).roots).includes('nasa/status/42'), req: requests.slice(-8) }));
     check('  the share is off the phone', !(await outbox.get(s1.sid)));
@@ -468,11 +458,9 @@ try {
     mark = created.length;
     await chip('f-fun').fire('click');
     await settle();
-    check('a folder this share was just filed into by the worker is saved by this tap, with Undo and Done, not "already here"',
-        /\bsaved\b/.test(chip('f-fun', mark).className) && Boolean(button('Undo', mark)) && Boolean(button('Done', mark)) && !drawnText('✓ already here', mark),
-        JSON.stringify({ cls: chip('f-fun', mark) && chip('f-fun', mark).className, done: Boolean(button('Done', mark)) }));
-    await button('Done', mark).fire('click');
-    await settle();
+    check('a folder this share was just filed into by the worker is saved by this tap: the sheet closes, with Undo, not "already here"',
+        !sheetOpen() && /Saved to Fun/.test(lastToast()) && Boolean(button('Undo', mark)) && !/already/.test(lastToast()),
+        JSON.stringify({ open: sheetOpen(), toast: lastToast() }));
 
     console.log('\n3. A push after a link was filed elsewhere');
     // The copy moved with each filing, so a push now goes straight through.
@@ -547,6 +535,11 @@ try {
         && (await api(`/api/shares/${s4.sid}`, { token: A })).json.share.filings.length === 2);
     check('  and the open sheet says so: saved, with Undo and Done, nothing waiting', Boolean(button('Done', mark)) && Boolean(button('Undo', mark))
         && /\bsaved\b/.test(chip('f-ai', mark).className) && /\bsaved\b/.test(chip('f-fun', mark).className) && !drawnText('Will save to', mark));
+    // A desktop keyboard: Enter on the focused Undo is that button's, not Done.
+    const enterOnUndo = { key: 'Enter', target: button('Undo', mark), preventDefault() {}, stopImmediatePropagation() {} };
+    for (const fn of documentListeners.keydown || []) fn(enterOnUndo);
+    await settle();
+    check('  Enter on a focused button does what that button does: the sheet does not close as Done', sheetOpen());
     await button('Done', mark).fire('click');
     await settle();
 

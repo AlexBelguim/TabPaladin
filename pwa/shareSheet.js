@@ -425,7 +425,28 @@ export function createShareSheet(ctx) {
             s.message = `Couldn't save: ${errors[errors.length - 1].message}`;
         }
         if (refused.length && !s.message) s.message = failedMessage(refused, keys.filter(k => s.saved.has(k)).length);
+        // Saved everywhere this tap asked, with nothing failed or waiting: the
+        // sheet's job is done, so it closes, and Undo moves to the toast.
+        if (keys.length && keys.every(k => s.saved.has(k)) && !s.message && !s.queued.size) {
+            const shareRef = ref(), asWho = expect();
+            const undone = keys.filter(k => !s.saved.get(k).already);
+            refreshInbox();
+            done(undone.length ? () => unfileAfterClose(shareRef, asWho, undone) : null);
+            return;
+        }
         render();
+        refreshInbox();
+    }
+
+    // Undo from the toast, once the sheet has closed.
+    async function unfileAfterClose(shareRef, asWho, folderIds) {
+        try {
+            const res = await ctx.api(`/api/shares/${encodeURIComponent(shareRef)}/unfile`, { method: 'POST', body: JSON.stringify({ folderIds, ...asWho }) });
+            ctx.applyUnfiled(res);
+            ctx.toast((res.kept || []).length ? 'Undone, except what was changed since.' : 'Undone.');
+        } catch (e) {
+            ctx.toast(`Couldn't undo: ${e.message}`);
+        }
         refreshInbox();
     }
 
@@ -526,12 +547,12 @@ export function createShareSheet(ctx) {
         refreshInbox();
     }
 
-    function done() {
+    function done(undo = null) {
         if (!s) return;
         const labels = [...s.saved.values()].filter(v => !v.already).map(v => v.label);
         const fromShare = s.fromShare;
         close();
-        ctx.done({ label: labels.length ? labels.join(', ') : '', fromShare });
+        ctx.done({ label: labels.length ? labels.join(', ') : '', fromShare, undo: typeof undo === 'function' ? undo : null });
     }
 
     // --- Prefs: pins, hides, slots ------------------------------------------------------

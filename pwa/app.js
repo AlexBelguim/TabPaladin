@@ -7094,13 +7094,14 @@ function makeShareSheet() {
             afterShareSheet().catch(() => {});
             refreshInbox();
         },
-        done: ({ label, fromShare }) => {
+        done: ({ label, fromShare, undo }) => {
             // A window the share opened goes back to the app it came from.
             if (fromShare && history.length === 1) {
                 try { window.close(); } catch (e) { /* not ours to close */ }
             }
             if (state.view !== 'notes') renderView();
-            if (label) showToast(`Saved to ${label}`);
+            if (label && undo) showUndoToast(`Saved to ${label}`, undo);
+            else if (label) showToast(`Saved to ${label}`);
         }
     });
 }
