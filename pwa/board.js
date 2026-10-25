@@ -12,6 +12,37 @@ export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
     if(ctx.helper.supports('windows.openUrls')){const result=await ctx.helper.request('windows.openUrls',{urls,mode});if(result.failed?.length)ctx.toast(result.failed.length+' bookmarks could not be opened. Your bookmarks are kept.');}
     else for(const url of urls)ctx.openExternal(url);
 }
+// A YouTube link's video id, and whether it is a Short.
+const youTubeVideo = url => {
+    try {
+        const u = new URL(url), host = u.hostname.replace(/^(www|m|music)\./, '');
+        let id = null;
+        if (host === 'youtu.be') id = u.pathname.split('/')[1];
+        else if (host === 'youtube.com') {
+            if (u.pathname === '/watch') id = u.searchParams.get('v');
+            else { const m = u.pathname.match(/^\/(?:shorts|live|embed)\/([^/?#]+)/); if (m) id = m[1]; }
+        }
+        return id && /^[A-Za-z0-9_-]{6,20}$/.test(id) ? { id, short: u.pathname.startsWith('/shorts/') } : null;
+    } catch { return null; }
+};
+// A YouTube folder played in order. All Shorts: the Shorts player, where the
+// helper's YouTube script makes the arrows, wheel and keys go through this
+// folder. Anything else (or without that script): YouTube's own temporary
+// playlist, which holds 50 videos.
+export async function playYouTube(ctx, title, nodes) {
+    const vids = nodes.map(n => youTubeVideo(n.url)).filter(Boolean);
+    if (!vids.length) { ctx.toast('No YouTube videos in ' + title + '.'); return; }
+    if (vids.every(v => v.short) && ctx.helper.supports('youtube.playlist')) {
+        try { await ctx.helper.request('youtube.playlist', { title, ids: vids.map(v => v.id) }); return; }
+        catch (x) {
+            if (x.code !== 'youtube-off') throw x;
+            ctx.toast('Turn on the YouTube button in helper Settings to scroll these Shorts as a playlist.');
+        }
+    }
+    const ids = [...new Set(vids.map(v => v.id))];
+    if (ids.length > 50) ctx.toast('A YouTube playlist holds 50 videos: playing the first 50 of ' + ids.length + '.');
+    ctx.openExternal('https://www.youtube.com/watch_videos?video_ids=' + ids.slice(0, 50).join(','));
+}
 function drag(elm,payload,ctx){elm.draggable=true;elm.addEventListener('dragstart',e=>{dragging={...payload,account:ctx.account()};e.dataTransfer.setData('text/plain','TabPaladin items');e.dataTransfer.effectAllowed='move';});elm.addEventListener('dragend',()=>{dragging=null;});}
 async function removeItems(ctx,nodes){
     if(!confirm('Delete '+nodes.length+' selected bookmarks?'))return;
@@ -42,6 +73,9 @@ function favicon(url) {
 export function createFolderCards(ctx){
     let generation=0;const timers=new Set();
     const budget=()=>({remaining:2000,controllers:[]});
+    // The YouTube folder and every folder inside it: those get ▶ Play.
+    let ytCache={roots:null,ids:new Set()};
+    const youTubeFolders=()=>{const roots=ctx.store.roots();if(ytCache.roots!==roots){const apps=walk(roots).filter(n=>n.kind==='folder'&&n.payload?.app==='youtube');ytCache={roots,ids:new Set(apps.flatMap(a=>[a,...walk(a.children)]).filter(n=>n.kind==='folder').map(n=>n.id))};}return ytCache.ids;};
     // lead: an element shown between the header and the body (Workflows' bar).
     // extra: other folders listed inside this one after its own (the Bookmarks
     // column holds the other top-level folders).
@@ -61,6 +95,7 @@ export function createFolderCards(ctx){
         const actions=el('div',{className:'board-tools'});
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
         const many=loose().length;
+        if(youTubeFolders().has(node.id)){const vids=walk(node.children||[]).filter(n=>n.kind==='bookmark'&&youTubeVideo(n.url));if(vids.length)actions.append(tool('▶ Play','Play '+(node.title||'this folder')+' on YouTube: next and previous go through this folder',()=>playYouTube(ctx,node.title||'YouTube',vids).catch(x=>ctx.toast(x.message)),'icon-btn tool-play'));}
         if(many)actions.append(tool(many>500?'▶ 500':'▶ All',many>500?'Open the first 500 bookmarks in a new window':'Open all '+many+' bookmarks in a new window',()=>openNodes(ctx,loose())));
         if(many>10)actions.append(tool('▶ 10','Open the first 10 in a new window',()=>openNodes(ctx,loose(),10)));
         head.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();openNodes(ctx,loose()).catch(x=>ctx.toast(x.message));}});

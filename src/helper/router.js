@@ -4,8 +4,8 @@
     const readsVisible = op => op.startsWith('tabs.') || op.startsWith('windows.') || ['actions.take', 'bookmarks.take', 'vault.get'].includes(op);
     // move.manifest starts a hand-over (and binds its document) only from a
     // click; its parts and ack are bound to that document and bundle (move.js).
-    const gestureOps = new Set(['tabs.snapshot', 'tabs.active', 'tabs.closeSnapshot', 'windows.openWorkflow', 'windows.openUrls', 'windows.list', 'bookmarks.take', 'options.open', 'move.manifest']);
-    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack', 'vault.put', 'vault.clear', 'move.ack']);
+    const gestureOps = new Set(['tabs.snapshot', 'tabs.active', 'tabs.closeSnapshot', 'windows.openWorkflow', 'windows.openUrls', 'windows.list', 'bookmarks.take', 'options.open', 'move.manifest', 'youtube.playlist']);
+    const mutations = new Set(['windows.openWorkflow', 'windows.openUrls', 'youtube.playlist', 'tabs.closeSnapshot', 'removals.ack', 'actions.done', 'bookmarks.ack', 'track.untrack', 'vault.put', 'vault.clear', 'move.ack']);
     const requestRates = new Map();
     const inFlight = new Map();
     let mutationChain = Promise.resolve();

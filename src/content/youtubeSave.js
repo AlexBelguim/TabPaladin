@@ -167,8 +167,132 @@
     };
     new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
     document.addEventListener('yt-navigate-finish', schedule);
-    window.__tpYouTubeSave = () => { enabled = true; schedule(); };
+    window.__tpYouTubeSave = () => { enabled = true; schedule(); checkPlaylist(); };
     schedule();
+
+    // --- A TabPaladin folder as a Shorts playlist ---------------------------
+    //
+    // In a tab the helper opened for a folder (save.js), the Shorts arrows,
+    // the wheel and the arrow keys step through that folder instead of
+    // YouTube's feed, and a panel says where in it you are. On a video that is
+    // not in the folder (one opened from here), YouTube is itself again.
+    const PANEL = 'tp-yt-playlist';
+    let playlist = null, turning = false, wheelSum = 0, wheelAt = 0;
+
+    const ask = (msg) => {
+        try {
+            return Promise.resolve(ext.runtime.sendMessage({ channel: 'tp-youtube-playlist', url: location.href, ...msg })).catch(() => null);
+        } catch (e) {
+            return Promise.resolve(null);
+        }
+    };
+
+    async function checkPlaylist() {
+        if (!enabled) return;
+        const reply = await ask({ op: 'get' });
+        playlist = reply && reply.ok && reply.playlist ? reply.playlist : null;
+        turning = false;
+        drawPanel();
+    }
+
+    async function go(dir) {
+        if (!playlist || turning) return;
+        turning = true;
+        const reply = await ask({ op: 'go', dir });
+        if (reply && reply.ok && reply.url) { location.assign(reply.url); return; }
+        turning = false;
+        if (reply && reply.end) note(dir > 0 ? 'End of ' + (playlist.title || 'the folder') : 'Start of ' + (playlist.title || 'the folder'));
+    }
+
+    function roundButton(text, title, dir) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        b.title = title;
+        Object.assign(b.style, { width: '56px', height: '56px', borderRadius: '50%', border: '0', cursor: 'pointer', fontSize: '22px',
+            color: 'var(--yt-spec-text-primary, #f1f1f1)', background: 'var(--yt-spec-badge-chip-background, rgba(255,255,255,0.1))' });
+        b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); go(dir); });
+        return b;
+    }
+
+    function note(text) {
+        const panel = document.getElementById(PANEL);
+        const pos = panel && panel.querySelector('[data-pos]');
+        if (!pos) return;
+        pos.textContent = text;
+        setTimeout(drawPanel, 1500);
+    }
+
+    function drawPanel() {
+        let panel = document.getElementById(PANEL);
+        let style = document.getElementById(PANEL + '-style');
+        if (!playlist || !enabled) {
+            if (panel) panel.remove();
+            if (style) style.remove();
+            return;
+        }
+        if (!style) {
+            // YouTube's own up/down arrows would leave the folder for its feed.
+            style = document.createElement('style');
+            style.id = PANEL + '-style';
+            style.textContent = '#navigation-button-up, #navigation-button-down { display: none !important; }';
+            document.documentElement.append(style);
+        }
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = PANEL;
+            Object.assign(panel.style, { position: 'fixed', right: '24px', top: '50%', transform: 'translateY(-50%)', zIndex: '2147483000',
+                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', font: '400 13px Roboto, Arial, sans-serif',
+                color: 'var(--yt-spec-text-primary, #f1f1f1)', textAlign: 'center', maxWidth: '120px' });
+            const title = document.createElement('div');
+            title.dataset.title = '';
+            Object.assign(title.style, { fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '120px' });
+            const pos = document.createElement('div');
+            pos.dataset.pos = '';
+            panel.append(title, roundButton('▲', 'Previous in this folder', -1), pos, roundButton('▼', 'Next in this folder', 1));
+            document.body.append(panel);
+        }
+        panel.querySelector('[data-title]').textContent = '📥 ' + (playlist.title || 'TabPaladin');
+        panel.querySelector('[data-pos]').textContent = (playlist.index + 1) + ' / ' + playlist.count;
+        const [up, down] = panel.querySelectorAll('button');
+        up.disabled = playlist.index === 0;
+        down.disabled = playlist.index === playlist.count - 1;
+        up.style.opacity = up.disabled ? '0.4' : '1';
+        down.style.opacity = down.disabled ? '0.4' : '1';
+    }
+
+    const typing = (t) => t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+    const onShorts = () => location.pathname.startsWith('/shorts/');
+    window.addEventListener('keydown', (e) => {
+        if (!playlist || !onShorts() || typing(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
+        const dir = e.key === 'ArrowDown' || e.key === 'PageDown' ? 1 : e.key === 'ArrowUp' || e.key === 'PageUp' ? -1 : 0;
+        if (!dir) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        go(dir);
+    }, true);
+    window.addEventListener('wheel', (e) => {
+        if (!playlist || !onShorts() || e.ctrlKey) return;
+        // Comments and menus still scroll themselves.
+        if (e.target && e.target.closest && e.target.closest('ytd-engagement-panel-section-list-renderer, tp-yt-iron-dropdown, #' + PANEL)) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const now = Date.now();
+        if (now - wheelAt > 300) wheelSum = 0;
+        wheelAt = now;
+        wheelSum += e.deltaY;
+        if (Math.abs(wheelSum) >= 60) {
+            const dir = wheelSum > 0 ? 1 : -1;
+            wheelSum = 0;
+            go(dir);
+        }
+    }, { capture: true, passive: false });
+    // A long video in the folder opens on the video page: at its end, the next.
+    document.addEventListener('ended', (e) => {
+        if (playlist && e.target && e.target.tagName === 'VIDEO' && location.pathname === '/watch') go(1);
+    }, true);
+    document.addEventListener('yt-navigate-finish', checkPlaylist);
+    checkPlaylist();
 
     try {
         ext.runtime.onMessage.addListener((msg, sender) => {
@@ -176,6 +300,8 @@
             if (msg && msg.type === 'tp-youtube-save-off') {
                 enabled = false;
                 document.querySelectorAll('.' + CLASS).forEach(b => b.remove());
+                playlist = null;
+                drawPanel();
             }
         });
     } catch (e) { /* stays until the page reloads */ }

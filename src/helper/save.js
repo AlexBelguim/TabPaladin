@@ -89,4 +89,92 @@
         api.permissions.onAdded.addListener(sync);
         api.permissions.onRemoved.addListener(sync);
     }
+
+    // --- A YouTube folder as a Shorts playlist ------------------------------
+    //
+    // The web app hands over a folder's Shorts (youtube.playlist, from a
+    // click). The tab opened for it keeps that list: on its pages the YouTube
+    // script steps through the folder with the Shorts arrows, the wheel and
+    // the arrow keys instead of YouTube's feed. Only video ids are kept, in
+    // session storage, and only for that tab.
+    const PLAYLISTS = 'tpYouTubePlaylists';
+    const ID = /^[A-Za-z0-9_-]{6,20}$/;
+    const videoId = (raw) => {
+        try {
+            const u = new URL(raw);
+            let id = null;
+            if (u.hostname === 'youtu.be') id = u.pathname.split('/')[1];
+            else if (/(^|\.)youtube\.com$/.test(u.hostname)) {
+                if (u.pathname === '/watch') id = u.searchParams.get('v');
+                else { const m = u.pathname.match(/^\/(?:shorts|live|embed)\/([^/?#]+)/); if (m) id = m[1]; }
+            }
+            return id && ID.test(id) ? id : null;
+        } catch (_) { return null; }
+    };
+    let playlistChain = Promise.resolve();
+    const withPlaylists = (fn) => {
+        const run = playlistChain.then(async () => {
+            const all = (await H.temporary.get(PLAYLISTS))[PLAYLISTS] || {};
+            const out = await fn(all);
+            await H.temporary.set({ [PLAYLISTS]: all });
+            return out;
+        });
+        playlistChain = run.catch(() => {});
+        return run;
+    };
+
+    H.handlers['youtube.playlist'] = async (body, ctx) => {
+        await H.assertContext(ctx);
+        const ids = [...new Set(Array.isArray(body.ids) ? body.ids.filter(id => typeof id === 'string' && ID.test(id)) : [])].slice(0, 1000);
+        if (!ids.length) H.fail('bad-args', 'No YouTube Shorts in this folder.');
+        const registered = api.scripting && api.scripting.getRegisteredContentScripts
+            && (await api.scripting.getRegisteredContentScripts({ ids: [YOUTUBE_ID] })).length;
+        if (!registered) H.fail('youtube-off', 'Turn on the YouTube button in helper Settings first.');
+        const win = await api.windows.get(ctx.sender.tab.windowId);
+        const tab = await api.tabs.create({ url: 'https://www.youtube.com/shorts/' + ids[0], active: true,
+            ...(win && win.type === 'normal' && !win.incognito ? { windowId: win.id } : {}) });
+        const title = String(body.title || '').slice(0, 200);
+        await withPlaylists((all) => {
+            for (const k of Object.keys(all)) if (Date.now() - all[k].at > 7 * 24 * 3600 * 1000) delete all[k];
+            all[tab.id] = { title, ids, index: 0, at: Date.now() };
+        });
+        return { tabId: tab.id, count: ids.length };
+    };
+    H.ops.push('youtube.playlist');
+
+    // The YouTube script asks where its page is in the tab's folder ('get'),
+    // and for the next or previous video ('go').
+    api.runtime.onMessage.addListener((message, sender, reply) => {
+        if (!message || message.channel !== 'tp-youtube-playlist') return;
+        const ok = sender && sender.id === api.runtime.id && sender.tab && !sender.tab.incognito && sender.frameId === 0
+            && /^https:\/\/(www|m)\.youtube\.com\//.test(String(sender.url || ''));
+        if (!ok) { reply({ ok: false }); return; }
+        // The page's own address: YouTube moves between videos without a load.
+        let id = null;
+        try { if (new URL(message.url).origin === new URL(sender.url).origin) id = videoId(message.url); } catch (_) { /* not a URL */ }
+        if (!id) id = videoId(sender.url);
+        withPlaylists((all) => {
+            const pl = all[sender.tab.id];
+            if (!pl) return { playlist: null };
+            const at = pl.ids.indexOf(id);
+            if (message.op === 'get') {
+                if (at < 0) return { playlist: null };
+                pl.index = at;
+                pl.at = Date.now();
+                return { playlist: { title: pl.title, index: at, count: pl.ids.length } };
+            }
+            if (message.op === 'go') {
+                const next = (at >= 0 ? at : pl.index) + (message.dir === -1 ? -1 : 1);
+                if (next < 0 || next >= pl.ids.length) return { end: true };
+                pl.index = next;
+                pl.at = Date.now();
+                return { url: 'https://www.youtube.com/shorts/' + pl.ids[next] };
+            }
+            return {};
+        }).then(r => reply({ ok: true, ...r }), e => reply({ ok: false, message: e.message }));
+        return true;
+    });
+    api.tabs.onRemoved.addListener((tabId) => {
+        withPlaylists((all) => { delete all[tabId]; }).catch(() => {});
+    });
 })();
