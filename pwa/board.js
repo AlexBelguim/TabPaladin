@@ -43,6 +43,26 @@ export async function playYouTube(ctx, title, nodes) {
     if (ids.length > 50) ctx.toast('A YouTube playlist holds 50 videos: playing the first 50 of ' + ids.length + '.');
     ctx.openExternal('https://www.youtube.com/watch_videos?video_ids=' + ids.slice(0, 50).join(','));
 }
+// A saved X or Instagram post (not a profile or a page of the site).
+const isPost = url => {
+    try {
+        const u = new URL(url), host = u.hostname.replace(/^(www|mobile)\./, '');
+        if (host === 'x.com' || host === 'twitter.com') return /\/status(?:es)?\/\d+/.test(u.pathname);
+        return host === 'instagram.com' && /^\/(?:[^/]+\/)?(p|reels?|tv)\/[A-Za-z0-9_-]+/.test(u.pathname);
+    } catch { return false; }
+};
+// A folder of X or Instagram posts as a feed: the helper opens the first in
+// a tab where next and previous go through the folder (src/helper/feed.js).
+export async function openFeed(ctx, title, nodes) {
+    const urls = nodes.map(n => n.url).filter(isPost);
+    if (!urls.length) { ctx.toast('No X or Instagram posts in ' + title + '.'); return; }
+    if (!ctx.helper.supports('feed.open')) { ctx.toast('Feeds need the TabPaladin helper (1.11 or later).'); return; }
+    try { await ctx.helper.request('feed.open', { title, urls }); }
+    catch (x) {
+        if (x.code === 'feeds-off') { ctx.toast('Turn on "Feeds for X and Instagram" in helper Settings first.'); return; }
+        throw x;
+    }
+}
 function drag(elm,payload,ctx){elm.draggable=true;elm.addEventListener('dragstart',e=>{dragging={...payload,account:ctx.account()};e.dataTransfer.setData('text/plain','TabPaladin items');e.dataTransfer.effectAllowed='move';});elm.addEventListener('dragend',()=>{dragging=null;});}
 async function removeItems(ctx,nodes){
     if(!confirm('Delete '+nodes.length+' selected bookmarks?'))return;
@@ -96,6 +116,8 @@ export function createFolderCards(ctx){
         const loose=()=>((ctx.store.roots().length?walk(ctx.store.roots()).find(n=>n.id===node.id):null)?.children||[]).filter(n=>n.kind==='bookmark');
         const many=loose().length;
         if(youTubeFolders().has(node.id)){const vids=walk(node.children||[]).filter(n=>n.kind==='bookmark'&&youTubeVideo(n.url));if(vids.length)actions.append(tool('▶ Play','Play '+(node.title||'this folder')+' on YouTube: next and previous go through this folder',()=>playYouTube(ctx,node.title||'YouTube',vids).catch(x=>ctx.toast(x.message)),'icon-btn tool-play'));}
+        // The archive's X and Instagram folders, and any folder that is mostly their posts.
+        {const marks=walk(node.children||[]).filter(n=>n.kind==='bookmark'),posts=marks.filter(n=>isPost(n.url));if(posts.length&&(String(node.id).startsWith('imp:src:')||posts.length*2>=marks.length))actions.append(tool('▶ Feed','Go through '+(node.title||'this folder')+' post by post on X or Instagram',()=>openFeed(ctx,node.title||'Feed',posts).catch(x=>ctx.toast(x.message)),'icon-btn tool-play'));}
         if(many)actions.append(tool(many>500?'▶ 500':'▶ All',many>500?'Open the first 500 bookmarks in a new window':'Open all '+many+' bookmarks in a new window',()=>openNodes(ctx,loose())));
         if(many>10)actions.append(tool('▶ 10','Open the first 10 in a new window',()=>openNodes(ctx,loose(),10)));
         head.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();openNodes(ctx,loose()).catch(x=>ctx.toast(x.message));}});
