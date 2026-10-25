@@ -207,6 +207,8 @@
             ['tp-helper-reopen', 'Reopen tabs TabPaladin closed'], ['tp-helper-settings', 'Settings']]) {
             menus.create({ id, title, contexts: [context] });
         }
+        menus.create({ id: 'tp-save-page', title: 'Save page to TabPaladin…', contexts: ['page', 'video', 'image'] });
+        menus.create({ id: 'tp-save-link', title: 'Save link to TabPaladin…', contexts: ['link'] });
     };
     api.runtime.onInstalled.addListener(() => install().catch(() => {}));
     if (api.runtime.onStartup) api.runtime.onStartup.addListener(() => install().catch(() => {}));
@@ -217,6 +219,10 @@
         if (info.menuItemId === 'tp-helper-open') run = H.openWebApp();
         if (info.menuItemId === 'tp-helper-save') run = H.stageSave(tab);
         if (info.menuItemId === 'tp-helper-reopen') run = H.reopenClosed();
-        if (run && run.catch) run.catch(() => api.runtime.openOptionsPage());
+        if (info.menuItemId === 'tp-save-page') run = H.openSave({ url: info.pageUrl || (tab && tab.url), title: tab && tab.title });
+        if (info.menuItemId === 'tp-save-link') run = H.openSave({ url: info.linkUrl, title: info.linkText || '' });
+        // Settings is where a missing connection is fixed; a link that cannot
+        // be saved, or a second click within a second, is no reason to go there.
+        if (run && run.catch) run.catch(e => { if (!e || !['bad-args', 'rate-limited'].includes(e.code)) api.runtime.openOptionsPage(); });
     });
 })();

@@ -30,6 +30,7 @@ const chrome = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf
 const firefox = JSON.parse(fs.readFileSync(path.join(ROOT, 'firefox/manifest.json'), 'utf8'));
 const PERMISSIONS = ['bookmarks', 'downloads', 'scripting', 'storage', 'tabs', 'unlimitedStorage'];
 const sorted = (a) => JSON.stringify([...(a || [])].sort());
+const ffScriptsOf = (m) => (m.background && m.background.scripts) || [];
 
 check('both manifests carry the same version', chrome.version === firefox.version, `${chrome.version} / ${firefox.version}`);
 check('the version is a plain x.y.z', /^\d+\.\d+\.\d+$/.test(chrome.version), chrome.version);
@@ -39,8 +40,9 @@ check('Chrome: only the warning-free menu permission is added to 1.0.0', sorted(
 check('Firefox: only the warning-free menu permission is added to 1.0.0', sorted(firefox.permissions) === sorted([...PERMISSIONS, 'menus']), sorted(firefox.permissions));
 check('Chrome: all-sites access stays optional', sorted(chrome.optional_host_permissions) === '["<all_urls>"]' && !chrome.host_permissions);
 check('Firefox: all-sites access stays optional', sorted(firefox.optional_permissions) === '["<all_urls>"]');
-check('P4 sideload release (the move) is 1.9.0', chrome.version === '1.9.0');
-const ffScripts = firefox.background?.scripts || [];
+check('the YouTube save button release is 1.10.0', chrome.version === '1.10.0');
+check('Firefox loads the save helper before the router', ffScriptsOf(firefox).indexOf('../src/helper/save.js') > -1 && ffScriptsOf(firefox).indexOf('../src/helper/save.js') < ffScriptsOf(firefox).indexOf('../src/helper/router.js'));
+const ffScripts = ffScriptsOf(firefox);
 check('Firefox loads the move after the helper modules and before the router', ffScripts.indexOf('../src/helper/move.js') > ffScripts.indexOf('../src/helper/vault.js') && ffScripts.indexOf('../src/helper/move.js') < ffScripts.indexOf('../src/helper/router.js'));
 const bg = fs.readFileSync(path.join(ROOT, 'src/background/background.js'), 'utf8');
 check('Chrome imports the move in the same place', bg.includes("'../helper/vault.js', '../helper/move.js', '../helper/router.js'"));

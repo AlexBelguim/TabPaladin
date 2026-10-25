@@ -440,5 +440,5 @@ if (api.runtime.onUpdateAvailable) {
 // Chrome's worker imports them after the legacy writer has been installed.
 if (typeof importScripts === 'function') {
     importScripts('../helper/config.js', '../helper/identity.js', '../helper/registration.js',
-        '../helper/tracking.js', '../helper/tabs.js', '../helper/menus.js', '../helper/vault.js', '../helper/move.js', '../helper/router.js');
+        '../helper/tracking.js', '../helper/tabs.js', '../helper/menus.js', '../helper/save.js', '../helper/vault.js', '../helper/move.js', '../helper/router.js');
 }
