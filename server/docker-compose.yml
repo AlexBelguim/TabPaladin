@@ -6,15 +6,21 @@ services:
       context: ..
       dockerfile: server/Dockerfile
     restart: unless-stopped
-    ports:
-      - "${HOST_PORT:-18921}:18921"
+    # The NAS's own network rather than a published port. Docker publishes a
+    # port through a helper process (its "userland proxy"), and on TrueNAS
+    # that sometimes fails: "failed to bind port 0.0.0.0:18921/tcp ... address
+    # already in use" or "Timed out proxy starting the userland proxy", and
+    # the container doesn't start at all. On the host's network the server
+    # listens on HOST_PORT itself: nothing for Docker to set up.
+    network_mode: host
     volumes:
       - ./data:/data
       # The web app is built into the image (rebuild to update it). To serve a
       # host folder live while developing, mount it over /app/pwa:
       # - ../pwa:/app/pwa:ro
     environment:
-      - PORT=18921
+      # On the host's network this is the NAS's port (default 18921).
+      - PORT=${HOST_PORT:-18921}
       - DATA_DIR=/data
       - PWA_DIR=/app/pwa
       # First admin, created on the first start with no accounts; ignored after.

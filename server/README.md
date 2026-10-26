@@ -57,7 +57,7 @@ the network.
 | `BACKUP_KEEP` | `7` | Boot-time database backups to keep (see below). |
 | `SESSION_DAYS` | `180` | Session lifetime. |
 | `MAX_SNAPSHOTS` | `200` | Tree history rows kept, per account. |
-| `HOST_PORT` | `18921` | Host port in docker-compose. |
+| `HOST_PORT` | `18921` | The port the server listens on, on the host's network (docker-compose uses `network_mode: host`). |
 
 **Backups.** At boot, before any migration touches it, the server writes a
 consistent copy of the database (`VACUUM INTO`, which includes what is still in
