@@ -184,7 +184,25 @@ function copyPresent() {
 function currentView() {
     if (!copyPresent()) return null;
     if (!view || view.stamp !== viewStamp) {
-        view = { stamp: viewStamp, snapshot: { type: 'root', title: '', _pwaId: ROOT_ID, children: TreeStore.roots().map(fromWire) } };
+        const roots = TreeStore.roots().map(fromWire);
+        // An app's folder (YouTube) is drawn inside the imports archive, as on
+        // the desktop Board. Only here: in the tree it stays a top-level
+        // folder, and this view is never what is pushed.
+        const findImports = (nodes) => {
+            for (const n of nodes) {
+                if (n._pwaId === 'imports:root') return n;
+                const hit = n.children ? findImports(n.children) : null;
+                if (hit) return hit;
+            }
+            return null;
+        };
+        const imports = findImports(roots);
+        if (imports) {
+            const apps = roots.filter(isAppFolder);
+            imports.children = [...(imports.children || []), ...apps];
+            roots.splice(0, roots.length, ...roots.filter(n => !isAppFolder(n)));
+        }
+        view = { stamp: viewStamp, snapshot: { type: 'root', title: '', _pwaId: ROOT_ID, children: roots } };
     }
     return view.snapshot;
 }
@@ -1244,12 +1262,22 @@ function isImportsFolder(node) {
     return node && node.type === 'folder' && (node._virtual || node.title === IMPORTS_ROOT_TITLE);
 }
 
-// Is the folder currently being viewed the imports root, or inside it?
+// An app's own folder (payload.app, e.g. YouTube): drawn inside the imports
+// archive, but the user's own and editable, as is everything in it.
+function isAppFolder(node) {
+    return Boolean(node && node.type === 'folder' && node._payload && typeof node._payload.app === 'string');
+}
+
+// Is the folder currently being viewed the imports root, or inside it (and
+// not inside an app folder drawn there)?
 function isInsideImports() {
-    return state.pathIds.some((_, idx) => {
+    let inside = false;
+    state.pathIds.forEach((_, idx) => {
         const node = findNodeByPath(state.pathIds.slice(0, idx + 1));
-        return isImportsFolder(node);
+        if (isAppFolder(node)) inside = false;
+        else if (isImportsFolder(node)) inside = true;
     });
+    return inside;
 }
 
 // Guard for anything that would write into the folder currently open. Nothing
@@ -1264,13 +1292,15 @@ function blockedByImports(action = 'add anything') {
 
 function renderFolderRow(folder) {
     const row = document.createElement('div');
-    row.className = 'row folder' + (isImportsFolder(folder) ? ' imports-root' : '');
+    // An app's folder looks like the archive it is drawn in.
+    const archiveLook = isImportsFolder(folder) || isAppFolder(folder);
+    row.className = 'row folder' + (archiveLook ? ' imports-root' : '');
     const subfolders = (folder.children || []).filter(c => c.type === 'folder');
     const bms = (folder.children || []).filter(c => c.type === 'bookmark' && !isInternalNode(c));
     row.innerHTML = `
-        <span class="icon">${isImportsFolder(folder) ? '📥' : '📁'}</span>
+        <span class="icon">${archiveLook ? '📥' : '📁'}</span>
         <span class="title">${escapeHtml(folder.title || '(unnamed)')}</span>
-        ${isImportsFolder(folder) ? '<span class="imports-badge">synced</span>' : ''}
+        ${archiveLook ? '<span class="imports-badge">synced</span>' : ''}
         <span class="count">${subfolders.length} 📁 · ${bms.length} 📄</span>
     `;
     row.addEventListener('click', () => {
