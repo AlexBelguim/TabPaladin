@@ -46,11 +46,15 @@ import { createVaultMirror } from './vault.js';
 import { createMoveReceiver } from './move.js';
 import { housekeeping } from './housekeeping.js';
 import { sameAccount as sameDesktopAccount } from './desktopCore.js';
+import { createLinkInfo } from './linkInfo.js';
 
 const platform = pagePlatform || globalThis.__tpPlatform;
 
 // The share core, loaded by a classic <script> before this module.
 const Share = window.TPShare;
+
+// MEGA links drawn as their folder's name and size (linkInfo.js).
+const linkInfo = createLinkInfo({ request: urls => api('/api/link-info', { method: 'POST', body: JSON.stringify({ urls }) }) });
 
 const LS = {
     url: 'tp_pwa_url',
@@ -1333,6 +1337,7 @@ function renderBookmarkRow(b) {
         a.target = '_blank';
         a.rel = 'noopener';
         row.appendChild(a);
+        linkInfo.decorate(a, b.url);
     } else {
         const text = nvEl('span', 'bookmark-inert', b.title || b.url);
         text.title = `Not a web link, so it does not open from here: ${String(b.url).slice(0, 200)}`;
@@ -1981,7 +1986,7 @@ function wireHelperUi() {
 function desktopContext() {
     return {
         store: TreeStore, storage: StorageManager, pins: PinsManager, helper, platform,
-        account: signedInAccount, assertAccount: assertHelperAccount, syncConfig,
+        account: signedInAccount, assertAccount: assertHelperAccount, syncConfig, linkInfo,
         async edit(fn) {
             const account=signedInAccount(); await assertHelperAccount(account);
             const before=await TreeStore.currentCopy(); const result=await fn(account);

@@ -27,6 +27,7 @@ import { migrateShares, makeSharesStore, attachShareRoutes } from './shares.js';
 import { migrateProposals, makeProposalsStore, attachProposalRoutes } from './proposals.js';
 import { attachLlmShareRoutes } from './llmShare.js';
 import { migrateMcpTokens, attachMcp } from './mcp.js';
+import { attachLinkInfo } from './linkInfo.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -528,6 +529,8 @@ attachUserAdmin(app, {
     limiter: { limited: rateLimited, fail: authFailed, ok: authOk }
 });
 attachPrefs(app, { db, requireAuth });
+// A MEGA link's folder name and size, for the web app to show (linkInfo.js).
+attachLinkInfo(app, { requireAuth });
 
 // --- Importers ---
 // Attached before the tree routes so /api/tree can append the virtual imports

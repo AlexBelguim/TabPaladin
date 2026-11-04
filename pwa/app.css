@@ -176,6 +176,9 @@ input:focus { outline: none; border-color: var(--primary); }
   white-space: nowrap;
 }
 .row.bookmark img { width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0; }
+/* A MEGA link's size beside its folder's name (linkInfo.js). */
+.link-size { flex: none; color: var(--muted); font-size: 0.8em; white-space: nowrap; }
+.link-size.link-gone { color: var(--danger); }
 /* Not an http(s) link (a bookmarklet, a file: URL): shown, never opened. */
 .row.bookmark .bookmark-inert {
   color: var(--muted);

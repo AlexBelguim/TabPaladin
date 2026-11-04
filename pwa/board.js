@@ -182,7 +182,7 @@ export function createFolderCards(ctx){
                     if(shown>=limit||pool.remaining<=0)break;shown++;pool.remaining--;
                     const row=el('div',{className:'board-bookmark'}),a=el('a',{href:item.url,target:'_blank',rel:'noopener',text:item.title||item.url,title:item.url});
                     if(helperUrl(item.url))row.addEventListener('auxclick',e=>{if(e.button===1&&ctx.helper.supports('windows.openUrls')){e.preventDefault();openNodes(ctx,[item],1,'background').catch(x=>ctx.toast(x.message));}});
-                    row.append(favicon(item.url),a,tool('🗑','Delete bookmark',()=>removeItems(ctx,[item]),'icon-btn danger bm-del'));drag(row,{kind:'nodes',ids:[item.id]},ctx);group.append(row);
+                    row.append(favicon(item.url),a,tool('🗑','Delete bookmark',()=>removeItems(ctx,[item]),'icon-btn danger bm-del'));ctx.linkInfo?.decorate(a,item.url);drag(row,{kind:'nodes',ids:[item.id]},ctx);group.append(row);
                 }body.append(group);
             }
             const total=children.filter(n=>n.kind==='bookmark').length;
