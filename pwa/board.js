@@ -247,13 +247,36 @@ export function createBoard(ctx){
         if(workflowId)await ctx.publishWorkflow?.(workflowId);
         snapshotTake=null;ctx.toast('Filed '+selected.length+' tabs; '+result.closed.length+' closed.'+keptSummary(result));relist();
     }
+    // Middle-click closes an open tab, or every tab under a header. Clicks
+    // close in batches: the helper closes one set of tabs a second.
+    let closing=[],closeTimer=null,lastClose=0;
+    // shown: what disappears at once (the row, or the header's whole group).
+    function closeOnMiddle(elm,tabs,shown=elm){
+        elm.addEventListener('mousedown',e=>{if(e.button===1)e.preventDefault();});
+        elm.addEventListener('auxclick',e=>{if(e.button!==1)return;e.preventDefault();e.stopPropagation();shown.remove();
+            closing.push(...tabs.filter(t=>!closing.includes(t)));clearTimeout(closeTimer);
+            closeTimer=setTimeout(closeQueued,Math.max(300,lastClose+1100-Date.now()));});
+    }
+    async function closeQueued(){
+        const want=closing;closing=[];closeTimer=null;if(!want.length)return;lastClose=Date.now();
+        try{
+            const body={purpose:'save-window'};if(windowId!=null)body.windowId=windowId;
+            const snap=await ctx.helper.request('tabs.snapshot',body);
+            const tabIds=want.filter(t=>snap.tabs.some(s=>s.tabId===t.tabId&&s.url===t.url)).map(t=>t.tabId);
+            const result=tabIds.length?await ctx.helper.request('tabs.closeSnapshot',{snapshotId:snap.snapshotId,tabIds,expectedCount:tabIds.length}):{closed:[],kept:[]};
+            lastClose=Date.now();
+            const summary=keptSummary(result)+(tabIds.length<want.length?' '+(want.length-tabIds.length)+' changed and stayed open.':'');
+            if(summary)ctx.toast('Closed '+result.closed.length+' tabs.'+summary);
+        }catch(x){ctx.toast(x.message);}
+        relist();
+    }
     const board={async render(root){
         rootRef=root;settings=await ctx.storage.getSettings();await ExpandState.load();
         const canList=ctx.helper.supports('tabs.listWindow');
         if(canList&&!listed&&!listError)listTabs();
         const toolbar=el('div',{className:'page-actions'});
         root.append(el('div',{className:'page-head'},
-            el('div',{className:'page-title'},el('h1',{},'Board'),el('p',{className:'page-sub'},'Drag open tabs onto a folder to file them. Middle-click a header to open its links.')),
+            el('div',{className:'page-title'},el('h1',{},'Board'),el('p',{className:'page-sub'},'Drag open tabs onto a folder to file them. Middle-click a folder header to open its links, an open tab or its header to close them.')),
             toolbar));
         const refresh=button('⟳ Refresh open tabs',relist,'primary');refresh.disabled=!canList;toolbar.append(refresh);
         toolbar.append(button('Choose window',async()=>{const wins=await ctx.helper.request('windows.list',{});const select=el('select',{'aria-label':'Browser window'});for(const w of wins)select.append(el('option',{value:String(w.windowId),text:(w.title||'Window')+' · '+w.tabCount}));select.addEventListener('change',()=>{windowId=Number(select.value);relist();});toolbar.append(select);}));
@@ -278,13 +301,22 @@ export function createBoard(ctx){
                 for(const[name,list]of Object.entries(groups)){
                     // A keyword group: the old page's violet .tab-group-card.
                     const group=el('section',{className:'board-domain tab-group'}),key=tabGroupKey(name),groupOpen=ExpandState.isOpen(key,true),header=button('',()=>{ExpandState.set(key,!ExpandState.isOpen(key,true));ctx.refresh();},'tab-group-head');
-                    header.title='Drag to file all '+list.length+' tabs';header.setAttribute('aria-expanded',String(groupOpen));
+                    header.title='Drag to file all '+list.length+' tabs. Middle-click to close them';header.setAttribute('aria-expanded',String(groupOpen));closeOnMiddle(header,list,group);
                     header.append(el('span',{className:'folder-caret','aria-hidden':'true',text:groupOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'🏷️'}),
                         el('span',{className:'domain-name',text:name}),el('span',{className:'domain-count',text:String(list.length)}));
                     dragTabs(header,{kind:'tabs',tabs:list,group:name});group.append(header);
                     group.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
                     group.addEventListener('drop',e=>{if(dragging?.kind!=='tabs')return;e.preventDefault();e.stopPropagation();const moving=new Set(dragging.tabs.map(t=>t.tabId));groupsOverride=Object.fromEntries(Object.entries(groups).map(([k,v])=>[k,v.filter(t=>!moving.has(t.tabId))]));groupsOverride[name].push(...dragging.tabs);dragging=null;ctx.refresh();});
-                    if(groupOpen)for(const t of list){const row=el('div',{className:'board-tab',title:t.url},favicon(t.url),el('span',{className:'board-tab-title',text:t.title||t.url}));dragTabs(row,{kind:'tabs',tabs:[t]});group.append(row);}tabsBody.append(group);
+                    // Inside, a header per site, as in the folder cards: dragging
+                    // one files its tabs straight into the folder dropped on.
+                    const sites=new Map();for(const t of list){const d=domain(t.url);if(!sites.has(d))sites.set(d,[]);sites.get(d).push(t);}
+                    const bySite=!(sites.size===1&&sites.has(name));
+                    if(groupOpen)for(const[site,siteTabs]of sites){
+                        const box=bySite?el('div',{className:'board-domain tab-site'}):group;
+                        if(bySite){const bar=el('div',{className:'board-domain-head'},el('span',{className:'drag-handle','aria-hidden':'true',text:'⋮⋮'}),el('span',{className:'domain-name',text:site}),el('span',{className:'domain-count',text:String(siteTabs.length)}));bar.title='Drag to file all '+siteTabs.length+' '+site+' tabs. Middle-click to close them';dragTabs(bar,{kind:'tabs',tabs:siteTabs});closeOnMiddle(bar,siteTabs,box);box.append(bar);group.append(box);}
+                        for(const t of siteTabs){const row=el('div',{className:'board-tab',title:t.url},favicon(t.url),el('span',{className:'board-tab-title',text:t.title||t.url}));dragTabs(row,{kind:'tabs',tabs:[t]});closeOnMiddle(row,[t]);box.append(row);}
+                    }
+                    tabsBody.append(group);
                 }
             }
         }

@@ -290,4 +290,6 @@
   }
   .desktop-page button.tab-group-head:hover { background: rgba(139, 92, 246, 0.16); }
   .tab-group .board-tab { padding-left: 14px; }
+  .board-domain.tab-site { margin: 4px 6px 2px; }
+  .tab-group .tab-site .board-tab { padding-left: 24px; }
 }
