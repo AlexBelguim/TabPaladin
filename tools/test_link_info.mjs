@@ -54,6 +54,8 @@ const NODES = [
     node('DEEPfold', 'SUBfoldr', 1, 'Raw'),
     node('file0003', 'DEEPfold', 0, 'sunset.raw', 40000)
 ];
+// A folder shared on by others carries their keys too, before the link's.
+NODES[0].k = `someone1:${b64(crypto.randomBytes(32))}/someone2:${b64(crypto.randomBytes(16))}/${NODES[0].k}`;
 const fileKey = crypto.randomBytes(32);
 const FOLDER = `https://mega.nz/folder/PUBhandl#${b64(folderKey)}`;
 const FILE = `https://mega.nz/file/FILEhndl#${b64(fileKey)}`;
@@ -170,6 +172,25 @@ check('MEGA\'s own pages are not', !isMegaLink('https://mega.nz/') && !isMegaLin
 check('other sites are not', !isMegaLink('https://example.com/folder/PUBhandl#x') && !isMegaLink('https://notmega.nz/folder/PUBhandl#x') && !isMegaLink(null));
 check('sizes', [formatSize(0), formatSize(923), formatSize(4185624), formatSize(91348633545), formatSize(2 ** 40 * 150)].join(' | ')
     === '0 B | 923 B | 4.0 MB | 85.1 GB | 150 TB', [formatSize(0), formatSize(923), formatSize(4185624), formatSize(91348633545), formatSize(2 ** 40 * 150)].join(' | '));
+
+{
+    // A "bad-key" answer an earlier release kept in the browser is asked again.
+    const stored = { 'tp_link_info': JSON.stringify({ [FOLDER]: { error: 'bad-key', at: Date.now() }, [FILE]: { error: 'gone', at: Date.now() } }) };
+    globalThis.localStorage = { getItem: (k) => stored[k] ?? null, setItem: (k, v) => { stored[k] = v; } };
+    globalThis.document = { createElement: () => ({ textContent: '', remove() {}, classList: { add() {}, remove() {}, contains: () => false } }) };
+    const asked = [];
+    const { createLinkInfo } = await import('../pwa/linkInfo.js');
+    const li = createLinkInfo({ request: async (urls) => { asked.push(...urls); return { info: { [FOLDER]: { kind: 'folder', name: 'Holiday photos', size: 1, files: 1, folders: 0 } } }; } });
+    const anchor = { isConnected: false, nextElementSibling: null, title: '', textContent: '', after() {} };
+    li.decorate(anchor, FOLDER);
+    li.decorate({ ...anchor, after() {} }, FILE);
+    await new Promise(r => setTimeout(r, 100));
+    const keptNow = JSON.parse(stored.tp_link_info);
+    check('a kept bad-key answer is asked again; a gone one is not', asked.length === 1 && asked[0] === FOLDER, asked);
+    check('and the new name is kept', keptNow[FOLDER] && keptNow[FOLDER].name === 'Holiday photos' && keptNow[FILE].error === 'gone', JSON.stringify(keptNow));
+    delete globalThis.localStorage;
+    delete globalThis.document;
+}
 
 if (failures) { console.error(`\n${failures} link-info check(s) failed.`); process.exit(1); }
 console.log('\nAll link-info tests passed.');

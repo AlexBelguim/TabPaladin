@@ -77,15 +77,19 @@ function nodeName(attrs, nodeKey) {
     }
 }
 
-// In a folder listing each node's key is encrypted with the folder's key
-// ('owner:key', several joined by '/').
-function folderNodeKey(node, folderKey) {
-    try {
-        const k = b64(String(node.k || '').split('/')[0].split(':').pop());
-        return k.length === 16 || k.length === 32 ? decipher('aes-128-ecb', folderKey, k) : null;
-    } catch (e) {
-        return null;
+// A node's name in a folder listing. Its key is encrypted with the folder's
+// key, as 'owner:key'; a folder shared on by others carries several, joined
+// by '/', and only one is the link's (often the last): each is tried.
+function folderNodeName(node, folderKey) {
+    for (const part of String(node.k || '').split('/')) {
+        try {
+            const k = b64(part.split(':').pop());
+            if (k.length !== 16 && k.length !== 32) continue;
+            const name = nodeName(node.a, decipher('aes-128-ecb', folderKey, k));
+            if (name) return name;
+        } catch (e) { /* not this one */ }
     }
+    return null;
 }
 
 class MegaError extends Error {
@@ -138,8 +142,7 @@ export async function lookupMega(link, { fetch: fetchImpl = globalThis.fetch, li
     const handles = new Set(nodes.map(n => n.h));
     const top = link.sub ? nodes.find(n => n.h === link.sub) : nodes.find(n => !handles.has(n.p));
     if (!top) return { error: 'gone' };
-    const key = folderNodeKey(top, link.key);
-    const name = key && nodeName(top.a, key);
+    const name = folderNodeName(top, link.key);
     if (!name) return { error: 'bad-key' };
     if (top.t === 0) return { kind: 'file', name, size: Number(top.s) || 0, files: 1, folders: 0 };
     // Everything under the folder the link opens on, however deep.

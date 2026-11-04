@@ -31,6 +31,9 @@ const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`
 export function createLinkInfo({ request }) {
     let kept = {};
     try { kept = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; } catch (e) { /* none kept */ }
+    // Only names and gone links are kept: an answer that the key did not fit
+    // came, before release 51, from folders the server read wrongly.
+    for (const url of Object.keys(kept)) if (!kept[url] || (kept[url].error && kept[url].error !== 'gone')) delete kept[url];
     const save = () => {
         const urls = Object.keys(kept);
         if (urls.length > MAX_KEPT) {
@@ -78,7 +81,7 @@ export function createLinkInfo({ request }) {
             try { answers = (await request(chunk)).info || {}; } catch (e) { /* asked again after RETRY_MS */ }
             for (const url of chunk) {
                 const info = answers[url];
-                if (info && info.error !== 'failed') kept[url] = { ...info, at: Date.now() };
+                if (info && (!info.error || info.error === 'gone')) kept[url] = { ...info, at: Date.now() };
                 for (const anchor of waiting.get(url) || []) if (info && anchor.isConnected) draw(anchor, url, info);
                 waiting.delete(url);
                 pending.delete(url);
