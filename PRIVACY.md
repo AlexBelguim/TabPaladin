@@ -19,6 +19,7 @@ on services you choose to connect.
 | **Toolbar menus** | Opens helper Settings, the web app, workflow-save review and recently closed tabs from the toolbar icon. |
 | **Server access** _(optional)_ | Runs the packaged bridge only on your configured server origin after you click Connect. Runtime checks include the exact origin and port. |
 | **Private windows** | None: TabPaladin does not run in private (incognito) windows. |
+| **Access to Linkvertise's and Lootlabs' sites** _(optional, off by default)_ | Only if you turn on **Skip Linkvertise and Lootlabs link pages**. On those sites' link pages, a TabPaladin page covers the locker while a script in the page does its steps with the page's own requests, then opens the destination. It reads none of TabPaladin's own data and sends nothing to TabPaladin or anyone else: only the requests the locker page itself makes go out, to the locker's servers and their ad partner (Taboola for Linkvertise). Turning it off stops it on the next page load. |
 | **Scripting + access to all sites** _(optional, off by default)_ | Only if you turn on **Scroll to seek in fullscreen videos**. It lets the mouse wheel skip through a fullscreen video. It reads nothing from the page, reads none of TabPaladin's own data, and sends nothing anywhere. Turning it off removes the permission. |
 
 ## Connecting the web app to browser tabs

@@ -46,14 +46,22 @@ $('video').addEventListener('change', () => {
     const on = $('video').checked;
     // Preserve the exact server grant before removing all-sites access.
     // Turning it off keeps the server's grant, and youtube.com's while its button is on.
-    const keep = [configuredPattern, ...($('youtube').checked ? YOUTUBE_ORIGINS : []), ...($('feeds').checked ? FEED_ORIGINS : [])].filter(Boolean);
+    const keep = [configuredPattern, ...($('youtube').checked ? YOUTUBE_ORIGINS : []), ...($('feeds').checked ? FEED_ORIGINS : []), ...($('unlock').checked ? UNLOCK_ORIGINS : [])].filter(Boolean);
     const requested = on ? api.permissions.request({ origins: ['<all_urls>'] })
         : keep.length ? api.permissions.request({ origins: keep }) : Promise.resolve(true);
     requested.then(async granted => {
         if (!granted) throw new Error('Access was not granted.');
         await api.storage.local.set({ tpVideoSeek: on });
-        if (!on) await api.permissions.remove({ origins: ['<all_urls>'] });
+        let lost = [];
+        if (!on) {
+            await api.permissions.remove({ origins: ['<all_urls>'] });
+            // A browser may not have kept a site grant that all sites covered.
+            for (const [key, id, origins, label] of [['tpYouTubeSave', 'youtube', YOUTUBE_ORIGINS, 'the YouTube button'], ['tpFeeds', 'feeds', FEED_ORIGINS, 'feeds'], ['tpUnlock', 'unlock', UNLOCK_ORIGINS, 'link lockers']]) {
+                if ($(id).checked && !await api.permissions.contains({ origins })) { await api.storage.local.set({ [key]: false }); lost.push(label); }
+            }
+        }
         await refresh();
+        if (lost.length) status('Switched off ' + lost.join(', ') + ': their site access went with all-sites access. Switch them on again to grant it.');
     }).catch(e => { $('video').checked = !on; status(e.message); });
 });
 const YOUTUBE_ORIGINS = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
@@ -67,6 +75,18 @@ $('feeds').addEventListener('change', () => {
         await refresh();
     }).catch(e => { $('feeds').checked = !on; status(e.message); });
 });
+const UNLOCK_ORIGINS = ['linkvertise.com', 'link-to.net', 'up-to-down.net', 'direct-link.net', 'link-center.net', 'link-hub.net', 'link-target.net', 'file-link.net',
+    'speedy-links.com', 'loot-link.com', 'loot-links.com', 'lootlink.org', 'lootlinks.co', 'lootdest.org', 'lootdest.com', 'lootdest.info', 'links-loot.com', 'linksloot.net', 'best-links.org']
+    .map(h => `https://*.${h}/*`);
+$('unlock').addEventListener('change', () => {
+    const on = $('unlock').checked;
+    const asked = on ? api.permissions.request({ origins: UNLOCK_ORIGINS }) : Promise.resolve(true);
+    asked.then(async granted => {
+        if (!granted) throw new Error('Access to Linkvertise and Lootlabs was not granted.');
+        await api.storage.local.set({ tpUnlock: on });
+        await refresh();
+    }).catch(e => { $('unlock').checked = !on; status(e.message); });
+});
 $('youtube').addEventListener('change', () => {
     const on = $('youtube').checked;
     const asked = on ? api.permissions.request({ origins: YOUTUBE_ORIGINS }) : Promise.resolve(true);
@@ -77,7 +97,7 @@ $('youtube').addEventListener('change', () => {
     }).catch(e => { $('youtube').checked = !on; status(e.message); });
 });
 async function refresh() {
-    const d = await api.storage.local.get(['tpHelper', 'settings', 'tpOpenWorkflowTabs', 'tpHelperRemovals', 'tpHelperRecentlyClosed', 'tpHelperCalls', 'tpVideoSeek', 'tpYouTubeSave', 'tpFeeds', 'tpHelperSession', 'tpMove']);
+    const d = await api.storage.local.get(['tpHelper', 'settings', 'tpOpenWorkflowTabs', 'tpHelperRemovals', 'tpHelperRecentlyClosed', 'tpHelperCalls', 'tpVideoSeek', 'tpYouTubeSave', 'tpFeeds', 'tpUnlock', 'tpHelperSession', 'tpMove']);
     const c = d.tpHelper || {};
     configuredPattern = c.pattern || null;
     if (!$('origin').value) $('origin').value = c.serverOrigin || d.settings?.backend?.url || '';
@@ -91,7 +111,7 @@ async function refresh() {
     const move = d.tpMove || {};
     const delivered = Object.entries(move.deliveredTo || {}).map(([origin, x]) => 'Moved to ' + origin + ' on ' + new Date(x.at).toLocaleString() + ' (' + (x.parts || []).length + ' parts).');
     $('move-status').textContent = delivered.length ? delivered.join(' ') + ' Send again from the move page.' : move.state === 'pending' ? "The old interface's data has not moved yet. The toolbar opens the move page until it has." : 'Nothing of the old interface needs moving.';
-    $('video').checked = !!d.tpVideoSeek; $('youtube').checked = !!d.tpYouTubeSave; $('feeds').checked = !!d.tpFeeds; $('version').textContent = api.runtime.getManifest().version;
+    $('video').checked = !!d.tpVideoSeek; $('youtube').checked = !!d.tpYouTubeSave; $('feeds').checked = !!d.tpFeeds; $('unlock').checked = !!d.tpUnlock; $('version').textContent = api.runtime.getManifest().version;
     showHost();
 }
 $('privacy').removeAttribute('href');
