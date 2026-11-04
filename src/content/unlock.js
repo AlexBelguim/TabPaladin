@@ -294,13 +294,15 @@ summary{cursor:pointer}
     // the page never sees: it is handed over before any page script runs.
     const secret = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
     // The work goes on underneath: a link that still arrives is opened.
-    $('show').addEventListener('click', () => {
+    const showPage = () => {
+        if (hidden) return;
         hidden = true;
         if (topLayer) { try { host.hidePopover(); } catch (_) { /* already hidden */ } }
         host.style.setProperty('display', 'none', 'important');
         document.dispatchEvent(new CustomEvent('tp-unlock-in-' + secret, { detail: 'shown' }));
         note('Page shown');
-    });
+    };
+    $('show').addEventListener('click', showPage);
     $('retry').addEventListener('click', () => location.reload());
     const copy = (text) => {
         const done = () => note('Copied');
@@ -353,6 +355,8 @@ summary{cursor:pointer}
             $('result').hidden = false;
             $('show').className = 'primary';
             note('Needs the user: ' + names.join(', '));
+            // Only the human check left: shown right away, at the check.
+            if (m.check === true) showPage();
         }
     });
 

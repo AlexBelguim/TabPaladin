@@ -69,7 +69,12 @@
             if (!handsOff && this.target && this.target !== '_self' && this.target !== '_top' && this.target !== '_parent') { blocked(this.href, 'new tab'); return; }
             return anchorClick.call(this);
         };
-        listen.call(document, 'tp-unlock-in-' + cfg.n, (e) => { if (String(e.detail) === 'shown') handsOff = true; });
+        let onShown = null;
+        listen.call(document, 'tp-unlock-in-' + cfg.n, (e) => {
+            if (String(e.detail) !== 'shown') return;
+            handsOff = true;
+            if (onShown) onShown();
+        });
 
         async function linkvertise() {
             const GQL = 'https://publisher.linkvertise.com/graphql';
@@ -188,6 +193,15 @@
             const human = (t) => /human|verif|captcha|robot/i.test(name(t));
             const since = Date.now();
             let pressed = false, asked = false;
+            // The human check was started with the others, so by now it often
+            // only waits for its Continue button: shown, the page goes
+            // straight to it. Pressing it stays the user's.
+            onShown = () => {
+                if (!asked) return;
+                const left = findTasks().filter(t => !t.classList.contains('done'));
+                const at = document.querySelector('iframe[src*="/captcha"]') || left.find(human) || left[0];
+                if (at) at.scrollIntoView({ block: 'center' });
+            };
             setInterval(() => {
                 tasks = findTasks();
                 const left = tasks.filter(t => !t.classList.contains('done'));
@@ -195,7 +209,7 @@
                 say('loot-progress', { done, total: tasks.length });
                 if (!asked && left.length && (left.every(human) || Date.now() - since > 75000)) {
                     asked = true;
-                    say('loot-needs', { names: left.map(name) });
+                    say('loot-needs', { names: left.map(name), check: left.every(human) });
                 }
                 // The page's own Unlock button opens the link itself, should
                 // it be ready before the socket says so.

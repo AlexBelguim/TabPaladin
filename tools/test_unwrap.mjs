@@ -251,8 +251,11 @@ check('Settings asks for the same rentry sites',
     HTMLAnchorElement.prototype.click = function () { clicked.push(this.attrs.href); };
     class HTMLFormElement { constructor(target) { this.target = target; } }
     HTMLFormElement.prototype.submit = function () { submitted.push(this.target); };
-    const win = { open: (u) => { opened.push(u); return {}; }, addEventListener: (t, fn, capture) => listeners.push({ t, fn, capture }) };
-    const box = { window: win, document: { querySelector: () => null }, HTMLAnchorElement, HTMLFormElement };
+    const assigned = [], timers = [], navigateListeners = [];
+    const win = { open: (u) => { opened.push(u); return {}; }, addEventListener: (t, fn, capture) => listeners.push({ t, fn, capture }),
+        navigation: { addEventListener: (t, fn) => { if (t === 'navigate') navigateListeners.push(fn); } } };
+    const box = { window: win, document: { querySelector: () => null }, HTMLAnchorElement, HTMLFormElement, URL,
+        location: { origin: 'https://rentry.co', assign: (u) => assigned.push(u) }, setTimeout: (fn) => timers.push(fn) };
     vm.createContext(box);
     vm.runInContext(noTabsSource, box, { filename: 'src/content/noNewTabs.js' });
     const popup = win.open('https://ads.example/');
@@ -264,15 +267,35 @@ check('Settings asks for the same rentry sites',
     check('scripts\' popups, new-tab link clicks and new-tab forms are stopped; same-tab ones and downloads go through',
         opened.length === 0 && popup && popup.closed === true && same(clicked, ['https://example.com/same', 'blob:x']) && same(submitted, ['']));
     const click = listeners.find(l => l.t === 'click' && l.capture);
-    const fire = (a, ev) => { let prevented = false; click.fn({ target: a, isTrusted: true, button: 0, ctrlKey: false, shiftKey: false, metaKey: false, altKey: false, ...ev, preventDefault: () => { prevented = true; } }); return prevented; };
+    // The page's own handlers run after this one; `pageCancels` is one of them calling preventDefault.
+    const fire = (a, ev = {}) => {
+        const e = { target: a, isTrusted: true, button: 0, ctrlKey: false, shiftKey: false, metaKey: false, altKey: false, defaultPrevented: false, ...ev, preventDefault() { this.defaultPrevented = true; } };
+        click.fn(e);
+        if (ev.pageCancels) e.preventDefault();
+        while (timers.length) timers.shift()();
+        return e.defaultPrevented;
+    };
     const plain = new HTMLAnchorElement({ href: 'https://mega.example/x', target: '_blank' });
+    plain.href = plain.attrs.href;
     fire(plain);
     const ctrl = new HTMLAnchorElement({ href: 'https://mega.example/y', target: '_blank' });
     fire(ctrl, { ctrlKey: true });
     const fake = new HTMLAnchorElement({ href: 'https://ads.example/b', target: '_blank' });
     const stopped = fire(fake, { isTrusted: false });
     check('a plain click on a link opens it in the same tab; Ctrl-click still opens a new tab; a made-up click opens nothing',
-        plain.getAttribute('target') === '_self' && ctrl.getAttribute('target') === '_blank' && stopped === true);
+        plain.getAttribute('target') === '_self' && ctrl.getAttribute('target') === '_blank' && stopped === true && assigned.length === 0, assigned);
+    const cancelled = new HTMLAnchorElement({ href: 'https://www.gigafans.example/', target: '_blank' });
+    cancelled.href = cancelled.attrs.href;
+    fire(cancelled, { pageCancels: true });
+    check('a plain click the page\'s ad script cancels still opens the link, here and once', same(assigned, ['https://www.gigafans.example/']), assigned);
+
+    const navigate = navigateListeners[0];
+    const go = (url, ev = {}) => { let prevented = false; navigate({ cancelable: true, userInitiated: false, navigationType: 'push', destination: { url }, ...ev, preventDefault: () => { prevented = true; } }); return prevented; };
+    check('a script sending the tab to another site is stopped; to the link just clicked, within rentry, by the user, or back and forth it is not',
+        navigateListeners.length === 1 && go('https://lightindividual.example/ad') === true && go('https://lightindividual.example/ad', { navigationType: 'replace' }) === true
+        && go('https://www.gigafans.example/') === false && go('https://rentry.co/other') === false
+        && go('https://t.example/', { userInitiated: true }) === false && go('https://t.example/', { navigationType: 'traverse' }) === false
+        && go('https://t.example/', { cancelable: false }) === false);
 }
 
 if (failures) { console.error(failures + ' failed'); process.exit(1); }
