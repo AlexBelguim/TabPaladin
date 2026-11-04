@@ -134,6 +134,32 @@ for (const [site, first] of [['linkvertise', 'page'], ['lootlabs', 'content']]) 
         && stub && typeof stub.close === 'function' && reports.some(m => m.type === 'log' && /popup/.test(m.text))
         && (site === 'linkvertise' || p.win.WebSocket !== p.NativeSocket), error ? error.message : p.said);
 }
+// What the Unlock button opens is the destination, opened by TabPaladin in
+// this tab, also once the page is shown (by hand or at the human check):
+// there the page would open its own redirect page in a new tab instead.
+{
+    const p = fakePage();
+    const opened = [];
+    p.win.open = (url) => { opened.push(url); return null; };
+    p.attrs['data-tp-unlock'] = JSON.stringify({ n: 'abc123', link: { site: 'lootlabs', userId: '1', url: 'a' } });
+    p.run();
+    const unlockButton = { closest: (sel) => (/unlock-btn/.test(sel) ? {} : null) };
+    const clickUnlock = () => p.document.dispatchEvent({ type: 'click', target: unlockButton });
+    const doneWith = (url) => p.said.some(m => m.type === 'done' && m.url === url);
+    clickUnlock();
+    p.win.open('https://lootdest.example/before');
+    check('before the page is shown, what Unlock opens is TabPaladin\'s to open', doneWith('https://lootdest.example/before') && opened.length === 0, opened);
+    const realNow = Date.now;
+    Date.now = () => realNow() + 5000;
+    p.document.dispatchEvent(new p.CustomEvent('tp-unlock-in-abc123', { detail: 'shown' }));
+    p.win.open('https://offer.example/');
+    check('once shown, the page\'s own popups are the user\'s again', opened.length === 1 && opened[0] === 'https://offer.example/' && !doneWith('https://offer.example/'), opened);
+    Date.now = () => realNow() + 10000;
+    clickUnlock();
+    p.win.open('https://lootdest.example/after');
+    Date.now = realNow;
+    check('once shown, what Unlock opens is still TabPaladin\'s to open, not a new tab', doneWith('https://lootdest.example/after') && opened.length === 1, opened);
+}
 {
     const p = fakePage();
     p.run();

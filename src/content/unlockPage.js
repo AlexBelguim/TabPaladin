@@ -44,29 +44,32 @@
         const pageFetch = window.fetch.bind(window);
         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-        // No popups or new tabs from this page while TabPaladin is on it,
-        // except what its Unlock button opens: that is the destination. Once
-        // the page is shown, it is the user's again (a Lootlabs check the user
-        // does may open its own tab).
+        // No popups or new tabs from this page while TabPaladin is on it.
+        // Once the page is shown, it is the user's again (a Lootlabs check the
+        // user does may open its own tab), except what its Unlock button
+        // opens: that is the destination, opened here by TabPaladin, also
+        // once the page is shown (by hand, or at the human check), where the
+        // page would open its own redirect page in a new tab instead.
         let unlockAt = 0, handsOff = false;
         listen.call(document, 'click', (e) => {
             if (e.target && e.target.closest && e.target.closest('button[class*="unlock-btn"]')) unlockAt = Date.now();
         }, true);
-        const blocked = (url, what) => {
-            if (url && Date.now() - unlockAt < 3000) say('done', { url: String(url) });
-            else say('log', { text: 'Blocked a ' + what });
-        };
+        const fromUnlock = (url) => Boolean(url) && Date.now() - unlockAt < 3000;
         const stubWindow = () => ({ closed: false, opener: null, close() { this.closed = true; }, focus() {}, blur() {}, postMessage() {},
             location: { href: '', assign() {}, replace() {} }, document: { open() {}, write() {}, close() {} } });
         const nativeOpen = window.open;
         window.open = function (url) {
+            if (fromUnlock(url)) { say('done', { url: String(url) }); return stubWindow(); }
             if (handsOff) return nativeOpen.apply(this, arguments);
-            blocked(url, 'popup');
+            say('log', { text: 'Blocked a popup' });
             return stubWindow();
         };
         const anchorClick = HTMLAnchorElement.prototype.click;
         HTMLAnchorElement.prototype.click = function () {
-            if (!handsOff && this.target && this.target !== '_self' && this.target !== '_top' && this.target !== '_parent') { blocked(this.href, 'new tab'); return; }
+            if (this.target && this.target !== '_self' && this.target !== '_top' && this.target !== '_parent') {
+                if (fromUnlock(this.href)) { say('done', { url: String(this.href) }); return; }
+                if (!handsOff) { say('log', { text: 'Blocked a new tab' }); return; }
+            }
             return anchorClick.call(this);
         };
         let onShown = null;
