@@ -83,35 +83,65 @@ const lootPayload = (url, key = 'Kq7#z') => {
 check('the Lootlabs link is read the way its page reads it', U.decodeLoot(lootPayload('https://www.gigafans.net/a?b=1&c=ö')) === 'https://www.gigafans.net/a?b=1&c=%C3%B6');
 check('a Lootlabs link that is not a web address, or junk, gives nothing',
     U.decodeLoot(lootPayload('javascript:alert(1)')) === null && U.decodeLoot('%%%') === null && U.decodeLoot('') === null && U.decodeLoot(Buffer.from('abc').toString('base64')) === null);
-const code = unlockSource.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-check('the locker script uses no extension API', !/\b(chrome|browser)\s*\./.test(code) && !/storage\.|sendMessage|runtime\./.test(code));
-// The page worker is injected as text, so it must run with nothing from the
-// script around it: here, in a page that has only the browser's globals.
-for (const site of ['linkvertise', 'lootlabs']) {
+const pageSource = fs.readFileSync(root + '/src/content/unlockPage.js', 'utf8');
+const bare = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+check('the locker scripts use no extension API', [unlockSource, pageSource].every(s => !/\b(chrome|browser)\s*\./.test(bare(s)) && !/storage\.|sendMessage|runtime\./.test(bare(s))));
+
+// The page's side, in a pretend page: it does nothing until handed the link
+// and the secret on the root element, whichever of the two runs first, and
+// then reports only on events named with the secret.
+const fakePage = () => {
     const said = [], listeners = {};
-    const channel = { addEventListener: (t, fn) => { listeners[t] = fn; } };
     class EventTarget {}
-    EventTarget.prototype.dispatchEvent = function (ev) { said.push(JSON.parse(ev.detail)); return true; };
-    class CustomEvent { constructor(type, init) { this.type = type; this.detail = init.detail; } }
+    EventTarget.prototype.addEventListener = function (t, fn) { (listeners[t] = listeners[t] || []).push(fn); };
+    EventTarget.prototype.removeEventListener = function (t, fn) { listeners[t] = (listeners[t] || []).filter(f => f !== fn); };
+    EventTarget.prototype.dispatchEvent = function (ev) {
+        said.push({ event: ev.type, ...(typeof ev.detail === 'string' && ev.detail.startsWith('{') ? JSON.parse(ev.detail) : {}) });
+        for (const fn of listeners[ev.type] || []) fn(ev);
+        return true;
+    };
+    class Element extends EventTarget {}
+    const attrs = {};
+    Element.prototype.getAttribute = (k) => (k in attrs ? attrs[k] : null);
+    Element.prototype.removeAttribute = (k) => { delete attrs[k]; };
+    const root = new Element();
+    const document = new EventTarget();
+    Object.assign(document, { documentElement: root, querySelectorAll: () => [], querySelector: () => null, referrer: '' });
+    class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail; } }
     class HTMLAnchorElement {}
     HTMLAnchorElement.prototype.click = () => {};
     const NativeSocket = function () {};
     const win = { fetch: () => new Promise(() => {}), open: () => null, WebSocket: NativeSocket };
-    const box = {
-        window: win, document: { currentScript: channel, addEventListener() {}, querySelectorAll: () => [], referrer: '' },
-        EventTarget, CustomEvent, HTMLAnchorElement, JSON, Promise, String, Number, Math, Date, Array, Error,
-        navigator: { userAgent: 'x' }, crypto: { randomUUID: () => 'u' }, location: { href: 'https://linkvertise.com/1/a' },
-        setTimeout: () => 0, setInterval: () => 0
-    };
+    const box = { window: win, document, EventTarget, Element, CustomEvent, HTMLAnchorElement, JSON, Promise, String, Number, Math, Date, Array, Error,
+        navigator: { userAgent: 'x' }, crypto: { randomUUID: () => 'u' }, location: { href: 'https://linkvertise.com/1/a' }, setTimeout: () => 0, setInterval: () => 0 };
     vm.createContext(box);
+    return { box, said, attrs, root, document, win, NativeSocket, CustomEvent, run: () => vm.runInContext(pageSource, box, { filename: 'src/content/unlockPage.js' }) };
+};
+for (const [site, first] of [['linkvertise', 'page'], ['lootlabs', 'content']]) {
+    const p = fakePage();
+    const hand = JSON.stringify({ n: 'abc123', link: { site, userId: '1', url: 'a' } });
     let error = null;
-    try { vm.runInContext('(' + U.pageWorker.toString() + ')(' + JSON.stringify({ link: { site, userId: '1', url: 'a' } }) + ')', box); } catch (e) { error = e; }
+    try {
+        if (first === 'content') { p.attrs['data-tp-unlock'] = hand; p.run(); }
+        else { p.run(); p.attrs['data-tp-unlock'] = hand; p.document.dispatchEvent(new p.CustomEvent('tp-unlock-hello')); }
+    } catch (e) { error = e; }
     await new Promise(r => setTimeout(r, 0));
-    const stub = win.open('https://ads.example/');
-    check(`the page worker runs on its own (${site})`, !error && said[0] && said[0].type === 'alive' && !said.some(m => m.type === 'fail')
-        && stub && typeof stub.close === 'function' && said.some(m => m.type === 'log' && /popup/.test(m.text))
-        && (site === 'linkvertise' || win.WebSocket !== NativeSocket) && typeof listeners['tp-unlock-in'] === 'function', error ? error.message : said);
+    const stub = p.win.open('https://ads.example/');
+    const reports = p.said.filter(m => m.event !== 'tp-unlock-hello');
+    check(`the page's side takes the hand-over (${first} script first) and reports on the secret event (${site})`,
+        !error && !('data-tp-unlock' in p.attrs) && reports.length >= 2 && reports.every(m => m.event === 'tp-unlock-abc123')
+        && reports[0].type === 'alive' && !reports.some(m => m.type === 'fail')
+        && stub && typeof stub.close === 'function' && reports.some(m => m.type === 'log' && /popup/.test(m.text))
+        && (site === 'linkvertise' || p.win.WebSocket !== p.NativeSocket), error ? error.message : p.said);
 }
+{
+    const p = fakePage();
+    p.run();
+    p.document.dispatchEvent(new p.CustomEvent('tp-unlock-hello'));
+    check('without a hand-over the page\'s side does nothing', p.said.every(m => m.event === 'tp-unlock-hello') && p.win.open('x') === null);
+}
+check('the content side hands over on the root element and listens on the secret event',
+    /setAttribute\('data-tp-unlock'/.test(unlockSource) && /'tp-unlock-' \+ secret/.test(unlockSource) && !/createElement\('script'\)/.test(unlockSource));
 const hostsIn = (file, re) => [...fs.readFileSync(root + '/' + file, 'utf8').match(re)[0].matchAll(/'([a-z0-9.-]+\.[a-z]+)'/g)].map(m => m[1]).sort();
 const lockerHosts = [...U.LINKVERTISE, ...U.LOOTLABS].sort();
 check('the helper, Settings and the script name the same sites',
@@ -120,6 +150,7 @@ check('the helper, Settings and the script name the same sites',
 
 // Registered only while switched on and granted; off unregisters it.
 const store = {}, granted = { on: false }, registered = [], storeListeners = [], permListeners = [];
+const refuse = { main: false };
 const regApi = {
     tabs: { onUpdated: { addListener() {} }, update: async () => {} },
     storage: { local: { get: async k => ({ [k]: store[k] }) }, onChanged: { addListener: fn => storeListeners.push(fn) } },
@@ -128,13 +159,17 @@ const regApi = {
         onAdded: { addListener: fn => permListeners.push(fn) }, onRemoved: { addListener: fn => permListeners.push(fn) }
     },
     scripting: {
-        registerContentScripts: async list => { registered.push(...list); },
+        registerContentScripts: async list => {
+            if (refuse.main && list.some(s => s.world === 'MAIN')) throw new Error('world is not supported');
+            registered.push(...list);
+        },
         unregisterContentScripts: async ({ ids }) => { for (const id of ids) registered.splice(registered.findIndex(s => s.id === id), 1); },
         getRegisteredContentScripts: async ({ ids }) => registered.filter(s => ids.includes(s.id))
     }
 };
 const H2 = { api: regApi };
-const regBox = { TPHelper: H2, URL, atob, TextDecoder, Uint8Array, console };
+const warned = [];
+const regBox = { TPHelper: H2, URL, atob, TextDecoder, Uint8Array, console: { warn: (...a) => warned.push(a.join(' ')) } };
 regBox.globalThis = regBox;
 vm.createContext(regBox);
 vm.runInContext(fs.readFileSync(root + '/src/helper/unwrap.js', 'utf8'), regBox, { filename: 'src/helper/unwrap.js' });
@@ -145,10 +180,23 @@ await H2.syncLockers();
 check('switched on without access: still nothing', registered.length === 0);
 granted.on = true;
 await H2.syncLockers();
-const reg = registered[0];
-check('switched on and granted: the script runs at document start on the locker sites only',
-    registered.length === 1 && reg.id === 'tp-unlock' && same(reg.js, ['src/content/unlock.js']) && reg.runAt === 'document_start'
-    && reg.matches.length === lockerHosts.length && reg.matches.every(m => /^https:\/\/\*\.[a-z0-9.-]+\/\*$/.test(m)) && !reg.allFrames, reg);
+const byId = id => registered.find(s => s.id === id);
+const lockerScript = (s) => s && s.runAt === 'document_start' && s.matches.length === lockerHosts.length
+    && s.matches.every(m => /^https:\/\/\*\.[a-z0-9.-]+\/\*$/.test(m)) && !s.allFrames;
+check('switched on and granted: both scripts run at document start on the locker sites only, the page\'s side in the page\'s world',
+    registered.length === 2 && lockerScript(byId('tp-unlock')) && same(byId('tp-unlock').js, ['src/content/unlock.js']) && !byId('tp-unlock').world
+    && lockerScript(byId('tp-unlock-page')) && same(byId('tp-unlock-page').js, ['src/content/unlockPage.js']) && byId('tp-unlock-page').world === 'MAIN', registered);
+// An update from 1.13.0, which registered only the content side.
+registered.splice(registered.findIndex(s => s.id === 'tp-unlock-page'), 1);
+await H2.syncLockers();
+check('after an update, the missing page\'s side is added', registered.length === 2 && !!byId('tp-unlock-page'));
+// A browser that refuses the page's world still gets the content side.
+registered.length = 0;
+refuse.main = true;
+await H2.syncLockers();
+check('a browser that refuses the page\'s world still gets the content side', registered.length === 1 && !!byId('tp-unlock') && warned.some(w => /tp-unlock-page/.test(w)));
+refuse.main = false;
+await H2.syncLockers();
 granted.on = false;
 await H2.syncLockers();
 check('access taken back while on: unregistered', registered.length === 0);

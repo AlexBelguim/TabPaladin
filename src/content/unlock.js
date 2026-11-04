@@ -6,12 +6,9 @@
  * accept) and opens the destination. It says what it is doing and, when it
  * cannot finish, why, with the page underneath one click away.
  *
- * Linkvertise: the page's own API calls. Ask for the link's tasks, complete
- * the wait task and each ad (after the time the page itself waits), then ask
- * again and get the destination or a paste.
- * Lootlabs: the page's own task list, clicked without opening any of the
- * offers (popups and new tabs are stubbed out). Its server marks each task
- * done after a while and sends the destination over its socket ("r:...").
+ * The steps themselves run in the page's own world, in
+ * src/content/unlockPage.js; this side draws TabPaladin's page, hands that
+ * script the link and a secret, and shows what it reports.
  *
  * Registered at runtime by the helper (src/helper/unwrap.js), only while
  * "Skip link lockers" is on in its Settings. It reads no extension storage
@@ -68,177 +65,13 @@
     }
 
     if (typeof document === 'undefined') {
-        globalThis.TPUnlock = { classify, decodeLoot, safeUrl, pageWorker, LINKVERTISE, LOOTLABS };
+        globalThis.TPUnlock = { classify, decodeLoot, safeUrl, LINKVERTISE, LOOTLABS };
         return;
     }
     if (window.top !== window || window.__tpUnlock) return;
     window.__tpUnlock = true;
     const link = classify(location.href);
     if (!link) return;
-
-    // Runs in the page's own world (injected below), so its requests are the
-    // page's. It sees nothing of the content script: it gets cfg and talks
-    // through events on its own script element, which the page cannot reach
-    // once it is removed. The page's later changes to dispatchEvent and the
-    // like do not reach it either: they are taken here, first.
-    function pageWorker(cfg) {
-        const channel = document.currentScript;
-        const dispatch = EventTarget.prototype.dispatchEvent, Custom = CustomEvent, stringify = JSON.stringify;
-        const say = (type, data) => { dispatch.call(channel, new Custom('tp-unlock-out', { detail: stringify({ type, ...data }) })); };
-        const pageFetch = window.fetch.bind(window);
-        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-        // No popups or new tabs from this page while TabPaladin is on it,
-        // except what its Unlock button opens: that is the destination. Once
-        // a Linkvertise page is shown, it is the user's again.
-        let unlockAt = 0, handsOff = false;
-        document.addEventListener('click', (e) => {
-            if (e.target && e.target.closest && e.target.closest('button[class*="unlock-btn"]')) unlockAt = Date.now();
-        }, true);
-        const blocked = (url, what) => {
-            if (url && Date.now() - unlockAt < 3000) say('done', { url: String(url) });
-            else say('log', { text: 'Blocked a ' + what });
-        };
-        const stubWindow = () => ({ closed: false, opener: null, close() { this.closed = true; }, focus() {}, blur() {}, postMessage() {},
-            location: { href: '', assign() {}, replace() {} }, document: { open() {}, write() {}, close() {} } });
-        const nativeOpen = window.open;
-        window.open = function (url) {
-            if (handsOff) return nativeOpen.apply(this, arguments);
-            blocked(url, 'popup');
-            return stubWindow();
-        };
-        const anchorClick = HTMLAnchorElement.prototype.click;
-        HTMLAnchorElement.prototype.click = function () {
-            if (!handsOff && this.target && this.target !== '_self' && this.target !== '_top' && this.target !== '_parent') { blocked(this.href, 'new tab'); return; }
-            return anchorClick.call(this);
-        };
-        channel.addEventListener('tp-unlock-in', (e) => { if (String(e.detail) === 'shown' && cfg.link.site === 'linkvertise') handsOff = true; });
-
-        async function linkvertise() {
-            const GQL = 'https://publisher.linkvertise.com/graphql';
-            const identifier = { userIdAndUrl: { user_id: cfg.link.userId, url: cfg.link.url } };
-            const GET = 'query getContent($identifier: PublicLinkIdentificationInput!, $task_args: TaskArgument) { getContent(input: $identifier, task_args: $task_args) { ... on ContentAccessTaskSet { __typename tasks { __typename id ... on WaitTask { status remainingWaitingTime } ... on AdTask { status adIndex adsTotal payloadBag { taboola { session_id } } ads { completion_token countdown provider_additional_payload { taboola { available_event_url visible_event_url } } } } ... on PremiumTask { status } } } ... on DetailPageTargetData { __typename type url paste } } }';
-            const DONE = 'mutation completeTask($identifier: PublicLinkIdentificationInput!, $task_id: String!, $task_args: TaskArgument) { completeTask(input: $identifier, task_id: $task_id, task_args: $task_args) { id ... on AdTask { status } ... on WaitTask { status } ... on PremiumTask { status } } }';
-            const mobile = navigator.userAgentData ? navigator.userAgentData.mobile : /Mobi|Android/i.test(navigator.userAgent);
-            let tbUser = 'fallbackUserId', tbSession = '';
-            try {
-                const r = await pageFetch('https://api.taboola.com/2.0/json/linkvertisenew-singlecardexperience/user.sync?app.type=' + (mobile ? 'mobile' : 'desktop')
-                    + '&app.apikey=' + (mobile ? '4ca5a7098b3d22c647cc4c0810721cabcdf09055' : 'ef1d95992fae5ed0b4440e58cae147e9a1f7ffea'));
-                tbUser = (await r.json()).user.id || tbUser;
-            } catch (_) { /* the page itself falls back to this too */ }
-            const args = (extra) => ({ additional_data: { taboola: { user_id: tbUser, consent_string: '', url: location.href, external_referrer: document.referrer, session_id: tbSession } },
-                action_id: crypto.randomUUID(), ...extra });
-            const gql = async (name, query, variables) => {
-                const r = await pageFetch(GQL + '?name=' + name, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...(name === 'completeTask' ? { cqreferrer: location.href } : {}) },
-                    body: JSON.stringify({ operationName: name, query, variables })
-                });
-                let j;
-                try { j = await r.json(); } catch (_) { throw new Error('HTTP ' + r.status + ' from Linkvertise'); }
-                if (j.errors && j.errors.length) throw new Error(j.errors.map(e => e.message).join('; '));
-                return j.data;
-            };
-            const complete = async (id, extra) => {
-                const r = (await gql('completeTask', DONE, { identifier, task_id: id, task_args: args(extra) })).completeTask;
-                say('log', { text: 'completeTask ' + id + ': ' + (r && r.status) });
-                if (!r || r.status !== 'DONE') throw new Error('Linkvertise did not accept the step (' + (r && r.status) + ')');
-            };
-            const ping = (u) => u ? pageFetch(u).catch(() => {}) : Promise.resolve();
-
-            say('step', { text: 'Asking Linkvertise what this link needs' });
-            let content = (await gql('getContent', GET, { identifier, task_args: args() })).getContent;
-            for (let round = 0; round < 12 && content && content.__typename === 'ContentAccessTaskSet'; round++) {
-                const tasks = content.tasks || [];
-                say('log', { text: 'Tasks: ' + tasks.map(t => t.__typename + ':' + t.status).join(', ') });
-                const task = tasks.find(t => t.__typename !== 'PremiumTask' && t.status === 'IN_PROGRESS')
-                    || tasks.find(t => t.__typename !== 'PremiumTask' && t.status === 'OPEN');
-                if (!task) return say('fail', { reason: tasks.some(t => t.__typename === 'PremiumTask') ? 'lv-premium' : 'lv-stuck' });
-                if (task.__typename === 'WaitTask') {
-                    say('step', { text: 'Skipping the waiting room' });
-                    await complete(task.id);
-                } else if (task.__typename === 'AdTask') {
-                    tbSession = (task.payloadBag && task.payloadBag.taboola && task.payloadBag.taboola.session_id) || tbSession;
-                    const ad = (task.ads || [])[0];
-                    say('step', { text: 'Ad ' + (task.adIndex || 1) + ' of ' + (task.adsTotal || 1) + ', without showing it' });
-                    if (!ad) await complete(task.id);
-                    else {
-                        const tb = ad.provider_additional_payload && ad.provider_additional_payload.taboola;
-                        await ping(tb && tb.available_event_url);
-                        await ping(tb && tb.visible_event_url);
-                        // The page offers "Skip Ad" after 5 to 15 seconds.
-                        say('wait', { ms: 15000, text: 'Linkvertise wants each ad on screen for a moment' });
-                        await sleep(15000);
-                        try { await complete(task.id, { completion_token: ad.completion_token || undefined }); } catch (e) {
-                            const rest = Math.max(0, (Number(ad.countdown) || 60) * 1000 - 15000);
-                            say('log', { text: 'First try refused (' + e.message + '); retrying after ' + rest / 1000 + ' s' });
-                            say('wait', { ms: rest, text: 'Not yet accepted, giving it the ad\'s full time' });
-                            await sleep(rest);
-                            await complete(task.id, { completion_token: ad.completion_token || undefined });
-                        }
-                    }
-                } else {
-                    return say('fail', { reason: 'lv-unknown', detail: task.__typename });
-                }
-                content = (await gql('getContent', GET, { identifier, task_args: args() })).getContent;
-            }
-            if (!content || content.__typename !== 'DetailPageTargetData') return say('fail', { reason: 'lv-stuck' });
-            if (content.type === 'PASTE' || (!content.url && content.paste)) return say('paste', { text: String(content.paste || '') });
-            say('done', { url: content.url });
-        }
-
-        async function lootlabs() {
-            const NativeSocket = window.WebSocket;
-            let socket = false;
-            const Socket = function (url, protocols) {
-                const ws = protocols === undefined ? new NativeSocket(url) : new NativeSocket(url, protocols);
-                socket = true;
-                say('log', { text: 'Socket opened to ' + String(url).split('?')[0] });
-                ws.addEventListener('message', (e) => {
-                    const m = String(e.data);
-                    if (m.startsWith('r:')) say('loot-link', { payload: m.slice(2) });
-                    else if (m !== '0') say('log', { text: 'Socket: ' + m.slice(0, 120) });
-                });
-                ws.addEventListener('close', (e) => say('log', { text: 'Socket closed (' + e.code + ')' }));
-                return ws;
-            };
-            Socket.prototype = NativeSocket.prototype;
-            for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Socket[k] = NativeSocket[k];
-            window.WebSocket = Socket;
-
-            // A task is an element whose class starts "<category>_<id>_<category>".
-            const isTask = (el) => /^(\d+)_\d+_\1(\s|$)/.test(el.getAttribute('class') || '');
-            const findTasks = () => [...document.querySelectorAll('[class]')].filter(isTask);
-            say('step', { text: 'Waiting for the Lootlabs task list' });
-            let tasks = [];
-            for (let i = 0; i < 60 && !tasks.length; i++) { await sleep(500); tasks = findTasks(); }
-            if (!tasks.length) return say('fail', { reason: 'loot-no-tasks' });
-            const name = (t) => ((t.querySelector('[class*="task-name"]') || t).textContent || '').trim().slice(0, 80);
-            say('step', { text: 'Starting ' + tasks.length + ' tasks without opening them', names: tasks.map(name) });
-            for (const t of tasks) {
-                if (t.classList.contains('done')) continue;
-                t.click();
-                await sleep(1200);
-            }
-            await sleep(3000);
-            if (!socket) return say('fail', { reason: 'loot-no-start' });
-            say('step', { text: 'Waiting for Lootlabs to release the link (usually about a minute)' });
-            let pressed = false;
-            setInterval(() => {
-                tasks = findTasks();
-                const done = tasks.filter(t => t.classList.contains('done')).length;
-                say('loot-progress', { done, total: tasks.length });
-                // The page's own Unlock button opens the link itself, should
-                // it be ready before the socket says so.
-                const unlock = document.querySelector('button[class*="unlock-btn"]');
-                if (!pressed && tasks.length && done === tasks.length && unlock && !unlock.disabled) { pressed = true; say('log', { text: 'Pressing Unlock' }); unlock.click(); }
-            }, 1000);
-        }
-
-        say('alive', {});
-        (cfg.link.site === 'linkvertise' ? linkvertise() : lootlabs())
-            .catch(e => say('fail', { reason: cfg.link.site === 'linkvertise' ? 'lv-error' : 'loot-error', detail: String(e && e.message || e) }));
-    }
 
     const SITE = link.site === 'linkvertise' ? 'Linkvertise' : 'Lootlabs';
     const LIMIT = link.site === 'linkvertise' ? 4 * 60000 : 5 * 60000;
@@ -255,13 +88,25 @@
             ? 'A task may need doing by hand, such as "Confirm you are human". Show the page to finish it: TabPaladin keeps listening and opens the link when it arrives.'
             : 'Try again, or show the page.'],
         'bad-destination': ['The destination is not a web address.', 'Show the page to see it.'],
-        'blocked': ['The page did not let TabPaladin\'s script run.', 'Its security settings block it. Show the page to do it by hand.']
+        'blocked': ['TabPaladin\'s script did not start in the page.', 'Try again. If it keeps happening, this browser may be too old for it (Firefox needs version 128 or later). Show the page to do it by hand.']
     };
 
     // The covering page, in a closed shadow root so the locker's styles and
-    // scripts leave it alone.
+    // scripts leave it alone, and in the browser's top layer (a popover) so
+    // nothing the page stacks can cover it. Without popovers (Firefox before
+    // 125) it is the last element at the highest z-index instead.
     const host = document.createElement('tp-unlock');
     host.setAttribute('style', 'all:initial!important;position:fixed!important;inset:0!important;z-index:2147483647!important;display:block!important');
+    const topLayer = typeof host.showPopover === 'function';
+    if (topLayer) host.setAttribute('popover', 'manual');
+    let hidden = false;
+    const raise = () => {
+        if (hidden) return;
+        const html = document.documentElement;
+        if (!html) return;
+        if (!host.isConnected || (!topLayer && html.lastElementChild !== host)) html.appendChild(host);
+        if (topLayer && !host.matches(':popover-open')) { try { host.showPopover(); } catch (_) { /* not yet in a document */ } }
+    };
     const root = host.attachShadow({ mode: 'closed' });
     root.innerHTML = `<style>
 :host{color-scheme:dark}
@@ -287,6 +132,7 @@ li small{display:block;color:#aebac8;font-size:13px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .result{margin-top:16px;padding:12px 16px;border-left:3px solid #d9776f;background:#10151d;border-radius:4px}
 .result.paste{border-left-color:#63baa8}
+.result.needs{border-left-color:#e0b25b}
 .result b{display:block}
 .result p{margin:4px 0 0;color:#aebac8}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,monospace;max-height:320px;overflow:auto;margin:8px 0 0;color:#e5eaf0}
@@ -316,7 +162,10 @@ summary{cursor:pointer}
     const $ = (id) => root.getElementById(id);
     $('t').textContent = 'Skipping the ' + SITE + ' page';
     $('where').textContent = location.hostname + location.pathname.slice(0, 80) + (location.pathname.length > 80 ? '\u2026' : '');
-    (document.documentElement || document).appendChild(host);
+    raise();
+    // Kept on top until it is put away, also after a failure or once done.
+    setInterval(raise, 500);
+    document.addEventListener('DOMContentLoaded', raise);
 
     // State: working, then failed (a link may still arrive), then done
     // (opening the link, or showing a paste).
@@ -330,7 +179,6 @@ summary{cursor:pointer}
     const clock = setInterval(() => {
         const s = Math.floor((Date.now() - started) / 1000);
         $('clock').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-        if (!host.isConnected) (document.documentElement || document).appendChild(host);
         if (!alive && Date.now() - started > 5000) fail('blocked');
         else if (Date.now() > deadline) fail('timeout');
     }, 1000);
@@ -362,6 +210,7 @@ summary{cursor:pointer}
         const [why, next] = REASONS[reason] || REASONS['lv-error'];
         $('why').textContent = 'Couldn\'t skip this page. ' + why;
         $('next').textContent = next;
+        $('result').className = 'result';
         $('result').hidden = false;
         $('retry').hidden = false;
         $('copy').hidden = false;
@@ -411,11 +260,15 @@ summary{cursor:pointer}
         note('Got a paste of ' + text.length + ' characters');
     }
 
-    const script = document.createElement('script');
+    // The page's script reports through events named with this secret, which
+    // the page never sees: it is handed over before any page script runs.
+    const secret = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
     // The work goes on underneath: a link that still arrives is opened.
     $('show').addEventListener('click', () => {
+        hidden = true;
+        if (topLayer) { try { host.hidePopover(); } catch (_) { /* already hidden */ } }
         host.style.setProperty('display', 'none', 'important');
-        script.dispatchEvent(new CustomEvent('tp-unlock-in', { detail: 'shown' }));
+        document.dispatchEvent(new CustomEvent('tp-unlock-in-' + secret, { detail: 'shown' }));
         note('Page shown');
     });
     $('retry').addEventListener('click', () => location.reload());
@@ -427,7 +280,7 @@ summary{cursor:pointer}
     $('copy').addEventListener('click', () => copy(['TabPaladin link locker: ' + SITE, location.hostname + location.pathname, ...log].join('\n')));
     $('copyPaste').addEventListener('click', () => { try { navigator.clipboard.writeText($('paste').textContent).then(() => { $('copyPaste').textContent = 'Copied'; }); } catch (_) { /* select it by hand */ } });
 
-    script.addEventListener('tp-unlock-out', (e) => {
+    document.addEventListener('tp-unlock-' + secret, (e) => {
         let m;
         try { m = JSON.parse(String(e.detail)); } catch (_) { return; }
         if (!m || typeof m !== 'object') return;
@@ -457,11 +310,29 @@ summary{cursor:pointer}
         } else if (m.type === 'loot-progress') {
             subtext(m.done + ' of ' + m.total + ' tasks done');
             if (m.total) progress(m.done / m.total);
+        } else if (m.type === 'loot-needs') {
+            // Not a failure: the page is the user's for this one step, and
+            // the link is still opened when it arrives.
+            const names = (Array.isArray(m.names) ? m.names : []).map(String).filter(Boolean);
+            deadline = Math.max(deadline, Date.now() + 15 * 60000);
+            $('result').className = 'result needs';
+            $('why').textContent = names.length === 1 ? 'One step needs you: ' + names[0] : 'These steps need you: ' + names.join(', ');
+            $('next').textContent = 'Lootlabs doesn\'t finish ' + (names.length === 1 ? 'it' : 'them') + ' on its own. Show the page and do '
+                + (names.length === 1 ? 'it' : 'them') + ' there; TabPaladin keeps listening and opens the link as soon as Lootlabs sends it.';
+            $('result').hidden = false;
+            $('show').className = 'primary';
+            note('Needs the user: ' + names.join(', '));
         }
     });
 
     step('Starting');
-    script.textContent = '(' + pageWorker.toString() + ')(' + JSON.stringify({ link }) + ');';
-    (document.head || document.documentElement).appendChild(script);
-    script.remove();
+    // Hand-over: the page's script takes this off the root element now if it
+    // ran first (on the event), or as soon as it runs.
+    const html = document.documentElement;
+    if (html) {
+        html.setAttribute('data-tp-unlock', JSON.stringify({ n: secret, link }));
+        document.dispatchEvent(new CustomEvent('tp-unlock-hello'));
+        // Not picked up in time: no page script to give it to.
+        setTimeout(() => { if (!alive) html.removeAttribute('data-tp-unlock'); }, 5000);
+    }
 })();
