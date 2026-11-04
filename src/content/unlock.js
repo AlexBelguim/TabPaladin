@@ -274,6 +274,8 @@ summary{cursor:pointer}
             $('next').replaceChildren(a);
             $('result').hidden = false;
         }, 4000);
+        // The page's side stops scripts sending this tab elsewhere: not this.
+        document.dispatchEvent(new CustomEvent('tp-unlock-in-' + secret, { detail: 'go:' + url }));
         location.replace(url);
     }
     function showPaste(text) {

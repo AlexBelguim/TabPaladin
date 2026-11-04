@@ -112,7 +112,7 @@ const fakePage = () => {
     HTMLAnchorElement.prototype.click = () => {};
     const NativeSocket = function () {};
     const win = { fetch: () => new Promise(() => {}), open: () => null, WebSocket: NativeSocket };
-    const box = { window: win, document, EventTarget, Element, CustomEvent, HTMLAnchorElement, JSON, Promise, String, Number, Math, Date, Array, Error,
+    const box = { window: win, document, EventTarget, Element, CustomEvent, HTMLAnchorElement, JSON, Promise, String, Number, Math, Date, Array, Error, URL,
         navigator: { userAgent: 'x' }, crypto: { randomUUID: () => 'u' }, location: { href: 'https://linkvertise.com/1/a' }, setTimeout: () => 0, setInterval: () => 0 };
     vm.createContext(box);
     return { box, said, attrs, root, document, win, NativeSocket, CustomEvent, run: () => vm.runInContext(pageSource, box, { filename: 'src/content/unlockPage.js' }) };
@@ -160,12 +160,46 @@ for (const [site, first] of [['linkvertise', 'page'], ['lootlabs', 'content']]) 
     Date.now = realNow;
     check('once shown, what Unlock opens is still TabPaladin\'s to open, not a new tab', doneWith('https://lootdest.example/after') && opened.length === 1, opened);
 }
+// A click on the page (its human check's Continue) sends the tab to an ad and
+// opens the locker again in a new tab: neither, shown page or not. Unlock's
+// link and the destination TabPaladin opens itself still go.
+{
+    const p = fakePage();
+    const opened = [];
+    p.win.open = (url) => { opened.push(url); return null; };
+    p.win.navigation = new p.box.EventTarget();
+    p.box.location = { href: 'https://speedy-links.com/s?f933e7ff', origin: 'https://speedy-links.com' };
+    p.attrs['data-tp-unlock'] = JSON.stringify({ n: 'abc123', link: { site: 'lootlabs', userId: '1', url: 'a' } });
+    p.run();
+    // Whether the navigation was stopped.
+    const navigate = (url, extra = {}) => {
+        const e = { type: 'navigate', cancelable: true, userInitiated: false, navigationType: 'push', destination: { url }, prevented: false, preventDefault() { this.prevented = true; }, ...extra };
+        p.win.navigation.dispatchEvent(e);
+        return e.prevented;
+    };
+    const realNow = Date.now;
+    Date.now = () => realNow() + 5000;
+    p.document.dispatchEvent(new p.CustomEvent('tp-unlock-in-abc123', { detail: 'shown' }));
+    check('once shown, a script sending the tab to an ad is stopped', navigate('https://echonverforrinho.info/?tid=1060711') === true);
+    check('a navigation on the locker\'s own site goes', navigate('https://speedy-links.com/s?f933e7ff&step=2') === false);
+    check('a link the user clicks goes', navigate('https://example.org/', { userInitiated: true }) === false);
+    p.win.open('https://speedy-links.com/s?f933e7ff');
+    check('once shown, the page opening itself again in a new tab is stopped', opened.length === 0, opened);
+    p.document.dispatchEvent(new p.CustomEvent('tp-unlock-in-abc123', { detail: 'go:https://dest.example/file' }));
+    check('the destination TabPaladin opens goes', navigate('https://dest.example/file', { navigationType: 'replace' }) === false);
+    Date.now = () => realNow() + 10000;
+    p.document.dispatchEvent({ type: 'click', target: { closest: (sel) => (/unlock-btn/.test(sel) ? {} : null) } });
+    check('what Unlock opens in this tab goes', navigate('https://lootdest.example/redirect') === false);
+    Date.now = realNow;
+}
 {
     const p = fakePage();
     p.run();
     p.document.dispatchEvent(new p.CustomEvent('tp-unlock-hello'));
     check('without a hand-over the page\'s side does nothing', p.said.every(m => m.event === 'tp-unlock-hello') && p.win.open('x') === null);
 }
+check('the content side names its destination to the page\'s side before going there, so it is not stopped as a redirect',
+    /detail: 'go:' \+ url \}\)\);\s*location\.replace\(url\)/.test(unlockSource));
 check('the content side hands over on the root element and listens on the secret event',
     /setAttribute\('data-tp-unlock'/.test(unlockSource) && /'tp-unlock-' \+ secret/.test(unlockSource) && !/createElement\('script'\)/.test(unlockSource));
 const hostsIn = (file, re) => [...fs.readFileSync(root + '/' + file, 'utf8').match(re)[0].matchAll(/'([a-z0-9.-]+\.[a-z]+)'/g)].map(m => m[1]).sort();

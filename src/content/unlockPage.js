@@ -22,7 +22,7 @@
     const root = document.documentElement;
     const dispatch = EventTarget.prototype.dispatchEvent, listen = EventTarget.prototype.addEventListener, unlisten = EventTarget.prototype.removeEventListener;
     const getAttr = Element.prototype.getAttribute, removeAttr = Element.prototype.removeAttribute;
-    const Custom = CustomEvent, stringify = JSON.stringify, parse = JSON.parse;
+    const Custom = CustomEvent, stringify = JSON.stringify, parse = JSON.parse, Url = URL;
     if (!root) return;
 
     // unlock.js leaves {n, link} on the root element; whichever of the two
@@ -55,26 +55,48 @@
             if (e.target && e.target.closest && e.target.closest('button[class*="unlock-btn"]')) unlockAt = Date.now();
         }, true);
         const fromUnlock = (url) => Boolean(url) && Date.now() - unlockAt < 3000;
+        // The page opening itself again in a new tab: half of the ad trick a
+        // click on it plays (the other half sends this tab to the ad, below).
+        const ownSite = (url) => { try { return new Url(String(url || ''), location.href).origin === location.origin; } catch (_) { return false; } };
         const stubWindow = () => ({ closed: false, opener: null, close() { this.closed = true; }, focus() {}, blur() {}, postMessage() {},
             location: { href: '', assign() {}, replace() {} }, document: { open() {}, write() {}, close() {} } });
         const nativeOpen = window.open;
         window.open = function (url) {
             if (fromUnlock(url)) { say('done', { url: String(url) }); return stubWindow(); }
-            if (handsOff) return nativeOpen.apply(this, arguments);
-            say('log', { text: 'Blocked a popup' });
+            if (handsOff && !ownSite(url)) return nativeOpen.apply(this, arguments);
+            say('log', { text: handsOff ? 'Blocked a copy of this page in a new tab' : 'Blocked a popup' });
             return stubWindow();
         };
         const anchorClick = HTMLAnchorElement.prototype.click;
         HTMLAnchorElement.prototype.click = function () {
             if (this.target && this.target !== '_self' && this.target !== '_top' && this.target !== '_parent') {
                 if (fromUnlock(this.href)) { say('done', { url: String(this.href) }); return; }
-                if (!handsOff) { say('log', { text: 'Blocked a new tab' }); return; }
+                if (!handsOff || ownSite(this.href)) { say('log', { text: 'Blocked a new tab' }); return; }
             }
             return anchorClick.call(this);
         };
+        // Nor does a script send this tab to another site while TabPaladin is
+        // on it, shown page or not: a click on the page (its human check's
+        // Continue) sends the tab to an ad, and the work done here is lost.
+        // Except what Unlock opens, and the destination TabPaladin opens
+        // itself, which unlock.js names first ("go:").
+        let going = '';
+        const nav = window.navigation;
+        if (nav && typeof nav.addEventListener === 'function') {
+            listen.call(nav, 'navigate', (e) => {
+                if (!e.cancelable || e.userInitiated || (e.navigationType !== 'push' && e.navigationType !== 'replace')) return;
+                let to;
+                try { to = new Url(e.destination.url); } catch (_) { return; }
+                if (to.origin === location.origin || to.href === going || fromUnlock(to.href)) return;
+                e.preventDefault();
+                say('log', { text: 'Blocked a redirect to ' + to.hostname });
+            });
+        }
         let onShown = null;
         listen.call(document, 'tp-unlock-in-' + cfg.n, (e) => {
-            if (String(e.detail) !== 'shown') return;
+            const detail = String(e.detail);
+            if (detail.startsWith('go:')) { going = detail.slice(3); return; }
+            if (detail !== 'shown') return;
             handsOff = true;
             if (onShown) onShown();
         });
