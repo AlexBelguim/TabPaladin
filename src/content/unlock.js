@@ -107,6 +107,32 @@
         if (!host.isConnected || (!topLayer && html.lastElementChild !== host)) html.appendChild(host);
         if (topLayer && !host.matches(':popover-open')) { try { host.showPopover(); } catch (_) { /* not yet in a document */ } }
     };
+
+    // The tab's icon while TabPaladin has the page, also once it is shown:
+    // TabPaladin's shield, saying what is going on. The page's own icons are
+    // switched off for as long as this page is open.
+    const SHIELD = 'M24 2 L44 9 V25 C44 36.5 35 43.5 24 46.5 C13 43.5 4 36.5 4 25 V9 Z';
+    const ICONS = {
+        working: ['#60a5fa', '#8b5cf6', '<path d="M13.5 15.5l8.5 8.5-8.5 8.5M24.5 15.5l8.5 8.5-8.5 8.5" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'],
+        needs: ['#fbbf24', '#f59e0b', '<circle cx="24" cy="17" r="5.5" fill="#fff"/><path d="M13.5 35.5c0-6.6 4.7-10 10.5-10s10.5 3.4 10.5 10z" fill="#fff"/>'],
+        failed: ['#f87171', '#dc2626', '<rect x="21.5" y="11" width="5" height="16.5" rx="2.5" fill="#fff"/><circle cx="24" cy="33.5" r="3.2" fill="#fff"/>']
+    };
+    const favicon = document.createElement('link');
+    favicon.rel = 'icon';
+    favicon.type = 'image/svg+xml';
+    const setIcon = (kind) => {
+        const [from, to, glyph] = ICONS[kind];
+        favicon.href = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            + `<stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="${to}"/></linearGradient></defs><path d="${SHIELD}" fill="url(#g)"/>${glyph}</svg>`);
+    };
+    setIcon('working');
+    // Browsers read icons from the head, which a page only has once parsing starts.
+    const keepIcon = () => {
+        const head = document.head;
+        if (!head) return;
+        for (const l of head.querySelectorAll('link[rel~="icon" i]')) if (l !== favicon) l.rel = 'tp-unlock-page-icon';
+        if (favicon.parentNode !== head || head.lastElementChild !== favicon) head.appendChild(favicon);
+    };
     const root = host.attachShadow({ mode: 'closed' });
     root.innerHTML = `<style>
 :host{color-scheme:dark}
@@ -163,9 +189,11 @@ summary{cursor:pointer}
     $('t').textContent = 'Skipping the ' + SITE + ' page';
     $('where').textContent = location.hostname + location.pathname.slice(0, 80) + (location.pathname.length > 80 ? '\u2026' : '');
     raise();
-    // Kept on top until it is put away, also after a failure or once done.
-    setInterval(raise, 500);
-    document.addEventListener('DOMContentLoaded', raise);
+    keepIcon();
+    // Kept on top until it is put away, also after a failure or once done;
+    // the tab's icon is kept the whole time.
+    setInterval(() => { raise(); keepIcon(); }, 500);
+    document.addEventListener('DOMContentLoaded', () => { raise(); keepIcon(); });
 
     // State: working, then failed (a link may still arrive), then done
     // (opening the link, or showing a paste).
@@ -204,6 +232,7 @@ summary{cursor:pointer}
     function fail(reason, detail) {
         if (state === 'done') return;
         state = 'failed';
+        setIcon('failed');
         stop();
         if (current) current.className = 'bad';
         $('bar').classList.add('failed');
@@ -219,6 +248,7 @@ summary{cursor:pointer}
     }
     const finish = () => {
         state = 'done';
+        setIcon('working');
         stop();
         if (current) current.className = 'ok';
         $('bar').classList.remove('failed');
@@ -316,6 +346,7 @@ summary{cursor:pointer}
             const names = (Array.isArray(m.names) ? m.names : []).map(String).filter(Boolean);
             deadline = Math.max(deadline, Date.now() + 15 * 60000);
             $('result').className = 'result needs';
+            setIcon('needs');
             $('why').textContent = names.length === 1 ? 'One step needs you: ' + names[0] : 'These steps need you: ' + names.join(', ');
             $('next').textContent = 'Lootlabs doesn\'t finish ' + (names.length === 1 ? 'it' : 'them') + ' on its own. Show the page and do '
                 + (names.length === 1 ? 'it' : 'them') + ' there; TabPaladin keeps listening and opens the link as soon as Lootlabs sends it.';
