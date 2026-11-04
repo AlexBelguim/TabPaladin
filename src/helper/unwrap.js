@@ -2,8 +2,9 @@
 // ?r=. A tab that lands on one goes straight to it.
 // Other Linkvertise and Lootlabs link pages are skipped by the link-locker
 // scripts (src/content/unlock.js, and src/content/unlockPage.js in the page's
-// own world), registered only while helper Settings has them switched on and
-// those sites' access is granted.
+// own world), and rentry.co, where they usually lead, is kept from opening
+// new tabs (src/content/noNewTabs.js). Each is registered only while helper
+// Settings has it switched on and its sites' access is granted.
 (() => {
     const H = globalThis.TPHelper, api = H.api;
     const HOSTS = ['linkvertise.com', 'link-to.net', 'up-to-down.net', 'direct-link.net', 'link-center.net', 'link-hub.net', 'link-target.net', 'file-link.net'];
@@ -16,7 +17,11 @@
         { id: 'tp-unlock', matches: LOCKERS.origins, js: ['src/content/unlock.js'], runAt: 'document_start' },
         { id: 'tp-unlock-page', matches: LOCKERS.origins, js: ['src/content/unlockPage.js'], runAt: 'document_start', world: 'MAIN' }
     ];
-    const UNLOCK_IDS = UNLOCK_SCRIPTS.map(s => s.id);
+    const NO_TABS = { origins: ['rentry.co', 'rentry.org'].map(h => `https://*.${h}/*`) };
+    const SWITCHES = [
+        { key: UNLOCK_KEY, sites: LOCKERS, scripts: UNLOCK_SCRIPTS },
+        { key: 'tpNoNewTabs', sites: NO_TABS, scripts: [{ id: 'tp-no-new-tabs', matches: NO_TABS.origins, js: ['src/content/noNewTabs.js'], runAt: 'document_start', world: 'MAIN' }] }
+    ];
     H.unwrapLink = (value) => {
         let u;
         try { u = new URL(value); } catch (_) { return null; }
@@ -37,20 +42,18 @@
         if (dest) api.tabs.update(tabId, { url: dest }).catch(() => {});
     });
 
-    // The switch: the locker scripts run only while it is on and access is
-    // granted. Pages already open keep them until they are reloaded. Each
-    // script is registered on its own, so one this browser refuses (the
-    // page's side, before Firefox 128) does not keep out the other, and an
-    // update that adds a script registers just that one.
-    let run = Promise.resolve();
-    async function syncNow() {
-        if (!api.scripting || !api.scripting.registerContentScripts) return;
+    // The switches: each one's scripts run only while it is on and its sites'
+    // access is granted. Pages already open keep them until they are
+    // reloaded. Each script is registered on its own, so one this browser
+    // refuses (the page's world, before Firefox 128) does not keep out the
+    // others, and an update that adds a script registers just that one.
+    async function syncSwitch({ key, sites, scripts }) {
         try {
-            const wanted = Boolean((await api.storage.local.get(UNLOCK_KEY))[UNLOCK_KEY]);
-            const granted = await api.permissions.contains(LOCKERS);
-            const existing = (await api.scripting.getRegisteredContentScripts({ ids: UNLOCK_IDS })).map(s => s.id);
+            const wanted = Boolean((await api.storage.local.get(key))[key]);
+            const granted = await api.permissions.contains(sites);
+            const existing = (await api.scripting.getRegisteredContentScripts({ ids: scripts.map(s => s.id) })).map(s => s.id);
             if (wanted && granted) {
-                for (const script of UNLOCK_SCRIPTS.filter(s => !existing.includes(s.id))) {
+                for (const script of scripts.filter(s => !existing.includes(s.id))) {
                     try { await api.scripting.registerContentScripts([{ ...script, persistAcrossSessions: true }]); }
                     catch (_) {
                         try { await api.scripting.registerContentScripts([script]); }
@@ -61,13 +64,18 @@
                 await api.scripting.unregisterContentScripts({ ids: existing });
             }
         } catch (e) {
-            console.warn('TabPaladin: could not update link lockers', e);
+            console.warn('TabPaladin: could not update ' + key, e);
         }
+    }
+    let run = Promise.resolve();
+    async function syncNow() {
+        if (!api.scripting || !api.scripting.registerContentScripts) return;
+        for (const s of SWITCHES) await syncSwitch(s);
     }
     const sync = () => { run = run.then(syncNow, syncNow); return run; };
     H.syncLockers = sync;
     sync();
-    if (api.storage && api.storage.onChanged) api.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes[UNLOCK_KEY]) sync(); });
+    if (api.storage && api.storage.onChanged) api.storage.onChanged.addListener((changes, area) => { if (area === 'local' && SWITCHES.some(s => changes[s.key])) sync(); });
     if (api.permissions && api.permissions.onAdded) {
         api.permissions.onAdded.addListener(sync);
         api.permissions.onRemoved.addListener(sync);

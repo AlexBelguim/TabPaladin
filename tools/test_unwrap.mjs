@@ -149,13 +149,14 @@ check('the helper, Settings and the script name the same sites',
     && same(hostsIn('src/helper/options.js', /const UNLOCK_ORIGINS[\s\S]*?\.map/), lockerHosts));
 
 // Registered only while switched on and granted; off unregisters it.
-const store = {}, granted = { on: false }, registered = [], storeListeners = [], permListeners = [];
+const store = {}, granted = { on: false, rentry: false }, registered = [], storeListeners = [], permListeners = [];
 const refuse = { main: false };
 const regApi = {
     tabs: { onUpdated: { addListener() {} }, update: async () => {} },
     storage: { local: { get: async k => ({ [k]: store[k] }) }, onChanged: { addListener: fn => storeListeners.push(fn) } },
     permissions: {
-        contains: async p => granted.on && p.origins.length === lockerHosts.length,
+        contains: async p => p.origins.length === lockerHosts.length ? granted.on
+            : same(p.origins, ['https://*.rentry.co/*', 'https://*.rentry.org/*']) ? granted.rentry : false,
         onAdded: { addListener: fn => permListeners.push(fn) }, onRemoved: { addListener: fn => permListeners.push(fn) }
     },
     scripting: {
@@ -206,6 +207,73 @@ store.tpUnlock = false;
 await H2.syncLockers();
 check('switched off: unregistered', registered.length === 0);
 check('it follows the switch and the permission', storeListeners.length === 1 && permListeners.length === 2);
+
+// rentry.co without new tabs: its own switch and its own sites.
+store.tpNoNewTabs = true;
+await H2.syncLockers();
+check('rentry switched on without access: nothing', registered.length === 0);
+granted.rentry = true;
+await H2.syncLockers();
+const rentry = byId('tp-no-new-tabs');
+check('rentry switched on and granted: its script runs in the page\'s world at document start on rentry.co and rentry.org only',
+    registered.length === 1 && rentry && same(rentry.js, ['src/content/noNewTabs.js']) && rentry.world === 'MAIN' && rentry.runAt === 'document_start'
+    && same(rentry.matches, ['https://*.rentry.co/*', 'https://*.rentry.org/*']) && !rentry.allFrames, registered);
+store.tpUnlock = true;
+granted.on = true;
+await H2.syncLockers();
+store.tpNoNewTabs = false;
+await H2.syncLockers();
+check('switching rentry off leaves the locker scripts alone', registered.length === 2 && !byId('tp-no-new-tabs') && !!byId('tp-unlock'));
+store.tpNoNewTabs = true;
+storeListeners[0]({ tpNoNewTabs: { newValue: true } }, 'local');
+for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+const onAfterEvent = !!byId('tp-no-new-tabs');
+store.tpNoNewTabs = false;
+storeListeners[0]({ tpNoNewTabs: { newValue: false } }, 'local');
+for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+check('flipping the rentry switch in storage registers and unregisters it', onAfterEvent && !byId('tp-no-new-tabs') && !!byId('tp-unlock'));
+check('Settings asks for the same rentry sites',
+    /const NO_TABS_ORIGINS = \['rentry\.co', 'rentry\.org'\]\.map\(h => `https:\/\/\*\.\$\{h\}\/\*`\)/.test(fs.readFileSync(root + '/src/helper/options.js', 'utf8')));
+
+// The rentry script, in a pretend page.
+{
+    const noTabsSource = fs.readFileSync(root + '/src/content/noNewTabs.js', 'utf8');
+    check('the rentry script uses no extension API', !/\b(chrome|browser)\s*\./.test(bare(noTabsSource)) && !/storage\.|sendMessage|runtime\./.test(bare(noTabsSource)));
+    const opened = [], clicked = [], submitted = [], listeners = [];
+    class HTMLAnchorElement {
+        constructor(attrs = {}) { this.attrs = { ...attrs }; }
+        get target() { return this.attrs.target || ''; }
+        getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+        setAttribute(k, v) { this.attrs[k] = v; }
+        hasAttribute(k) { return k in this.attrs; }
+        closest() { return this; }
+    }
+    HTMLAnchorElement.prototype.click = function () { clicked.push(this.attrs.href); };
+    class HTMLFormElement { constructor(target) { this.target = target; } }
+    HTMLFormElement.prototype.submit = function () { submitted.push(this.target); };
+    const win = { open: (u) => { opened.push(u); return {}; }, addEventListener: (t, fn, capture) => listeners.push({ t, fn, capture }) };
+    const box = { window: win, document: { querySelector: () => null }, HTMLAnchorElement, HTMLFormElement };
+    vm.createContext(box);
+    vm.runInContext(noTabsSource, box, { filename: 'src/content/noNewTabs.js' });
+    const popup = win.open('https://ads.example/');
+    new HTMLAnchorElement({ href: 'https://ads.example/a', target: '_blank' }).click();
+    new HTMLAnchorElement({ href: 'https://example.com/same', target: '_self' }).click();
+    new HTMLAnchorElement({ href: 'blob:x', target: '_blank', download: 'f.txt' }).click();
+    new HTMLFormElement('_blank').submit();
+    new HTMLFormElement('').submit();
+    check('scripts\' popups, new-tab link clicks and new-tab forms are stopped; same-tab ones and downloads go through',
+        opened.length === 0 && popup && popup.closed === true && same(clicked, ['https://example.com/same', 'blob:x']) && same(submitted, ['']));
+    const click = listeners.find(l => l.t === 'click' && l.capture);
+    const fire = (a, ev) => { let prevented = false; click.fn({ target: a, isTrusted: true, button: 0, ctrlKey: false, shiftKey: false, metaKey: false, altKey: false, ...ev, preventDefault: () => { prevented = true; } }); return prevented; };
+    const plain = new HTMLAnchorElement({ href: 'https://mega.example/x', target: '_blank' });
+    fire(plain);
+    const ctrl = new HTMLAnchorElement({ href: 'https://mega.example/y', target: '_blank' });
+    fire(ctrl, { ctrlKey: true });
+    const fake = new HTMLAnchorElement({ href: 'https://ads.example/b', target: '_blank' });
+    const stopped = fire(fake, { isTrusted: false });
+    check('a plain click on a link opens it in the same tab; Ctrl-click still opens a new tab; a made-up click opens nothing',
+        plain.getAttribute('target') === '_self' && ctrl.getAttribute('target') === '_blank' && stopped === true);
+}
 
 if (failures) { console.error(failures + ' failed'); process.exit(1); }
 console.log('all passed');
