@@ -292,4 +292,49 @@
   .tab-group .board-tab { padding-left: 14px; }
   .board-domain.tab-site { margin: 4px 6px 2px; }
   .tab-group .tab-site .board-tab { padding-left: 24px; }
+
+  /* Open tabs already in the tree (board.js): apart and quieter, with where they are. */
+  .board-domain.tab-group.is-saved { border-left-color: var(--success); }
+  .tab-group.is-saved .tab-group-head { background: rgba(16, 185, 129, 0.08); }
+  .tab-group.is-saved .board-tab-title { color: var(--muted); }
+  .board-tab-where {
+    flex: none;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
 }
+
+/* "Already saved": move or copy (board.js), over the page. */
+.saved-ask-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12vh 16px;
+  background: rgba(0, 0, 0, 0.55);
+}
+.saved-ask-panel {
+  width: 100%;
+  max-width: 520px;
+  padding: 18px 20px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.saved-ask-panel h2 { margin: 0 0 10px; font-size: 1.05rem; }
+.saved-ask-list { margin: 0 0 12px; padding: 0; list-style: none; max-height: 40vh; overflow: auto; }
+.saved-ask-list li { display: flex; gap: 10px; padding: 5px 0; border-top: 1px solid var(--border); font-size: 0.85rem; }
+.saved-ask-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.saved-ask-where,
+.saved-ask-more { color: var(--muted); white-space: nowrap; }
+.saved-ask-hint { margin: 0 0 6px; }
+.saved-ask-note { margin: 0 0 6px; color: var(--muted); font-size: 0.85rem; }
+.saved-ask-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }

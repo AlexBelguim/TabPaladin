@@ -4,6 +4,35 @@ import { TabGrouper } from './lib/tabGrouper.js';
 import { helperUrl, keptSummary } from './helper.js';
 let dragging = null;
 const domain = url => { try { return new URL(url).hostname.replace(/^www\./,'') || 'Local files'; } catch { return 'Other'; } };
+// Where each URL is saved: its bookmarks, each with the folder it is in.
+const savedPlaces=roots=>{const out=new Map();const visit=(nodes,folder)=>{for(const n of nodes||[]){if(n.kind==='bookmark'&&n.url){if(!out.has(n.url))out.set(n.url,[]);out.get(n.url).push({node:n,folder});}if(n.children)visit(n.children,n);}};visit(roots,null);return out;};
+// A bookmark in the imports archive: the server's record, left where it is.
+const archived=n=>Boolean(n.virtual||n.readOnly||String(n.id).startsWith('imp:'));
+const placeNames=list=>[...new Set((list||[]).map(p=>p.folder?p.folder.title||'Untitled':'the top level'))];
+// Filing tabs that are already saved: move those bookmarks into the folder,
+// or add a copy there so the link is in both places. 'move', 'copy' or null.
+function askMoveOrCopy(tabs,places,target,others){
+    return new Promise(resolve=>{
+        const name=target.title||'this folder',one=tabs.length===1;
+        const done=v=>{sheet.remove();document.removeEventListener('keydown',key,true);resolve(v);};
+        const key=e=>{if(e.key==='Escape'){e.preventDefault();e.stopPropagation();done(null);}};
+        const several=tabs.some(t=>places.get(t.url).filter(p=>!archived(p.node)).length>1),inArchive=tabs.some(t=>places.get(t.url).some(p=>archived(p.node)));
+        const notes=[others?(others===1?'The other tab is new and is filed as usual.':'The other '+others+' tabs are new and are filed as usual.'):'',
+            several?'Moving a link saved in more than one folder leaves it only in '+name+'.':'',inArchive?'Copies in the imports archive stay there either way.':''].filter(Boolean);
+        const sheet=el('div',{className:'saved-ask-sheet',role:'dialog','aria-modal':'true','aria-label':'Already saved'},
+            el('div',{className:'saved-ask-panel'},
+                el('h2',{text:one?'This tab is already saved':tabs.length+' of these tabs are already saved'}),
+                el('ul',{className:'saved-ask-list'},tabs.slice(0,6).map(t=>el('li',{},el('span',{className:'saved-ask-title',text:t.title||t.url}),el('span',{className:'saved-ask-where',text:'in '+placeNames(places.get(t.url)).join(', ')}))),
+                    tabs.length>6?el('li',{className:'saved-ask-more',text:'and '+(tabs.length-6)+' more'}):null),
+                el('p',{className:'saved-ask-hint',text:(one?'Move it to ':'Move them to ')+name+', or add a copy there so '+(one?'it is':'they are')+' in both places.'}),
+                notes.length?el('p',{className:'saved-ask-note',text:notes.join(' ')}):null,
+                el('div',{className:'saved-ask-actions'},button('Move to '+name,()=>done('move'),'primary'),button('Add a copy',()=>done('copy')),button('Cancel',()=>done(null)))));
+        sheet.addEventListener('click',e=>{if(e.target===sheet)done(null);});
+        document.addEventListener('keydown',key,true);
+        document.body.append(sheet);
+        sheet.querySelector('button.primary').focus();
+    });
+}
 export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
     const eligible=nodes.filter(n=>n.kind==='bookmark'&&helperUrl(n.url));
     const urls=eligible.slice(0,limit).map(n=>n.url);
@@ -227,6 +256,17 @@ export function createBoard(ctx){
         if(!sameAccount(filingSnapshot.account,ctx.account()))throw new Error('The account changed; nothing was filed.');
         const selected=payload.tabs.map(t=>filingSnapshot.tabs.find(s=>s.tabId===t.tabId&&s.url===t.url)).filter(Boolean);
         if(!selected.length||selected.length!==payload.tabs.length)throw new Error('The tabs changed while you dragged them. No tabs were closed.');
+        // Tabs already saved: their bookmarks move here, or a copy is added
+        // (asked; cancelled, nothing is filed). A workflow always gets its own.
+        const places=savedPlaces(ctx.store.roots()),into=await ctx.store.getNode(targetId);
+        if(!into||into.readOnly||into.virtual)throw new Error('Choose an editable folder.');
+        const already=selected.filter(t=>places.has(t.url));
+        let move=false;
+        if(already.length&&into.role!=='workflows'){
+            const choice=await askMoveOrCopy(already,places,into,selected.length-already.length);
+            if(!choice)return;
+            move=choice==='move';
+        }
         let savedIds=[],workflowId=null;
         await ctx.edit(async()=>{
             let target=await ctx.store.getNode(targetId);if(!target||target.readOnly||target.virtual)throw new Error('Choose an editable folder.');
@@ -237,7 +277,15 @@ export function createBoard(ctx){
                 target=existing||await ctx.store.createNode({parentId:target.id,kind:'folder',title,payload:{createdAt:new Date().toISOString()}});
                 if((await ctx.store.getNode(targetId)).role==='workflows')workflowId=target.id;
             }
-            for(const t of selected){const n=await ctx.store.createNode({parentId:target.id,kind:'bookmark',title:t.title||t.url,url:t.url});savedIds.push({id:n.id,url:t.url});}
+            for(const t of selected){
+                // Moved: its first bookmark comes here, its other copies go (the archive's stay).
+                const mine=move?(places.get(t.url)||[]).filter(p=>!archived(p.node)):[];
+                if(mine.length){await ctx.store.moveNode(mine[0].node.id,{parentId:target.id});for(const p of mine.slice(1))await ctx.store.removeNode(p.node.id);savedIds.push({id:mine[0].node.id,url:t.url});continue;}
+                // A copy, but not a second one in the same folder.
+                const here=(target.children||[]).find(c=>c.kind==='bookmark'&&c.url===t.url);
+                if(here){savedIds.push({id:here.id,url:t.url});continue;}
+                const n=await ctx.store.createNode({parentId:target.id,kind:'bookmark',title:t.title||t.url,url:t.url});savedIds.push({id:n.id,url:t.url});
+            }
         });
         const kind=await ctx.platform.backendKind();if(!['indexeddb','cache'].includes(kind))throw new Error('The bookmarks are kept in memory only; tabs remain open.');
         const record=(await ctx.platform.getRaw('tpTree')).tpTree;const nodes=walk(record?.roots||[]);
@@ -283,20 +331,21 @@ export function createBoard(ctx){
         toolbar.append(button(smart?'Group by domain':'Group by keyword',()=>{smart=!smart;groupsOverride=null;ctx.refresh();}));
         const columns=el('div',{className:'board-columns'}),tabs=el('section',{className:'board-card board-column open-tabs'});
         const tabsOpen=ExpandState.isOpen(OPEN_TABS_KEY,true);
-        const known=new Set(walk(ctx.store.roots()).filter(n=>n.url).map(n=>n.url));
-        const items=listed?listed.tabs.filter(t=>!known.has(t.url)):[];
+        // New tabs in groups; those already in the tree apart, below them.
+        const places=savedPlaces(ctx.store.roots());
+        const items=listed?listed.tabs.filter(t=>!places.has(t.url)):[],saved=listed?listed.tabs.filter(t=>places.has(t.url)):[];
         const toggle=button('',()=>{ExpandState.set(OPEN_TABS_KEY,!ExpandState.isOpen(OPEN_TABS_KEY,true));ctx.refresh();},'board-toggle');
         toggle.setAttribute('aria-expanded',String(tabsOpen));
         toggle.append(el('span',{className:'folder-caret','aria-hidden':'true',text:tabsOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'🌐'}),
-            el('span',{className:'folder-title',text:'Open Tabs'}),el('span',{className:'folder-stats',text:listed?String(items.length):''}));
+            el('span',{className:'folder-title',text:'Open Tabs'}),el('span',{className:'folder-stats',text:listed?String(items.length)+(saved.length?' · '+saved.length+' saved':''):''}));
         const tabsBody=el('div',{className:'board-body'});
         tabs.append(el('div',{className:'board-heading'},toggle),tabsBody);tabs.classList.toggle('is-open',tabsOpen);tabsBody.hidden=!tabsOpen;
         if(tabsOpen){
-            if(!canList)tabsBody.append(el('p',{className:'board-empty'},'Open tabs show here with the TabPaladin helper installed. Tabs already in your tree are hidden.'));
+            if(!canList)tabsBody.append(el('p',{className:'board-empty'},'Open tabs show here with the TabPaladin helper installed. Tabs already in your tree are listed apart.'));
             else if(listError&&!listed)tabsBody.append(el('p',{className:'board-empty'},listError));
             else if(!listed)tabsBody.append(el('p',{className:'board-empty'},'Reading open tabs…'));
             else{
-                if(!items.length)tabsBody.append(el('p',{className:'board-empty'},'No tabs to file: every open tab is already in your tree.'));
+                if(!items.length)tabsBody.append(el('p',{className:'board-empty'},saved.length?'No new tabs: every open tab is already in your tree (below).':'No tabs to file: every open tab is already in your tree.'));
                 const groups=groupsOverride||(smart?TabGrouper.groupSmart(items,settings.customKeywords,settings.categoryOrder):Object.fromEntries([...new Set(items.map(t=>domain(t.url)))].map(d=>[d,items.filter(t=>domain(t.url)===d)])));
                 for(const[name,list]of Object.entries(groups)){
                     // A keyword group: the old page's violet .tab-group-card.
@@ -305,8 +354,8 @@ export function createBoard(ctx){
                     header.append(el('span',{className:'folder-caret','aria-hidden':'true',text:groupOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'🏷️'}),
                         el('span',{className:'domain-name',text:name}),el('span',{className:'domain-count',text:String(list.length)}));
                     dragTabs(header,{kind:'tabs',tabs:list,group:name});group.append(header);
-                    group.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
-                    group.addEventListener('drop',e=>{if(dragging?.kind!=='tabs')return;e.preventDefault();e.stopPropagation();const moving=new Set(dragging.tabs.map(t=>t.tabId));groupsOverride=Object.fromEntries(Object.entries(groups).map(([k,v])=>[k,v.filter(t=>!moving.has(t.tabId))]));groupsOverride[name].push(...dragging.tabs);dragging=null;ctx.refresh();});
+                    group.addEventListener('dragover',e=>{if(dragging?.kind==='tabs'&&!dragging.saved)e.preventDefault();});
+                    group.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||dragging.saved)return;e.preventDefault();e.stopPropagation();const moving=new Set(dragging.tabs.map(t=>t.tabId));groupsOverride=Object.fromEntries(Object.entries(groups).map(([k,v])=>[k,v.filter(t=>!moving.has(t.tabId))]));groupsOverride[name].push(...dragging.tabs);dragging=null;ctx.refresh();});
                     // Inside, a header per site, as in the folder cards: dragging
                     // one files its tabs straight into the folder dropped on.
                     const sites=new Map();for(const t of list){const d=domain(t.url);if(!sites.has(d))sites.set(d,[]);sites.get(d).push(t);}
@@ -318,10 +367,26 @@ export function createBoard(ctx){
                     }
                     tabsBody.append(group);
                 }
+                // Tabs already in the tree, with where they are. Dropped on a
+                // folder, they are moved there or copied (askMoveOrCopy).
+                if(saved.length){
+                    const key=tabGroupKey('__saved__'),savedOpen=ExpandState.isOpen(key,true),box=el('section',{className:'board-domain tab-group is-saved'});
+                    const header=button('',()=>{ExpandState.set(key,!ExpandState.isOpen(key,true));ctx.refresh();},'tab-group-head');
+                    header.title='Already in your tree. Drag to a folder to move them there or add a copy. Middle-click to close them';header.setAttribute('aria-expanded',String(savedOpen));closeOnMiddle(header,saved,box);
+                    header.append(el('span',{className:'folder-caret','aria-hidden':'true',text:savedOpen?'▾':'▸'}),el('span',{className:'folder-icon','aria-hidden':'true',text:'✓'}),
+                        el('span',{className:'domain-name',text:'Already saved'}),el('span',{className:'domain-count',text:String(saved.length)}));
+                    dragTabs(header,{kind:'tabs',tabs:saved,saved:true});box.append(header);
+                    if(savedOpen)for(const t of saved){
+                        const where=placeNames(places.get(t.url)).join(', ');
+                        const row=el('div',{className:'board-tab',title:t.url+'\nSaved in '+where},favicon(t.url),el('span',{className:'board-tab-title',text:t.title||t.url}),el('span',{className:'board-tab-where',text:where}));
+                        dragTabs(row,{kind:'tabs',tabs:[t],saved:true});closeOnMiddle(row,[t]);box.append(row);
+                    }
+                    tabsBody.append(box);
+                }
             }
         }
-        tabs.addEventListener('dragover',e=>{if(dragging?.kind==='tabs')e.preventDefault();});
-        tabs.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||!listed)return;e.preventDefault();const moving=dragging.tabs;const ids=new Set(moving.map(t=>t.tabId));const original=groupsOverride||TabGrouper.groupSmart(items,settings.customKeywords,settings.categoryOrder);groupsOverride=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,v.filter(t=>!ids.has(t.tabId))]));groupsOverride.Ungrouped=[...(groupsOverride.Ungrouped||[]),...moving];dragging=null;ctx.refresh();});
+        tabs.addEventListener('dragover',e=>{if(dragging?.kind==='tabs'&&!dragging.saved)e.preventDefault();});
+        tabs.addEventListener('drop',e=>{if(dragging?.kind!=='tabs'||dragging.saved||!listed)return;e.preventDefault();const moving=dragging.tabs;const ids=new Set(moving.map(t=>t.tabId));const original=groupsOverride||TabGrouper.groupSmart(items,settings.customKeywords,settings.categoryOrder);groupsOverride=Object.fromEntries(Object.entries(original).map(([k,v])=>[k,v.filter(t=>!ids.has(t.tabId))]));groupsOverride.Ungrouped=[...(groupsOverride.Ungrouped||[]),...moving];dragging=null;ctx.refresh();});
         columns.append(tabs);
         // Three columns: Open Tabs, Workflows (wherever its folder sits) and
         // Bookmarks, which holds the other top-level folders after its own.
