@@ -338,3 +338,10 @@
 .saved-ask-hint { margin: 0 0 6px; }
 .saved-ask-note { margin: 0 0 6px; color: var(--muted); font-size: 0.85rem; }
 .saved-ask-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* Copy links (board.js): the sites of the open tabs, to tick. */
+.copy-links-row { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
+.copy-links-row input { margin: 0; flex: none; }
+.copy-links-all { padding: 5px 0; font-weight: 600; font-size: 0.85rem; }
+.copy-links-manual { width: 100%; margin-top: 8px; font: inherit; font-size: 0.8rem; background: var(--bg, transparent); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+.copy-links-manual[hidden] { display: none; }

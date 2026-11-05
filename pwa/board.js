@@ -33,6 +33,36 @@ function askMoveOrCopy(tabs,places,target,others){
         sheet.querySelector('button.primary').focus();
     });
 }
+// Copy links: the open tabs by site, and the links of the ticked sites copied one per line, to paste into another app
+// (a downloader that takes links from the clipboard, say). Over the page, like askMoveOrCopy.
+function copyLinks(tabs,toast){
+    const bySite=new Map();for(const t of tabs){const d=domain(t.url);if(!bySite.has(d))bySite.set(d,[]);bySite.get(d).push(t.url);}
+    const sites=[...bySite].sort((a,b)=>b[1].length-a[1].length||a[0].localeCompare(b[0])).map(([name,urls])=>({name,urls,box:el('input',{type:'checkbox'})}));
+    const done=()=>{sheet.remove();document.removeEventListener('keydown',key,true);};
+    const key=e=>{if(e.key==='Escape'){e.preventDefault();e.stopPropagation();done();}};
+    const picked=()=>sites.filter(s=>s.box.checked).flatMap(s=>s.urls);
+    const hint=el('p',{className:'saved-ask-hint',text:'Tick the sites whose tabs you want: their links are copied, one per line.'});
+    // when the browser will not let the page write the clipboard, the links are shown selected to copy by hand
+    const manual=el('textarea',{className:'copy-links-manual',readOnly:true,rows:'5','aria-label':'The links',hidden:true});
+    const copy=button('Copy',async()=>{const urls=picked();if(!urls.length)return;const text=urls.join('\n');
+        try{await navigator.clipboard.writeText(text);done();toast('Copied '+urls.length+(urls.length===1?' link.':' links.'));}
+        catch{manual.value=text;manual.hidden=false;manual.focus();manual.select();hint.textContent='The browser did not let the page copy: press Ctrl+C now, the links are selected.';}},'primary');
+    const all=el('input',{type:'checkbox'});
+    const sync=()=>{const n=picked().length,k=sites.filter(s=>s.box.checked).length;copy.disabled=!n;copy.textContent=n?'Copy '+n+(n===1?' link':' links'):'Copy';all.checked=k===sites.length;all.indeterminate=k>0&&k<sites.length;};
+    all.addEventListener('change',()=>{for(const s of sites)s.box.checked=all.checked;sync();});
+    for(const s of sites)s.box.addEventListener('change',sync);
+    const sheet=el('div',{className:'saved-ask-sheet',role:'dialog','aria-modal':'true','aria-label':'Copy links'},
+        el('div',{className:'saved-ask-panel'},
+            el('h2',{text:'Copy links of the open tabs'}),hint,
+            el('label',{className:'copy-links-row copy-links-all'},all,el('span',{className:'saved-ask-title',text:'All sites'}),el('span',{className:'saved-ask-where',text:String(tabs.length)})),
+            el('ul',{className:'saved-ask-list copy-links-list'},sites.map(s=>el('li',{},el('label',{className:'copy-links-row'},s.box,el('span',{className:'saved-ask-title',text:s.name}),el('span',{className:'saved-ask-where',text:String(s.urls.length)}))))),
+            manual,
+            el('div',{className:'saved-ask-actions'},copy,button('Cancel',done))));
+    sheet.addEventListener('click',e=>{if(e.target===sheet)done();});
+    document.addEventListener('keydown',key,true);
+    document.body.append(sheet);sync();
+    if(sites.length)sites[0].box.focus();
+}
 export async function openNodes(ctx,nodes,limit=500,mode='new-window') {
     const eligible=nodes.filter(n=>n.kind==='bookmark'&&helperUrl(n.url));
     const urls=eligible.slice(0,limit).map(n=>n.url);
@@ -327,6 +357,7 @@ export function createBoard(ctx){
             el('div',{className:'page-title'},el('h1',{},'Board'),el('p',{className:'page-sub'},'Drag open tabs onto a folder to file them. Middle-click a folder header to open its links, an open tab or its header to close them.')),
             toolbar));
         const refresh=button('⟳ Refresh open tabs',relist,'primary');refresh.disabled=!canList;toolbar.append(refresh);
+        const openTabs=(listed&&listed.tabs)||[],copyBtn=button('⧉ Copy links',()=>copyLinks(openTabs,ctx.toast));copyBtn.disabled=!openTabs.length;copyBtn.title='Copy the links of the open tabs, by site';toolbar.append(copyBtn);
         toolbar.append(button('Choose window',async()=>{const wins=await ctx.helper.request('windows.list',{});const select=el('select',{'aria-label':'Browser window'});for(const w of wins)select.append(el('option',{value:String(w.windowId),text:(w.title||'Window')+' · '+w.tabCount}));select.addEventListener('change',()=>{windowId=Number(select.value);relist();});toolbar.append(select);}));
         toolbar.append(button(smart?'Group by domain':'Group by keyword',()=>{smart=!smart;groupsOverride=null;ctx.refresh();}));
         const columns=el('div',{className:'board-columns'}),tabs=el('section',{className:'board-card board-column open-tabs'});
